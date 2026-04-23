@@ -124,10 +124,10 @@ export async function findPublishedHashes(
 ): Promise<string[]> {
 	if (storePathHashes.length === 0) return [];
 
-	// D1 has a lower effective parameter limit than SQLite's 999
+	// D1 limits bound parameters to 100 per query; reserve 1 for cacheId
 	const results: string[] = [];
-	for (let i = 0; i < storePathHashes.length; i += 75) {
-		const chunk = storePathHashes.slice(i, i + 75);
+	for (let i = 0; i < storePathHashes.length; i += 99) {
+		const chunk = storePathHashes.slice(i, i + 99);
 		const rows = await db
 			.select({ storePathHash: publishedPaths.storePathHash })
 			.from(publishedPaths)
