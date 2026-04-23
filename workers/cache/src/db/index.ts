@@ -30,6 +30,7 @@ export {
 	findBlobObjectById,
 	createBlobObject,
 	findPublishedPath,
+	findPublishedHashes,
 	createPublishedPath,
 	findUploadSession,
 	createUploadSession,

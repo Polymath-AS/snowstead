@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt } from "drizzle-orm";
+import { eq, and, notInArray, lt, inArray } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import {
 	caches,
@@ -115,6 +115,27 @@ export async function createPublishedPath(
 		.values(params)
 		.returning()
 		.get();
+}
+
+export async function findPublishedHashes(
+	db: DrizzleD1Database,
+	cacheId: number,
+	storePathHashes: string[],
+): Promise<string[]> {
+	if (storePathHashes.length === 0) return [];
+
+	const rows = await db
+		.select({ storePathHash: publishedPaths.storePathHash })
+		.from(publishedPaths)
+		.where(
+			and(
+				eq(publishedPaths.cacheId, cacheId),
+				inArray(publishedPaths.storePathHash, storePathHashes),
+			),
+		)
+		.all();
+
+	return rows.map((r) => r.storePathHash);
 }
 
 // ── Upload Sessions ──

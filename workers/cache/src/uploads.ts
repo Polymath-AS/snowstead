@@ -9,6 +9,7 @@ import {
 	findBlobObject,
 	createPublishedPath,
 	findPublishedPath,
+	findPublishedHashes,
 } from "./db/repository.js";
 import { buildR2ObjectKey, parseFileHash, parseCompression } from "@odin/cache-domain";
 
@@ -294,13 +295,9 @@ export async function handleGetMissingPaths(
 		return errorResponse("Cache not found", 404);
 	}
 
-	const missing: string[] = [];
-	for (const hash of body.storePathHashes) {
-		const found = await findPublishedPath(config.db, cache.id, hash);
-		if (!found) {
-			missing.push(hash);
-		}
-	}
+	const existingHashes = await findPublishedHashes(config.db, cache.id, body.storePathHashes);
+	const existingSet = new Set(existingHashes);
+	const missing = body.storePathHashes.filter((h) => !existingSet.has(h));
 
 	return jsonResponse({ missing });
 }
