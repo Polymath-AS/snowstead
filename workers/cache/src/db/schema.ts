@@ -37,7 +37,7 @@ export const publishedPaths = sqliteTable("published_paths", {
 	createdAt: timestamp("created_at"),
 }, (table) => [
 	uniqueIndex("published_paths_cache_store_unique").on(table.cacheId, table.storePathHash),
-	index("idx_published_paths_lookup").on(table.cacheId, table.storePathHash),
+	index("idx_published_paths_blob_object").on(table.blobObjectId),
 ]);
 
 export const uploadSessions = sqliteTable("upload_sessions", {
