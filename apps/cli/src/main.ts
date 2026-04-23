@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+
+import { login, getServer } from "./config.js";
+import { createClient } from "./api.js";
+import { pushPaths } from "./push.js";
+import { getClosurePaths } from "./nix.js";
+
+const USAGE = `odin - Nix binary cache CLI
+
+Commands:
+  odin login <name> <server-url> <token>   Save server credentials
+  odin push <cache> <paths...>             Push store paths to a cache
+  odin push <cache> --closure <path>       Push a store path and its closure
+
+Options:
+  --server <name>    Use a specific server (default: last logged-in)
+  --help             Show this help
+
+Examples:
+  odin login prod https://cache.example.com my-token
+  odin push main /nix/store/abc...-hello
+  odin push main --closure /run/current-system
+  odin push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+`;
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+
+  if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
+  const command = args[0];
+
+  if (command === "login") {
+    if (args.length < 4) {
+      console.error("Usage: odin login <name> <server-url> <token>");
+      process.exit(1);
+    }
+    await login(args[1], args[2], args[3]);
+    console.log(`Logged in to '${args[1]}' at ${args[2]}`);
+    return;
+  }
+
+  if (command === "push") {
+    if (args.length < 3) {
+      console.error("Usage: odin push <cache> <paths...> | odin push <cache> --closure <path>");
+      process.exit(1);
+    }
+
+    let serverName: string | undefined;
+    const filteredArgs = [...args];
+    const serverIdx = filteredArgs.indexOf("--server");
+    if (serverIdx !== -1 && serverIdx + 1 < filteredArgs.length) {
+      serverName = filteredArgs[serverIdx + 1];
+      filteredArgs.splice(serverIdx, 2);
+    }
+
+    const serverConfig = await getServer(serverName);
+    const client = createClient(serverConfig.server, serverConfig.token);
+    const cache = filteredArgs[1];
+
+    const progress = (current: number, total: number, name: string, status: string) => {
+      console.log(`[${String(current)}/${String(total)}] ${name}`);
+      console.log(`  ${status}`);
+    };
+
+    const closureIdx = filteredArgs.indexOf("--closure");
+    let result;
+    if (closureIdx !== -1) {
+      const rootPath = filteredArgs[closureIdx + 1];
+      if (!rootPath) {
+        console.error("--closure requires a store path or installable");
+        process.exit(1);
+      }
+      console.log(`Resolving closure for ${rootPath}...`);
+      const paths = await getClosurePaths(rootPath);
+      console.log(`Found ${String(paths.length)} paths in closure`);
+      result = await pushPaths(client, cache, paths, progress);
+    } else {
+      const paths = filteredArgs.slice(2);
+      if (paths.length === 0) {
+        console.error("No paths specified");
+        process.exit(1);
+      }
+      result = await pushPaths(client, cache, paths, progress);
+    }
+
+    console.log("");
+    console.log(`Done: ${String(result.pushed)} pushed, ${String(result.skipped)} skipped, ${String(result.failed)} failed`);
+
+    if (result.failed > 0) {
+      process.exit(1);
+    }
+    return;
+  }
+
+  console.error(`Unknown command: ${command}`);
+  console.error("Run 'odin --help' for usage");
+  process.exit(1);
+}
+
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});
