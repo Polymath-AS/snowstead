@@ -14,6 +14,7 @@ Commands:
 
 Options:
   --server <name>    Use a specific server (default: last logged-in)
+  --jobs <n>         Number of parallel uploads (default: 8)
   --help             Show this help
 
 Examples:
@@ -49,12 +50,22 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    let serverName: string | undefined;
     const filteredArgs = [...args];
+
+    // Extract --server flag
+    let serverName: string | undefined;
     const serverIdx = filteredArgs.indexOf("--server");
     if (serverIdx !== -1 && serverIdx + 1 < filteredArgs.length) {
       serverName = filteredArgs[serverIdx + 1];
       filteredArgs.splice(serverIdx, 2);
+    }
+
+    // Extract --jobs flag
+    let concurrency: number | undefined;
+    const jobsIdx = filteredArgs.indexOf("--jobs");
+    if (jobsIdx !== -1 && jobsIdx + 1 < filteredArgs.length) {
+      concurrency = parseInt(filteredArgs[jobsIdx + 1], 10);
+      filteredArgs.splice(jobsIdx, 2);
     }
 
     const serverConfig = await getServer(serverName);
@@ -62,9 +73,10 @@ async function main(): Promise<void> {
     const cache = filteredArgs[1];
 
     const progress = (current: number, total: number, name: string, status: string) => {
-      console.log(`[${String(current)}/${String(total)}] ${name}`);
-      console.log(`  ${status}`);
+      console.log(`[${String(current)}/${String(total)}] ${name}  ${status}`);
     };
+
+    const pushOpts = { concurrency, onProgress: progress };
 
     const closureIdx = filteredArgs.indexOf("--closure");
     let result;
@@ -77,14 +89,14 @@ async function main(): Promise<void> {
       console.log(`Resolving closure for ${rootPath}...`);
       const paths = await getClosurePaths(rootPath);
       console.log(`Found ${String(paths.length)} paths in closure`);
-      result = await pushPaths(client, cache, paths, progress);
+      result = await pushPaths(client, cache, paths, pushOpts);
     } else {
       const paths = filteredArgs.slice(2);
       if (paths.length === 0) {
         console.error("No paths specified");
         process.exit(1);
       }
-      result = await pushPaths(client, cache, paths, progress);
+      result = await pushPaths(client, cache, paths, pushOpts);
     }
 
     console.log("");
