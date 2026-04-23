@@ -7,6 +7,7 @@ import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } f
 import {
 	handleCreateSession,
 	handleMultipart,
+	handleUploadBlob,
 	handleComplete,
 	handlePublish,
 	handleGetMissingPaths,
@@ -27,12 +28,12 @@ export async function handleRequest(
 		return handleHealthz(config);
 	}
 
-	// Write API routes (POST only)
+	// Write API routes (POST and PUT)
 	if (url.pathname.startsWith("/_api/v1/")) {
-		if (method !== "POST") {
+		if (method !== "POST" && method !== "PUT") {
 			return new Response("Method Not Allowed", {
 				status: 405,
-				headers: { allow: "POST" },
+				headers: { allow: "POST, PUT" },
 			});
 		}
 		return handleWriteApi(request, config, url.pathname);
@@ -202,6 +203,11 @@ async function handleWriteApi(
 	const multipart = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/multipart$/);
 	if (multipart) {
 		return handleMultipart(config, multipart[1]);
+	}
+
+	const blob = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/blob$/);
+	if (blob) {
+		return handleUploadBlob(request, config, blob[1]);
 	}
 
 	const complete = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/complete$/);

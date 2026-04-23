@@ -18,7 +18,7 @@ set -euo pipefail
 #   ./scripts/push-paths.sh https://odin-cache.polymath-as.workers.dev "$TOKEN" main \
 #     $(nix path-info -r .#nixosConfigurations.myhost.config.system.build.toplevel)
 #
-# Requirements: curl, nix, zstd, sha256sum, wrangler (authenticated)
+# Requirements: curl, nix, zstd, sha256sum
 
 BASE="${1:?usage: push-paths.sh <base-url> <auth-token> <cache-name> <paths...>}"
 TOKEN="${2:?usage: push-paths.sh <base-url> <auth-token> <cache-name> <paths...>}"
@@ -33,8 +33,6 @@ if [ ${#PATHS[@]} -eq 0 ]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKER_DIR="$(cd "$SCRIPT_DIR/../workers/cache" && pwd)"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -135,16 +133,20 @@ for hash in "${MISSING_HASHES[@]}"; do
   session_id=$(grep -o '"sessionId":"[^"]*"' "$TMPDIR/session.json" | cut -d'"' -f4)
   r2_key=$(grep -o '"r2Key":"[^"]*"' "$TMPDIR/session.json" | cut -d'"' -f4)
 
-  # Upload to R2 via wrangler
-  if ! wrangler r2 object put "odin-cache/$r2_key" --file "$nar_file" --remote \
-    -c "$WORKER_DIR/wrangler.jsonc" > /dev/null 2>&1; then
-    echo "  FAIL: R2 upload failed"
-    FAILED=$((FAILED + 1))
-    rm -f "$nar_file"
-    continue
-  fi
+  # Upload blob through the API
+  upload_status=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$BASE/_api/v1/uploads/$session_id/blob" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$nar_file")
 
   rm -f "$nar_file"
+
+  if [ "$upload_status" != "200" ]; then
+    echo "  FAIL: blob upload returned $upload_status"
+    FAILED=$((FAILED + 1))
+    continue
+  fi
 
   # Complete
   complete_status=$(curl -s -o /dev/null -w "%{http_code}" \

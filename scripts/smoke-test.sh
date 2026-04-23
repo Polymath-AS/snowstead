@@ -16,7 +16,7 @@ TOKEN="${2:?usage: smoke-test.sh <base-url> <auth-token>}"
 # Strip trailing slash
 BASE="${BASE%/}"
 
-# Resolve the worker directory for wrangler commands
+# Resolve worker dir for wrangler d1 seeding
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKER_DIR="$(cd "$SCRIPT_DIR/../workers/cache" && pwd)"
 
@@ -107,13 +107,14 @@ else
   check "session created (201)" "201" "$SESSION_STATUS"
   echo "  session=$SESSION_ID r2Key=$R2_KEY"
 
-  # 5b. Upload blob to R2
-  echo "  5b. Uploading blob to R2"
-  echo -n "$NAR_CONTENT" > /tmp/smoke-nar.bin
-  wrangler r2 object put "odin-cache/$R2_KEY" --file /tmp/smoke-nar.bin --remote \
-    -c "$WORKER_DIR/wrangler.jsonc" > /dev/null 2>&1
-  rm /tmp/smoke-nar.bin
-  echo "  ok: blob uploaded"
+  # 5b. Upload blob via API
+  echo "  5b. Uploading blob via API"
+  UPLOAD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PUT "$BASE/_api/v1/uploads/$SESSION_ID/blob" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "$NAR_CONTENT")
+  check "blob upload returns 200" "200" "$UPLOAD_STATUS"
 
   # 5c. Complete
   echo "  5c. Completing upload"

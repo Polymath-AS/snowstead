@@ -125,6 +125,39 @@ export async function handleMultipart(
 	});
 }
 
+// ── Upload Blob ──
+
+export async function handleUploadBlob(
+	request: Request,
+	config: WorkerConfig,
+	sessionId: string,
+): Promise<Response> {
+	const session = await findUploadSession(config.db, sessionId);
+	if (!session) {
+		return errorResponse("Session not found", 404);
+	}
+
+	if (session.status !== "pending" && session.status !== "uploading") {
+		return errorResponse(`Session is in '${session.status}' state, expected 'pending' or 'uploading'`, 409);
+	}
+
+	if (!session.r2UploadKey) {
+		return errorResponse("Session has no R2 upload key", 500);
+	}
+
+	if (!request.body) {
+		return errorResponse("Request body is empty", 400);
+	}
+
+	await config.bucket.put(session.r2UploadKey, request.body, {
+		httpMetadata: { contentType: "application/x-nix-nar" },
+	});
+
+	await updateUploadSessionStatus(config.db, sessionId, "uploading");
+
+	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
+}
+
 // ── Complete Upload ──
 
 export async function handleComplete(
