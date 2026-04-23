@@ -124,18 +124,27 @@ export async function findPublishedHashes(
 ): Promise<string[]> {
 	if (storePathHashes.length === 0) return [];
 
-	const rows = await db
-		.select({ storePathHash: publishedPaths.storePathHash })
-		.from(publishedPaths)
-		.where(
-			and(
-				eq(publishedPaths.cacheId, cacheId),
-				inArray(publishedPaths.storePathHash, storePathHashes),
-			),
-		)
-		.all();
+	// D1 has a lower effective parameter limit than SQLite's 999
+	const results: string[] = [];
+	for (let i = 0; i < storePathHashes.length; i += 75) {
+		const chunk = storePathHashes.slice(i, i + 75);
+		const rows = await db
+			.select({ storePathHash: publishedPaths.storePathHash })
+			.from(publishedPaths)
+			.where(
+				and(
+					eq(publishedPaths.cacheId, cacheId),
+					inArray(publishedPaths.storePathHash, chunk),
+				),
+			)
+			.all();
 
-	return rows.map((r) => r.storePathHash);
+		for (const r of rows) {
+			results.push(r.storePathHash);
+		}
+	}
+
+	return results;
 }
 
 // ── Upload Sessions ──

@@ -45,19 +45,12 @@ export async function pushPaths(
     hashes.push(hash);
   }
 
-  // Check missing in parallel batches
-  const chunks: string[][] = [];
-  for (let i = 0; i < hashes.length; i += 500) {
-    chunks.push(hashes.slice(i, i + 500));
-  }
-
-  const batchResults = await Promise.all(
-    chunks.map((chunk) => getMissingPaths(client, cache, chunk)),
-  );
-
+  // Check missing in sequential batches (server chunks internally for D1 limits)
   const missingSet = new Set<string>();
-  for (const batch of batchResults) {
-    for (const h of batch) {
+  for (let i = 0; i < hashes.length; i += 500) {
+    const chunk = hashes.slice(i, i + 500);
+    const missing = await getMissingPaths(client, cache, chunk);
+    for (const h of missing) {
       missingSet.add(h);
     }
   }
