@@ -1,7 +1,6 @@
 # Helios
 
-A Cloudflare-native Nix binary cache. Stores NARs in R2 and metadata in D1, serves standard Nix cache endpoints from Workers.
-
+A Cloudflare-native Nix binary cache.
 ## Workspace
 
 ```
