@@ -6,7 +6,11 @@ settings:
 
 importers:
 
-  .: {}
+  .:
+    devDependencies:
+      wrangler:
+        specifier: ^4.84.1
+        version: 4.84.1
 
   apps/cli:
     dependencies:

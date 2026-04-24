@@ -7,7 +7,7 @@
   "description": "Cloudflare-native Nix binary cache",
   "scripts": {
     "build": "echo 'wrangler bundles at deploy time'",
-    "deploy": "wrangler d1 migrations apply CACHE_DB --remote && wrangler deploy",
+    "deploy": "pnpm exec wrangler d1 migrations apply CACHE_DB --remote && pnpm exec wrangler deploy",
     "dev": "pnpm --filter @helios/cache-worker dev",
     "check": "pnpm -r check"
   },
@@ -20,5 +20,8 @@
         "description": "Ed25519 private key in PEM format for signing narinfo. Generate with `nix key generate-secret --key-name your-cache-1`."
       }
     }
+  },
+  "devDependencies": {
+    "wrangler": "^4.84.1"
   }
 }
