@@ -4,9 +4,9 @@ import { runGarbageCollection } from "./gc.js";
 import { logRequest } from "./logging.js";
 
 export default {
-	async fetch(request, env): Promise<Response> {
+	async fetch(request, env, ctx): Promise<Response> {
 		const start = Date.now();
-		const config = resolveConfig(env);
+		const config = { ...resolveConfig(env), ctx };
 		const response = await handleRequest(request, config);
 		logRequest(request, response, start);
 		return response;

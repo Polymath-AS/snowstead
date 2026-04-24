@@ -10,6 +10,7 @@ export interface WorkerConfig {
 	readonly r2AccessKeyId: string;
 	readonly r2SecretAccessKey: string;
 	readonly r2Endpoint: string;
+	readonly ctx?: ExecutionContext;
 }
 
 export function resolveConfig(env: Env): WorkerConfig {

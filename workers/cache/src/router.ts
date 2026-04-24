@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName, findPublishedPath, findBlobObject, findBlobObjectById } from "./db/repository.js";
+import { findCacheByName, findPublishedPath, findBlobObjectById } from "./db/repository.js";
 import { renderNarinfo } from "./narinfo.js";
 import { verifyAuth } from "./auth.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
@@ -74,7 +74,7 @@ export async function handleRequest(
 	}
 
 	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
-		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length));
+		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -153,6 +153,7 @@ async function handleNarDownload(
 	config: WorkerConfig,
 	rawFileHash: string,
 	rawCompression: string,
+	request: Request,
 ): Promise<Response> {
 	const fileHash = parseFileHash(rawFileHash);
 	if (typeof fileHash === "object") {
@@ -164,18 +165,18 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const blob = await findBlobObject(config.db, fileHash, compression);
-	if (!blob) {
-		return new Response("Not Found", { status: 404 });
-	}
+	// NAR keys are content-addressed, so we can skip the D1 lookup
+	// and go straight to R2 using the key derived from the URL
+	const r2Key = `nars/sha256/${fileHash}/${compression}.nar`;
 
+	// Presigned R2 redirect (bypasses Worker entirely)
 	if (config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
 		const url = await createPresignedUrl(
 			config.r2Endpoint,
 			config.r2AccessKeyId,
 			config.r2SecretAccessKey,
 			"odin-cache",
-			blob.r2Key,
+			r2Key,
 			3600,
 		);
 		return new Response(null, {
@@ -187,18 +188,32 @@ async function handleNarDownload(
 		});
 	}
 
-	const object = await config.bucket.get(blob.r2Key);
+	// Check CF edge cache first
+	const cache = await caches.open("odin-nar");
+	const cached = await cache.match(request);
+	if (cached) {
+		return cached;
+	}
+
+	const object = await config.bucket.get(r2Key);
 	if (!object) {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	return new Response(object.body, {
+	const response = new Response(object.body, {
 		headers: {
 			"content-type": "application/x-nix-nar",
-			"content-length": String(blob.fileSize),
+			"content-length": String(object.size),
 			"cache-control": "public, max-age=31536000, immutable",
 		},
 	});
+
+	// Store in CF edge cache (non-blocking)
+	if (config.ctx) {
+		config.ctx.waitUntil(cache.put(request, response.clone()));
+	}
+
+	return response;
 }
 
 async function handleWriteApi(
