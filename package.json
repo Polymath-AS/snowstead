@@ -1,12 +1,13 @@
 {
   "packageManager": "pnpm@10.33.0",
   "type": "module",
-  "name": "odin",
+  "name": "helios",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "description": "Cloudflare-native Nix cache workspace",
   "scripts": {
-    "dev": "pnpm --filter @odin/cache-worker dev",
-    "deploy": "pnpm --filter @odin/cache-worker deploy",
+    "dev": "pnpm --filter @helios/cache-worker dev",
+    "deploy": "pnpm --filter @helios/cache-worker deploy",
     "check": "pnpm -r check"
   }
 }

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Push Nix store paths to an Odin binary cache.
+# Push Nix store paths to a Helios binary cache.
 #
 # Usage:
 #   ./scripts/push-paths.sh <base-url> <auth-token> <cache-name> <store-path>...
 #
 # Examples:
 #   # Push a single path
-#   ./scripts/push-paths.sh https://odin-cache.polymath-as.workers.dev "$TOKEN" main /nix/store/abc...-hello
+#   ./scripts/push-paths.sh https://helios-cache.polymath-as.workers.dev "$TOKEN" main /nix/store/abc...-hello
 #
 #   # Push a NixOS system closure
-#   ./scripts/push-paths.sh https://odin-cache.polymath-as.workers.dev "$TOKEN" main \
+#   ./scripts/push-paths.sh https://helios-cache.polymath-as.workers.dev "$TOKEN" main \
 #     $(nix path-info -r /run/current-system)
 #
 #   # Push a flake output closure
-#   ./scripts/push-paths.sh https://odin-cache.polymath-as.workers.dev "$TOKEN" main \
+#   ./scripts/push-paths.sh https://helios-cache.polymath-as.workers.dev "$TOKEN" main \
 #     $(nix path-info -r .#nixosConfigurations.myhost.config.system.build.toplevel)
 #
 # Requirements: curl, nix, zstd, sha256sum

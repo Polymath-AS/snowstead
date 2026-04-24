@@ -1,5 +1,5 @@
 {
-  "name": "@odin/cache-worker",
+  "name": "@helios/cache-worker",
   "version": "0.0.0",
   "private": true,
   "scripts": {
@@ -18,7 +18,7 @@
     "wrangler": "^4.84.1"
   },
   "dependencies": {
-    "@odin/cache-domain": "workspace:*",
+    "@helios/cache-domain": "workspace:*",
     "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.2"
   }

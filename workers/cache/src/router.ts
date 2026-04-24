@@ -3,8 +3,8 @@ import { findCacheByName, findPublishedPathWithBlob } from "./db/repository.js";
 import { renderNarinfo } from "./narinfo.js";
 import { verifyAuth } from "./auth.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
-import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@odin/cache-domain";
-import type { CacheName } from "@odin/cache-domain";
+import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@helios/cache-domain";
+import type { CacheName } from "@helios/cache-domain";
 import {
 	handleCreateSession,
 	handleMultipart,
@@ -43,7 +43,7 @@ export async function handleRequest(
 	const method = request.method;
 
 	if (url.pathname === "/") {
-		return json({ service: "odin-cache", status: "ok" });
+		return json({ service: "helios-cache", status: "ok" });
 	}
 
 	if (url.pathname === "/healthz") {
@@ -112,9 +112,9 @@ function json(body: Record<string, string | boolean | number>, status = 200): Re
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
 	try {
 		await findCacheByName(config.db, "__healthz_probe__");
-		return json({ ok: true, service: "odin-cache" });
+		return json({ ok: true, service: "helios-cache" });
 	} catch {
-		return json({ ok: false, service: "odin-cache" }, 503);
+		return json({ ok: false, service: "helios-cache" }, 503);
 	}
 }
 
@@ -144,7 +144,7 @@ async function handleNarinfo(
 
 	// Normalize to GET for shared cache (HEAD and GET share the same cache entry)
 	const cacheKey = new Request(request.url, { method: "GET" });
-	const cache = await caches.open("odin-narinfo");
+	const cache = await caches.open("helios-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
 		if (method === "HEAD") {
@@ -232,7 +232,7 @@ async function handleNarDownload(
 	// Edge cache check (use a GET key for shared cache)
 	const cacheUrl = new URL(request.url);
 	const cacheRequest = new Request(cacheUrl, { method: "GET" });
-	const cache = await caches.open("odin-nar");
+	const cache = await caches.open("helios-nar");
 	const cached = await cache.match(cacheRequest);
 	if (cached) {
 		if (method === "HEAD") {

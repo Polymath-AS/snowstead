@@ -19,7 +19,7 @@ describe("cache worker", () => {
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
-			service: "odin-cache",
+			service: "helios-cache",
 			status: "ok",
 		});
 	});
@@ -30,7 +30,7 @@ describe("cache worker", () => {
 
 		expect(response.status).toBe(200);
 		const body = await response.json<{ ok: boolean; service: string }>();
-		expect(body.service).toBe("odin-cache");
+		expect(body.service).toBe("helios-cache");
 		expect(body.ok).toBe(true);
 	});
 

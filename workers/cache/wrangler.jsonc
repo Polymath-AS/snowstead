@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "odin-cache",
+	"name": "helios-cache",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-03-10",
 	"observability": {
@@ -9,29 +9,23 @@
 	"upload_source_maps": true,
 	"workers_dev": true,
 	"vars": {
-		"SIGNING_KEY_NAME": "odin-cache-1"
+		"SIGNING_KEY_NAME": "helios-cache-1"
 	},
 	"r2_buckets": [
 		{
 			"binding": "CACHE_BUCKET",
-			"bucket_name": "odin-cache"
+			"bucket_name": "helios-cache"
 		}
 	],
 	"d1_databases": [
 		{
 			"binding": "CACHE_DB",
-			"database_name": "odin-cache",
+			"database_name": "helios-cache",
 			"database_id": "0d2fd053-e119-4fc1-8c00-758e2e6d1c5f",
 			"migrations_dir": "migrations"
 		}
 	],
 	"triggers": {
 		"crons": ["0 */6 * * *"]
-	},
-	"routes": [
-		{
-			"pattern": "cache.polmath.no",
-			"custom_domain": true
-		}
-	]
+	}
 }

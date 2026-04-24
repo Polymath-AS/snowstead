@@ -45,7 +45,7 @@ async function pushSinglePath(
   hash: string,
 ): Promise<{ sizeKb: number }> {
   const info = await getPathInfo(storePath);
-  const narDir = await mkdtemp(join(tmpdir(), "odin-nar-"));
+  const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
   const narFile = join(narDir, "nar.zst");
 
   try {

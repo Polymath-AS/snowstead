@@ -8,7 +8,7 @@ declare namespace Cloudflare {
 	interface Env {
 		CACHE_BUCKET: R2Bucket;
 		CACHE_DB: D1Database;
-		SIGNING_KEY_NAME: "odin-cache-1";
+		SIGNING_KEY_NAME: "helios-cache-1";
 	}
 }
 interface Env extends Cloudflare.Env {}

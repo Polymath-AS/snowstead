@@ -1,4 +1,4 @@
-# Odin
+# Helios
 
 This repository is a `pnpm` workspace for Cloudflare-native services.
 

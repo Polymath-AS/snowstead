@@ -4,21 +4,21 @@
 
 Create these resources before deploying:
 
-1. **R2 Bucket**: `odin-cache`
+1. **R2 Bucket**: `helios-cache`
    ```bash
-   wrangler r2 bucket create odin-cache
+   wrangler r2 bucket create helios-cache
    ```
 
-2. **D1 Database**: `odin-cache`
+2. **D1 Database**: `helios-cache`
    ```bash
-   wrangler d1 create odin-cache
+   wrangler d1 create helios-cache
    ```
    Update the `database_id` in `workers/cache/wrangler.jsonc` with the
    returned ID.
 
 3. **Apply D1 migrations**:
    ```bash
-   wrangler d1 migrations apply odin-cache --remote
+   wrangler d1 migrations apply helios-cache --remote
    ```
 
 ## Secrets
@@ -33,7 +33,7 @@ wrangler secret put SIGNING_KEY_NAME
 
 - `AUTH_TOKEN`: bearer token for write API authentication
 - `SIGNING_PRIVATE_KEY`: base64-encoded Ed25519 private key for narinfo signing
-- `SIGNING_KEY_NAME`: the key name prefix for signatures (e.g., `odin-cache-1`)
+- `SIGNING_KEY_NAME`: the key name prefix for signatures (e.g., `helios-cache-1`)
 
 ## Deploy
 

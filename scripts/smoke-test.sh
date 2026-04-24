@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smoke test for the Odin Nix binary cache worker.
+# Smoke test for the Helios Nix binary cache worker.
 #
 # Usage:
 #   ./scripts/smoke-test.sh <base-url> <auth-token>
 #
 # Example:
-#   ./scripts/smoke-test.sh https://odin-cache.your-subdomain.workers.dev "your-token"
+#   ./scripts/smoke-test.sh https://helios-cache.your-subdomain.workers.dev "your-token"
 #   ./scripts/smoke-test.sh https://cache.polmath.no "your-token"
 
 BASE="${1:?usage: smoke-test.sh <base-url> <auth-token>}"
@@ -49,7 +49,7 @@ echo
 # ── 2. Seed a cache via D1 ──
 echo "2. Seeding test cache via D1"
 CACHE_NAME="smoke-$(date +%s)"
-wrangler d1 execute odin-cache --remote --yes \
+wrangler d1 execute helios-cache --remote --yes \
   -c "$WORKER_DIR/wrangler.jsonc" \
   --command "INSERT OR IGNORE INTO caches (name, is_public) VALUES ('$CACHE_NAME', 1)" \
   > /dev/null 2>&1

@@ -13,7 +13,7 @@ import {
 	findPublishedPath,
 	findPublishedHashes,
 } from "./db/repository.js";
-import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@odin/cache-domain";
+import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@helios/cache-domain";
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {

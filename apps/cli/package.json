@@ -1,17 +1,17 @@
 {
-  "name": "@odin/cli",
+  "name": "@helios/cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "bin": {
-    "odin": "./dist/main.js"
+    "helios": "./dist/main.js"
   },
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@odin/cache-domain": "workspace:*"
+    "@helios/cache-domain": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

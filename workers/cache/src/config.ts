@@ -24,12 +24,12 @@ export function resolveConfig(env: Env): WorkerConfig {
 	return {
 		bucket: env.CACHE_BUCKET,
 		db: drizzle(env.CACHE_DB),
-		signingKeyName: env.SIGNING_KEY_NAME || "odin-cache-1",
+		signingKeyName: env.SIGNING_KEY_NAME || "helios-cache-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		authToken: env.AUTH_TOKEN || "",
 		r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
 		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
 		r2Endpoint: env.R2_ENDPOINT || "",
-		r2BucketName: env.R2_BUCKET_NAME || "odin-cache",
+		r2BucketName: env.R2_BUCKET_NAME || "helios-cache",
 	};
 }

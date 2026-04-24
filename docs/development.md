@@ -37,13 +37,13 @@ pnpm check
 Run worker tests only:
 
 ```bash
-pnpm --filter @odin/cache-worker test
+pnpm --filter @helios/cache-worker test
 ```
 
 Run domain package tests only:
 
 ```bash
-pnpm --filter @odin/cache-domain test
+pnpm --filter @helios/cache-domain test
 ```
 
 ## Type Generation
@@ -51,7 +51,7 @@ pnpm --filter @odin/cache-domain test
 After changing `wrangler.jsonc` bindings:
 
 ```bash
-pnpm --filter @odin/cache-worker cf-typegen
+pnpm --filter @helios/cache-worker cf-typegen
 ```
 
 ## Database Migrations
@@ -59,13 +59,13 @@ pnpm --filter @odin/cache-worker cf-typegen
 After changing `workers/cache/src/db/schema.ts`:
 
 ```bash
-pnpm --filter @odin/cache-worker exec drizzle-kit generate
+pnpm --filter @helios/cache-worker exec drizzle-kit generate
 ```
 
 ## Project Structure
 
 ```
-odin/
+helios/
 ├── packages/
 │   └── cache-domain/     # Shared types and input parsers
 ├── workers/

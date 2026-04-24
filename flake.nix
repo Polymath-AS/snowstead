@@ -1,5 +1,5 @@
 {
-  description = "Odin – Cloudflare-native Nix binary cache";
+  description = "Helios – Cloudflare-native Nix binary cache";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -23,7 +23,7 @@
 
       checks = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
-          name = "odin-check";
+          name = "helios-check";
           src = self;
 
           nativeBuildInputs = [
@@ -33,7 +33,7 @@
           ];
 
           pnpmDeps = pkgs.fetchPnpmDeps {
-            pname = "odin";
+            pname = "helios";
             version = "0.0.0";
             src = self;
             hash = "sha256-kcyj1DbZfzUU8OyPh4vAjKEnJdEJwhEOBqqAZCaCCZI=";
@@ -42,10 +42,10 @@
 
           buildPhase = ''
             # Domain package: full check (tsc + unit tests)
-            pnpm --filter @odin/cache-domain check
+            pnpm --filter @helios/cache-domain check
 
             # Worker: type-check only (integration tests need workerd runtime)
-            pnpm --filter @odin/cache-worker exec tsc --noEmit
+            pnpm --filter @helios/cache-worker exec tsc --noEmit
           '';
 
           installPhase = ''

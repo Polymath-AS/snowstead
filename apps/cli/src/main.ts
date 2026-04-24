@@ -5,12 +5,12 @@ import { createClient } from "./api.js";
 import { pushPaths } from "./push.js";
 import { getClosurePaths } from "./nix.js";
 
-const USAGE = `odin - Nix binary cache CLI
+const USAGE = `helios - Nix binary cache CLI
 
 Commands:
-  odin login <name> <server-url> <token>   Save server credentials
-  odin push <cache> <paths...>             Push store paths to a cache
-  odin push <cache> --closure <path>       Push a store path and its closure
+  helios login <name> <server-url> <token>   Save server credentials
+  helios push <cache> <paths...>             Push store paths to a cache
+  helios push <cache> --closure <path>       Push a store path and its closure
 
 Options:
   --server <name>    Use a specific server (default: last logged-in)
@@ -18,10 +18,10 @@ Options:
   --help             Show this help
 
 Examples:
-  odin login prod https://cache.example.com my-token
-  odin push main /nix/store/abc...-hello
-  odin push main --closure /run/current-system
-  odin push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+  helios login prod https://cache.example.com my-token
+  helios push main /nix/store/abc...-hello
+  helios push main --closure /run/current-system
+  helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
 `;
 
 async function main(): Promise<void> {
@@ -36,7 +36,7 @@ async function main(): Promise<void> {
 
   if (command === "login") {
     if (args.length < 4) {
-      console.error("Usage: odin login <name> <server-url> <token>");
+      console.error("Usage: helios login <name> <server-url> <token>");
       process.exit(1);
     }
     await login(args[1], args[2], args[3]);
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
 
   if (command === "push") {
     if (args.length < 3) {
-      console.error("Usage: odin push <cache> <paths...> | odin push <cache> --closure <path>");
+      console.error("Usage: helios push <cache> <paths...> | helios push <cache> --closure <path>");
       process.exit(1);
     }
 
@@ -114,7 +114,7 @@ async function main(): Promise<void> {
   }
 
   console.error(`Unknown command: ${command}`);
-  console.error("Run 'odin --help' for usage");
+  console.error("Run 'helios --help' for usage");
   process.exit(1);
 }
 
