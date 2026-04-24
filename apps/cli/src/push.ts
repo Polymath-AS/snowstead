@@ -8,6 +8,8 @@ import {
   getMissingPaths,
   createUploadSession,
   uploadBlob,
+  shouldUseMultipart,
+  uploadBlobMultipart,
   completeUpload,
   publishPath,
 } from "./api.js";
@@ -63,7 +65,11 @@ async function pushSinglePath(
       references: info.references,
     });
 
-    await uploadBlob(client, session.sessionId, narFile);
+    if (shouldUseMultipart(fileSize)) {
+      await uploadBlobMultipart(client, session.sessionId, narFile);
+    } else {
+      await uploadBlob(client, session.sessionId, narFile);
+    }
     await completeUpload(client, session.sessionId);
     await publishPath(client, session.sessionId);
 

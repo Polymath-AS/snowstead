@@ -7,6 +7,9 @@ export interface WorkerConfig {
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
 	readonly authToken: string;
+	readonly r2AccessKeyId: string;
+	readonly r2SecretAccessKey: string;
+	readonly r2Endpoint: string;
 }
 
 export function resolveConfig(env: Env): WorkerConfig {
@@ -22,5 +25,8 @@ export function resolveConfig(env: Env): WorkerConfig {
 		signingKeyName: env.SIGNING_KEY_NAME || "odin-cache-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		authToken: env.AUTH_TOKEN || "",
+		r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
+		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
+		r2Endpoint: env.R2_ENDPOINT || "",
 	};
 }

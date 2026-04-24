@@ -4,7 +4,9 @@ import {
 	createUploadSession,
 	findUploadSession,
 	updateUploadSessionStatus,
+	updateUploadSessionMultipart,
 	createUploadPart,
+	findUploadParts,
 	createBlobObject,
 	findBlobObject,
 	createPublishedPath,
@@ -118,12 +120,50 @@ export async function handleMultipart(
 
 	const multipart = await config.bucket.createMultipartUpload(session.r2UploadKey);
 
-	await updateUploadSessionStatus(config.db, sessionId, "uploading");
+	await updateUploadSessionMultipart(config.db, sessionId, multipart.uploadId);
 
 	return jsonResponse({
 		uploadId: multipart.uploadId,
 		r2Key: session.r2UploadKey,
 	});
+}
+
+// ── Upload Part (Multipart) ──
+
+export async function handleUploadPart(
+	request: Request,
+	config: WorkerConfig,
+	sessionId: string,
+	partNumber: number,
+): Promise<Response> {
+	const session = await findUploadSession(config.db, sessionId);
+	if (!session) {
+		return errorResponse("Session not found", 404);
+	}
+
+	if (session.status !== "uploading") {
+		return errorResponse(`Session is in '${session.status}' state, expected 'uploading'`, 409);
+	}
+
+	if (!session.r2UploadKey || !session.r2UploadId) {
+		return errorResponse("Session has no active multipart upload", 400);
+	}
+
+	if (!request.body) {
+		return errorResponse("Request body is empty", 400);
+	}
+
+	const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+	const uploadedPart = await multipart.uploadPart(partNumber, request.body);
+
+	await createUploadPart(config.db, {
+		sessionId,
+		partNumber,
+		etag: uploadedPart.etag,
+		size: 0,
+	});
+
+	return jsonResponse({ partNumber, etag: uploadedPart.etag });
 }
 
 // ── Upload Blob ──
@@ -192,6 +232,12 @@ export async function handleComplete(
 				size: part.size,
 			});
 		}
+	}
+
+	if (session.r2UploadId) {
+		const parts = await findUploadParts(config.db, sessionId);
+		const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+		await multipart.complete(parts.map(p => ({ partNumber: p.partNumber, etag: p.etag })));
 	}
 
 	const head = await config.bucket.head(session.r2UploadKey);

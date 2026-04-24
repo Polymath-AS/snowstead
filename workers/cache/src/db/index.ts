@@ -35,6 +35,7 @@ export {
 	findUploadSession,
 	createUploadSession,
 	updateUploadSessionStatus,
+	updateUploadSessionMultipart,
 	findExpiredSessions,
 	createUploadPart,
 	findUploadParts,

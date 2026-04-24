@@ -216,6 +216,19 @@ export async function findExpiredSessions(
 		.all();
 }
 
+export async function updateUploadSessionMultipart(
+	db: DrizzleD1Database,
+	sessionId: string,
+	r2UploadId: string,
+): Promise<UploadSession | undefined> {
+	return db
+		.update(uploadSessions)
+		.set({ status: "uploading", r2UploadId })
+		.where(eq(uploadSessions.id, sessionId))
+		.returning()
+		.get();
+}
+
 // ── Upload Parts ──
 
 export async function createUploadPart(

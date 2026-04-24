@@ -7,11 +7,13 @@ import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } f
 import {
 	handleCreateSession,
 	handleMultipart,
+	handleUploadPart,
 	handleUploadBlob,
 	handleComplete,
 	handlePublish,
 	handleGetMissingPaths,
 } from "./uploads.js";
+import { createPresignedUrl } from "./presign.js";
 
 export async function handleRequest(
 	request: Request,
@@ -167,6 +169,24 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
+	if (config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
+		const url = await createPresignedUrl(
+			config.r2Endpoint,
+			config.r2AccessKeyId,
+			config.r2SecretAccessKey,
+			"odin-cache",
+			blob.r2Key,
+			3600,
+		);
+		return new Response(null, {
+			status: 302,
+			headers: {
+				location: url,
+				"cache-control": "public, max-age=3600",
+			},
+		});
+	}
+
 	const object = await config.bucket.get(blob.r2Key);
 	if (!object) {
 		return new Response("Not Found", { status: 404 });
@@ -203,6 +223,11 @@ async function handleWriteApi(
 	const multipart = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/multipart$/);
 	if (multipart) {
 		return handleMultipart(config, multipart[1]);
+	}
+
+	const partUpload = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/);
+	if (partUpload) {
+		return handleUploadPart(request, config, partUpload[1], parseInt(partUpload[2], 10));
 	}
 
 	const blob = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/blob$/);

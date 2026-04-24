@@ -119,6 +119,72 @@ export async function completeUpload(
   }
 }
 
+const MULTIPART_THRESHOLD = 90 * 1024 * 1024; // 90MB
+
+export function shouldUseMultipart(fileSize: number): boolean {
+  return fileSize > MULTIPART_THRESHOLD;
+}
+
+export async function initiateMultipart(
+  client: ApiClient,
+  sessionId: string,
+): Promise<{ uploadId: string; r2Key: string }> {
+  const resp = await request(client, "POST", `/_api/v1/uploads/${sessionId}/multipart`, {});
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`multipart initiation failed (${resp.status}): ${text}`);
+  }
+  return resp.json() as Promise<{ uploadId: string; r2Key: string }>;
+}
+
+export async function uploadPart(
+  client: ApiClient,
+  sessionId: string,
+  partNumber: number,
+  body: ReadableStream,
+  contentLength: number,
+): Promise<{ partNumber: number; etag: string }> {
+  const resp = await request(
+    client,
+    "PUT",
+    `/_api/v1/uploads/${sessionId}/part/${String(partNumber)}`,
+    body,
+    {
+      "content-type": "application/octet-stream",
+      "content-length": String(contentLength),
+    },
+  );
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`part upload failed (${resp.status}): ${text}`);
+  }
+  return resp.json() as Promise<{ partNumber: number; etag: string }>;
+}
+
+export async function uploadBlobMultipart(
+  client: ApiClient,
+  sessionId: string,
+  filePath: string,
+): Promise<void> {
+  const fileInfo = await stat(filePath);
+  const fileSize = Number(fileInfo.size);
+  const partSize = 90 * 1024 * 1024; // 90MB parts
+
+  await initiateMultipart(client, sessionId);
+
+  const totalParts = Math.ceil(fileSize / partSize);
+  for (let i = 0; i < totalParts; i++) {
+    const start = i * partSize;
+    const end = Math.min(start + partSize, fileSize);
+    const length = end - start;
+
+    const stream = createReadStream(filePath, { start, end: end - 1 });
+    const webStream = ReadableStream.from(stream);
+
+    await uploadPart(client, sessionId, i + 1, webStream, length);
+  }
+}
+
 export async function publishPath(
   client: ApiClient,
   sessionId: string,
