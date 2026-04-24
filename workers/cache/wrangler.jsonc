@@ -21,7 +21,7 @@
 		{
 			"binding": "CACHE_DB",
 			"database_name": "helios-cache",
-			"database_id": "0d2fd053-e119-4fc1-8c00-758e2e6d1c5f",
+			"database_id": "",
 			"migrations_dir": "migrations"
 		}
 	],

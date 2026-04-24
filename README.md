@@ -1,6 +1,8 @@
 # Helios
 
 A Cloudflare-native Nix binary cache.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Polymath-AS/helios)
 ## Workspace
 
 ```

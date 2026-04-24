@@ -4,10 +4,21 @@
   "name": "helios",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
-  "description": "Cloudflare-native Nix cache workspace",
+  "description": "Cloudflare-native Nix binary cache",
   "scripts": {
+    "build": "echo 'wrangler bundles at deploy time'",
+    "deploy": "wrangler d1 migrations apply CACHE_DB --remote && wrangler deploy",
     "dev": "pnpm --filter @helios/cache-worker dev",
-    "deploy": "pnpm --filter @helios/cache-worker deploy",
     "check": "pnpm -r check"
+  },
+  "cloudflare": {
+    "bindings": {
+      "AUTH_TOKEN": {
+        "description": "Bearer token for write operations (push). Generate with `openssl rand -hex 32`."
+      },
+      "SIGNING_PRIVATE_KEY": {
+        "description": "Ed25519 private key in PEM format for signing narinfo. Generate with `nix key generate-secret --key-name your-cache-1`."
+      }
+    }
   }
 }
