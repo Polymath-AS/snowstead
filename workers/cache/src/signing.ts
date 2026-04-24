@@ -1,5 +1,7 @@
 import type { PublishedPath } from "./db/types.js";
 
+const textEncoder = new TextEncoder();
+
 export function computeFingerprint(path: PublishedPath, refs: readonly string[]): string {
 	const refPaths = refs.map(r => `/nix/store/${r}`);
 	return `1;${path.storePath};${path.narHash};${path.narSize};${refPaths.join(",")}`;
@@ -49,7 +51,7 @@ export async function signNarinfo(
 	}
 
 	const key = await getSigningKey(privateKeyBase64);
-	const data = new TextEncoder().encode(fingerprint);
+	const data = textEncoder.encode(fingerprint);
 	const signature = await crypto.subtle.sign("Ed25519", key, data);
 	const sigBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
 

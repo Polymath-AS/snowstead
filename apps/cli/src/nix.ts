@@ -21,7 +21,7 @@ interface NixPathInfoJson {
 
 export async function getPathInfo(storePath: string): Promise<PathInfo> {
   const { stdout } = await exec("nix", ["path-info", "--json", storePath]);
-  const parsed = JSON.parse(stdout) as Record<string, NixPathInfoJson>;
+  const parsed: Record<string, NixPathInfoJson> = JSON.parse(stdout);
   const entry = parsed[storePath];
   if (!entry) {
     throw new Error(`nix path-info returned no data for ${storePath}`);

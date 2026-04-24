@@ -4,6 +4,7 @@ import { renderNarinfo } from "./narinfo.js";
 import { verifyAuth } from "./auth.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
 import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@odin/cache-domain";
+import type { CacheName } from "@odin/cache-domain";
 import {
 	handleCreateSession,
 	handleMultipart,
@@ -14,6 +15,25 @@ import {
 	handleGetMissingPaths,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
+
+// Module-scope cache: cache name → D1 cache ID.
+// Workers are short-lived isolates reused across requests on the same edge node,
+// so this avoids a ~20ms D1 round trip on every narinfo warm hit.
+const cacheNameToId = new Map<CacheName, number>();
+
+async function resolveCacheId(
+	db: WorkerConfig["db"],
+	name: CacheName,
+): Promise<number | undefined> {
+	const cached = cacheNameToId.get(name);
+	if (cached !== undefined) return cached;
+
+	const row = await findCacheByName(db, name);
+	if (!row) return undefined;
+
+	cacheNameToId.set(name, row.id);
+	return row.id;
+}
 
 export async function handleRequest(
 	request: Request,
@@ -56,7 +76,7 @@ export async function handleRequest(
 
 	// nix-cache-info is static — skip D1 lookup for the cache
 	if (segments[1] === "nix-cache-info") {
-		return handleNixCacheInfo();
+		return NIX_CACHE_INFO_RESPONSE();
 	}
 
 	// NAR downloads are content-addressed — skip cache name D1 lookup
@@ -69,14 +89,14 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const cache = await findCacheByName(config.db, cacheName);
-	if (!cache) {
+	const cacheId = await resolveCacheId(config.db, cacheName);
+	if (cacheId === undefined) {
 		return new Response("Not Found", { status: 404 });
 	}
 
 	if (segments[1].endsWith(".narinfo")) {
 		const hashStr = segments[1].slice(0, -".narinfo".length);
-		return handleNarinfo(config, cache.id, hashStr, method, request);
+		return handleNarinfo(config, cacheId, hashStr, method, request);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -98,14 +118,14 @@ async function handleHealthz(config: WorkerConfig): Promise<Response> {
 	}
 }
 
-function handleNixCacheInfo(): Response {
-	const body = [
-		"StoreDir: /nix/store",
-		"WantMassQuery: 1",
-		"Priority: 40",
-	].join("\n") + "\n";
+// Reused across requests — avoids per-request allocation
+const textEncoder = new TextEncoder();
 
-	return new Response(body, {
+// Pre-computed static nix-cache-info body — avoids per-request string allocation
+const NIX_CACHE_INFO_BODY = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
+
+function NIX_CACHE_INFO_RESPONSE(): Response {
+	return new Response(NIX_CACHE_INFO_BODY, {
 		headers: { "content-type": "text/x-nix-cache-info" },
 	});
 }
@@ -149,7 +169,7 @@ async function handleNarinfo(
 	const response = new Response(body, {
 		headers: {
 			"content-type": "text/x-nix-narinfo",
-			"content-length": String(new TextEncoder().encode(body).byteLength),
+			"content-length": String(textEncoder.encode(body).byteLength),
 			"cache-control": "public, max-age=31536000, immutable",
 		},
 	});

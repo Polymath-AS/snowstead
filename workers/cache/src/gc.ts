@@ -8,6 +8,12 @@ import {
 } from "./db/repository.js";
 import type { UploadSessionStatus } from "./db/types.js";
 
+const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading"]);
+
+function isTransitionableStatus(s: string): s is UploadSessionStatus {
+	return VALID_TRANSITION_STATUSES.has(s);
+}
+
 export interface GcResult {
 	readonly expiredSessions: number;
 	readonly deletedBlobs: number;
@@ -25,10 +31,14 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 	for (const session of expired) {
 		try {
+			// findExpiredSessions already excludes "completed" and "expired",
+			// but validate to satisfy the type system without an assertion.
+			if (!isTransitionableStatus(session.status)) continue;
+
 			const transitioned = await transitionSessionStatus(
 				config.db,
 				session.id,
-				session.status as UploadSessionStatus,
+				session.status,
 				"expired",
 			);
 			if (!transitioned) continue;

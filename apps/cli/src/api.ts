@@ -36,6 +36,12 @@ async function request(
   return fetch(url, init);
 }
 
+// System boundary: Response.json() returns Promise<unknown> in Node's lib types.
+// We trust the shape of our own API responses at this boundary.
+async function jsonBody<T>(resp: Response): Promise<T> {
+  return resp.json() as Promise<T>;
+}
+
 export interface SessionResponse {
   readonly sessionId: string;
   readonly r2Key: string;
@@ -56,7 +62,7 @@ export async function getMissingPaths(
     const text = await resp.text();
     throw new Error(`get-missing-paths failed (${resp.status}): ${text}`);
   }
-  const data = await resp.json() as { missing: string[] };
+  const data = await jsonBody<{ missing: string[] }>(resp);
   return data.missing;
 }
 
@@ -86,7 +92,7 @@ export async function createUploadSession(
     const text = await resp.text();
     throw new Error(`create-session failed (${resp.status}): ${text}`);
   }
-  return resp.json() as Promise<SessionResponse>;
+  return jsonBody<SessionResponse>(resp);
 }
 
 export async function uploadBlob(
@@ -134,7 +140,7 @@ export async function initiateMultipart(
     const text = await resp.text();
     throw new Error(`multipart initiation failed (${resp.status}): ${text}`);
   }
-  return resp.json() as Promise<{ uploadId: string; r2Key: string }>;
+  return jsonBody<{ uploadId: string; r2Key: string }>(resp);
 }
 
 export async function uploadPart(
@@ -158,7 +164,7 @@ export async function uploadPart(
     const text = await resp.text();
     throw new Error(`part upload failed (${resp.status}): ${text}`);
   }
-  return resp.json() as Promise<{ partNumber: number; etag: string }>;
+  return jsonBody<{ partNumber: number; etag: string }>(resp);
 }
 
 export async function uploadBlobMultipart(
@@ -194,5 +200,5 @@ export async function publishPath(
     const text = await resp.text();
     throw new Error(`publish failed (${resp.status}): ${text}`);
   }
-  return resp.json() as Promise<{ published: boolean; alreadyExisted?: boolean }>;
+  return jsonBody<{ published: boolean; alreadyExisted?: boolean }>(resp);
 }
