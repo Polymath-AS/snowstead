@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName, findPublishedPath, findBlobObjectById } from "./db/repository.js";
+import { findCacheByName, findPublishedPathWithBlob } from "./db/repository.js";
 import { renderNarinfo } from "./narinfo.js";
 import { verifyAuth } from "./auth.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
@@ -54,6 +54,16 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
+	// nix-cache-info is static — skip D1 lookup for the cache
+	if (segments[1] === "nix-cache-info") {
+		return handleNixCacheInfo();
+	}
+
+	// NAR downloads are content-addressed — skip cache name D1 lookup
+	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
+		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request);
+	}
+
 	const cacheName = parseCacheName(segments[0]);
 	if (typeof cacheName === "object") {
 		return new Response("Not Found", { status: 404 });
@@ -64,17 +74,9 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	if (segments[1] === "nix-cache-info") {
-		return handleNixCacheInfo();
-	}
-
 	if (segments[1].endsWith(".narinfo")) {
 		const hashStr = segments[1].slice(0, -".narinfo".length);
-		return handleNarinfo(config, cache.id, hashStr, method);
-	}
-
-	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
-		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request);
+		return handleNarinfo(config, cache.id, hashStr, method, request);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -113,40 +115,58 @@ async function handleNarinfo(
 	cacheId: number,
 	hashStr: string,
 	method: string,
+	request: Request,
 ): Promise<Response> {
 	const storePathHash = parseStorePathHash(hashStr);
 	if (typeof storePathHash === "object") {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const path = await findPublishedPath(config.db, cacheId, storePathHash);
-	if (!path) {
+	// Check edge cache first (narinfo is immutable once published)
+	const cache = await caches.open("odin-narinfo");
+	const cached = await cache.match(request);
+	if (cached) {
+		if (method === "HEAD") {
+			return new Response(null, {
+				status: 200,
+				headers: cached.headers,
+			});
+		}
+		return cached;
+	}
+
+	// Single joined query: published_paths + blob_objects
+	const result = await findPublishedPathWithBlob(config.db, cacheId, storePathHash);
+	if (!result) {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const blob = await findBlobObjectById(config.db, path.blobObjectId);
-	if (!blob) {
-		return new Response("Not Found", { status: 404 });
-	}
-
-	const fingerprint = computeFingerprint(path);
+	const fingerprint = computeFingerprint(result.path);
 	const sig = await signNarinfo(fingerprint, config.signingKeyName, config.signingPrivateKey);
 	const signatures = sig ? [sig] : [];
-	const body = renderNarinfo(path, blob, signatures);
+	const body = renderNarinfo(result.path, result.blob, signatures);
+
+	const response = new Response(body, {
+		headers: {
+			"content-type": "text/x-nix-narinfo",
+			"content-length": String(new TextEncoder().encode(body).byteLength),
+			"cache-control": "public, max-age=31536000, immutable",
+		},
+	});
+
+	// Cache at edge (non-blocking)
+	if (config.ctx) {
+		config.ctx.waitUntil(cache.put(request, response.clone()));
+	}
 
 	if (method === "HEAD") {
 		return new Response(null, {
 			status: 200,
-			headers: {
-				"content-type": "text/x-nix-narinfo",
-				"content-length": String(new TextEncoder().encode(body).byteLength),
-			},
+			headers: response.headers,
 		});
 	}
 
-	return new Response(body, {
-		headers: { "content-type": "text/x-nix-narinfo" },
-	});
+	return response;
 }
 
 async function handleNarDownload(

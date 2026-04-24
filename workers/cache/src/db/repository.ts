@@ -78,6 +78,28 @@ export async function createBlobObject(
 
 // ── Published Paths ──
 
+export async function findPublishedPathWithBlob(
+	db: DrizzleD1Database,
+	cacheId: number,
+	storePathHash: string,
+): Promise<{ path: PublishedPath; blob: BlobObject } | undefined> {
+	const row = await db
+		.select({
+			path: publishedPaths,
+			blob: blobObjects,
+		})
+		.from(publishedPaths)
+		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.where(
+			and(
+				eq(publishedPaths.cacheId, cacheId),
+				eq(publishedPaths.storePathHash, storePathHash),
+			),
+		)
+		.get();
+	return row;
+}
+
 export async function findPublishedPath(
 	db: DrizzleD1Database,
 	cacheId: number,
