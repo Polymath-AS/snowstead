@@ -122,15 +122,13 @@ async function handleNarinfo(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// Check edge cache first (narinfo is immutable once published)
+	// Normalize to GET for shared cache (HEAD and GET share the same cache entry)
+	const cacheKey = new Request(request.url, { method: "GET" });
 	const cache = await caches.open("odin-narinfo");
-	const cached = await cache.match(request);
+	const cached = await cache.match(cacheKey);
 	if (cached) {
 		if (method === "HEAD") {
-			return new Response(null, {
-				status: 200,
-				headers: cached.headers,
-			});
+			return new Response(null, { status: 200, headers: cached.headers });
 		}
 		return cached;
 	}
@@ -158,7 +156,7 @@ async function handleNarinfo(
 
 	// Cache at edge (non-blocking)
 	if (config.ctx) {
-		config.ctx.waitUntil(cache.put(request, response.clone()));
+		config.ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	}
 
 	if (method === "HEAD") {
