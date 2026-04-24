@@ -3,6 +3,8 @@ import type { PublishedPath, BlobObject } from "./db/types.js";
 export function renderNarinfo(
 	path: PublishedPath,
 	blob: BlobObject,
+	refs: readonly string[],
+	storedSigs: readonly string[],
 	signatures: readonly string[] = [],
 ): string {
 	const lines: string[] = [
@@ -15,7 +17,6 @@ export function renderNarinfo(
 		`NarSize: ${path.narSize}`,
 	];
 
-	const refs: string[] = JSON.parse(path.referencesJson);
 	if (refs.length > 0) {
 		lines.push(`References: ${refs.join(" ")}`);
 	}
@@ -28,9 +29,10 @@ export function renderNarinfo(
 		lines.push(`System: ${path.system}`);
 	}
 
-	const storedSigs: string[] = JSON.parse(path.signaturesJson);
-	const allSigs = [...storedSigs, ...signatures];
-	for (const sig of allSigs) {
+	for (const sig of storedSigs) {
+		lines.push(`Sig: ${sig}`);
+	}
+	for (const sig of signatures) {
 		lines.push(`Sig: ${sig}`);
 	}
 

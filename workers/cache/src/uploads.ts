@@ -3,9 +3,9 @@ import {
 	findCacheByName,
 	createUploadSession,
 	findUploadSession,
-	updateUploadSessionStatus,
-	updateUploadSessionMultipart,
-	createUploadPart,
+	transitionSessionStatus,
+	transitionToMultipart,
+	upsertUploadPart,
 	findUploadParts,
 	createBlobObject,
 	findBlobObject,
@@ -13,7 +13,7 @@ import {
 	findPublishedPath,
 	findPublishedHashes,
 } from "./db/repository.js";
-import { buildR2ObjectKey, parseFileHash, parseCompression } from "@odin/cache-domain";
+import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@odin/cache-domain";
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -24,6 +24,14 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function errorResponse(message: string, status: number): Response {
 	return jsonResponse({ error: message }, status);
+}
+
+async function parseJsonBody<T>(request: Request): Promise<T | Response> {
+	try {
+		return await request.json<T>();
+	} catch {
+		return errorResponse("Invalid JSON in request body", 400);
+	}
 }
 
 // ── Create Upload Session ──
@@ -38,7 +46,7 @@ export async function handleCreateSession(
 		return errorResponse("Cache not found", 404);
 	}
 
-	const body = await request.json<{
+	const body = await parseJsonBody<{
 		storePath: string;
 		storePathHash: string;
 		narHash: string;
@@ -49,7 +57,8 @@ export async function handleCreateSession(
 		references?: string[];
 		deriver?: string;
 		system?: string;
-	}>();
+	}>(request);
+	if (body instanceof Response) return body;
 
 	if (!body.storePath || !body.storePathHash || !body.narHash || !body.fileHash || !body.compression) {
 		return errorResponse("Missing required fields", 400);
@@ -57,6 +66,18 @@ export async function handleCreateSession(
 
 	if (typeof body.narSize !== "number" || typeof body.fileSize !== "number") {
 		return errorResponse("narSize and fileSize must be numbers", 400);
+	}
+
+	const parsedHash = parseStorePathHash(body.storePathHash);
+	if (typeof parsedHash === "object") {
+		return errorResponse(parsedHash.message, 400);
+	}
+
+	if (!Number.isFinite(body.narSize) || body.narSize <= 0) {
+		return errorResponse("narSize must be a positive number", 400);
+	}
+	if (!Number.isFinite(body.fileSize) || body.fileSize <= 0) {
+		return errorResponse("fileSize must be a positive number", 400);
 	}
 
 	const fileHash = parseFileHash(body.fileHash);
@@ -120,7 +141,11 @@ export async function handleMultipart(
 
 	const multipart = await config.bucket.createMultipartUpload(session.r2UploadKey);
 
-	await updateUploadSessionMultipart(config.db, sessionId, multipart.uploadId);
+	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId);
+	if (!transitioned) {
+		try { await multipart.abort(); } catch { /* best effort */ }
+		return errorResponse("Session state changed concurrently, expected 'pending'", 409);
+	}
 
 	return jsonResponse({
 		uploadId: multipart.uploadId,
@@ -156,7 +181,7 @@ export async function handleUploadPart(
 	const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
 	const uploadedPart = await multipart.uploadPart(partNumber, request.body);
 
-	await createUploadPart(config.db, {
+	await upsertUploadPart(config.db, {
 		sessionId,
 		partNumber,
 		etag: uploadedPart.etag,
@@ -190,11 +215,22 @@ export async function handleUploadBlob(
 		return errorResponse("Request body is empty", 400);
 	}
 
+	// Blob upload is idempotent (PUT overwrites), so allow both pending and uploading states.
+	// Attempt pending→uploading; if already uploading the transition fails but that is acceptable.
+	if (session.status === "pending") {
+		const transitioned = await transitionSessionStatus(config.db, sessionId, "pending", "uploading");
+		if (!transitioned) {
+			// Re-read to check if someone else moved it to uploading (retry-safe)
+			const current = await findUploadSession(config.db, sessionId);
+			if (!current || current.status !== "uploading") {
+				return errorResponse("Session state changed concurrently", 409);
+			}
+		}
+	}
+
 	await config.bucket.put(session.r2UploadKey, request.body, {
 		httpMetadata: { contentType: "application/x-nix-nar" },
 	});
-
-	await updateUploadSessionStatus(config.db, sessionId, "uploading");
 
 	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
 }
@@ -211,21 +247,22 @@ export async function handleComplete(
 		return errorResponse("Session not found", 404);
 	}
 
-	if (session.status !== "pending" && session.status !== "uploading") {
-		return errorResponse(`Session is in '${session.status}' state`, 409);
+	if (session.status !== "uploading") {
+		return errorResponse(`Session is in '${session.status}' state, expected 'uploading'`, 409);
 	}
 
 	if (!session.r2UploadKey) {
 		return errorResponse("Session has no R2 upload key", 500);
 	}
 
-	const body = await request.json<{
+	const body = await parseJsonBody<{
 		parts?: Array<{ partNumber: number; etag: string; size: number }>;
-	}>();
+	}>(request);
+	if (body instanceof Response) return body;
 
 	if (body.parts && body.parts.length > 0) {
 		for (const part of body.parts) {
-			await createUploadPart(config.db, {
+			await upsertUploadPart(config.db, {
 				sessionId,
 				partNumber: part.partNumber,
 				etag: part.etag,
@@ -252,7 +289,10 @@ export async function handleComplete(
 		);
 	}
 
-	await updateUploadSessionStatus(config.db, sessionId, "completed");
+	const transitioned = await transitionSessionStatus(config.db, sessionId, "uploading", "completed");
+	if (!transitioned) {
+		return errorResponse("Session state changed concurrently", 409);
+	}
 
 	return jsonResponse({ status: "completed" });
 }
@@ -323,17 +363,24 @@ export async function handlePublish(
 
 // ── Get Missing Paths ──
 
+const MAX_MISSING_PATHS_BATCH = 1000;
+
 export async function handleGetMissingPaths(
 	request: Request,
 	config: WorkerConfig,
 ): Promise<Response> {
-	const body = await request.json<{
+	const body = await parseJsonBody<{
 		cache: string;
 		storePathHashes: string[];
-	}>();
+	}>(request);
+	if (body instanceof Response) return body;
 
 	if (!body.cache || !Array.isArray(body.storePathHashes)) {
 		return errorResponse("Missing required fields: cache, storePathHashes", 400);
+	}
+
+	if (body.storePathHashes.length > MAX_MISSING_PATHS_BATCH) {
+		return errorResponse(`storePathHashes exceeds maximum of ${MAX_MISSING_PATHS_BATCH}`, 400);
 	}
 
 	const cache = await findCacheByName(config.db, body.cache);

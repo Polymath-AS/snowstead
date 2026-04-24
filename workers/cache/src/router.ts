@@ -61,7 +61,7 @@ export async function handleRequest(
 
 	// NAR downloads are content-addressed — skip cache name D1 lookup
 	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
-		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request);
+		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request, method);
 	}
 
 	const cacheName = parseCacheName(segments[0]);
@@ -141,10 +141,12 @@ async function handleNarinfo(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const fingerprint = computeFingerprint(result.path);
+	const refs: string[] = JSON.parse(result.path.referencesJson);
+	const storedSigs: string[] = JSON.parse(result.path.signaturesJson);
+	const fingerprint = computeFingerprint(result.path, refs);
 	const sig = await signNarinfo(fingerprint, config.signingKeyName, config.signingPrivateKey);
 	const signatures = sig ? [sig] : [];
-	const body = renderNarinfo(result.path, result.blob, signatures);
+	const body = renderNarinfo(result.path, result.blob, refs, storedSigs, signatures);
 
 	const response = new Response(body, {
 		headers: {
@@ -174,6 +176,7 @@ async function handleNarDownload(
 	rawFileHash: string,
 	rawCompression: string,
 	request: Request,
+	method: string,
 ): Promise<Response> {
 	const fileHash = parseFileHash(rawFileHash);
 	if (typeof fileHash === "object") {
@@ -195,7 +198,7 @@ async function handleNarDownload(
 			config.r2Endpoint,
 			config.r2AccessKeyId,
 			config.r2SecretAccessKey,
-			"odin-cache",
+			config.r2BucketName,
 			r2Key,
 			3600,
 		);
@@ -208,11 +211,31 @@ async function handleNarDownload(
 		});
 	}
 
-	// Check CF edge cache first
+	// Edge cache check (use a GET key for shared cache)
+	const cacheUrl = new URL(request.url);
+	const cacheRequest = new Request(cacheUrl, { method: "GET" });
 	const cache = await caches.open("odin-nar");
-	const cached = await cache.match(request);
+	const cached = await cache.match(cacheRequest);
 	if (cached) {
+		if (method === "HEAD") {
+			return new Response(null, { status: 200, headers: cached.headers });
+		}
 		return cached;
+	}
+
+	if (method === "HEAD") {
+		const head = await config.bucket.head(r2Key);
+		if (!head) {
+			return new Response("Not Found", { status: 404 });
+		}
+		return new Response(null, {
+			status: 200,
+			headers: {
+				"content-type": "application/x-nix-nar",
+				"content-length": String(head.size),
+				"cache-control": "public, max-age=31536000, immutable",
+			},
+		});
 	}
 
 	const object = await config.bucket.get(r2Key);
@@ -230,7 +253,7 @@ async function handleNarDownload(
 
 	// Store in CF edge cache (non-blocking)
 	if (config.ctx) {
-		config.ctx.waitUntil(cache.put(request, response.clone()));
+		config.ctx.waitUntil(cache.put(cacheRequest, response.clone()));
 	}
 
 	return response;

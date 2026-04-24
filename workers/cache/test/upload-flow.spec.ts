@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
-import { createCache } from "../src/db/repository.js";
+import { createCache, findPublishedPath, findCacheByName } from "../src/db/repository.js";
 
 const CACHE_NAME = "upload-test";
 const BLOB_DATA = new Uint8Array([1, 2, 3, 4]);
@@ -48,7 +48,11 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 	expect(createRes.status).toBe(201);
 	const session = await createRes.json<{ sessionId: string; r2Key: string }>();
 
-	await env.CACHE_BUCKET.put(session.r2Key, BLOB_DATA);
+	const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
+		method: "PUT",
+		body: BLOB_DATA,
+	});
+	expect(blobRes.status).toBe(200);
 
 	const completeRes = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
 	expect(completeRes.status).toBe(200);
@@ -58,7 +62,7 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 
 beforeAll(async () => {
 	const db = getDb();
-	await createCache(db, CACHE_NAME, true);
+	await createCache(db, CACHE_NAME);
 });
 
 describe("create upload session", () => {
@@ -104,7 +108,11 @@ describe("complete upload (direct)", () => {
 		expect(createRes.status).toBe(201);
 		const session = await createRes.json<{ sessionId: string; r2Key: string }>();
 
-		await env.CACHE_BUCKET.put(session.r2Key, BLOB_DATA);
+		const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
+			method: "PUT",
+			body: BLOB_DATA,
+		});
+		expect(blobRes.status).toBe(200);
 
 		const completeRes = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
 		expect(completeRes.status).toBe(200);
@@ -125,7 +133,7 @@ describe("complete upload (direct)", () => {
 		expect(res.status).toBe(409);
 	});
 
-	it("returns 400 when R2 object does not exist", async () => {
+	it("returns 409 when session has not uploaded a blob yet", async () => {
 		const createRes = await post(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
 			sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
@@ -134,7 +142,7 @@ describe("complete upload (direct)", () => {
 		const session = await createRes.json<{ sessionId: string }>();
 
 		const res = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
-		expect(res.status).toBe(400);
+		expect(res.status).toBe(409);
 	});
 });
 
@@ -150,8 +158,11 @@ describe("publish", () => {
 		expect(publishBody.published).toBe(true);
 		expect(publishBody.storePathHash).toBe(storePathHash);
 
-		const narinfo = await SELF.fetch(`http://example.com/${CACHE_NAME}/${storePathHash}.narinfo`);
-		expect(narinfo.status).toBe(200);
+		const db = getDb();
+		const cache = await findCacheByName(db, CACHE_NAME);
+		expect(cache).toBeDefined();
+		const published = await findPublishedPath(db, cache!.id, storePathHash);
+		expect(published).toBeDefined();
 	});
 
 	it("returns 409 for uncompleted session", async () => {

@@ -9,17 +9,11 @@ export {
 
 export type {
 	Cache,
-	NewCache,
 	BlobObject,
-	NewBlobObject,
 	PublishedPath,
-	NewPublishedPath,
 	UploadSession,
-	NewUploadSession,
 	UploadPart,
-	NewUploadPart,
 	GcMark,
-	NewGcMark,
 	UploadSessionStatus,
 } from './types.js';
 
@@ -35,10 +29,10 @@ export {
 	createPublishedPath,
 	findUploadSession,
 	createUploadSession,
-	updateUploadSessionStatus,
-	updateUploadSessionMultipart,
+	transitionSessionStatus,
+	transitionToMultipart,
 	findExpiredSessions,
-	createUploadPart,
+	upsertUploadPart,
 	findUploadParts,
 	createGcMark,
 	findGcMarks,

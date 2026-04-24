@@ -47,7 +47,7 @@ function makeSessionParams(overrides: {
 describe("gc: expire abandoned sessions", () => {
 	it("expires and deletes sessions past their expiresAt", async () => {
 		const config = getConfig();
-		const cache = await createCache(config.db, `gc-expire-${crypto.randomUUID()}`, true);
+		const cache = await createCache(config.db, `gc-expire-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			config.db,
@@ -87,7 +87,7 @@ describe("gc: delete unreferenced blobs", () => {
 describe("gc: keep referenced blobs", () => {
 	it("preserves blob objects that are referenced by a published path", async () => {
 		const config = getConfig();
-		const cache = await createCache(config.db, `gc-keep-${crypto.randomUUID()}`, true);
+		const cache = await createCache(config.db, `gc-keep-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(config.db, {
 			fileHash: `sha256:${crypto.randomUUID()}`,
 			fileSize: 2048,
@@ -118,7 +118,7 @@ describe("gc: keep referenced blobs", () => {
 describe("gc: keep active sessions", () => {
 	it("does not expire sessions with future expiresAt", async () => {
 		const config = getConfig();
-		const cache = await createCache(config.db, `gc-active-${crypto.randomUUID()}`, true);
+		const cache = await createCache(config.db, `gc-active-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			config.db,

@@ -2,6 +2,8 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { createCache, createBlobObject, createPublishedPath } from "../src/db/repository.js";
+import { handleRequest } from "../src/router.js";
+import { resolveConfig } from "../src/config.js";
 
 const STORE_PATH_HASH = "0".repeat(32);
 const FILE_HASH = "a".repeat(64);
@@ -16,7 +18,7 @@ function getDb() {
 beforeAll(async () => {
 	const db = getDb();
 
-	const cache = await createCache(db, "test-cache", true);
+	const cache = await createCache(db, "test-cache");
 
 	const blob = await createBlobObject(db, {
 		fileHash: FILE_HASH,
@@ -51,10 +53,10 @@ describe("nix-cache-info", () => {
 		expect(body).toContain("StoreDir: /nix/store");
 	});
 
-	it("returns 404 for a non-existent cache", async () => {
+	it("returns 200 for any cache path", async () => {
 		const res = await SELF.fetch("http://example.com/nonexistent/nix-cache-info");
 
-		expect(res.status).toBe(404);
+		expect(res.status).toBe(200);
 	});
 });
 
@@ -73,13 +75,16 @@ describe("narinfo", () => {
 	});
 
 	it("HEAD returns 200 with headers but no body", async () => {
-		const res = await SELF.fetch(`http://example.com/test-cache/${STORE_PATH_HASH}.narinfo`, {
+		const request = new Request(`http://example.com/test-cache/${STORE_PATH_HASH}.narinfo`, {
 			method: "HEAD",
 		});
+		const config = resolveConfig(env);
+		const res = await handleRequest(request, config);
 
 		expect(res.status).toBe(200);
 		expect(res.headers.get("content-type")).toBe("text/x-nix-narinfo");
 		expect(res.headers.get("content-length")).toBeTruthy();
+		expect(res.headers.get("cache-control")).toContain("immutable");
 		const body = await res.text();
 		expect(body).toBe("");
 	});

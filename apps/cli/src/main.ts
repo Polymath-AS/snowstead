@@ -68,6 +68,11 @@ async function main(): Promise<void> {
       filteredArgs.splice(jobsIdx, 2);
     }
 
+    if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 1)) {
+      console.error("--jobs must be a positive integer");
+      process.exit(1);
+    }
+
     const serverConfig = await getServer(serverName);
     const client = createClient(serverConfig.server, serverConfig.token);
     const cache = filteredArgs[1];

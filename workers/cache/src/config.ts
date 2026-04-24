@@ -10,6 +10,7 @@ export interface WorkerConfig {
 	readonly r2AccessKeyId: string;
 	readonly r2SecretAccessKey: string;
 	readonly r2Endpoint: string;
+	readonly r2BucketName: string;
 	readonly ctx?: ExecutionContext;
 }
 
@@ -29,5 +30,6 @@ export function resolveConfig(env: Env): WorkerConfig {
 		r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
 		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
 		r2Endpoint: env.R2_ENDPOINT || "",
+		r2BucketName: env.R2_BUCKET_NAME || "odin-cache",
 	};
 }

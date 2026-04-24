@@ -30,11 +30,10 @@ export async function findCacheByName(
 export async function createCache(
 	db: DrizzleD1Database,
 	name: string,
-	isPublic: boolean,
 ): Promise<Cache> {
 	return db
 		.insert(caches)
-		.values({ name, isPublic: isPublic ? 1 : 0 })
+		.values({ name })
 		.returning()
 		.get();
 }
@@ -209,15 +208,29 @@ export async function createUploadSession(
 		.get();
 }
 
-export async function updateUploadSessionStatus(
+export async function transitionSessionStatus(
 	db: DrizzleD1Database,
 	sessionId: string,
-	status: UploadSessionStatus,
+	fromStatus: UploadSessionStatus,
+	toStatus: UploadSessionStatus,
 ): Promise<UploadSession | undefined> {
 	return db
 		.update(uploadSessions)
-		.set({ status })
-		.where(eq(uploadSessions.id, sessionId))
+		.set({ status: toStatus })
+		.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, fromStatus)))
+		.returning()
+		.get();
+}
+
+export async function transitionToMultipart(
+	db: DrizzleD1Database,
+	sessionId: string,
+	r2UploadId: string,
+): Promise<UploadSession | undefined> {
+	return db
+		.update(uploadSessions)
+		.set({ status: "uploading", r2UploadId })
+		.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, "pending")))
 		.returning()
 		.get();
 }
@@ -238,22 +251,9 @@ export async function findExpiredSessions(
 		.all();
 }
 
-export async function updateUploadSessionMultipart(
-	db: DrizzleD1Database,
-	sessionId: string,
-	r2UploadId: string,
-): Promise<UploadSession | undefined> {
-	return db
-		.update(uploadSessions)
-		.set({ status: "uploading", r2UploadId })
-		.where(eq(uploadSessions.id, sessionId))
-		.returning()
-		.get();
-}
-
 // ── Upload Parts ──
 
-export async function createUploadPart(
+export async function upsertUploadPart(
 	db: DrizzleD1Database,
 	params: {
 		readonly sessionId: string;
@@ -265,6 +265,10 @@ export async function createUploadPart(
 	return db
 		.insert(uploadParts)
 		.values(params)
+		.onConflictDoUpdate({
+			target: [uploadParts.sessionId, uploadParts.partNumber],
+			set: { etag: params.etag, size: params.size },
+		})
 		.returning()
 		.get();
 }

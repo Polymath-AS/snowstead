@@ -1,11 +1,12 @@
 import type { WorkerConfig } from "./config.js";
 import {
 	findExpiredSessions,
-	updateUploadSessionStatus,
+	transitionSessionStatus,
 	deleteUploadSession,
 	findUnreferencedBlobObjects,
 	deleteBlobObject,
 } from "./db/repository.js";
+import type { UploadSessionStatus } from "./db/types.js";
 
 export interface GcResult {
 	readonly expiredSessions: number;
@@ -24,7 +25,22 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 	for (const session of expired) {
 		try {
-			await updateUploadSessionStatus(config.db, session.id, "expired");
+			const transitioned = await transitionSessionStatus(
+				config.db,
+				session.id,
+				session.status as UploadSessionStatus,
+				"expired",
+			);
+			if (!transitioned) continue;
+
+			if (session.r2UploadId && session.r2UploadKey) {
+				try {
+					const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+					await multipart.abort();
+				} catch {
+					// Multipart may already be completed or aborted
+				}
+			}
 
 			if (session.r2UploadKey) {
 				try {
@@ -46,13 +62,13 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 	for (const blob of unreferenced) {
 		try {
+			// Delete DB record first to prevent re-referencing during R2 delete
+			await deleteBlobObject(config.db, blob.id);
 			try {
 				await config.bucket.delete(blob.r2Key);
 			} catch {
 				// R2 object may already be gone
 			}
-
-			await deleteBlobObject(config.db, blob.id);
 			deletedBlobs++;
 		} catch (err) {
 			errors.push(`Failed to delete blob ${blob.id}: ${err instanceof Error ? err.message : String(err)}`);

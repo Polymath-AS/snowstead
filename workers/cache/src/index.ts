@@ -6,10 +6,23 @@ import { logRequest } from "./logging.js";
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		const start = Date.now();
-		const config = { ...resolveConfig(env), ctx };
-		const response = await handleRequest(request, config);
-		logRequest(request, response, start);
-		return response;
+		try {
+			const config = { ...resolveConfig(env), ctx };
+			const url = new URL(request.url);
+			const response = await handleRequest(request, config);
+			if (response.status >= 400 || url.pathname.startsWith("/_api/")) {
+				logRequest(request, response, start);
+			}
+			return response;
+		} catch (err) {
+			console.error("Unhandled error", { error: err instanceof Error ? err.message : String(err) });
+			const response = new Response(JSON.stringify({ error: "Internal server error" }), {
+				status: 500,
+				headers: { "content-type": "application/json" },
+			});
+			logRequest(request, response, start);
+			return response;
+		}
 	},
 
 	async scheduled(event, env, ctx): Promise<void> {

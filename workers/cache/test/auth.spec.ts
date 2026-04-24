@@ -29,7 +29,7 @@ function postWithWorker(
 
 beforeAll(async () => {
 	const db = drizzle(env.CACHE_DB);
-	await createCache(db, CACHE_NAME, true);
+	await createCache(db, CACHE_NAME);
 });
 
 describe("write auth", () => {

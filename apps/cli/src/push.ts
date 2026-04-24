@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { stat, rm } from "node:fs/promises";
+import { mkdtemp, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ApiClient } from "./api.js";
@@ -13,7 +13,7 @@ import {
   completeUpload,
   publishPath,
 } from "./api.js";
-import { getPathInfo, getClosurePaths, dumpAndCompress } from "./nix.js";
+import { getPathInfo, dumpAndCompress } from "./nix.js";
 
 const DEFAULT_CONCURRENCY = 8;
 
@@ -45,7 +45,8 @@ async function pushSinglePath(
   hash: string,
 ): Promise<{ sizeKb: number }> {
   const info = await getPathInfo(storePath);
-  const narFile = join(tmpdir(), `odin-nar-${hash}.zst`);
+  const narDir = await mkdtemp(join(tmpdir(), "odin-nar-"));
+  const narFile = join(narDir, "nar.zst");
 
   try {
     await dumpAndCompress(storePath, narFile);
@@ -75,7 +76,7 @@ async function pushSinglePath(
 
     return { sizeKb: Math.round(fileSize / 1024) };
   } finally {
-    await rm(narFile, { force: true });
+    await rm(narDir, { recursive: true, force: true });
   }
 }
 
@@ -165,12 +166,3 @@ export async function pushPaths(
   return { pushed, skipped, failed, errors };
 }
 
-export async function pushClosure(
-  client: ApiClient,
-  cache: string,
-  rootPath: string,
-  options?: PushOptions,
-): Promise<PushResult> {
-  const paths = await getClosurePaths(rootPath);
-  return pushPaths(client, cache, paths, options);
-}

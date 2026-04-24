@@ -10,9 +10,9 @@ import {
 	findPublishedPath,
 	createUploadSession,
 	findUploadSession,
-	updateUploadSessionStatus,
+	transitionSessionStatus,
 	findExpiredSessions,
-	createUploadPart,
+	upsertUploadPart,
 	findUploadParts,
 	createGcMark,
 	findGcMarks,
@@ -51,23 +51,21 @@ function makeSessionParams(overrides: {
 describe("caches", () => {
 	it("createCache creates a public cache with expected fields", async () => {
 		const name = `cache-create-${crypto.randomUUID()}`;
-		const row = await createCache(getDb(), name, true);
+		const row = await createCache(getDb(), name);
 
 		expect(row.name).toBe(name);
-		expect(row.isPublic).toBe(1);
 		expect(typeof row.id).toBe("number");
 		expect(typeof row.createdAt).toBe("string");
 	});
 
 	it("findCacheByName returns a matching cache", async () => {
 		const name = `cache-find-${crypto.randomUUID()}`;
-		const created = await createCache(getDb(), name, false);
+		const created = await createCache(getDb(), name);
 		const found = await findCacheByName(getDb(), name);
 
 		expect(found).toBeDefined();
 		expect(found!.id).toBe(created.id);
 		expect(found!.name).toBe(name);
-		expect(found!.isPublic).toBe(0);
 	});
 
 	it("findCacheByName returns undefined for non-existent name", async () => {
@@ -77,9 +75,9 @@ describe("caches", () => {
 
 	it("createCache with duplicate name throws", async () => {
 		const name = `cache-dup-${crypto.randomUUID()}`;
-		await createCache(getDb(), name, true);
+		await createCache(getDb(), name);
 
-		await expect(createCache(getDb(), name, true)).rejects.toThrow();
+		await expect(createCache(getDb(), name)).rejects.toThrow();
 	});
 });
 
@@ -141,7 +139,7 @@ describe("blob_objects", () => {
 
 describe("published_paths", () => {
 	it("createPublishedPath creates a row with expected fields", async () => {
-		const cache = await createCache(getDb(), `pp-create-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `pp-create-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(getDb(), {
 			fileHash: `sha256:${crypto.randomUUID()}`,
 			fileSize: 500,
@@ -172,7 +170,7 @@ describe("published_paths", () => {
 	});
 
 	it("findPublishedPath returns a matching path", async () => {
-		const cache = await createCache(getDb(), `pp-find-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `pp-find-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(getDb(), {
 			fileHash: `sha256:${crypto.randomUUID()}`,
 			fileSize: 500,
@@ -205,7 +203,7 @@ describe("published_paths", () => {
 	});
 
 	it("createPublishedPath with same cache+storePathHash throws", async () => {
-		const cache = await createCache(getDb(), `pp-dup-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `pp-dup-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(getDb(), {
 			fileHash: `sha256:${crypto.randomUUID()}`,
 			fileSize: 500,
@@ -233,7 +231,7 @@ describe("published_paths", () => {
 
 describe("upload_sessions", () => {
 	it("createUploadSession creates a session with status pending", async () => {
-		const cache = await createCache(getDb(), `us-create-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `us-create-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		const row = await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 
@@ -244,7 +242,7 @@ describe("upload_sessions", () => {
 	});
 
 	it("findUploadSession returns a matching session", async () => {
-		const cache = await createCache(getDb(), `us-find-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `us-find-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 		const found = await findUploadSession(getDb(), sessionId);
@@ -253,12 +251,12 @@ describe("upload_sessions", () => {
 		expect(found!.id).toBe(sessionId);
 	});
 
-	it("updateUploadSessionStatus updates and returns the session", async () => {
-		const cache = await createCache(getDb(), `us-update-${crypto.randomUUID()}`, true);
+	it("transitionSessionStatus updates and returns the session", async () => {
+		const cache = await createCache(getDb(), `us-update-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 
-		const updated = await updateUploadSessionStatus(getDb(), sessionId, "uploading");
+		const updated = await transitionSessionStatus(getDb(), sessionId, "pending", "uploading");
 
 		expect(updated).toBeDefined();
 		expect(updated!.status).toBe("uploading");
@@ -266,7 +264,7 @@ describe("upload_sessions", () => {
 	});
 
 	it("findExpiredSessions returns only expired non-completed sessions", async () => {
-		const cache = await createCache(getDb(), `us-expired-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `us-expired-${crypto.randomUUID()}`);
 
 		const expiredId = crypto.randomUUID();
 		await createUploadSession(
@@ -288,14 +286,14 @@ describe("upload_sessions", () => {
 	});
 
 	it("findExpiredSessions excludes completed sessions even if expired", async () => {
-		const cache = await createCache(getDb(), `us-exp-compl-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `us-exp-compl-${crypto.randomUUID()}`);
 
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			getDb(),
 			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: "2020-01-01T00:00:00.000Z" }),
 		);
-		await updateUploadSessionStatus(getDb(), sessionId, "completed");
+		await transitionSessionStatus(getDb(), sessionId, "pending", "completed");
 
 		const expired = await findExpiredSessions(getDb(), new Date().toISOString());
 		const expiredIds = expired.map((s) => s.id);
@@ -305,12 +303,12 @@ describe("upload_sessions", () => {
 });
 
 describe("upload_parts", () => {
-	it("createUploadPart creates a part with expected fields", async () => {
-		const cache = await createCache(getDb(), `up-create-${crypto.randomUUID()}`, true);
+	it("upsertUploadPart creates a part with expected fields", async () => {
+		const cache = await createCache(getDb(), `up-create-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 
-		const row = await createUploadPart(getDb(), {
+		const row = await upsertUploadPart(getDb(), {
 			sessionId,
 			partNumber: 1,
 			etag: "etag-abc",
@@ -325,13 +323,13 @@ describe("upload_parts", () => {
 	});
 
 	it("findUploadParts returns parts ordered by partNumber", async () => {
-		const cache = await createCache(getDb(), `up-find-${crypto.randomUUID()}`, true);
+		const cache = await createCache(getDb(), `up-find-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 
-		await createUploadPart(getDb(), { sessionId, partNumber: 3, etag: "e3", size: 300 });
-		await createUploadPart(getDb(), { sessionId, partNumber: 1, etag: "e1", size: 100 });
-		await createUploadPart(getDb(), { sessionId, partNumber: 2, etag: "e2", size: 200 });
+		await upsertUploadPart(getDb(), { sessionId, partNumber: 3, etag: "e3", size: 300 });
+		await upsertUploadPart(getDb(), { sessionId, partNumber: 1, etag: "e1", size: 100 });
+		await upsertUploadPart(getDb(), { sessionId, partNumber: 2, etag: "e2", size: 200 });
 
 		const parts = await findUploadParts(getDb(), sessionId);
 
