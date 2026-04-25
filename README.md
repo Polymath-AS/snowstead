@@ -36,7 +36,8 @@ wrangler r2 bucket create helios-cache
 wrangler d1 create helios-cache
 # update database_id in workers/cache/wrangler.jsonc
 wrangler d1 migrations apply helios-cache --remote
-wrangler secret put AUTH_TOKEN
+wrangler secret put JWT_SECRET
+wrangler secret put ADMIN_SECRET
 wrangler secret put SIGNING_PRIVATE_KEY
 wrangler secret put SIGNING_KEY_NAME
 pnpm deploy
