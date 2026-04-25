@@ -9,7 +9,7 @@ A Cloudflare-native Nix binary cache.
 workers/cache/        Cloudflare Worker (main service)
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
-scripts/              push-paths.sh, smoke-test.sh
+scripts/              smoke-test.sh
 ```
 
 ## Setup
@@ -44,22 +44,37 @@ pnpm deploy
 
 ## Push store paths
 
+Build the CLI (or `nix run .` for one-off use):
+
 ```bash
-./scripts/push-paths.sh <base-url> <auth-token> <cache-name> <store-path>...
+nix build       # produces ./result/bin/helios
+```
+
+Save credentials once:
+
+```bash
+helios login prod https://your-worker.workers.dev "$PUSH_TOKEN"
+```
+
+Push a single path:
+
+```bash
+helios push main /nix/store/abc...-hello
 ```
 
 Push a full closure:
 
 ```bash
-./scripts/push-paths.sh https://your-worker.workers.dev "$TOKEN" main \
-  $(nix path-info -r /run/current-system)
+helios push main --closure /run/current-system
 ```
 
-Or use the CLI (builds with `nix build`):
+Push a flake output closure:
 
 ```bash
-nix run . -- push --cache main /nix/store/...
+helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
 ```
+
+See [docs.md](docs.md) for token management and parallelism options.
 
 ## Use as a substituter
 
