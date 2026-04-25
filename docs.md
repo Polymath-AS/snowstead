@@ -21,83 +21,77 @@ pnpm deploy
 | `SIGNING_PRIVATE_KEY` | Ed25519 key for narinfo signing |
 | `SIGNING_KEY_NAME` | Key name prefix for signatures |
 
+## Setup
+
+Configure the CLI with your server URL and admin secret:
+
+```bash
+helios login prod https://your-worker.workers.dev $ADMIN_SECRET
+```
+
 ## Using as a substituter
 
 ```nix
 nix.settings.substituters = [ "https://your-worker.workers.dev/main" ];
 ```
 
-## Pushing store paths
+## Managing tokens
 
-```bash
-# Single path
-nix run . -- push --cache main /nix/store/...
-
-# Full closure
-./scripts/push-paths.sh https://your-worker.workers.dev "$TOKEN" main \
-  $(nix path-info -r /run/current-system)
-```
-
-## Authentication
-
-JWT tokens scope write access to specific caches. At least one of
-`JWT_SECRET` or `AUTH_TOKEN` must be configured, otherwise all writes
-are rejected.
-
-### Managing tokens
+JWT tokens scope write access to specific caches. The signed JWT is
+returned once on creation and never stored. Save it immediately.
 
 ```bash
 # Create a token scoped to the "main" cache with push access
-curl -X POST $URL/_api/v1/admin/tokens \
-  -H "Authorization: Bearer $ADMIN_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"subject":"ci-main","caches":["main"],"perms":["push"],"expiresInDays":90}'
+helios token create ci-runner --caches main --perms push --expires 90
+
+# Create a token with access to all caches
+helios token create admin-bot --caches "*" --perms push,pull
 
 # List all tokens
-curl $URL/_api/v1/admin/tokens \
-  -H "Authorization: Bearer $ADMIN_SECRET"
+helios token list
 
 # Revoke a token
-curl -X POST $URL/_api/v1/admin/tokens/$JTI/revoke \
-  -H "Authorization: Bearer $ADMIN_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"reason":"offboarded"}'
+helios token revoke $JTI "employee offboarded"
 ```
 
-The signed JWT is returned once on creation and never stored. Save it
-immediately.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--caches` | `*` | Comma-separated cache names or `*` for all |
+| `--perms` | `push` | Comma-separated: `push` and/or `pull` |
+| `--expires` | `90` | Token lifetime in days (1-365) |
 
-### Create token parameters
+## Pushing store paths
 
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `subject` | yes | | Human label, max 256 chars |
-| `caches` | yes | | Cache names to grant access to, or `["*"]` for all |
-| `perms` | yes | | `"push"` and/or `"pull"` |
-| `expiresInDays` | no | 90 | Token lifetime, 1 to 365 |
-
-### Using a token
-
-Pass the JWT as a bearer token on any write request:
+Log in with a push token (not the admin secret):
 
 ```bash
-curl -X POST $URL/_api/v1/caches/main/upload-sessions \
-  -H "Authorization: Bearer $JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{ ... }'
+helios login prod https://your-worker.workers.dev $PUSH_TOKEN
 ```
 
-The CLI and `push-paths.sh` accept it the same way as the legacy
-`AUTH_TOKEN`.
+Then push:
 
-### Migrating from AUTH_TOKEN
+```bash
+# Single path
+helios push main /nix/store/abc...-hello
+
+# Full closure
+helios push main --closure /run/current-system
+
+# Flake output closure
+helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+```
+
+Use `--jobs <n>` to control parallelism (default 8).
+
+## Migrating from AUTH_TOKEN
 
 1. Set `JWT_SECRET` and `ADMIN_SECRET` via `wrangler secret put`
-2. Create scoped JWT tokens for each publisher
-3. Update each publisher to use its JWT
-4. Remove `AUTH_TOKEN` to disable legacy auth
+2. Log in with the admin secret: `helios login prod $URL $ADMIN_SECRET`
+3. Create scoped tokens: `helios token create ci-runner --caches main`
+4. Update publishers to log in with their JWT
+5. Remove `AUTH_TOKEN` to disable legacy auth
 
-### Audit logging
+## Audit logging
 
 All write operations and admin actions are logged to D1 with actor,
 action, cache name, IP, and status code. Logs are retained for 30 days.

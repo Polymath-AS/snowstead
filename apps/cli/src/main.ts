@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { login, getServer } from "./config.js";
-import { createClient } from "./api.js";
+import { createClient, createToken, listTokens, revokeToken } from "./api.js";
 import { pushPaths } from "./push.js";
 import { getClosurePaths } from "./nix.js";
 
@@ -11,17 +11,27 @@ Commands:
   helios login <name> <server-url> <token>   Save server credentials
   helios push <cache> <paths...>             Push store paths to a cache
   helios push <cache> --closure <path>       Push a store path and its closure
+  helios token create <subject>              Create a new API token
+  helios token list                          List all API tokens
+  helios token revoke <jti> <reason>         Revoke an API token
 
 Options:
   --server <name>    Use a specific server (default: last logged-in)
   --jobs <n>         Number of parallel uploads (default: 8)
   --help             Show this help
 
+Token create options:
+  --caches <names>   Comma-separated cache names or "*" (default: *)
+  --perms <perms>    Comma-separated permissions (default: push)
+  --expires <days>   Token lifetime in days (default: 90)
+
 Examples:
-  helios login prod https://cache.example.com my-token
+  helios login prod https://cache.example.com my-admin-secret
   helios push main /nix/store/abc...-hello
   helios push main --closure /run/current-system
-  helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+  helios token create ci-runner --caches main --perms push --expires 90
+  helios token list
+  helios token revoke a1b2c3d4-... "employee offboarded"
 `;
 
 async function main(): Promise<void> {
@@ -111,6 +121,91 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     return;
+  }
+
+  if (command === "token") {
+    const subcommand = args[1];
+
+    // Extract --server flag
+    let serverName: string | undefined;
+    const serverIdx = args.indexOf("--server");
+    if (serverIdx !== -1 && serverIdx + 1 < args.length) {
+      serverName = args[serverIdx + 1];
+    }
+
+    const serverConfig = await getServer(serverName);
+    const client = createClient(serverConfig.server, serverConfig.token);
+
+    if (subcommand === "create") {
+      const subject = args[2];
+      if (!subject) {
+        console.error("Usage: helios token create <subject> [--caches ...] [--perms ...] [--expires <days>]");
+        process.exit(1);
+      }
+
+      let cachesStr = "*";
+      const cachesIdx = args.indexOf("--caches");
+      if (cachesIdx !== -1 && cachesIdx + 1 < args.length) {
+        cachesStr = args[cachesIdx + 1];
+      }
+
+      let permsStr = "push";
+      const permsIdx = args.indexOf("--perms");
+      if (permsIdx !== -1 && permsIdx + 1 < args.length) {
+        permsStr = args[permsIdx + 1];
+      }
+
+      let expiresInDays: number | undefined;
+      const expiresIdx = args.indexOf("--expires");
+      if (expiresIdx !== -1 && expiresIdx + 1 < args.length) {
+        expiresInDays = parseInt(args[expiresIdx + 1], 10);
+        if (!Number.isInteger(expiresInDays) || expiresInDays < 1) {
+          console.error("--expires must be a positive integer");
+          process.exit(1);
+        }
+      }
+
+      const caches = cachesStr.split(",").map(s => s.trim()).filter(Boolean);
+      const perms = permsStr.split(",").map(s => s.trim()).filter(Boolean);
+
+      const result = await createToken(client, { subject, caches, perms, expiresInDays });
+      console.log(`Token created for '${result.subject}'`);
+      console.log(`  JTI:     ${result.jti}`);
+      console.log(`  Caches:  ${result.caches.join(", ")}`);
+      console.log(`  Perms:   ${result.perms.join(", ")}`);
+      console.log(`  Expires: ${result.expiresAt}`);
+      console.log("");
+      console.log(result.token);
+      return;
+    }
+
+    if (subcommand === "list") {
+      const tokens = await listTokens(client);
+      if (tokens.length === 0) {
+        console.log("No tokens found");
+        return;
+      }
+      for (const t of tokens) {
+        const status = t.revokedAt ? `revoked (${t.revokedAt})` : "active";
+        console.log(`${t.jti}  ${t.subject}  [${t.perms.join(",")}]  caches=[${t.caches.join(",")}]  ${status}  expires=${t.expiresAt}`);
+      }
+      return;
+    }
+
+    if (subcommand === "revoke") {
+      const jti = args[2];
+      const reason = args.slice(3).join(" ");
+      if (!jti || !reason) {
+        console.error("Usage: helios token revoke <jti> <reason>");
+        process.exit(1);
+      }
+      await revokeToken(client, jti, reason);
+      console.log(`Token ${jti} revoked`);
+      return;
+    }
+
+    console.error("Usage: helios token <create|list|revoke>");
+    process.exit(1);
   }
 
   console.error(`Unknown command: ${command}`);

@@ -202,3 +202,68 @@ export async function publishPath(
   }
   return jsonBody<{ published: boolean; alreadyExisted?: boolean }>(resp);
 }
+
+// ── Token Management (Admin API) ──
+
+export interface TokenInfo {
+  readonly jti: string;
+  readonly subject: string;
+  readonly caches: string[];
+  readonly perms: string[];
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly createdBy: string;
+  readonly revokedAt: string | null;
+  readonly revokedBy: string | null;
+  readonly revocationReason: string | null;
+}
+
+export interface CreateTokenResponse {
+  readonly token: string;
+  readonly jti: string;
+  readonly subject: string;
+  readonly caches: string[];
+  readonly perms: string[];
+  readonly expiresAt: string;
+}
+
+export async function createToken(
+  client: ApiClient,
+  params: {
+    subject: string;
+    caches: string[];
+    perms: string[];
+    expiresInDays?: number;
+  },
+): Promise<CreateTokenResponse> {
+  const resp = await request(client, "POST", "/_api/v1/admin/tokens", params);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`token create failed (${resp.status}): ${text}`);
+  }
+  return jsonBody<CreateTokenResponse>(resp);
+}
+
+export async function listTokens(
+  client: ApiClient,
+): Promise<TokenInfo[]> {
+  const resp = await request(client, "GET", "/_api/v1/admin/tokens");
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`token list failed (${resp.status}): ${text}`);
+  }
+  const data = await jsonBody<{ tokens: TokenInfo[] }>(resp);
+  return data.tokens;
+}
+
+export async function revokeToken(
+  client: ApiClient,
+  jti: string,
+  reason: string,
+): Promise<void> {
+  const resp = await request(client, "POST", `/_api/v1/admin/tokens/${jti}/revoke`, { reason });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`token revoke failed (${resp.status}): ${text}`);
+  }
+}
