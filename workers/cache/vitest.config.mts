@@ -12,7 +12,10 @@ export default defineWorkersConfig(async () => {
 				workers: {
 					wrangler: { configPath: './wrangler.jsonc' },
 					miniflare: {
-						bindings: { TEST_MIGRATIONS: migrations },
+						bindings: {
+							TEST_MIGRATIONS: migrations,
+							AUTH_TOKEN: "test-auth-token",
+						},
 					},
 				},
 			},

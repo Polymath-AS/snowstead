@@ -4,6 +4,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { createCache, findPublishedPath, findCacheByName } from "../src/db/repository.js";
 
 const CACHE_NAME = "upload-test";
+const AUTH_TOKEN = "test-auth-token";
 const BLOB_DATA = new Uint8Array([1, 2, 3, 4]);
 
 function getDb() {
@@ -13,7 +14,10 @@ function getDb() {
 function post(path: string, body: unknown): Promise<Response> {
 	return SELF.fetch(`http://example.com${path}`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${AUTH_TOKEN}`,
+		},
 		body: JSON.stringify(body),
 	});
 }
@@ -50,6 +54,7 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 
 	const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 		method: "PUT",
+		headers: { authorization: `Bearer ${AUTH_TOKEN}` },
 		body: BLOB_DATA,
 	});
 	expect(blobRes.status).toBe(200);
@@ -110,6 +115,7 @@ describe("complete upload (direct)", () => {
 
 		const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 			method: "PUT",
+			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
 			body: BLOB_DATA,
 		});
 		expect(blobRes.status).toBe(200);

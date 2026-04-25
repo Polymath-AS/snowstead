@@ -1,7 +1,10 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName, findPublishedPathWithBlob } from "./db/repository.js";
+import { findCacheByName, findPublishedPathWithBlob, createAuditLog } from "./db/repository.js";
 import { renderNarinfo } from "./narinfo.js";
-import { verifyAuth } from "./auth.js";
+import { authenticateWrite, authenticateAdmin, actorId } from "./auth.js";
+import type { AuthIdentity } from "./auth.js";
+import { hasPermission, hasCacheAccess } from "./jwt.js";
+import { errorResponse } from "./responses.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
 import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@helios/cache-domain";
 import type { CacheName } from "@helios/cache-domain";
@@ -15,6 +18,16 @@ import {
 	handleGetMissingPaths,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken } from "./admin.js";
+
+// Pre-compiled route patterns. Compiled once per isolate, not per request.
+const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
+const RE_MULTIPART = /^\/_api\/v1\/uploads\/([^/]+)\/multipart$/;
+const RE_PART_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/;
+const RE_BLOB = /^\/_api\/v1\/uploads\/([^/]+)\/blob$/;
+const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
+const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
+const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 
 // Module-scope cache: cache name → D1 cache ID.
 // Workers are short-lived isolates reused across requests on the same edge node,
@@ -48,6 +61,11 @@ export async function handleRequest(
 
 	if (url.pathname === "/healthz") {
 		return handleHealthz(config);
+	}
+
+	// Admin API routes
+	if (url.pathname.startsWith("/_api/v1/admin/")) {
+		return handleAdminApi(request, config, url.pathname);
 	}
 
 	// Write API routes (POST and PUT)
@@ -107,6 +125,30 @@ function json(body: Record<string, string | boolean | number>, status = 200): Re
 		status,
 		headers: { "content-type": "application/json; charset=utf-8" },
 	});
+}
+
+function writeAuditLog(
+	config: WorkerConfig,
+	identity: AuthIdentity,
+	action: string,
+	cacheName: string | null,
+	status: number,
+	detail: string,
+	ip: string | null,
+): void {
+	if (!config.ctx) return;
+	config.ctx.waitUntil(
+		createAuditLog(config.db, {
+			actor: actorId(identity),
+			action,
+			cacheName,
+			detail,
+			ip,
+			status,
+		}).catch((err) => {
+			console.error("Failed to write audit log", { error: err instanceof Error ? err.message : String(err) });
+		}),
+	);
 }
 
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
@@ -277,48 +319,119 @@ async function handleNarDownload(
 	return response;
 }
 
+async function handleAdminApi(
+	request: Request,
+	config: WorkerConfig,
+	pathname: string,
+): Promise<Response> {
+	const authResult = await authenticateAdmin(request, config);
+	if (authResult.kind === "error") {
+		return authResult.response;
+	}
+
+	const ip = request.headers.get("cf-connecting-ip");
+
+	if (pathname === "/_api/v1/admin/tokens" && request.method === "POST") {
+		const response = await handleCreateToken(request, config);
+		writeAuditLog(config, authResult.identity, "token.create", null, response.status, "{}", ip);
+		return response;
+	}
+
+	if (pathname === "/_api/v1/admin/tokens" && request.method === "GET") {
+		const response = await handleListTokens(config);
+		writeAuditLog(config, authResult.identity, "token.list", null, response.status, "{}", ip);
+		return response;
+	}
+
+	const revokeMatch = pathname.match(RE_REVOKE);
+	if (revokeMatch && request.method === "POST") {
+		const response = await handleRevokeToken(request, config, revokeMatch[1]);
+		writeAuditLog(config, authResult.identity, "token.revoke", null, response.status, JSON.stringify({ jti: revokeMatch[1] }), ip);
+		return response;
+	}
+
+	return new Response("Not Found", { status: 404 });
+}
+
 async function handleWriteApi(
 	request: Request,
 	config: WorkerConfig,
 	pathname: string,
 ): Promise<Response> {
-	const authError = verifyAuth(request, config);
-	if (authError) {
-		return authError;
+	const authResult = await authenticateWrite(request, config);
+	if (authResult.kind === "error") {
+		return authResult.response;
+	}
+
+	const identity = authResult.identity;
+	const ip = request.headers.get("cf-connecting-ip");
+
+	// Check push permission for JWT tokens
+	if (identity.kind === "jwt" && !hasPermission(identity.claims, "push")) {
+		const response = errorResponse("Forbidden", 403);
+		writeAuditLog(config, identity, "push", null, 403, '{"reason":"missing push permission"}', ip);
+		return response;
 	}
 
 	if (pathname === "/_api/v1/get-missing-paths") {
-		return handleGetMissingPaths(request, config);
+		const response = await handleGetMissingPaths(request, config, identity);
+		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"get-missing-paths"}', ip);
+		return response;
 	}
 
-	const sessionCreate = pathname.match(/^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/);
+	const sessionCreate = pathname.match(RE_SESSION_CREATE);
 	if (sessionCreate) {
-		return handleCreateSession(request, config, sessionCreate[1]);
+		const cacheName = sessionCreate[1];
+		if (identity.kind === "jwt" && !hasCacheAccess(identity.claims, cacheName)) {
+			const response = errorResponse("Forbidden", 403);
+			writeAuditLog(config, identity, "push", cacheName, 403, '{"reason":"cache access denied"}', ip);
+			return response;
+		}
+		const response = await handleCreateSession(request, config, cacheName);
+		writeAuditLog(config, identity, "push", cacheName, response.status, '{"endpoint":"create-session"}', ip);
+		return response;
 	}
 
-	const multipart = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/multipart$/);
-	if (multipart) {
-		return handleMultipart(config, multipart[1]);
-	}
+	// Session-scoped upload routes — all share the same audit pattern
+	const uploadRoutes: ReadonlyArray<{
+		readonly pattern: RegExp;
+		readonly endpoint: string;
+		readonly handle: (match: RegExpMatchArray) => Promise<Response>;
+	}> = [
+		{
+			pattern: RE_MULTIPART,
+			endpoint: "multipart",
+			handle: (m) => handleMultipart(config, m[1], identity),
+		},
+		{
+			pattern: RE_PART_UPLOAD,
+			endpoint: "upload-part",
+			handle: (m) => handleUploadPart(request, config, m[1], parseInt(m[2], 10), identity),
+		},
+		{
+			pattern: RE_BLOB,
+			endpoint: "upload-blob",
+			handle: (m) => handleUploadBlob(request, config, m[1], identity),
+		},
+		{
+			pattern: RE_COMPLETE,
+			endpoint: "complete",
+			handle: (m) => handleComplete(request, config, m[1], identity),
+		},
+		{
+			pattern: RE_PUBLISH,
+			endpoint: "publish",
+			handle: (m) => handlePublish(config, m[1], identity),
+		},
+	];
 
-	const partUpload = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/);
-	if (partUpload) {
-		return handleUploadPart(request, config, partUpload[1], parseInt(partUpload[2], 10));
-	}
-
-	const blob = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/blob$/);
-	if (blob) {
-		return handleUploadBlob(request, config, blob[1]);
-	}
-
-	const complete = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/complete$/);
-	if (complete) {
-		return handleComplete(request, config, complete[1]);
-	}
-
-	const publish = pathname.match(/^\/_api\/v1\/uploads\/([^/]+)\/publish$/);
-	if (publish) {
-		return handlePublish(config, publish[1]);
+	for (const route of uploadRoutes) {
+		const match = pathname.match(route.pattern);
+		if (match) {
+			const response = await route.handle(match);
+			writeAuditLog(config, identity, "push", null, response.status, `{"endpoint":"${route.endpoint}"}`, ip);
+			return response;
+		}
 	}
 
 	return new Response("Not Found", { status: 404 });

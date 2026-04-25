@@ -1,6 +1,9 @@
 import type { WorkerConfig } from "./config.js";
+import type { AuthIdentity } from "./auth.js";
+import { hasCacheAccess } from "./jwt.js";
 import {
 	findCacheByName,
+	findCacheById,
 	createUploadSession,
 	findUploadSession,
 	transitionSessionStatus,
@@ -13,25 +16,40 @@ import {
 	findPublishedPath,
 	findPublishedHashes,
 } from "./db/repository.js";
+import type { UploadSession } from "./db/types.js";
 import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@helios/cache-domain";
+import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
-function jsonResponse(body: unknown, status = 200): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json; charset=utf-8" },
-	});
-}
+// ── Session Auth Helper ──
 
-function errorResponse(message: string, status: number): Response {
-	return jsonResponse({ error: message }, status);
-}
-
-async function parseJsonBody<T>(request: Request): Promise<T | Response> {
-	try {
-		return await request.json<T>();
-	} catch {
-		return errorResponse("Invalid JSON in request body", 400);
+/**
+ * Load an upload session and verify the caller has access to its cache.
+ * Bearer-token callers are trusted implicitly; JWT callers must hold
+ * access to the cache the session belongs to.
+ */
+async function loadSessionWithAuthCheck(
+	config: WorkerConfig,
+	sessionId: string,
+	identity: AuthIdentity,
+): Promise<{ session: UploadSession; error?: never } | { session?: never; error: Response }> {
+	const session = await findUploadSession(config.db, sessionId);
+	if (!session) {
+		return { error: errorResponse("Not found", 404) };
 	}
+
+	// Enforce session expiry at request time, not just via GC
+	if (session.expiresAt <= new Date().toISOString()) {
+		return { error: errorResponse("Not found", 404) };
+	}
+
+	if (identity.kind === "jwt") {
+		const cache = await findCacheById(config.db, session.cacheId);
+		if (!cache || !hasCacheAccess(identity.claims, cache.name)) {
+			return { error: errorResponse("Forbidden", 403) };
+		}
+	}
+
+	return { session };
 }
 
 // ── Create Upload Session ──
@@ -125,18 +143,18 @@ export async function handleCreateSession(
 export async function handleMultipart(
 	config: WorkerConfig,
 	sessionId: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
-	const session = await findUploadSession(config.db, sessionId);
-	if (!session) {
-		return errorResponse("Session not found", 404);
-	}
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
 
 	if (session.status !== "pending") {
-		return errorResponse(`Session is in '${session.status}' state, expected 'pending'`, 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	if (!session.r2UploadKey) {
-		return errorResponse("Session has no R2 upload key", 500);
+		return errorResponse("Internal error", 500);
 	}
 
 	const multipart = await config.bucket.createMultipartUpload(session.r2UploadKey);
@@ -144,7 +162,7 @@ export async function handleMultipart(
 	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId);
 	if (!transitioned) {
 		try { await multipart.abort(); } catch { /* best effort */ }
-		return errorResponse("Session state changed concurrently, expected 'pending'", 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	return jsonResponse({
@@ -160,18 +178,18 @@ export async function handleUploadPart(
 	config: WorkerConfig,
 	sessionId: string,
 	partNumber: number,
+	identity: AuthIdentity,
 ): Promise<Response> {
-	const session = await findUploadSession(config.db, sessionId);
-	if (!session) {
-		return errorResponse("Session not found", 404);
-	}
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
 
 	if (session.status !== "uploading") {
-		return errorResponse(`Session is in '${session.status}' state, expected 'uploading'`, 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	if (!session.r2UploadKey || !session.r2UploadId) {
-		return errorResponse("Session has no active multipart upload", 400);
+		return errorResponse("Bad request", 400);
 	}
 
 	if (!request.body) {
@@ -197,18 +215,18 @@ export async function handleUploadBlob(
 	request: Request,
 	config: WorkerConfig,
 	sessionId: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
-	const session = await findUploadSession(config.db, sessionId);
-	if (!session) {
-		return errorResponse("Session not found", 404);
-	}
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
 
 	if (session.status !== "pending" && session.status !== "uploading") {
-		return errorResponse(`Session is in '${session.status}' state, expected 'pending' or 'uploading'`, 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	if (!session.r2UploadKey) {
-		return errorResponse("Session has no R2 upload key", 500);
+		return errorResponse("Internal error", 500);
 	}
 
 	if (!request.body) {
@@ -223,7 +241,7 @@ export async function handleUploadBlob(
 			// Re-read to check if someone else moved it to uploading (retry-safe)
 			const current = await findUploadSession(config.db, sessionId);
 			if (!current || current.status !== "uploading") {
-				return errorResponse("Session state changed concurrently", 409);
+				return errorResponse("Conflict", 409);
 			}
 		}
 	}
@@ -241,18 +259,18 @@ export async function handleComplete(
 	request: Request,
 	config: WorkerConfig,
 	sessionId: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
-	const session = await findUploadSession(config.db, sessionId);
-	if (!session) {
-		return errorResponse("Session not found", 404);
-	}
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
 
 	if (session.status !== "uploading") {
-		return errorResponse(`Session is in '${session.status}' state, expected 'uploading'`, 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	if (!session.r2UploadKey) {
-		return errorResponse("Session has no R2 upload key", 500);
+		return errorResponse("Internal error", 500);
 	}
 
 	const body = await parseJsonBody<{
@@ -279,19 +297,16 @@ export async function handleComplete(
 
 	const head = await config.bucket.head(session.r2UploadKey);
 	if (!head) {
-		return errorResponse("Object not found in R2, upload may not be complete", 400);
+		return errorResponse("Upload incomplete", 400);
 	}
 
 	if (head.size !== session.fileSize) {
-		return errorResponse(
-			`File size mismatch: expected ${session.fileSize}, got ${head.size}`,
-			400,
-		);
+		return errorResponse("File size mismatch", 400);
 	}
 
 	const transitioned = await transitionSessionStatus(config.db, sessionId, "uploading", "completed");
 	if (!transitioned) {
-		return errorResponse("Session state changed concurrently", 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	return jsonResponse({ status: "completed" });
@@ -302,14 +317,14 @@ export async function handleComplete(
 export async function handlePublish(
 	config: WorkerConfig,
 	sessionId: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
-	const session = await findUploadSession(config.db, sessionId);
-	if (!session) {
-		return errorResponse("Session not found", 404);
-	}
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
 
 	if (session.status !== "completed") {
-		return errorResponse(`Session must be completed before publishing, current status: '${session.status}'`, 409);
+		return errorResponse("Conflict", 409);
 	}
 
 	const existing = await findPublishedPath(config.db, session.cacheId, session.storePathHash);
@@ -320,7 +335,7 @@ export async function handlePublish(
 	let blob = await findBlobObject(config.db, session.fileHash, session.compression);
 	if (!blob) {
 		if (!session.r2UploadKey) {
-			return errorResponse("Session has no R2 upload key", 500);
+			return errorResponse("Internal error", 500);
 		}
 		try {
 			blob = await createBlobObject(config.db, {
@@ -332,7 +347,7 @@ export async function handlePublish(
 		} catch {
 			blob = await findBlobObject(config.db, session.fileHash, session.compression);
 			if (!blob) {
-				return errorResponse("Failed to create or find blob object", 500);
+				return errorResponse("Internal error", 500);
 			}
 		}
 	}
@@ -355,7 +370,7 @@ export async function handlePublish(
 		if (raced) {
 			return jsonResponse({ published: true, storePathHash: session.storePathHash, alreadyExisted: true });
 		}
-		return errorResponse("Failed to publish path", 500);
+		return errorResponse("Internal error", 500);
 	}
 
 	return jsonResponse({ published: true, storePathHash: session.storePathHash });
@@ -368,6 +383,7 @@ const MAX_MISSING_PATHS_BATCH = 1000;
 export async function handleGetMissingPaths(
 	request: Request,
 	config: WorkerConfig,
+	identity: AuthIdentity,
 ): Promise<Response> {
 	const body = await parseJsonBody<{
 		cache: string;
@@ -386,6 +402,10 @@ export async function handleGetMissingPaths(
 	const cache = await findCacheByName(config.db, body.cache);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
+	}
+
+	if (identity.kind === "jwt" && !hasCacheAccess(identity.claims, body.cache)) {
+		return errorResponse("Forbidden", 403);
 	}
 
 	const existingHashes = await findPublishedHashes(config.db, cache.id, body.storePathHashes);

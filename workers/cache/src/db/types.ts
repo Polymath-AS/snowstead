@@ -6,6 +6,8 @@ import type {
 	uploadSessions,
 	uploadParts,
 	gcMarks,
+	apiTokens,
+	auditLogs,
 } from "./schema.js";
 
 export type Cache = InferSelectModel<typeof caches>;
@@ -19,5 +21,11 @@ export type UploadSession = InferSelectModel<typeof uploadSessions>;
 export type UploadPart = InferSelectModel<typeof uploadParts>;
 
 export type GcMark = InferSelectModel<typeof gcMarks>;
+
+export type ApiToken = InferSelectModel<typeof apiTokens>;
+
+export type AuditLog = InferSelectModel<typeof auditLogs>;
+
+export type TokenPermission = "pull" | "push";
 
 export type UploadSessionStatus = "pending" | "uploading" | "completed" | "expired";

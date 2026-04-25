@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt, inArray } from "drizzle-orm";
+import { eq, and, notInArray, lt, inArray, isNull } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import {
 	caches,
@@ -7,6 +7,8 @@ import {
 	uploadSessions,
 	uploadParts,
 	gcMarks,
+	apiTokens,
+	auditLogs,
 } from "./schema.js";
 import type {
 	Cache,
@@ -15,6 +17,8 @@ import type {
 	UploadSession,
 	UploadPart,
 	GcMark,
+	ApiToken,
+	AuditLog,
 	UploadSessionStatus,
 } from "./types.js";
 
@@ -25,6 +29,13 @@ export async function findCacheByName(
 	name: string,
 ): Promise<Cache | undefined> {
 	return db.select().from(caches).where(eq(caches.name, name)).get();
+}
+
+export async function findCacheById(
+	db: DrizzleD1Database,
+	id: number,
+): Promise<Cache | undefined> {
+	return db.select().from(caches).where(eq(caches.id, id)).get();
 }
 
 export async function createCache(
@@ -355,4 +366,109 @@ export async function deleteGcMark(
 		.delete(gcMarks)
 		.where(and(eq(gcMarks.targetType, targetType), eq(gcMarks.targetId, targetId)))
 		.run();
+}
+
+// ── API Tokens ──
+
+export async function createApiToken(
+	db: DrizzleD1Database,
+	params: {
+		readonly jti: string;
+		readonly subject: string;
+		readonly cachesJson: string;
+		readonly permsJson: string;
+		readonly expiresAt: string;
+		readonly createdBy: string;
+	},
+): Promise<ApiToken> {
+	return db
+		.insert(apiTokens)
+		.values(params)
+		.returning()
+		.get();
+}
+
+export async function findApiToken(
+	db: DrizzleD1Database,
+	jti: string,
+): Promise<ApiToken | undefined> {
+	return db.select().from(apiTokens).where(eq(apiTokens.jti, jti)).get();
+}
+
+export async function listApiTokens(
+	db: DrizzleD1Database,
+): Promise<ApiToken[]> {
+	return db.select().from(apiTokens).all();
+}
+
+export async function revokeApiToken(
+	db: DrizzleD1Database,
+	jti: string,
+	revokedBy: string,
+	reason: string,
+): Promise<ApiToken | undefined> {
+	return db
+		.update(apiTokens)
+		.set({
+			revokedAt: new Date().toISOString(),
+			revokedBy,
+			revocationReason: reason,
+		})
+		.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
+		.returning()
+		.get();
+}
+
+export async function isTokenActive(
+	db: DrizzleD1Database,
+	jti: string,
+): Promise<boolean> {
+	const row = await db
+		.select({ jti: apiTokens.jti })
+		.from(apiTokens)
+		.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
+		.get();
+	return row !== undefined;
+}
+
+export async function deleteExpiredApiTokens(
+	db: DrizzleD1Database,
+	now: string,
+): Promise<number> {
+	const result = await db
+		.delete(apiTokens)
+		.where(lt(apiTokens.expiresAt, now))
+		.run();
+	return result.meta.changes ?? 0;
+}
+
+// ── Audit Logs ──
+
+export async function createAuditLog(
+	db: DrizzleD1Database,
+	params: {
+		readonly actor: string;
+		readonly action: string;
+		readonly cacheName: string | null;
+		readonly detail: string;
+		readonly ip: string | null;
+		readonly status: number;
+	},
+): Promise<AuditLog> {
+	return db
+		.insert(auditLogs)
+		.values(params)
+		.returning()
+		.get();
+}
+
+export async function deleteExpiredAuditLogs(
+	db: DrizzleD1Database,
+	cutoff: string,
+): Promise<number> {
+	const result = await db
+		.delete(auditLogs)
+		.where(lt(auditLogs.timestamp, cutoff))
+		.run();
+	return result.meta.changes ?? 0;
 }

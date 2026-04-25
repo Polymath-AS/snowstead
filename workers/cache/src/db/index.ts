@@ -5,6 +5,8 @@ export {
 	uploadSessions,
 	uploadParts,
 	gcMarks,
+	apiTokens,
+	auditLogs,
 } from './schema.js';
 
 export type {
@@ -14,11 +16,15 @@ export type {
 	UploadSession,
 	UploadPart,
 	GcMark,
+	ApiToken,
+	AuditLog,
+	TokenPermission,
 	UploadSessionStatus,
 } from './types.js';
 
 export {
 	findCacheByName,
+	findCacheById,
 	createCache,
 	findBlobObject,
 	findBlobObjectById,
@@ -40,4 +46,12 @@ export {
 	findUnreferencedBlobObjects,
 	deleteBlobObject,
 	deleteUploadSession,
+	createApiToken,
+	findApiToken,
+	listApiTokens,
+	revokeApiToken,
+	isTokenActive,
+	deleteExpiredApiTokens,
+	createAuditLog,
+	deleteExpiredAuditLogs,
 } from './repository.js';

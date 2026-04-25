@@ -5,6 +5,8 @@ import {
 	deleteUploadSession,
 	findUnreferencedBlobObjects,
 	deleteBlobObject,
+	deleteExpiredApiTokens,
+	deleteExpiredAuditLogs,
 } from "./db/repository.js";
 import type { UploadSessionStatus } from "./db/types.js";
 
@@ -14,9 +16,13 @@ function isTransitionableStatus(s: string): s is UploadSessionStatus {
 	return VALID_TRANSITION_STATUSES.has(s);
 }
 
+const AUDIT_LOG_RETENTION_DAYS = 30;
+
 export interface GcResult {
 	readonly expiredSessions: number;
 	readonly deletedBlobs: number;
+	readonly expiredTokens: number;
+	readonly expiredAuditLogs: number;
 	readonly errors: string[];
 }
 
@@ -24,6 +30,8 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	const errors: string[] = [];
 	let expiredSessions = 0;
 	let deletedBlobs = 0;
+	let expiredTokens = 0;
+	let expiredAuditLogs = 0;
 
 	// Phase 1: Expire abandoned upload sessions
 	const now = new Date().toISOString();
@@ -85,5 +93,20 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 		}
 	}
 
-	return { expiredSessions, deletedBlobs, errors };
+	// Phase 3: Delete expired API tokens
+	try {
+		expiredTokens = await deleteExpiredApiTokens(config.db, now);
+	} catch (err) {
+		errors.push(`Failed to delete expired tokens: ${err instanceof Error ? err.message : String(err)}`);
+	}
+
+	// Phase 4: Delete audit logs older than retention period
+	try {
+		const cutoff = new Date(Date.now() - AUDIT_LOG_RETENTION_DAYS * 86400_000).toISOString();
+		expiredAuditLogs = await deleteExpiredAuditLogs(config.db, cutoff);
+	} catch (err) {
+		errors.push(`Failed to delete expired audit logs: ${err instanceof Error ? err.message : String(err)}`);
+	}
+
+	return { expiredSessions, deletedBlobs, expiredTokens, expiredAuditLogs, errors };
 }

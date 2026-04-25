@@ -41,7 +41,7 @@ describe("write auth", () => {
 
 		expect(res.status).toBe(401);
 		const body = await res.json<{ error: string }>();
-		expect(body.error).toContain("authorization");
+		expect(body.error).toBe("Unauthorized");
 	});
 
 	it("rejects write requests with wrong bearer token", async () => {
@@ -53,7 +53,7 @@ describe("write auth", () => {
 
 		expect(res.status).toBe(403);
 		const body = await res.json<{ error: string }>();
-		expect(body.error).toContain("Invalid credentials");
+		expect(body.error).toBe("Forbidden");
 	});
 
 	it("accepts write requests with valid bearer token", async () => {
@@ -73,7 +73,7 @@ describe("write auth", () => {
 			{ authorization: `Basic ${AUTH_TOKEN}` },
 		);
 
-		expect(res.status).toBe(403);
+		expect(res.status).toBe(401);
 	});
 });
 

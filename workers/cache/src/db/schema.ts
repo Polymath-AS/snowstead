@@ -81,3 +81,31 @@ export const gcMarks = sqliteTable("gc_marks", {
 }, (table) => [
 	uniqueIndex("gc_marks_target_unique").on(table.targetType, table.targetId),
 ]);
+
+export const apiTokens = sqliteTable("api_tokens", {
+	jti: text("jti").primaryKey(),
+	subject: text("subject").notNull(),
+	cachesJson: text("caches_json").notNull(),
+	permsJson: text("perms_json").notNull(),
+	createdAt: timestamp("created_at"),
+	expiresAt: text("expires_at").notNull(),
+	createdBy: text("created_by").notNull(),
+	revokedAt: text("revoked_at"),
+	revokedBy: text("revoked_by"),
+	revocationReason: text("revocation_reason"),
+});
+
+export const auditLogs = sqliteTable("audit_logs", {
+	id: integer("id").primaryKey({ autoIncrement: true }),
+	timestamp: timestamp("timestamp"),
+	actor: text("actor").notNull(),
+	action: text("action").notNull(),
+	cacheName: text("cache_name"),
+	detail: text("detail").notNull().default("{}"),
+	ip: text("ip"),
+	status: integer("status").notNull(),
+}, (table) => [
+	index("idx_audit_logs_actor").on(table.actor),
+	index("idx_audit_logs_cache").on(table.cacheName),
+	index("idx_audit_logs_time").on(table.timestamp),
+]);

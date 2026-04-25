@@ -33,12 +33,16 @@ export default {
 			console.error("GC completed with errors", {
 				expiredSessions: result.expiredSessions,
 				deletedBlobs: result.deletedBlobs,
+				expiredTokens: result.expiredTokens,
+				expiredAuditLogs: result.expiredAuditLogs,
 				errors: result.errors,
-			});
-		} else {
-			console.log("GC completed", {
+				});
+				} else {
+				console.log("GC completed", {
 				expiredSessions: result.expiredSessions,
 				deletedBlobs: result.deletedBlobs,
+				expiredTokens: result.expiredTokens,
+				expiredAuditLogs: result.expiredAuditLogs,
 			});
 		}
 	},
