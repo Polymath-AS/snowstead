@@ -10,7 +10,6 @@ workers/cache/        Cloudflare Worker (main service)
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
 scripts/              push-paths.sh, smoke-test.sh
-docs/                 Architecture decisions, deployment, development
 ```
 
 ## Setup
@@ -29,7 +28,7 @@ pnpm check # type-check + tests across the workspace
 
 ## Deploy
 
-See [docs/deployment.md](docs/deployment.md) for the full checklist. Short version:
+See [docs.md](docs.md) for the full reference. Short version:
 
 ```bash
 wrangler r2 bucket create helios-cache
