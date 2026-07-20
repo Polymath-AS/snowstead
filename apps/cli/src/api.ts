@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import { runPool } from "./pool.js";
 
 export interface ApiClient {
   readonly server: string;
@@ -167,6 +168,10 @@ export async function uploadPart(
   return jsonBody<{ partNumber: number; etag: string }>(resp);
 }
 
+// Parts of a single blob upload in parallel. Kept modest because pushPaths
+// already uploads several blobs concurrently.
+const PART_UPLOAD_CONCURRENCY = 4;
+
 export async function uploadBlobMultipart(
   client: ApiClient,
   sessionId: string,
@@ -179,16 +184,20 @@ export async function uploadBlobMultipart(
   await initiateMultipart(client, sessionId);
 
   const totalParts = Math.ceil(fileSize / partSize);
-  for (let i = 0; i < totalParts; i++) {
-    const start = i * partSize;
+  const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
+
+  // Parts are independent byte ranges of the same file, so they can be
+  // read and uploaded concurrently.
+  await runPool(partNumbers, PART_UPLOAD_CONCURRENCY, async (partNumber) => {
+    const start = (partNumber - 1) * partSize;
     const end = Math.min(start + partSize, fileSize);
     const length = end - start;
 
     const stream = createReadStream(filePath, { start, end: end - 1 });
     const webStream = ReadableStream.from(stream);
 
-    await uploadPart(client, sessionId, i + 1, webStream, length);
-  }
+    await uploadPart(client, sessionId, partNumber, webStream, length);
+  });
 }
 
 export async function publishPath(

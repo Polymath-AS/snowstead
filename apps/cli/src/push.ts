@@ -13,6 +13,7 @@ import {
 } from "./api.js";
 import { getPathInfos, dumpAndCompress } from "./nix.js";
 import type { PathInfo } from "./nix.js";
+import { runPool } from "./pool.js";
 
 const DEFAULT_CONCURRENCY = 8;
 
@@ -65,28 +66,6 @@ async function pushSinglePath(
   } finally {
     await rm(narDir, { recursive: true, force: true });
   }
-}
-
-async function runPool<T>(
-  items: readonly T[],
-  concurrency: number,
-  fn: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-
-  async function worker(): Promise<void> {
-    while (next < items.length) {
-      const idx = next;
-      next++;
-      await fn(items[idx], idx);
-    }
-  }
-
-  const workers: Promise<void>[] = [];
-  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
 }
 
 export async function pushPaths(
