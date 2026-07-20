@@ -19,6 +19,26 @@ import {
 import type { UploadSession } from "./db/types.js";
 import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
+import type { DrizzleD1Database } from "drizzle-orm/d1";
+
+// Module-scope cache: cache ID → cache name. Cache rows are immutable today
+// (no rename or delete endpoints), so entries never go stale. Avoids a D1
+// round trip on every session-scoped upload request made with a JWT.
+const cacheIdToName = new Map<number, string>();
+
+async function resolveCacheName(
+	db: DrizzleD1Database,
+	cacheId: number,
+): Promise<string | undefined> {
+	const cached = cacheIdToName.get(cacheId);
+	if (cached !== undefined) return cached;
+
+	const row = await findCacheById(db, cacheId);
+	if (!row) return undefined;
+
+	cacheIdToName.set(cacheId, row.name);
+	return row.name;
+}
 
 // ── Session Auth Helper ──
 
@@ -43,8 +63,8 @@ async function loadSessionWithAuthCheck(
 	}
 
 	if (identity.kind === "jwt") {
-		const cache = await findCacheById(config.db, session.cacheId);
-		if (!cache || !hasCacheAccess(identity.claims, cache.name)) {
+		const cacheName = await resolveCacheName(config.db, session.cacheId);
+		if (cacheName === undefined || !hasCacheAccess(identity.claims, cacheName)) {
 			return { error: errorResponse("Forbidden", 403) };
 		}
 	}
@@ -63,6 +83,8 @@ export async function handleCreateSession(
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
 	}
+	// Seed the ID → name cache so session-scoped requests skip the D1 lookup.
+	cacheIdToName.set(cache.id, cache.name);
 
 	const body = await parseJsonBody<{
 		storePath: string;

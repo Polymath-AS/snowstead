@@ -18,7 +18,6 @@ import type {
 	UploadPart,
 	GcMark,
 	ApiToken,
-	AuditLog,
 	UploadSessionStatus,
 } from "./types.js";
 
@@ -454,12 +453,10 @@ export async function createAuditLog(
 		readonly ip: string | null;
 		readonly status: number;
 	},
-): Promise<AuditLog> {
-	return db
-		.insert(auditLogs)
-		.values(params)
-		.returning()
-		.get();
+): Promise<void> {
+	// No RETURNING: audit inserts are fire-and-forget on the hot write path,
+	// and skipping the row round trip keeps them as cheap as possible.
+	await db.insert(auditLogs).values(params).run();
 }
 
 export async function deleteExpiredAuditLogs(
