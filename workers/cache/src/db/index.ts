@@ -39,6 +39,7 @@ export {
 	transitionToMultipart,
 	findExpiredSessions,
 	upsertUploadPart,
+	upsertUploadParts,
 	findUploadParts,
 	createGcMark,
 	findGcMarks,

@@ -156,10 +156,15 @@ export async function findPublishedHashes(
 	if (storePathHashes.length === 0) return [];
 
 	// D1 limits bound parameters to 100 per query; reserve 1 for cacheId
-	const results: string[] = [];
+	const chunks: string[][] = [];
 	for (let i = 0; i < storePathHashes.length; i += 99) {
-		const chunk = storePathHashes.slice(i, i + 99);
-		const rows = await db
+		chunks.push(storePathHashes.slice(i, i + 99));
+	}
+
+	// Send all chunk queries in a single D1 batch round trip instead of one
+	// sequential round trip per chunk.
+	const queries = chunks.map((chunk) =>
+		db
 			.select({ storePathHash: publishedPaths.storePathHash })
 			.from(publishedPaths)
 			.where(
@@ -167,9 +172,15 @@ export async function findPublishedHashes(
 					eq(publishedPaths.cacheId, cacheId),
 					inArray(publishedPaths.storePathHash, chunk),
 				),
-			)
-			.all();
+			),
+	);
 
+	const [firstQuery, ...restQueries] = queries;
+	if (firstQuery === undefined) return [];
+	const chunkResults = await db.batch([firstQuery, ...restQueries]);
+
+	const results: string[] = [];
+	for (const rows of chunkResults) {
 		for (const r of rows) {
 			results.push(r.storePathHash);
 		}
@@ -281,6 +292,31 @@ export async function upsertUploadPart(
 		})
 		.returning()
 		.get();
+}
+
+export async function upsertUploadParts(
+	db: DrizzleD1Database,
+	sessionId: string,
+	parts: ReadonlyArray<{
+		readonly partNumber: number;
+		readonly etag: string;
+		readonly size: number;
+	}>,
+): Promise<void> {
+	// One D1 batch round trip for all parts instead of one round trip each.
+	const statements = parts.map((part) =>
+		db
+			.insert(uploadParts)
+			.values({ sessionId, partNumber: part.partNumber, etag: part.etag, size: part.size })
+			.onConflictDoUpdate({
+				target: [uploadParts.sessionId, uploadParts.partNumber],
+				set: { etag: part.etag, size: part.size },
+			}),
+	);
+
+	const [firstStatement, ...restStatements] = statements;
+	if (firstStatement === undefined) return;
+	await db.batch([firstStatement, ...restStatements]);
 }
 
 export async function findUploadParts(

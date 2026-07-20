@@ -9,6 +9,7 @@ import {
 	transitionSessionStatus,
 	transitionToMultipart,
 	upsertUploadPart,
+	upsertUploadParts,
 	findUploadParts,
 	createBlobObject,
 	findBlobObject,
@@ -301,14 +302,7 @@ export async function handleComplete(
 	if (body instanceof Response) return body;
 
 	if (body.parts && body.parts.length > 0) {
-		for (const part of body.parts) {
-			await upsertUploadPart(config.db, {
-				sessionId,
-				partNumber: part.partNumber,
-				etag: part.etag,
-				size: part.size,
-			});
-		}
+		await upsertUploadParts(config.db, sessionId, body.parts);
 	}
 
 	if (session.r2UploadId) {
