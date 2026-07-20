@@ -1,6 +1,4 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdtemp, stat, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ApiClient } from "./api.js";
@@ -17,15 +15,6 @@ import { getPathInfos, dumpAndCompress } from "./nix.js";
 import type { PathInfo } from "./nix.js";
 
 const DEFAULT_CONCURRENCY = 8;
-
-async function computeFileHash(filePath: string): Promise<string> {
-  const hash = createHash("sha256");
-  const stream = createReadStream(filePath);
-  for await (const chunk of stream) {
-    hash.update(chunk);
-  }
-  return hash.digest("hex");
-}
 
 export interface PushResult {
   readonly pushed: number;
@@ -49,11 +38,9 @@ async function pushSinglePath(
   const narFile = join(narDir, "nar.zst");
 
   try {
-    await dumpAndCompress(storePath, narFile);
-
-    const fileHash = await computeFileHash(narFile);
-    const fileStat = await stat(narFile);
-    const fileSize = Number(fileStat.size);
+    // Hash and size are computed while the compressed NAR is written,
+    // avoiding a second full read of the file.
+    const { fileHash, fileSize } = await dumpAndCompress(storePath, narFile);
 
     const session = await createUploadSession(client, cache, {
       storePath: info.storePath,

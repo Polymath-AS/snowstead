@@ -1,4 +1,6 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -86,22 +88,46 @@ export async function getClosurePaths(storePath: string): Promise<string[]> {
   return stdout.trim().split("\n").filter(Boolean);
 }
 
+export interface CompressedNar {
+  readonly fileHash: string;
+  readonly fileSize: number;
+}
+
+/**
+ * Dump a store path as a NAR, compress it with zstd, and write it to
+ * outputPath. The compressed stream is hashed and counted while it is
+ * written, so callers do not need to re-read the file to compute the
+ * upload hash and size.
+ */
 export async function dumpAndCompress(
   storePath: string,
   outputPath: string,
-): Promise<void> {
+): Promise<CompressedNar> {
   const nix = spawn("nix", ["store", "dump-path", storePath], {
     stdio: ["ignore", "pipe", "ignore"],
   });
-  const zstd = spawn("zstd", ["-q", "-o", outputPath], {
-    stdio: ["pipe", "ignore", "ignore"],
+  const zstd = spawn("zstd", ["-q", "-c"], {
+    stdio: ["pipe", "pipe", "ignore"],
   });
 
   nix.stdout.pipe(zstd.stdin);
 
-  return new Promise((resolve, reject) => {
+  // Observe the piped chunks to hash and count them; pipe() still owns
+  // backpressure to the file stream.
+  const hash = createHash("sha256");
+  let fileSize = 0;
+  zstd.stdout.on("data", (chunk: Buffer) => {
+    hash.update(chunk);
+    fileSize += chunk.length;
+  });
+
+  const out = createWriteStream(outputPath);
+  zstd.stdout.pipe(out);
+
+  await new Promise<void>((resolve, reject) => {
     let nixExited = false;
     let zstdExited = false;
+    let fileFlushed = false;
     let settled = false;
 
     const fail = (err: Error) => {
@@ -112,7 +138,7 @@ export async function dumpAndCompress(
     };
 
     const tryResolve = () => {
-      if (nixExited && zstdExited && !settled) {
+      if (nixExited && zstdExited && fileFlushed && !settled) {
         settled = true;
         resolve();
       }
@@ -120,6 +146,7 @@ export async function dumpAndCompress(
 
     nix.on("error", fail);
     zstd.on("error", fail);
+    out.on("error", fail);
 
     nix.on("close", (code) => {
       nixExited = true;
@@ -138,5 +165,12 @@ export async function dumpAndCompress(
       }
       tryResolve();
     });
+
+    out.on("finish", () => {
+      fileFlushed = true;
+      tryResolve();
+    });
   });
+
+  return { fileHash: hash.digest("hex"), fileSize };
 }
