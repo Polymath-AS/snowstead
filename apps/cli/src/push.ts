@@ -13,7 +13,8 @@ import {
   completeUpload,
   publishPath,
 } from "./api.js";
-import { getPathInfo, dumpAndCompress } from "./nix.js";
+import { getPathInfos, dumpAndCompress } from "./nix.js";
+import type { PathInfo } from "./nix.js";
 
 const DEFAULT_CONCURRENCY = 8;
 
@@ -42,9 +43,8 @@ async function pushSinglePath(
   client: ApiClient,
   cache: string,
   storePath: string,
-  hash: string,
+  info: PathInfo,
 ): Promise<{ sizeKb: number }> {
-  const info = await getPathInfo(storePath);
   const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
   const narFile = join(narDir, "nar.zst");
 
@@ -144,13 +144,26 @@ export async function pushPaths(
     return { pushed: 0, skipped, failed: 0, errors: [] };
   }
 
+  // One batched nix path-info call for all missing paths, instead of one
+  // process spawn per path inside the upload pool.
+  const missingPaths: string[] = [];
+  for (const hash of missingHashes) {
+    const storePath = hashToPath.get(hash);
+    if (storePath) missingPaths.push(storePath);
+  }
+  const pathInfos = await getPathInfos(missingPaths);
+
   await runPool(missingHashes, concurrency, async (hash) => {
     const storePath = hashToPath.get(hash);
     if (!storePath) return;
     const name = storePath.split("/").pop() ?? hash;
 
     try {
-      const result = await pushSinglePath(client, cache, storePath, hash);
+      const info = pathInfos.get(storePath);
+      if (!info) {
+        throw new Error(`missing path info for ${storePath}`);
+      }
+      const result = await pushSinglePath(client, cache, storePath, info);
       completed++;
       onProgress?.(completed, total, name, `ok (${String(result.sizeKb)}KB)`);
       pushed++;

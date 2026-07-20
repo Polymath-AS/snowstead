@@ -19,14 +19,14 @@ interface NixPathInfoJson {
   readonly deriver?: string;
 }
 
-export async function getPathInfo(storePath: string): Promise<PathInfo> {
-  const { stdout } = await exec("nix", ["path-info", "--json", storePath]);
-  const parsed: Record<string, NixPathInfoJson> = JSON.parse(stdout);
-  const entry = parsed[storePath];
-  if (!entry) {
-    throw new Error(`nix path-info returned no data for ${storePath}`);
-  }
+// nix path-info output for a large batch (references lists included) can far
+// exceed execFile's default 1 MiB stdout buffer.
+const EXEC_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
+// Bound argv size per nix invocation; store paths are ~90 bytes each.
+const PATH_INFO_BATCH_SIZE = 500;
+
+function toPathInfo(storePath: string, entry: NixPathInfoJson): PathInfo {
   const basename = storePath.split("/").pop();
   if (!basename) {
     throw new Error(`Invalid store path: ${storePath}`);
@@ -51,8 +51,38 @@ export async function getPathInfo(storePath: string): Promise<PathInfo> {
   };
 }
 
+/**
+ * Query path info for many store paths with a bounded number of nix
+ * invocations, instead of one process spawn per path.
+ */
+export async function getPathInfos(
+  storePaths: readonly string[],
+): Promise<Map<string, PathInfo>> {
+  const infos = new Map<string, PathInfo>();
+
+  for (let i = 0; i < storePaths.length; i += PATH_INFO_BATCH_SIZE) {
+    const chunk = storePaths.slice(i, i + PATH_INFO_BATCH_SIZE);
+    const { stdout } = await exec("nix", ["path-info", "--json", ...chunk], {
+      maxBuffer: EXEC_MAX_BUFFER_BYTES,
+    });
+    const parsed: Record<string, NixPathInfoJson> = JSON.parse(stdout);
+
+    for (const storePath of chunk) {
+      const entry = parsed[storePath];
+      if (!entry) {
+        throw new Error(`nix path-info returned no data for ${storePath}`);
+      }
+      infos.set(storePath, toPathInfo(storePath, entry));
+    }
+  }
+
+  return infos;
+}
+
 export async function getClosurePaths(storePath: string): Promise<string[]> {
-  const { stdout } = await exec("nix", ["path-info", "-r", storePath]);
+  const { stdout } = await exec("nix", ["path-info", "-r", storePath], {
+    maxBuffer: EXEC_MAX_BUFFER_BYTES,
+  });
   return stdout.trim().split("\n").filter(Boolean);
 }
 
