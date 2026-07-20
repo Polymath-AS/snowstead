@@ -107,14 +107,9 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	const cacheId = await resolveCacheId(config.db, cacheName);
-	if (cacheId === undefined) {
-		return new Response("Not Found", { status: 404 });
-	}
-
 	if (segments[1].endsWith(".narinfo")) {
 		const hashStr = segments[1].slice(0, -".narinfo".length);
-		return handleNarinfo(config, cacheId, hashStr, method, request);
+		return handleNarinfo(config, cacheName, hashStr, method, request);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -172,9 +167,14 @@ function NIX_CACHE_INFO_RESPONSE(): Response {
 	});
 }
 
+// Nix mass-queries every substituter for every store path in a build, so most
+// narinfo lookups are misses. Cache 404s briefly at the edge to keep that
+// negative-lookup storm off D1. Short TTL so newly published paths appear quickly.
+const NARINFO_NEGATIVE_TTL_SECONDS = 60;
+
 async function handleNarinfo(
 	config: WorkerConfig,
-	cacheId: number,
+	cacheName: CacheName,
 	hashStr: string,
 	method: string,
 	request: Request,
@@ -190,15 +190,29 @@ async function handleNarinfo(
 	const cached = await cache.match(cacheKey);
 	if (cached) {
 		if (method === "HEAD") {
-			return new Response(null, { status: 200, headers: cached.headers });
+			return new Response(null, { status: cached.status, headers: cached.headers });
 		}
 		return cached;
 	}
 
-	// Single joined query: published_paths + blob_objects
-	const result = await findPublishedPathWithBlob(config.db, cacheId, storePathHash);
+	// Unknown cache and unpublished path both produce a (negatively cached) 404.
+	const cacheId = await resolveCacheId(config.db, cacheName);
+	const result = cacheId === undefined
+		? undefined
+		: await findPublishedPathWithBlob(config.db, cacheId, storePathHash);
 	if (!result) {
-		return new Response("Not Found", { status: 404 });
+		const notFoundHeaders = { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` };
+		if (config.ctx) {
+			// Fresh Response instead of clone(): a tee'd body whose sibling is
+			// never consumed can stall cache.put.
+			config.ctx.waitUntil(
+				cache.put(cacheKey, new Response("Not Found", { status: 404, headers: notFoundHeaders })),
+			);
+		}
+		if (method === "HEAD") {
+			return new Response(null, { status: 404, headers: notFoundHeaders });
+		}
+		return new Response("Not Found", { status: 404, headers: notFoundHeaders });
 	}
 
 	const refs: string[] = JSON.parse(result.path.referencesJson);
