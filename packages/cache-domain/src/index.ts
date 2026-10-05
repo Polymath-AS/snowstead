@@ -14,6 +14,8 @@ export {
   parseCacheName,
   parseStorePathHash,
   parseNarHash,
+  parseStorePathBasename,
+  nix32Encode,
   parseFileHash,
   parseCompression,
   buildR2ObjectKey,

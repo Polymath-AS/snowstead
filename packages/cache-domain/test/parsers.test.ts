@@ -3,6 +3,7 @@ import {
   parseCacheName,
   parseStorePathHash,
   parseNarHash,
+  parseStorePathBasename,
   parseFileHash,
   parseCompression,
   buildR2ObjectKey,
@@ -61,18 +62,15 @@ describe('parseStorePathHash', () => {
 });
 
 describe('parseNarHash', () => {
-  it('accepts sha256: prefix + 52 valid nix-base32 chars (zeros)', () => {
-    const input = 'sha256:' + '0'.repeat(52);
-    const result = parseNarHash(input);
-    expect(isParseError(result)).toBe(false);
-    expect(result).toBe(input);
-  });
+  // `nix path-info --json` and `nix hash convert` agree on these.
+  const nix32 = 'sha256:02crsn39w9wxan1z3dz9g1zb76l09jb462qzb3q8r8zic4p2k6rg';
 
-  it('accepts sha256: prefix + 52 mixed valid nix-base32 chars', () => {
-    const input = 'sha256:' + 'abcdfghijklmnpqrsvwxyz0123456789abcdfghijklmnpqrsvwx';
-    const result = parseNarHash(input);
-    expect(isParseError(result)).toBe(false);
-    expect(result).toBe(input);
+  it.each([
+    { input: nix32, label: 'nix32' },
+    { input: 'sha256-L5spLmHxo4zwWB8LQ5ZMgJqzfnjpt/GDVZ0nnobVmQk=', label: 'SRI' },
+    { input: 'sha256:2f9b292e61f1a38cf0581f0b43964c809ab37e78e9b7f183559d279e86d59909', label: 'hex' },
+  ])('canonicalises $label to nix32', ({ input }) => {
+    expect(parseNarHash(input)).toBe(nix32);
   });
 
   it.each([
@@ -81,9 +79,27 @@ describe('parseNarHash', () => {
     { input: 'sha256:' + '0'.repeat(51), label: '51 hash chars' },
     { input: 'sha256:' + '0'.repeat(53), label: '53 hash chars' },
     { input: 'sha256:' + '0'.repeat(51) + 'e', label: "hash contains 'e'" },
+    { input: 'sha256:' + 'z'.repeat(52), label: 'more than 256 bits' },
+    { input: 'sha256-' + 'A'.repeat(43), label: 'SRI without padding' },
   ])('rejects $label', ({ input }) => {
-    const result = parseNarHash(input);
-    expect(isParseError(result)).toBe(true);
+    expect(isParseError(parseNarHash(input))).toBe(true);
+  });
+});
+
+describe('parseStorePathBasename', () => {
+  it('accepts a basename', () => {
+    expect(parseStorePathBasename('g60m3aky9f59wgy1gi0y06xwmbw19d6m-xgcc-16.2.0-libgcc')).toBe(
+      'g60m3aky9f59wgy1gi0y06xwmbw19d6m-xgcc-16.2.0-libgcc',
+    );
+  });
+
+  it.each([
+    { input: 'g60m3aky9f59wgy1gi0y06xwmbw19d6m', label: 'a bare hash' },
+    { input: '/nix/store/g60m3aky9f59wgy1gi0y06xwmbw19d6m-xgcc', label: 'a full path' },
+    { input: 'g60m3aky9f59wgy1gi0y06xwmbw19d6m-a b', label: 'a space' },
+    { input: 'g60m3aky9f59wgy1gi0y06xwmbw19d6m-a\nb', label: 'a newline' },
+  ])('rejects $label', ({ input }) => {
+    expect(isParseError(parseStorePathBasename(input))).toBe(true);
   });
 });
 

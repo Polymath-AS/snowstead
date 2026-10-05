@@ -6,7 +6,7 @@ import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
 import { errorResponse } from "./responses.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
-import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@helios/cache-domain";
+import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression, parseNarHash } from "@helios/cache-domain";
 import type { CacheName } from "@helios/cache-domain";
 import {
 	handleCreateSession,
@@ -217,10 +217,14 @@ async function handleNarinfo(
 
 	const refs: string[] = JSON.parse(result.path.referencesJson);
 	const storedSigs: string[] = JSON.parse(result.path.signaturesJson);
-	const fingerprint = computeFingerprint(result.path, refs);
+	// Rows published before uploads canonicalised the hash may hold the SRI
+	// form, which Nix would not verify a signature over.
+	const narHash = parseNarHash(result.path.narHash);
+	const path = typeof narHash === "object" ? result.path : { ...result.path, narHash };
+	const fingerprint = computeFingerprint(path, refs);
 	const sig = await signNarinfo(fingerprint, config.signingKeyName, config.signingPrivateKey);
 	const signatures = sig ? [sig] : [];
-	const body = renderNarinfo(result.path, result.blob, refs, storedSigs, signatures);
+	const body = renderNarinfo(path, result.blob, refs, storedSigs, signatures);
 
 	const response = new Response(body, {
 		headers: {

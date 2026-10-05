@@ -36,7 +36,7 @@ describe("write auth", () => {
 	it("rejects write requests without authorization header", async () => {
 		const res = await postWithWorker(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			{ storePath: "/nix/store/test", storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
+			{ storePath: `/nix/store/${"a".repeat(32)}-test`, storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
 		);
 
 		expect(res.status).toBe(401);
@@ -47,7 +47,7 @@ describe("write auth", () => {
 	it("rejects write requests with wrong bearer token", async () => {
 		const res = await postWithWorker(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			{ storePath: "/nix/store/test", storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
+			{ storePath: `/nix/store/${"a".repeat(32)}-test`, storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
 			{ authorization: "Bearer wrong-token" },
 		);
 
@@ -59,7 +59,7 @@ describe("write auth", () => {
 	it("accepts write requests with valid bearer token", async () => {
 		const res = await postWithWorker(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			{ storePath: "/nix/store/test", storePathHash: "c".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "d".repeat(64), fileSize: 100, compression: "zstd" },
+			{ storePath: `/nix/store/${"c".repeat(32)}-test`, storePathHash: "c".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "d".repeat(64), fileSize: 100, compression: "zstd" },
 			{ authorization: `Bearer ${AUTH_TOKEN}` },
 		);
 
@@ -69,7 +69,7 @@ describe("write auth", () => {
 	it("rejects non-bearer auth schemes", async () => {
 		const res = await postWithWorker(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			{ storePath: "/nix/store/test", storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
+			{ storePath: `/nix/store/${"a".repeat(32)}-test`, storePathHash: "a".repeat(32), narHash: "sha256:" + "1".repeat(52), narSize: 100, fileHash: "b".repeat(64), fileSize: 100, compression: "zstd" },
 			{ authorization: `Basic ${AUTH_TOKEN}` },
 		);
 

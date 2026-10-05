@@ -18,7 +18,14 @@ import {
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
-import { buildR2ObjectKey, parseFileHash, parseCompression, parseStorePathHash } from "@helios/cache-domain";
+import {
+	buildR2ObjectKey,
+	parseFileHash,
+	parseCompression,
+	parseNarHash,
+	parseStorePathBasename,
+	parseStorePathHash,
+} from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
@@ -131,6 +138,37 @@ export async function handleCreateSession(
 		return errorResponse(compression.message, 400);
 	}
 
+	// Stored canonical: the narinfo signature covers the nix32 form.
+	const narHash = parseNarHash(body.narHash);
+	if (typeof narHash === "object") {
+		return errorResponse(narHash.message, 400);
+	}
+
+	// Each of these becomes a narinfo line.
+	const storeBasename = body.storePath.startsWith("/nix/store/") ? body.storePath.slice(11) : "";
+	if (
+		typeof parseStorePathBasename(storeBasename) === "object" ||
+		!storeBasename.startsWith(`${body.storePathHash}-`)
+	) {
+		return errorResponse("storePath must be /nix/store/<storePathHash>-<name>", 400);
+	}
+	for (const [field, value] of [["deriver", body.deriver], ["system", body.system]] as const) {
+		if (value != null && (typeof value !== "string" || !/^[!-~]+$/.test(value))) {
+			return errorResponse(`${field} must be printable ASCII without spaces`, 400);
+		}
+	}
+
+	const references = body.references ?? [];
+	if (!Array.isArray(references)) {
+		return errorResponse("references must be an array", 400);
+	}
+	for (const r of references) {
+		const parsed = parseStorePathBasename(String(r));
+		if (typeof parsed === "object") {
+			return errorResponse(parsed.message, 400);
+		}
+	}
+
 	const r2Key = buildR2ObjectKey(fileHash, compression);
 	const sessionId = crypto.randomUUID();
 	const expiresAt = new Date(Date.now() + 3600_000).toISOString();
@@ -140,12 +178,12 @@ export async function handleCreateSession(
 		cacheId: cache.id,
 		storePathHash: body.storePathHash,
 		storePath: body.storePath,
-		narHash: body.narHash,
+		narHash,
 		narSize: body.narSize,
 		fileHash: body.fileHash,
 		fileSize: body.fileSize,
 		compression: body.compression,
-		referencesJson: JSON.stringify(body.references ?? []),
+		referencesJson: JSON.stringify(references),
 		deriver: body.deriver ?? null,
 		system: body.system ?? null,
 		r2UploadKey: r2Key,

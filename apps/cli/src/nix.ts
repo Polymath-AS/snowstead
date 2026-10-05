@@ -35,12 +35,13 @@ function toPathInfo(storePath: string, entry: NixPathInfoJson): PathInfo {
   }
   const storePathHash = basename.split("-")[0];
 
+  // narinfo References are basenames, not bare hashes.
   const refs = entry.references.map((r: string) => {
     const refBase = r.split("/").pop();
     if (!refBase) {
       throw new Error(`Invalid reference path: ${r}`);
     }
-    return refBase.split("-")[0];
+    return refBase;
   });
 
   return {

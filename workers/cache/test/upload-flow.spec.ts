@@ -99,6 +99,20 @@ describe("create upload session", () => {
 
 		expect(res.status).toBe(400);
 	});
+
+	it.each([
+		{ label: "a bare-hash reference", patch: { references: ["0".repeat(32)] } },
+		{ label: "a store path for another hash", patch: { storePath: `/nix/store/${"0".repeat(32)}-hello` } },
+		{ label: "a newline in the deriver", patch: { deriver: "x.drv\nSig: forged" } },
+		{ label: "an MD5 NAR hash", patch: { narHash: `md5:${"0".repeat(32)}` } },
+	])("returns 400 for $label", async ({ patch }) => {
+		const res = await post(`/_api/v1/caches/${CACHE_NAME}/upload-sessions`, {
+			...sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			...patch,
+		});
+
+		expect(res.status).toBe(400);
+	});
 });
 
 describe("complete upload (direct)", () => {
@@ -153,6 +167,35 @@ describe("complete upload (direct)", () => {
 });
 
 describe("publish", () => {
+	// What `nix path-info --json` prints: SRI hashes, full reference paths
+	// (which the CLI reduces to basenames).
+	it("serves the narinfo Nix expects for an SRI hash and references", async () => {
+		const storePathHash = uniqueStorePathHash();
+		const ref = `${"1".repeat(32)}-dep`;
+		const createRes = await post(`/_api/v1/caches/${CACHE_NAME}/upload-sessions`, {
+			...sessionBody({ fileHash: uniqueFileHash(), storePathHash }),
+			narHash: "sha256-L5spLmHxo4zwWB8LQ5ZMgJqzfnjpt/GDVZ0nnobVmQk=",
+			references: [ref],
+		});
+		expect(createRes.status).toBe(201);
+		const { sessionId } = await createRes.json<{ sessionId: string }>();
+		await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, {
+			method: "PUT",
+			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
+			body: BLOB_DATA,
+		});
+		expect((await post(`/_api/v1/uploads/${sessionId}/complete`, {})).status).toBe(200);
+		expect((await post(`/_api/v1/uploads/${sessionId}/publish`, {})).status).toBe(200);
+
+		const res = await SELF.fetch(`http://example.com/${CACHE_NAME}/${storePathHash}.narinfo`, {
+			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
+		});
+		expect(res.status).toBe(200);
+		const narinfo = await res.text();
+		expect(narinfo).toContain("NarHash: sha256:02crsn39w9wxan1z3dz9g1zb76l09jb462qzb3q8r8zic4p2k6rg\n");
+		expect(narinfo).toContain(`References: ${ref}\n`);
+	});
+
 	it("publishes a completed upload and path is readable", async () => {
 		const fileHash = uniqueFileHash();
 		const storePathHash = uniqueStorePathHash();
