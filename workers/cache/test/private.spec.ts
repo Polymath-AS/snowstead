@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCacheByName } from "../src/db/repository.js";
+import { createBlobObject, createPublishedPath, findCacheByName, revokeApiToken } from "../src/db/repository.js";
 
 const db = testDb();
 const PRIVATE = "private-test";
@@ -113,6 +113,16 @@ describe("private caches", () => {
 		const { token: revoked, jti } = await token([PRIVATE], ["pull"]);
 		expect((await admin(`/tokens/${jti}/revoke`, { reason: "test" })).status).toBe(200);
 		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(revoked))).status).toBe(401);
+	});
+
+	it("refuse a token revoked before KV held revocations, once synced", async () => {
+		const { token: old, jti } = await token([PRIVATE], ["pull"]);
+		await revokeApiToken(db, jti, "admin", "revoked in the database only");
+		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(old))).status).toBe(200);
+
+		const sync = await admin("/revocations/sync", {});
+		expect(sync.status).toBe(200);
+		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(old))).status).toBe(401);
 	});
 
 	it("leave public caches open", async () => {

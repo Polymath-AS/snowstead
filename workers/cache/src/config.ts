@@ -6,6 +6,8 @@ export interface WorkerConfig {
 	readonly bucket: R2Bucket;
 	/** Public caches, served straight from R2 on cache.polmath.no. */
 	readonly publicBucket: R2Bucket;
+	/** Authorization state read per request: token revocations. */
+	readonly authKv: KVNamespace;
 	readonly db: Db;
 	/** Database work that may outlive the response. */
 	readonly defer: (task: Promise<unknown>) => void;
@@ -31,6 +33,9 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	if (!env.PUBLIC_BUCKET) {
 		throw new Error("Missing required binding: PUBLIC_BUCKET");
 	}
+	if (!env.AUTH_KV) {
+		throw new Error("Missing required binding: AUTH_KV");
+	}
 	if (!env.HYPERDRIVE) {
 		throw new Error("Missing required binding: HYPERDRIVE");
 	}
@@ -38,6 +43,7 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	return {
 		bucket: env.CACHE_BUCKET,
 		publicBucket: env.PUBLIC_BUCKET,
+		authKv: env.AUTH_KV,
 		// A getter, so the database client is only built for requests that use it.
 		get db() {
 			return connection.db;

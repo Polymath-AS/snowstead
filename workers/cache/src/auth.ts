@@ -1,6 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
 import { verifyJwt, hasPermission, hasCacheAccess } from "./jwt.js";
+import { isRevoked } from "./revocations.js";
 import { isTokenActive } from "./db/repository.js";
 import type { Db } from "./db/connection.js";
 
@@ -131,7 +132,9 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 		return readAuthError("Forbidden", 403);
 	}
 	const result = await verifyJwt(token, config.jwtSecret);
-	if (result.kind !== "ok" || !(await isTokenActiveCached(config.db, result.claims.jti))) {
+	// The signature vouches for the claims; only revocation needs looking up,
+	// and that is in KV, so private reads never touch the database.
+	if (result.kind !== "ok" || (await isRevoked(config, result.claims.jti))) {
 		return readAuthError("Unauthorized", 401);
 	}
 	if (!hasPermission(result.claims, "pull") || !hasCacheAccess(result.claims, cacheName)) {

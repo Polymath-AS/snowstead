@@ -59,6 +59,7 @@ export {
 	listApiTokens,
 	revokeApiToken,
 	isTokenActive,
+	listRevokedTokens,
 	deleteExpiredApiTokens,
 	createAuditLog,
 	deleteExpiredAuditLogs,

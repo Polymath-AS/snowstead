@@ -27,6 +27,14 @@
 			"bucket_name": "helios-public"
 		}
 	],
+	// What authorization reads per request, cached at the edge: token
+	// revocations, so checking a token never touches the database.
+	"kv_namespaces": [
+		{
+			"binding": "AUTH_KV",
+			"id": "d2e64836d5fa4888957d15bdd3370067"
+		}
+	],
 	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
 	// caching off (`wrangler hyperdrive create helios-cache --caching-disabled
 	// --connection-string ...`): upload sessions and token revocation must

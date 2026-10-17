@@ -6,6 +6,8 @@ import {
 	createApiToken,
 	listApiTokens,
 	revokeApiToken,
+	findApiToken,
+	listRevokedTokens,
 	ensureCache,
 	listCaches,
 	setCachePublic,
@@ -15,6 +17,7 @@ import {
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
 import { setPrivateMarker, isPrivateCache } from "./visibility.js";
+import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
@@ -157,10 +160,15 @@ export async function handleRevokeToken(
 		return errorResponse("reason exceeds maximum length", 400);
 	}
 
-	const revoked = await revokeApiToken(config.db, jti, "admin", body.reason);
-	if (!revoked) {
+	const token = await findApiToken(config.db, jti);
+	if (!token || token.revokedAt) {
 		return errorResponse("Token not found or already revoked", 404);
 	}
+	// KV first: requests check revocation there, and a failure after it still
+	// leaves the token refused, while the reverse would leave it working with
+	// the database saying otherwise.
+	await recordRevocation(config, jti, token.expiresAt);
+	await revokeApiToken(config.db, jti, "admin", body.reason);
 
 	return jsonResponse({ revoked: true, jti });
 }
@@ -271,4 +279,13 @@ export async function handleBackfillNarinfo(
 		skipped,
 		next: rows.length === limit && last ? last.path.id : null,
 	});
+}
+
+/** Writes the database's revocations of unexpired tokens to KV, for tokens revoked before KV held them. */
+export async function handleSyncRevocations(config: WorkerConfig): Promise<Response> {
+	const revoked = await listRevokedTokens(config.db, new Date());
+	for (const token of revoked) {
+		await recordRevocation(config, token.jti, token.expiresAt);
+	}
+	return jsonResponse({ synced: revoked.length });
 }

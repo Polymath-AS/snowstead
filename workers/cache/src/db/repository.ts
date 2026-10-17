@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt, gt, isNull, sql } from "drizzle-orm";
+import { eq, and, notInArray, lt, gt, isNull, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
 	caches,
@@ -420,6 +420,13 @@ export async function revokeApiToken(
 			.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
 			.returning(),
 	);
+}
+
+export async function listRevokedTokens(db: Db, now: Date): Promise<ApiToken[]> {
+	return db
+		.select()
+		.from(apiTokens)
+		.where(and(isNotNull(apiTokens.revokedAt), gt(apiTokens.expiresAt, now)));
 }
 
 export async function isTokenActive(
