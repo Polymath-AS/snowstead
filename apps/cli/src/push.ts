@@ -7,6 +7,7 @@ import {
   createUploadSession,
   uploadBlob,
   shouldUseMultipart,
+  uploadPresigned,
   uploadBlobMultipart,
   completeUpload,
   publishPath,
@@ -54,7 +55,10 @@ async function pushSinglePath(
       references: info.references,
     });
 
-    if (shouldUseMultipart(fileSize)) {
+    if (session.uploadMethod === "presigned" && session.uploadUrl) {
+      // Straight to R2; the API never handles the NAR.
+      await uploadPresigned(session.uploadUrl, session.uploadHeaders ?? {}, narFile);
+    } else if (shouldUseMultipart(fileSize)) {
       await uploadBlobMultipart(client, session.sessionId, narFile);
     } else {
       await uploadBlob(client, session.sessionId, narFile);

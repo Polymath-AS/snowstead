@@ -46,7 +46,10 @@ async function jsonBody<T>(resp: Response): Promise<T> {
 export interface SessionResponse {
   readonly sessionId: string;
   readonly r2Key: string;
+  /** "presigned": PUT the NAR to uploadUrl with uploadHeaders; "direct": through the API. */
   readonly uploadMethod: string;
+  readonly uploadUrl?: string;
+  readonly uploadHeaders?: Record<string, string>;
   readonly expiresAt: string;
 }
 
@@ -112,6 +115,32 @@ export async function uploadBlob(
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`blob upload failed (${resp.status}): ${text}`);
+  }
+}
+
+/**
+ * Uploads straight to R2 through a presigned URL. The signed checksum
+ * header makes R2 reject any body but the one the session names.
+ */
+export async function uploadPresigned(
+  url: string,
+  headers: Record<string, string>,
+  filePath: string,
+): Promise<void> {
+  const fileInfo = await stat(filePath);
+  const resp = await fetch(url, {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "content-type": "application/x-nix-nar",
+      "content-length": String(fileInfo.size),
+    },
+    body: ReadableStream.from(createReadStream(filePath)),
+    duplex: "half",
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`presigned upload failed (${resp.status}): ${text}`);
   }
 }
 

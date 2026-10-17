@@ -36,3 +36,42 @@ export async function createPresignedUrl(
 
 	return signed.url;
 }
+
+/**
+ * A presigned PUT that only accepts the body whose SHA-256 is `sha256Hex`:
+ * the checksum header is signed, and R2 rejects a body that does not match
+ * it (400 BadDigest), so uploads stay content-addressed though the Worker
+ * never sees the bytes.
+ */
+export async function createPresignedPut(
+	endpoint: string,
+	accessKeyId: string,
+	secretAccessKey: string,
+	bucket: string,
+	key: string,
+	sha256Hex: string,
+	expiresIn: number,
+): Promise<{ url: string; headers: Record<string, string> }> {
+	const client = getClient(accessKeyId, secretAccessKey);
+	const url = new URL(`/${bucket}/${key}`, endpoint);
+	url.searchParams.set("X-Amz-Expires", String(expiresIn));
+	// cache-control is signed too, so the stored object carries what the CDN
+	// serves; aws4fetch never signs content-type, which Nix does not read.
+	const headers = {
+		"x-amz-checksum-sha256": hexToBase64(sha256Hex),
+		"content-type": "application/x-nix-nar",
+		"cache-control": "public, max-age=31536000, immutable",
+	};
+	const signed = await client.sign(new Request(url, { method: "PUT", headers }), {
+		aws: { signQuery: true },
+	});
+	return { url: signed.url, headers };
+}
+
+function hexToBase64(hex: string): string {
+	let binary = "";
+	for (let i = 0; i < hex.length; i += 2) {
+		binary += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+	}
+	return btoa(binary);
+}

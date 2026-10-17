@@ -18,6 +18,7 @@ export interface WorkerConfig {
 	readonly r2SecretAccessKey: string;
 	readonly r2Endpoint: string;
 	readonly r2BucketName: string;
+	readonly r2PublicBucketName: string;
 	readonly jwtSecret: string;
 	readonly adminSecret: string;
 	readonly ctx?: ExecutionContext;
@@ -51,6 +52,7 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
 		r2Endpoint: env.R2_ENDPOINT || "",
 		r2BucketName: env.R2_BUCKET_NAME || "helios-cache",
+		r2PublicBucketName: env.R2_PUBLIC_BUCKET_NAME || "helios-public",
 		jwtSecret: env.JWT_SECRET || "",
 		adminSecret: env.ADMIN_SECRET || "",
 	};

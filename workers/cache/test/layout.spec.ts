@@ -13,18 +13,24 @@ function api(path: string, body: unknown, token = "test-auth-token"): Promise<Re
 
 let counter = 0;
 
-/** Uploads and publishes one path through the API; returns its hashes. */
-async function publish(cache: string): Promise<{ hash: string; fileHash: string }> {
+/**
+ * Uploads and publishes one path through the API; returns its hashes and
+ * body. Each body is unique, and its file hash is its real SHA-256: R2
+ * checks uploads against it.
+ */
+async function publish(cache: string): Promise<{ hash: string; fileHash: string; body: Uint8Array }> {
 	counter += 1;
 	const hash = `${"abcdfghijk"[counter % 10]}${"9".repeat(31)}`;
-	const fileHash = `${counter.toString(16).padStart(2, "0")}${"e".repeat(62)}`;
+	const body = new Uint8Array([...NAR, counter]);
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+	const fileHash = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 	const session = await api(`/caches/${cache}/upload-sessions`, {
 		storePath: `/nix/store/${hash}-layout`,
 		storePathHash: hash,
 		narHash: `sha256:${"1".repeat(52)}`,
 		narSize: 64,
 		fileHash,
-		fileSize: NAR.byteLength,
+		fileSize: body.byteLength,
 		compression: "zstd",
 	});
 	expect(session.status).toBe(201);
@@ -32,12 +38,12 @@ async function publish(cache: string): Promise<{ hash: string; fileHash: string 
 	const put = await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, {
 		method: "PUT",
 		headers: { authorization: "Bearer test-auth-token" },
-		body: NAR,
+		body,
 	});
 	expect(put.status).toBe(200);
 	expect((await api(`/uploads/${sessionId}/complete`, {})).status).toBe(200);
 	expect((await api(`/uploads/${sessionId}/publish`, {})).status).toBe(200);
-	return { hash, fileHash };
+	return { hash, fileHash, body };
 }
 
 beforeAll(async () => {
@@ -50,13 +56,13 @@ describe("public caches live in the public bucket as Nix requests them", () => {
 		const info = await env.PUBLIC_BUCKET.get("open/nix-cache-info");
 		expect(await info?.text()).toContain("StoreDir: /nix/store");
 
-		const { hash, fileHash } = await publish("open");
+		const { hash, fileHash, body } = await publish("open");
 		const narinfo = await env.PUBLIC_BUCKET.get(`open/${hash}.narinfo`);
 		expect(narinfo?.httpMetadata?.cacheControl).toContain("immutable");
 		expect(await narinfo?.text()).toContain(`URL: ../nar/${fileHash}/zstd.nar`);
 
 		const nar = await env.PUBLIC_BUCKET.get(`nar/${fileHash}/zstd.nar`);
-		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(NAR);
+		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(body);
 
 		// The Worker serves the same layout where it fronts every cache.
 		const viaWorker = await SELF.fetch(`http://example.com/nar/${fileHash}/zstd.nar`);

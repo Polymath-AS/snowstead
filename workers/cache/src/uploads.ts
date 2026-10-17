@@ -20,7 +20,8 @@ import {
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
-import { bucketForKey, narKey } from "./layout.js";
+import { IMMUTABLE, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
+import { createPresignedPut } from "./presign.js";
 import { isPrivateCache } from "./visibility.js";
 import {
 	parseFileHash,
@@ -171,7 +172,7 @@ export async function handleCreateSession(
 	// Straight into the bucket the cache is served from.
 	const r2Key = narKey(fileHash, compression, await isPrivateCache(config, cacheName));
 	const sessionId = crypto.randomUUID();
-	const expiresAt = new Date(Date.now() + 3600_000);
+	const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
 
 	const session = await createUploadSession(config.db, {
 		id: sessionId,
@@ -190,6 +191,28 @@ export async function handleCreateSession(
 		r2UploadId: null,
 		expiresAt,
 	});
+
+	// Straight to R2 when presigning is configured and one PUT can carry it;
+	// R2 then checks the bytes against the file hash itself.
+	if (config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint && body.fileSize <= PRESIGNED_PUT_MAX_BYTES) {
+		const put = await createPresignedPut(
+			config.r2Endpoint,
+			config.r2AccessKeyId,
+			config.r2SecretAccessKey,
+			bucketNameForKey(config, r2Key),
+			r2Key,
+			fileHash,
+			SESSION_TTL_SECONDS,
+		);
+		return jsonResponse({
+			sessionId: session.id,
+			r2Key,
+			uploadMethod: "presigned",
+			uploadUrl: put.url,
+			uploadHeaders: put.headers,
+			expiresAt,
+		}, 201);
+	}
 
 	return jsonResponse({
 		sessionId: session.id,
@@ -301,8 +324,11 @@ export async function handleUploadBlob(
 		}
 	}
 
+	// R2 rejects a body whose SHA-256 is not the session's file hash, as it
+	// does for presigned uploads.
 	await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
-		httpMetadata: { contentType: "application/x-nix-nar" },
+		sha256: session.fileHash,
+		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
 	});
 
 	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
@@ -318,7 +344,9 @@ export async function handleComplete(
 	if (result.error) return result.error;
 	const session = result.session;
 
-	if (session.status !== "uploading") {
+	// A presigned upload goes straight to R2, so its session is still pending.
+	const presigned = session.status === "pending" && !session.r2UploadId;
+	if (session.status !== "uploading" && !presigned) {
 		return errorResponse("Conflict", 409);
 	}
 
@@ -350,7 +378,14 @@ export async function handleComplete(
 		return errorResponse("File size mismatch", 400);
 	}
 
-	const transitioned = await transitionSessionStatus(config.db, sessionId, "uploading", "completed");
+	// R2 checked a presigned upload against this hash already; check what it
+	// recorded, wherever it recorded one.
+	const stored = head.checksums.sha256;
+	if (stored && hex(stored) !== session.fileHash) {
+		return errorResponse("File hash mismatch", 400);
+	}
+
+	const transitioned = await transitionSessionStatus(config.db, sessionId, presigned ? "pending" : "uploading", "completed");
 	if (!transitioned) {
 		return errorResponse("Conflict", 409);
 	}
@@ -452,6 +487,10 @@ export async function handlePublish(
 	return jsonResponse({ published: true, storePathHash: session.storePathHash });
 }
 
+// R2 takes single PUTs up to 5 GiB; larger NARs go through the Worker in parts.
+const PRESIGNED_PUT_MAX_BYTES = 5 * 1024 ** 3 - (1 << 20);
+const SESSION_TTL_SECONDS = 3600;
+
 const MAX_MISSING_PATHS_BATCH = 1000;
 
 export async function handleGetMissingPaths(
@@ -487,4 +526,8 @@ export async function handleGetMissingPaths(
 	const missing = body.storePathHashes.filter((h) => !existingSet.has(h));
 
 	return jsonResponse({ missing });
+}
+
+function hex(bytes: ArrayBuffer): string {
+	return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

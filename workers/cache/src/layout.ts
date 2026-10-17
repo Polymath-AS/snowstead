@@ -80,3 +80,8 @@ export async function placeNar(
 		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
 	});
 }
+
+/** The S3 bucket name an upload's key belongs to, for presigning. */
+export function bucketNameForKey(config: WorkerConfig, key: string): string {
+	return key.startsWith("nar/") ? config.r2PublicBucketName : config.r2BucketName;
+}

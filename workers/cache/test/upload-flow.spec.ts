@@ -5,7 +5,16 @@ import { createCache, findPublishedPath, findCacheByName } from "../src/db/repos
 
 const CACHE_NAME = "upload-test";
 const AUTH_TOKEN = "test-auth-token";
-const BLOB_DATA = new Uint8Array([1, 2, 3, 4]);
+// R2 checks every upload against its file hash, so bodies are real: each
+// uniqueFileHash() makes a fresh body and returns its SHA-256.
+const BLOB_SIZE = 16;
+const blobs = new Map<string, Uint8Array>();
+
+function blob(fileHash: string): Uint8Array {
+	const body = blobs.get(fileHash);
+	if (!body) throw new Error(`no body for ${fileHash}`);
+	return body;
+}
 
 const db = testDb();
 
@@ -31,13 +40,17 @@ function sessionBody(overrides: { fileHash: string; storePathHash: string }) {
 		narHash: `sha256:${"1".repeat(52)}`,
 		narSize: 2048,
 		fileHash: overrides.fileHash,
-		fileSize: BLOB_DATA.byteLength,
+		fileSize: BLOB_SIZE,
 		compression: "zstd",
 	};
 }
 
-function uniqueFileHash() {
-	return crypto.randomUUID().replace(/-/g, "").slice(0, 64).padEnd(64, "0");
+async function uniqueFileHash(): Promise<string> {
+	const body = crypto.getRandomValues(new Uint8Array(BLOB_SIZE));
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
+	const hash = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+	blobs.set(hash, body);
+	return hash;
 }
 
 let storePathCounter = 1;
@@ -57,7 +70,7 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 	const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 		method: "PUT",
 		headers: { authorization: `Bearer ${AUTH_TOKEN}` },
-		body: BLOB_DATA,
+		body: blob(fileHash),
 	});
 	expect(blobRes.status).toBe(200);
 
@@ -76,7 +89,7 @@ describe("create upload session", () => {
 	it("creates a session and returns 201 with expected fields", async () => {
 		const res = await post(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
 		);
 
 		expect(res.status).toBe(201);
@@ -90,7 +103,7 @@ describe("create upload session", () => {
 	it("returns 404 for non-existent cache", async () => {
 		const res = await post(
 			"/_api/v1/caches/no-such-cache/upload-sessions",
-			sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
 		);
 
 		expect(res.status).toBe(404);
@@ -109,7 +122,7 @@ describe("create upload session", () => {
 		{ label: "an MD5 NAR hash", patch: { narHash: `md5:${"0".repeat(32)}` } },
 	])("returns 400 for $label", async ({ patch }) => {
 		const res = await post(`/_api/v1/caches/${CACHE_NAME}/upload-sessions`, {
-			...sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			...sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
 			...patch,
 		});
 
@@ -119,7 +132,7 @@ describe("create upload session", () => {
 
 describe("complete upload (direct)", () => {
 	it("completes a direct upload flow", async () => {
-		const fileHash = uniqueFileHash();
+		const fileHash = await uniqueFileHash();
 		const storePathHash = uniqueStorePathHash();
 
 		const createRes = await post(
@@ -132,7 +145,7 @@ describe("complete upload (direct)", () => {
 		const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 			method: "PUT",
 			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
-			body: BLOB_DATA,
+			body: blob(fileHash),
 		});
 		expect(blobRes.status).toBe(200);
 
@@ -149,22 +162,25 @@ describe("complete upload (direct)", () => {
 	});
 
 	it("returns 409 for already-completed session", async () => {
-		const session = await createSessionAndUpload(uniqueFileHash(), uniqueStorePathHash());
+		const session = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
 
 		const res = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
 		expect(res.status).toBe(409);
 	});
 
-	it("returns 409 when session has not uploaded a blob yet", async () => {
+	// A session may have been uploaded to straight from a presigned URL, so
+	// completing it checks the object, which is not there yet.
+	it("returns 400 when nothing has been uploaded yet", async () => {
 		const createRes = await post(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
 		);
 		expect(createRes.status).toBe(201);
 		const session = await createRes.json<{ sessionId: string }>();
 
 		const res = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
-		expect(res.status).toBe(409);
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ error: "Upload incomplete" });
 	});
 });
 
@@ -174,7 +190,7 @@ describe("publish", () => {
 		const url = `http://example.com/${CACHE_NAME}/${storePathHash}.narinfo`;
 		expect((await SELF.fetch(url)).status).toBe(404);
 
-		const session = await createSessionAndUpload(uniqueFileHash(), storePathHash);
+		const session = await createSessionAndUpload(await uniqueFileHash(), storePathHash);
 		expect((await post(`/_api/v1/uploads/${session.sessionId}/publish`, {})).status).toBe(200);
 
 		expect((await SELF.fetch(url)).status).toBe(200);
@@ -183,10 +199,11 @@ describe("publish", () => {
 	// What `nix path-info --json` prints: SRI hashes, full reference paths
 	// (which the CLI reduces to basenames).
 	it("serves the narinfo Nix expects for an SRI hash and references", async () => {
+		const fileHash = await uniqueFileHash();
 		const storePathHash = uniqueStorePathHash();
 		const ref = `${"1".repeat(32)}-dep`;
 		const createRes = await post(`/_api/v1/caches/${CACHE_NAME}/upload-sessions`, {
-			...sessionBody({ fileHash: uniqueFileHash(), storePathHash }),
+			...sessionBody({ fileHash: fileHash, storePathHash }),
 			narHash: "sha256-L5spLmHxo4zwWB8LQ5ZMgJqzfnjpt/GDVZ0nnobVmQk=",
 			references: [ref],
 		});
@@ -195,7 +212,7 @@ describe("publish", () => {
 		await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, {
 			method: "PUT",
 			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
-			body: BLOB_DATA,
+			body: blob(fileHash),
 		});
 		expect((await post(`/_api/v1/uploads/${sessionId}/complete`, {})).status).toBe(200);
 		expect((await post(`/_api/v1/uploads/${sessionId}/publish`, {})).status).toBe(200);
@@ -210,7 +227,7 @@ describe("publish", () => {
 	});
 
 	it("publishes a completed upload and path is readable", async () => {
-		const fileHash = uniqueFileHash();
+		const fileHash = await uniqueFileHash();
 		const storePathHash = uniqueStorePathHash();
 		const session = await createSessionAndUpload(fileHash, storePathHash);
 
@@ -230,7 +247,7 @@ describe("publish", () => {
 	it("returns 409 for uncompleted session", async () => {
 		const createRes = await post(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			sessionBody({ fileHash: uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
 		);
 		expect(createRes.status).toBe(201);
 		const session = await createRes.json<{ sessionId: string }>();
@@ -240,7 +257,7 @@ describe("publish", () => {
 	});
 
 	it("concurrent duplicate publish does not create duplicate paths", async () => {
-		const session = await createSessionAndUpload(uniqueFileHash(), uniqueStorePathHash());
+		const session = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
 
 		const [r1, r2] = await Promise.all([
 			post(`/_api/v1/uploads/${session.sessionId}/publish`, {}),
@@ -256,7 +273,7 @@ describe("publish", () => {
 	});
 
 	it("duplicate publish is idempotent", async () => {
-		const session = await createSessionAndUpload(uniqueFileHash(), uniqueStorePathHash());
+		const session = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
 
 		const first = await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
 		expect(first.status).toBe(200);
@@ -271,7 +288,7 @@ describe("publish", () => {
 describe("get-missing-paths", () => {
 	it("returns only unpublished paths as missing", async () => {
 		const storePathHash = uniqueStorePathHash();
-		const session = await createSessionAndUpload(uniqueFileHash(), storePathHash);
+		const session = await createSessionAndUpload(await uniqueFileHash(), storePathHash);
 		await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
 
 		const randomHash = "x".repeat(32).replace(/x/g, () => "abcdfg0123456789"[Math.floor(Math.random() * 16)]);
