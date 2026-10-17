@@ -9,10 +9,13 @@ export default {
 		const start = Date.now();
 		let config: WorkerConfig | undefined;
 		try {
-			config = { ...resolveConfig(env), ctx };
+			config = resolveConfig(env, ctx);
 			const url = new URL(request.url);
 			const response = await handleRequest(request, config);
-			if (response.status >= 400 || url.pathname.startsWith("/_api/")) {
+			// Narinfo 404s are most of what Nix sends, not errors; logging each
+			// cost a quarter of a miss's CPU. Workers records every request anyway.
+			const expectedMiss = response.status === 404 && url.pathname.endsWith(".narinfo");
+			if ((response.status >= 400 && !expectedMiss) || url.pathname.startsWith("/_api/")) {
 				logRequest(request, response, start);
 			}
 			return response;

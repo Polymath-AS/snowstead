@@ -14,32 +14,43 @@ export interface Connection {
 
 /**
  * One client per request: Hyperdrive pools the connections to the database,
- * and a Worker may not hold sockets between requests. The client connects
- * on its first query, so requests that never touch the database (cache
- * hits, nix-cache-info, NARs) open no connection at all.
+ * and a Worker may not hold sockets between requests. Nothing is built
+ * until `db` is first used, and the client connects on its first query, so
+ * requests that never touch the database (cache hits, nix-cache-info, NARs)
+ * pay for neither: constructing a client parses the connection string.
  */
 export function connect(connectionString: string): Connection {
-	const client = new Client({ connectionString });
-	// A connection that drops is reported to the query using it; without a
-	// listener the event would also surface as unhandled.
-	client.on("error", () => {});
+	let client: Client | undefined;
+	let db: Db | undefined;
 	let connecting: Promise<unknown> | undefined;
-	const query = client.query.bind(client) as (...args: unknown[]) => Promise<unknown>;
-	(client as { query: unknown }).query = async (...args: unknown[]) => {
-		connecting ??= client.connect();
-		await connecting;
-		return query(...args);
+
+	const open = (): Db => {
+		const c = new Client({ connectionString });
+		// A connection that drops is reported to the query using it; without a
+		// listener the event would also surface as unhandled.
+		c.on("error", () => {});
+		const query = c.query.bind(c) as (...args: unknown[]) => Promise<unknown>;
+		(c as { query: unknown }).query = async (...args: unknown[]) => {
+			connecting ??= c.connect();
+			await connecting;
+			return query(...args);
+		};
+		client = c;
+		return drizzle(c);
 	};
 
 	const deferred: Promise<unknown>[] = [];
 	return {
-		db: drizzle(client),
+		get db() {
+			db ??= open();
+			return db;
+		},
 		defer: (task) => {
 			deferred.push(task);
 		},
 		close: async () => {
 			await Promise.allSettled(deferred);
-			if (connecting) {
+			if (client && connecting) {
 				await connecting.catch(() => {});
 				await client.end().catch(() => {});
 			}

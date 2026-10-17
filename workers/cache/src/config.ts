@@ -20,19 +20,23 @@ export interface WorkerConfig {
 	readonly ctx?: ExecutionContext;
 }
 
-export function resolveConfig(env: Env): WorkerConfig {
+export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	if (!env.CACHE_BUCKET) {
 		throw new Error("Missing required binding: CACHE_BUCKET");
 	}
 	if (!env.HYPERDRIVE) {
 		throw new Error("Missing required binding: HYPERDRIVE");
 	}
-	const { db, defer, close } = connect(env.HYPERDRIVE.connectionString);
+	const connection = connect(env.HYPERDRIVE.connectionString);
 	return {
 		bucket: env.CACHE_BUCKET,
-		db,
-		defer,
-		close,
+		// A getter, so the database client is only built for requests that use it.
+		get db() {
+			return connection.db;
+		},
+		defer: connection.defer,
+		close: connection.close,
+		ctx,
 		signingKeyName: env.SIGNING_KEY_NAME || "helios-cache-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		authToken: env.AUTH_TOKEN || "",
