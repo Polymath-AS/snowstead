@@ -354,10 +354,23 @@ export async function handleComplete(
 	return jsonResponse({ status: "completed" });
 }
 
+/**
+ * Drops a cached 404 for a path just published, so it shows up at once
+ * rather than after the negative TTL. The Cache API is per data center: this
+ * clears the one handling the publish, where the pusher's own lookups land.
+ */
+async function forgetNarinfoMiss(config: WorkerConfig, origin: string, cacheId: number, storePathHash: string): Promise<void> {
+	const cacheName = await resolveCacheName(config.db, cacheId);
+	if (cacheName === undefined) return;
+	const cache = await caches.open("helios-narinfo");
+	await cache.delete(new Request(`${origin}/${cacheName}/${storePathHash}.narinfo`));
+}
+
 export async function handlePublish(
 	config: WorkerConfig,
 	sessionId: string,
 	identity: AuthIdentity,
+	origin: string,
 ): Promise<Response> {
 	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
 	if (result.error) return result.error;
@@ -413,6 +426,7 @@ export async function handlePublish(
 		return errorResponse("Internal error", 500);
 	}
 
+	await forgetNarinfoMiss(config, origin, session.cacheId, session.storePathHash);
 	return jsonResponse({ published: true, storePathHash: session.storePathHash });
 }
 

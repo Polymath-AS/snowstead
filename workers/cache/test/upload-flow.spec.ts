@@ -169,6 +169,17 @@ describe("complete upload (direct)", () => {
 });
 
 describe("publish", () => {
+	it("shows a path right after publish, even after a cached miss", async () => {
+		const storePathHash = uniqueStorePathHash();
+		const url = `http://example.com/${CACHE_NAME}/${storePathHash}.narinfo`;
+		expect((await SELF.fetch(url)).status).toBe(404);
+
+		const session = await createSessionAndUpload(uniqueFileHash(), storePathHash);
+		expect((await post(`/_api/v1/uploads/${session.sessionId}/publish`, {})).status).toBe(200);
+
+		expect((await SELF.fetch(url)).status).toBe(200);
+	});
+
 	// What `nix path-info --json` prints: SRI hashes, full reference paths
 	// (which the CLI reduces to basenames).
 	it("serves the narinfo Nix expects for an SRI hash and references", async () => {

@@ -447,7 +447,7 @@ async function handleWriteApi(
 		{
 			pattern: RE_PUBLISH,
 			endpoint: "publish",
-			handle: (m) => handlePublish(config, m[1], identity),
+			handle: (m) => handlePublish(config, m[1], identity, new URL(request.url).origin),
 		},
 	];
 
