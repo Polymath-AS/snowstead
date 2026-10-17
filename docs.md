@@ -38,6 +38,35 @@ helios login prod https://your-worker.workers.dev $ADMIN_SECRET
 nix.settings.substituters = [ "https://your-worker.workers.dev/main" ];
 ```
 
+## Private caches
+
+Caches are public unless created private. Reading a private cache
+(`nix-cache-info`, narinfo, NARs) needs a token with `pull` on it, as a
+bearer token or as the password of HTTP Basic auth, which is what Nix sends
+from a netrc file.
+
+```bash
+helios cache create team --private        # or: helios cache set team --private
+helios token create builders --caches team --perms pull
+```
+
+On the machines that substitute from it:
+
+```
+# /etc/nix/netrc
+machine your-worker.workers.dev
+password <the pull token>
+```
+
+```nix
+nix.settings = {
+  substituters = [ "https://your-worker.workers.dev/team" ];
+  netrc-file = "/etc/nix/netrc";
+};
+```
+
+Making a cache private or public takes effect within 30 seconds everywhere.
+
 ## Managing tokens
 
 JWT tokens scope write access to specific caches. The signed JWT is

@@ -277,19 +277,22 @@ export async function revokeToken(
 
 export interface CacheInfo {
   readonly name: string;
+  readonly private: boolean;
   readonly createdAt: string;
 }
 
+/** Creates a cache, or sets an existing one's visibility when `isPrivate` is given. */
 export async function createCache(
   client: ApiClient,
   name: string,
-): Promise<CacheInfo & { readonly created: boolean }> {
-  const resp = await request(client, "POST", "/_api/v1/admin/caches", { name });
+  isPrivate?: boolean,
+): Promise<CacheInfo & { readonly created: boolean; readonly changed: boolean }> {
+  const resp = await request(client, "POST", "/_api/v1/admin/caches", { name, private: isPrivate });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`cache create failed (${resp.status}): ${text}`);
   }
-  return jsonBody<CacheInfo & { created: boolean }>(resp);
+  return jsonBody<CacheInfo & { created: boolean; changed: boolean }>(resp);
 }
 
 export async function listCaches(

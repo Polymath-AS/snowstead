@@ -75,3 +75,12 @@ export async function storeNarinfo(config: WorkerConfig, cacheName: string, path
 		httpMetadata: { contentType: "text/x-nix-narinfo" },
 	});
 }
+
+/**
+ * The Cache API key for a narinfo response. Private caches use a host of
+ * their own, so their entries can never answer a request for a public URL.
+ */
+export function narinfoCacheKey(origin: string, cacheName: string, storePathHash: string, isPrivate: boolean): Request {
+	const base = isPrivate ? "https://private.helios-cache.internal" : origin;
+	return new Request(`${base}/${cacheName}/${storePathHash}.narinfo`, { method: "GET" });
+}

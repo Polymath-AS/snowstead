@@ -1,7 +1,8 @@
 import type { WorkerConfig } from "./config.js";
 import { findCacheByName, createAuditLog } from "./db/repository.js";
-import { narinfoKey } from "./narinfo.js";
-import { authenticateWrite, authenticateAdmin, actorId } from "./auth.js";
+import { narinfoKey, narinfoCacheKey } from "./narinfo.js";
+import { authenticateWrite, authenticateAdmin, authorizeRead, actorId } from "./auth.js";
+import { isPrivateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
 import { errorResponse } from "./responses.js";
@@ -71,24 +72,32 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// nix-cache-info is static — skip the database lookup for the cache
-	if (segments[1] === "nix-cache-info") {
-		return NIX_CACHE_INFO_RESPONSE();
-	}
-
-	// NAR downloads are content-addressed — skip the cache name lookup
-	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
-		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request, method);
-	}
-
 	const cacheName = parseCacheName(segments[0]);
 	if (typeof cacheName === "object") {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	if (segments[1].endsWith(".narinfo")) {
+	// Before any cache lookup, so a response one caller was allowed to see
+	// is never served to another.
+	const isPrivate = await isPrivateCache(config, cacheName);
+	if (isPrivate) {
+		const denied = await authorizeRead(request, config, cacheName);
+		if (denied) return denied;
+	}
+
+	if (segments[1] === "nix-cache-info" && segments.length === 2) {
+		const response = NIX_CACHE_INFO_RESPONSE();
+		if (isPrivate) response.headers.set("cache-control", "private, no-cache");
+		return response;
+	}
+
+	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
+		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request, method, isPrivate);
+	}
+
+	if (segments[1].endsWith(".narinfo") && segments.length === 2) {
 		const hashStr = segments[1].slice(0, -".narinfo".length);
-		return handleNarinfo(config, cacheName, hashStr, method, request);
+		return handleNarinfo(config, cacheName, hashStr, method, request, isPrivate);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -150,45 +159,51 @@ function NIX_CACHE_INFO_RESPONSE(): Response {
 // negative-lookup storm off the database. Short TTL so newly published paths appear quickly.
 const NARINFO_NEGATIVE_TTL_SECONDS = 60;
 
+/**
+ * What a client may cache: private caches' responses only by the client
+ * itself. The copy kept in the Cache API stays cacheable, since cache.put
+ * refuses responses that say otherwise; it is only ever served through this
+ * Worker, after authorization.
+ */
+function forClient(response: Response, isPrivate: boolean, method: string): Response {
+	const headers = new Headers(response.headers);
+	if (isPrivate) headers.set("cache-control", "private, no-cache");
+	return new Response(method === "HEAD" ? null : response.body, { status: response.status, headers });
+}
+
 async function handleNarinfo(
 	config: WorkerConfig,
 	cacheName: CacheName,
 	hashStr: string,
 	method: string,
 	request: Request,
+	isPrivate: boolean,
 ): Promise<Response> {
 	const storePathHash = parseStorePathHash(hashStr);
 	if (typeof storePathHash === "object") {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// Normalize to GET for shared cache (HEAD and GET share the same cache entry)
-	const cacheKey = new Request(request.url, { method: "GET" });
+	// HEAD and GET share the entry.
+	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cacheName, storePathHash, isPrivate);
 	const cache = await caches.open("helios-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
-		if (method === "HEAD") {
-			return new Response(null, { status: cached.status, headers: cached.headers });
-		}
-		return cached;
+		return forClient(cached, isPrivate, method);
 	}
 
 	// The narinfo was rendered and signed at publish. An unknown cache and an
 	// unpublished path are both a missing object: a (negatively cached) 404.
 	const object = await config.bucket.get(narinfoKey(cacheName, storePathHash));
 	if (!object) {
-		const notFoundHeaders = { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` };
+		const notFound = () =>
+			new Response("Not Found", { status: 404, headers: { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` } });
 		if (config.ctx) {
-			// Fresh Response instead of clone(): a tee'd body whose sibling is
+			// A fresh Response rather than clone(): a tee'd body whose sibling is
 			// never consumed can stall cache.put.
-			config.ctx.waitUntil(
-				cache.put(cacheKey, new Response("Not Found", { status: 404, headers: notFoundHeaders })),
-			);
+			config.ctx.waitUntil(cache.put(cacheKey, notFound()));
 		}
-		if (method === "HEAD") {
-			return new Response(null, { status: 404, headers: notFoundHeaders });
-		}
-		return new Response("Not Found", { status: 404, headers: notFoundHeaders });
+		return forClient(notFound(), isPrivate, method);
 	}
 
 	const body = await object.text();
@@ -199,20 +214,10 @@ async function handleNarinfo(
 			"cache-control": "public, max-age=31536000, immutable",
 		},
 	});
-
-	// Cache at edge (non-blocking)
 	if (config.ctx) {
 		config.ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	}
-
-	if (method === "HEAD") {
-		return new Response(null, {
-			status: 200,
-			headers: response.headers,
-		});
-	}
-
-	return response;
+	return forClient(response, isPrivate, method);
 }
 
 async function handleNarDownload(
@@ -221,6 +226,7 @@ async function handleNarDownload(
 	rawCompression: string,
 	request: Request,
 	method: string,
+	isPrivate: boolean,
 ): Promise<Response> {
 	const fileHash = parseFileHash(rawFileHash);
 	if (typeof fileHash === "object") {
@@ -250,21 +256,20 @@ async function handleNarDownload(
 			status: 302,
 			headers: {
 				location: url,
-				"cache-control": "public, max-age=3600",
+				// The URL is a credential for an hour; a private cache's must not be shared.
+				"cache-control": isPrivate ? "private, max-age=3600" : "public, max-age=3600",
 			},
 		});
 	}
 
-	// Edge cache check (use a GET key for shared cache)
+	// HEAD and GET share the entry; private caches' entries live under a host
+	// of their own, as narinfo's do.
 	const cacheUrl = new URL(request.url);
-	const cacheRequest = new Request(cacheUrl, { method: "GET" });
+	const cacheRequest = new Request(isPrivate ? `https://private.helios-cache.internal${cacheUrl.pathname}` : cacheUrl, { method: "GET" });
 	const cache = await caches.open("helios-nar");
 	const cached = await cache.match(cacheRequest);
 	if (cached) {
-		if (method === "HEAD") {
-			return new Response(null, { status: 200, headers: cached.headers });
-		}
-		return cached;
+		return forClient(cached, isPrivate, method);
 	}
 
 	if (method === "HEAD") {
@@ -272,14 +277,18 @@ async function handleNarDownload(
 		if (!head) {
 			return new Response("Not Found", { status: 404 });
 		}
-		return new Response(null, {
-			status: 200,
-			headers: {
-				"content-type": "application/x-nix-nar",
-				"content-length": String(head.size),
-				"cache-control": "public, max-age=31536000, immutable",
-			},
-		});
+		return forClient(
+			new Response(null, {
+				status: 200,
+				headers: {
+					"content-type": "application/x-nix-nar",
+					"content-length": String(head.size),
+					"cache-control": "public, max-age=31536000, immutable",
+				},
+			}),
+			isPrivate,
+			method,
+		);
 	}
 
 	const object = await config.bucket.get(r2Key);
@@ -300,7 +309,7 @@ async function handleNarDownload(
 		config.ctx.waitUntil(cache.put(cacheRequest, response.clone()));
 	}
 
-	return response;
+	return forClient(response, isPrivate, method);
 }
 
 async function handleAdminApi(

@@ -22,6 +22,7 @@ export default defineConfig({
 				bindings: {
 					AUTH_TOKEN: "test-auth-token",
 					ADMIN_SECRET: "test-admin-secret",
+					JWT_SECRET: "test-jwt-secret-0123456789abcdef",
 				},
 			},
 		}),

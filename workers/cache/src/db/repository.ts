@@ -60,12 +60,17 @@ export async function createCache(
 export async function ensureCache(
 	db: Db,
 	name: string,
+	isPublic = true,
 ): Promise<{ cache: Cache; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name }).onConflictDoNothing().returning());
+	const inserted = await first(db.insert(caches).values({ name, isPublic }).onConflictDoNothing().returning());
 	if (inserted) return { cache: inserted, created: true };
 	const existing = await findCacheByName(db, name);
 	if (!existing) throw new Error(`cache ${name} vanished`);
 	return { cache: existing, created: false };
+}
+
+export async function setCachePublic(db: Db, name: string, isPublic: boolean): Promise<void> {
+	await db.update(caches).set({ isPublic }).where(eq(caches.name, name));
 }
 
 export async function listCaches(db: Db): Promise<Cache[]> {

@@ -19,7 +19,7 @@ import {
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
-import { storeNarinfo } from "./narinfo.js";
+import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import {
 	buildR2ObjectKey,
 	parseFileHash,
@@ -363,7 +363,11 @@ export async function handleComplete(
  */
 async function forgetNarinfoMiss(origin: string, cacheName: string, storePathHash: string): Promise<void> {
 	const cache = await caches.open("helios-narinfo");
-	await cache.delete(new Request(`${origin}/${cacheName}/${storePathHash}.narinfo`));
+	// Both keys: cheaper than looking up whether the cache is private.
+	await Promise.all([
+		cache.delete(narinfoCacheKey(origin, cacheName, storePathHash, false)),
+		cache.delete(narinfoCacheKey(origin, cacheName, storePathHash, true)),
+	]);
 }
 
 export async function handlePublish(

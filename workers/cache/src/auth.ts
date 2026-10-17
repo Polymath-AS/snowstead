@@ -1,6 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
-import { verifyJwt } from "./jwt.js";
+import { verifyJwt, hasPermission, hasCacheAccess } from "./jwt.js";
 import { isTokenActive } from "./db/repository.js";
 import type { Db } from "./db/connection.js";
 
@@ -81,6 +81,63 @@ async function timingSafeEqual(a: string, b: string): Promise<boolean> {
 	let diff = a.length ^ b.length;
 	for (let i = 0; i < ba.length; i++) diff |= ba[i] ^ bb[i];
 	return diff === 0;
+}
+
+/**
+ * The token in a request: a bearer token, or the password of HTTP Basic auth,
+ * which is what Nix sends for a substituter listed in its netrc file.
+ */
+function extractCredential(request: Request): string | undefined {
+	const header = request.headers.get("authorization");
+	if (!header) return undefined;
+	const space = header.indexOf(" ");
+	if (space === -1) return undefined;
+	const scheme = header.slice(0, space).toLowerCase();
+	const value = header.slice(space + 1).trim();
+	if (scheme === "bearer") return value || undefined;
+	if (scheme !== "basic") return undefined;
+	let decoded: string;
+	try {
+		decoded = atob(value);
+	} catch {
+		return undefined;
+	}
+	const colon = decoded.indexOf(":");
+	return colon === -1 ? undefined : decoded.slice(colon + 1) || undefined;
+}
+
+function readAuthError(message: string, status: number): Response {
+	const headers: Record<string, string> = {
+		"content-type": "application/json; charset=utf-8",
+		"cache-control": "no-store",
+	};
+	if (status === 401) {
+		// Basic, so Nix and curl answer with their netrc credentials.
+		headers["www-authenticate"] = 'Basic realm="helios-cache"';
+	}
+	return new Response(JSON.stringify({ error: message }), { status, headers });
+}
+
+/**
+ * Authorizes a read of a private cache: a token granting `pull` on it.
+ * Returns the response to send instead, or undefined to proceed.
+ */
+export async function authorizeRead(request: Request, config: WorkerConfig, cacheName: string): Promise<Response | undefined> {
+	const token = extractCredential(request);
+	if (!token) {
+		return readAuthError("Unauthorized", 401);
+	}
+	if (!config.jwtSecret) {
+		return readAuthError("Forbidden", 403);
+	}
+	const result = await verifyJwt(token, config.jwtSecret);
+	if (result.kind !== "ok" || !(await isTokenActiveCached(config.db, result.claims.jti))) {
+		return readAuthError("Unauthorized", 401);
+	}
+	if (!hasPermission(result.claims, "pull") || !hasCacheAccess(result.claims, cacheName)) {
+		return readAuthError("Forbidden", 403);
+	}
+	return undefined;
 }
 
 /** Represents the authenticated caller for write operations. */

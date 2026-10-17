@@ -8,9 +8,11 @@ import {
 	revokeApiToken,
 	ensureCache,
 	listCaches,
+	setCachePublic,
 	listPublishedPathsAfter,
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
+import { setPrivateMarker } from "./visibility.js";
 import { parseCacheName } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
@@ -160,28 +162,49 @@ export async function handleRevokeToken(
 	return jsonResponse({ revoked: true, jti });
 }
 
+/**
+ * Creates a cache, or sets an existing one's visibility when `private` is
+ * given. Idempotent, so setup can declare its caches on every run.
+ */
 export async function handleCreateCache(
 	request: Request,
 	config: WorkerConfig,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ name: string }>(request);
+	const body = await parseJsonBody<{ name: string; private?: boolean }>(request);
 	if (body instanceof Response) return body;
 
 	const name = parseCacheName(String(body.name ?? ""));
 	if (typeof name === "object") {
 		return errorResponse(name.message, 400);
 	}
+	if (body.private !== undefined && typeof body.private !== "boolean") {
+		return errorResponse("private must be a boolean", 400);
+	}
 
-	// Idempotent, so setup scripts can declare caches on every run.
-	const { cache, created } = await ensureCache(config.db, name);
-	return jsonResponse({ name: cache.name, createdAt: cache.createdAt, created }, created ? 201 : 200);
+	// The marker before the database when turning private, after it when
+	// turning public: a failure in between leaves the cache private.
+	if (body.private === true) {
+		await setPrivateMarker(config, name, true);
+	}
+	const { cache, created } = await ensureCache(config.db, name, body.private !== true);
+	let isPublic = cache.isPublic;
+	const changed = !created && body.private !== undefined && isPublic === body.private;
+	if (changed) {
+		isPublic = !body.private;
+		await setCachePublic(config.db, name, isPublic);
+	}
+	if (body.private === false) {
+		await setPrivateMarker(config, name, false);
+	}
+
+	return jsonResponse({ name: cache.name, private: !isPublic, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
 }
 
 export async function handleListCaches(
 	config: WorkerConfig,
 ): Promise<Response> {
 	const caches = await listCaches(config.db);
-	return jsonResponse({ caches: caches.map((c) => ({ name: c.name, createdAt: c.createdAt })) });
+	return jsonResponse({ caches: caches.map((c) => ({ name: c.name, private: !c.isPublic, createdAt: c.createdAt })) });
 }
 
 const MAX_BACKFILL_BATCH = 1000;

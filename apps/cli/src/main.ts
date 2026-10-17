@@ -11,7 +11,8 @@ Commands:
   helios login <name> <server-url> <token>   Save server credentials
   helios push <cache> <paths...>             Push store paths to a cache
   helios push <cache> --closure <path>       Push a store path and its closure
-  helios cache create <name>                 Create a cache (admin)
+  helios cache create <name> [--private]     Create a cache (admin)
+  helios cache set <name> --private|--public Change who can read a cache (admin)
   helios cache list                          List caches (admin)
   helios token create <subject>              Create a new API token
   helios token list                          List all API tokens
@@ -220,25 +221,33 @@ async function main(): Promise<void> {
     const serverConfig = await getServer(serverName);
     const client = createClient(serverConfig.server, serverConfig.token);
 
-    if (subcommand === "create") {
+    if (subcommand === "create" || subcommand === "set") {
       const name = args[2];
-      if (!name) {
-        console.error("Usage: helios cache create <name>");
+      const wantPrivate = args.includes("--private") ? true : args.includes("--public") ? false : undefined;
+      if (!name || (subcommand === "set" && wantPrivate === undefined)) {
+        console.error(subcommand === "set" ? "Usage: helios cache set <name> --private|--public" : "Usage: helios cache create <name> [--private]");
         process.exit(1);
       }
-      const result = await createCache(client, name);
-      console.log(result.created ? `Cache '${result.name}' created` : `Cache '${result.name}' already exists`);
+      const result = await createCache(client, name, wantPrivate);
+      const visibility = result.private ? "private" : "public";
+      if (result.created) {
+        console.log(`Cache '${result.name}' created (${visibility})`);
+      } else if (result.changed) {
+        console.log(`Cache '${result.name}' is now ${visibility}`);
+      } else {
+        console.log(`Cache '${result.name}' already exists (${visibility})`);
+      }
       return;
     }
 
     if (subcommand === "list") {
       for (const c of await listCaches(client)) {
-        console.log(`${c.name}  created=${c.createdAt}`);
+        console.log(`${c.name}  ${c.private ? "private" : "public"}  created=${c.createdAt}`);
       }
       return;
     }
 
-    console.error("Usage: helios cache <create|list>");
+    console.error("Usage: helios cache <create|set|list>");
     process.exit(1);
   }
 
