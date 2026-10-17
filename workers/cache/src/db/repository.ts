@@ -1,5 +1,5 @@
-import { eq, and, notInArray, lt, inArray, isNull } from "drizzle-orm";
-import type { DrizzleD1Database } from "drizzle-orm/d1";
+import { eq, and, inArray, notInArray, lt, isNull, sql } from "drizzle-orm";
+import type { Db } from "./connection.js";
 import {
 	caches,
 	blobObjects,
@@ -21,56 +21,68 @@ import type {
 	UploadSessionStatus,
 } from "./types.js";
 
+/** The first row a query returns, if any. */
+async function first<T>(rows: Promise<T[]>): Promise<T | undefined> {
+	return (await rows)[0];
+}
+
+/** The first row of a write with RETURNING, which must produce one. */
+async function returned<T>(rows: Promise<T[]>): Promise<T> {
+	const [row] = await rows;
+	if (row === undefined) {
+		throw new Error("write returned no row");
+	}
+	return row;
+}
+
 // ── Caches ──
 
 export async function findCacheByName(
-	db: DrizzleD1Database,
+	db: Db,
 	name: string,
 ): Promise<Cache | undefined> {
-	return db.select().from(caches).where(eq(caches.name, name)).get();
+	return first(db.select().from(caches).where(eq(caches.name, name)).limit(1));
 }
 
 export async function findCacheById(
-	db: DrizzleD1Database,
+	db: Db,
 	id: number,
 ): Promise<Cache | undefined> {
-	return db.select().from(caches).where(eq(caches.id, id)).get();
+	return first(db.select().from(caches).where(eq(caches.id, id)).limit(1));
 }
 
 export async function createCache(
-	db: DrizzleD1Database,
+	db: Db,
 	name: string,
 ): Promise<Cache> {
-	return db
-		.insert(caches)
-		.values({ name })
-		.returning()
-		.get();
+	return returned(db.insert(caches).values({ name }).returning());
 }
 
 // ── Blob Objects ──
 
 export async function findBlobObject(
-	db: DrizzleD1Database,
+	db: Db,
 	fileHash: string,
 	compression: string,
 ): Promise<BlobObject | undefined> {
-	return db
-		.select()
-		.from(blobObjects)
-		.where(and(eq(blobObjects.fileHash, fileHash), eq(blobObjects.compression, compression)))
-		.get();
+	return first(
+		db
+			.select()
+			.from(blobObjects)
+			.where(and(eq(blobObjects.fileHash, fileHash), eq(blobObjects.compression, compression)))
+			.limit(1),
+	);
 }
 
 export async function findBlobObjectById(
-	db: DrizzleD1Database,
+	db: Db,
 	id: number,
 ): Promise<BlobObject | undefined> {
-	return db.select().from(blobObjects).where(eq(blobObjects.id, id)).get();
+	return first(db.select().from(blobObjects).where(eq(blobObjects.id, id)).limit(1));
 }
 
 export async function createBlobObject(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly fileHash: string;
 		readonly fileSize: number;
@@ -78,56 +90,55 @@ export async function createBlobObject(
 		readonly r2Key: string;
 	},
 ): Promise<BlobObject> {
-	return db
-		.insert(blobObjects)
-		.values(params)
-		.returning()
-		.get();
+	return returned(db.insert(blobObjects).values(params).returning());
 }
 
 // ── Published Paths ──
 
 export async function findPublishedPathWithBlob(
-	db: DrizzleD1Database,
+	db: Db,
 	cacheId: number,
 	storePathHash: string,
 ): Promise<{ path: PublishedPath; blob: BlobObject } | undefined> {
-	const row = await db
-		.select({
-			path: publishedPaths,
-			blob: blobObjects,
-		})
-		.from(publishedPaths)
-		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
-		.where(
-			and(
-				eq(publishedPaths.cacheId, cacheId),
-				eq(publishedPaths.storePathHash, storePathHash),
-			),
-		)
-		.get();
-	return row;
+	return first(
+		db
+			.select({
+				path: publishedPaths,
+				blob: blobObjects,
+			})
+			.from(publishedPaths)
+			.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+			.where(
+				and(
+					eq(publishedPaths.cacheId, cacheId),
+					eq(publishedPaths.storePathHash, storePathHash),
+				),
+			)
+			.limit(1),
+	);
 }
 
 export async function findPublishedPath(
-	db: DrizzleD1Database,
+	db: Db,
 	cacheId: number,
 	storePathHash: string,
 ): Promise<PublishedPath | undefined> {
-	return db
-		.select()
-		.from(publishedPaths)
-		.where(
-			and(
-				eq(publishedPaths.cacheId, cacheId),
-				eq(publishedPaths.storePathHash, storePathHash),
-			),
-		)
-		.get();
+	return first(
+		db
+			.select()
+			.from(publishedPaths)
+			.where(
+				and(
+					eq(publishedPaths.cacheId, cacheId),
+					eq(publishedPaths.storePathHash, storePathHash),
+				),
+			)
+			.limit(1),
+	);
 }
 
 export async function createPublishedPath(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly cacheId: number;
 		readonly storePathHash: string;
@@ -141,69 +152,41 @@ export async function createPublishedPath(
 		readonly signaturesJson: string;
 	},
 ): Promise<PublishedPath> {
-	return db
-		.insert(publishedPaths)
-		.values(params)
-		.returning()
-		.get();
+	return returned(db.insert(publishedPaths).values(params).returning());
 }
 
 export async function findPublishedHashes(
-	db: DrizzleD1Database,
+	db: Db,
 	cacheId: number,
 	storePathHashes: string[],
 ): Promise<string[]> {
 	if (storePathHashes.length === 0) return [];
 
-	// D1 limits bound parameters to 100 per query; reserve 1 for cacheId
-	const chunks: string[][] = [];
-	for (let i = 0; i < storePathHashes.length; i += 99) {
-		chunks.push(storePathHashes.slice(i, i + 99));
-	}
-
-	// Send all chunk queries in a single D1 batch round trip instead of one
-	// sequential round trip per chunk.
-	const queries = chunks.map((chunk) =>
-		db
-			.select({ storePathHash: publishedPaths.storePathHash })
-			.from(publishedPaths)
-			.where(
-				and(
-					eq(publishedPaths.cacheId, cacheId),
-					inArray(publishedPaths.storePathHash, chunk),
-				),
+	// One round trip for the whole batch; callers cap it at 1000 hashes, far
+	// below Postgres's 65535 bound parameters.
+	const rows = await db
+		.select({ storePathHash: publishedPaths.storePathHash })
+		.from(publishedPaths)
+		.where(
+			and(
+				eq(publishedPaths.cacheId, cacheId),
+				inArray(publishedPaths.storePathHash, storePathHashes),
 			),
-	);
-
-	const [firstQuery, ...restQueries] = queries;
-	if (firstQuery === undefined) return [];
-	const chunkResults = await db.batch([firstQuery, ...restQueries]);
-
-	const results: string[] = [];
-	for (const rows of chunkResults) {
-		for (const r of rows) {
-			results.push(r.storePathHash);
-		}
-	}
-
-	return results;
+		);
+	return rows.map((r) => r.storePathHash);
 }
 
 // ── Upload Sessions ──
 
 export async function findUploadSession(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 ): Promise<UploadSession | undefined> {
-	return db
-		.select()
-		.from(uploadSessions)
-		.where(eq(uploadSessions.id, sessionId))
-		.get();
+	return first(db.select().from(uploadSessions).where(eq(uploadSessions.id, sessionId)).limit(1));
 }
 
 export async function createUploadSession(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly id: string;
 		readonly cacheId: number;
@@ -219,46 +202,44 @@ export async function createUploadSession(
 		readonly system: string | null;
 		readonly r2UploadKey: string | null;
 		readonly r2UploadId: string | null;
-		readonly expiresAt: string;
+		readonly expiresAt: Date;
 	},
 ): Promise<UploadSession> {
-	return db
-		.insert(uploadSessions)
-		.values(params)
-		.returning()
-		.get();
+	return returned(db.insert(uploadSessions).values(params).returning());
 }
 
 export async function transitionSessionStatus(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 	fromStatus: UploadSessionStatus,
 	toStatus: UploadSessionStatus,
 ): Promise<UploadSession | undefined> {
-	return db
-		.update(uploadSessions)
-		.set({ status: toStatus })
-		.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, fromStatus)))
-		.returning()
-		.get();
+	return first(
+		db
+			.update(uploadSessions)
+			.set({ status: toStatus })
+			.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, fromStatus)))
+			.returning(),
+	);
 }
 
 export async function transitionToMultipart(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 	r2UploadId: string,
 ): Promise<UploadSession | undefined> {
-	return db
-		.update(uploadSessions)
-		.set({ status: "uploading", r2UploadId })
-		.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, "pending")))
-		.returning()
-		.get();
+	return first(
+		db
+			.update(uploadSessions)
+			.set({ status: "uploading", r2UploadId })
+			.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, "pending")))
+			.returning(),
+	);
 }
 
 export async function findExpiredSessions(
-	db: DrizzleD1Database,
-	now: string,
+	db: Db,
+	now: Date,
 ): Promise<UploadSession[]> {
 	return db
 		.select()
@@ -268,14 +249,13 @@ export async function findExpiredSessions(
 				notInArray(uploadSessions.status, ["completed", "expired"]),
 				lt(uploadSessions.expiresAt, now),
 			),
-		)
-		.all();
+		);
 }
 
 // ── Upload Parts ──
 
 export async function upsertUploadPart(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly sessionId: string;
 		readonly partNumber: number;
@@ -283,19 +263,20 @@ export async function upsertUploadPart(
 		readonly size: number;
 	},
 ): Promise<UploadPart> {
-	return db
-		.insert(uploadParts)
-		.values(params)
-		.onConflictDoUpdate({
-			target: [uploadParts.sessionId, uploadParts.partNumber],
-			set: { etag: params.etag, size: params.size },
-		})
-		.returning()
-		.get();
+	return returned(
+		db
+			.insert(uploadParts)
+			.values(params)
+			.onConflictDoUpdate({
+				target: [uploadParts.sessionId, uploadParts.partNumber],
+				set: { etag: params.etag, size: params.size },
+			})
+			.returning(),
+	);
 }
 
 export async function upsertUploadParts(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 	parts: ReadonlyArray<{
 		readonly partNumber: number;
@@ -303,38 +284,32 @@ export async function upsertUploadParts(
 		readonly size: number;
 	}>,
 ): Promise<void> {
-	// One D1 batch round trip for all parts instead of one round trip each.
-	const statements = parts.map((part) =>
-		db
-			.insert(uploadParts)
-			.values({ sessionId, partNumber: part.partNumber, etag: part.etag, size: part.size })
-			.onConflictDoUpdate({
-				target: [uploadParts.sessionId, uploadParts.partNumber],
-				set: { etag: part.etag, size: part.size },
-			}),
-	);
-
-	const [firstStatement, ...restStatements] = statements;
-	if (firstStatement === undefined) return;
-	await db.batch([firstStatement, ...restStatements]);
+	if (parts.length === 0) return;
+	// One multi-row statement for all parts.
+	await db
+		.insert(uploadParts)
+		.values(parts.map((part) => ({ sessionId, partNumber: part.partNumber, etag: part.etag, size: part.size })))
+		.onConflictDoUpdate({
+			target: [uploadParts.sessionId, uploadParts.partNumber],
+			set: { etag: sql`excluded.etag`, size: sql`excluded.size` },
+		});
 }
 
 export async function findUploadParts(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 ): Promise<UploadPart[]> {
 	return db
 		.select()
 		.from(uploadParts)
 		.where(eq(uploadParts.sessionId, sessionId))
-		.orderBy(uploadParts.partNumber)
-		.all();
+		.orderBy(uploadParts.partNumber);
 }
 
 // ── Blob Object Cleanup ──
 
 export async function findUnreferencedBlobObjects(
-	db: DrizzleD1Database,
+	db: Db,
 ): Promise<BlobObject[]> {
 	const referenced = db
 		.select({ id: publishedPaths.blobObjectId })
@@ -343,144 +318,137 @@ export async function findUnreferencedBlobObjects(
 	return db
 		.select()
 		.from(blobObjects)
-		.where(notInArray(blobObjects.id, referenced))
-		.all();
+		.where(notInArray(blobObjects.id, referenced));
 }
 
 export async function deleteBlobObject(
-	db: DrizzleD1Database,
+	db: Db,
 	id: number,
 ): Promise<void> {
-	await db.delete(blobObjects).where(eq(blobObjects.id, id)).run();
+	await db.delete(blobObjects).where(eq(blobObjects.id, id));
 }
 
 // ── Upload Session Cleanup ──
 
 export async function deleteUploadSession(
-	db: DrizzleD1Database,
+	db: Db,
 	sessionId: string,
 ): Promise<void> {
-	await db.delete(uploadParts).where(eq(uploadParts.sessionId, sessionId)).run();
-	await db.delete(uploadSessions).where(eq(uploadSessions.id, sessionId)).run();
+	await db.transaction(async (tx) => {
+		await tx.delete(uploadParts).where(eq(uploadParts.sessionId, sessionId));
+		await tx.delete(uploadSessions).where(eq(uploadSessions.id, sessionId));
+	});
 }
 
 // ── GC Marks ──
 
 export async function createGcMark(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly targetType: string;
 		readonly targetId: string;
 		readonly reason: string;
 	},
 ): Promise<GcMark> {
-	return db
-		.insert(gcMarks)
-		.values(params)
-		.returning()
-		.get();
+	return returned(db.insert(gcMarks).values(params).returning());
 }
 
 export async function findGcMarks(
-	db: DrizzleD1Database,
+	db: Db,
 	targetType: string,
 ): Promise<GcMark[]> {
 	return db
 		.select()
 		.from(gcMarks)
-		.where(eq(gcMarks.targetType, targetType))
-		.all();
+		.where(eq(gcMarks.targetType, targetType));
 }
 
 export async function deleteGcMark(
-	db: DrizzleD1Database,
+	db: Db,
 	targetType: string,
 	targetId: string,
 ): Promise<void> {
 	await db
 		.delete(gcMarks)
-		.where(and(eq(gcMarks.targetType, targetType), eq(gcMarks.targetId, targetId)))
-		.run();
+		.where(and(eq(gcMarks.targetType, targetType), eq(gcMarks.targetId, targetId)));
 }
 
 // ── API Tokens ──
 
 export async function createApiToken(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly jti: string;
 		readonly subject: string;
 		readonly cachesJson: string;
 		readonly permsJson: string;
-		readonly expiresAt: string;
+		readonly expiresAt: Date;
 		readonly createdBy: string;
 	},
 ): Promise<ApiToken> {
-	return db
-		.insert(apiTokens)
-		.values(params)
-		.returning()
-		.get();
+	return returned(db.insert(apiTokens).values(params).returning());
 }
 
 export async function findApiToken(
-	db: DrizzleD1Database,
+	db: Db,
 	jti: string,
 ): Promise<ApiToken | undefined> {
-	return db.select().from(apiTokens).where(eq(apiTokens.jti, jti)).get();
+	return first(db.select().from(apiTokens).where(eq(apiTokens.jti, jti)).limit(1));
 }
 
 export async function listApiTokens(
-	db: DrizzleD1Database,
+	db: Db,
 ): Promise<ApiToken[]> {
-	return db.select().from(apiTokens).all();
+	return db.select().from(apiTokens);
 }
 
 export async function revokeApiToken(
-	db: DrizzleD1Database,
+	db: Db,
 	jti: string,
 	revokedBy: string,
 	reason: string,
 ): Promise<ApiToken | undefined> {
-	return db
-		.update(apiTokens)
-		.set({
-			revokedAt: new Date().toISOString(),
-			revokedBy,
-			revocationReason: reason,
-		})
-		.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
-		.returning()
-		.get();
+	return first(
+		db
+			.update(apiTokens)
+			.set({
+				revokedAt: new Date(),
+				revokedBy,
+				revocationReason: reason,
+			})
+			.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
+			.returning(),
+	);
 }
 
 export async function isTokenActive(
-	db: DrizzleD1Database,
+	db: Db,
 	jti: string,
 ): Promise<boolean> {
-	const row = await db
-		.select({ jti: apiTokens.jti })
-		.from(apiTokens)
-		.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
-		.get();
+	const row = await first(
+		db
+			.select({ jti: apiTokens.jti })
+			.from(apiTokens)
+			.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
+			.limit(1),
+	);
 	return row !== undefined;
 }
 
 export async function deleteExpiredApiTokens(
-	db: DrizzleD1Database,
-	now: string,
+	db: Db,
+	now: Date,
 ): Promise<number> {
 	const result = await db
 		.delete(apiTokens)
-		.where(lt(apiTokens.expiresAt, now))
-		.run();
-	return result.meta.changes ?? 0;
+		.where(lt(apiTokens.expiresAt, now));
+	return result.rowCount ?? 0;
 }
 
 // ── Audit Logs ──
 
 export async function createAuditLog(
-	db: DrizzleD1Database,
+	db: Db,
 	params: {
 		readonly actor: string;
 		readonly action: string;
@@ -492,16 +460,15 @@ export async function createAuditLog(
 ): Promise<void> {
 	// No RETURNING: audit inserts are fire-and-forget on the hot write path,
 	// and skipping the row round trip keeps them as cheap as possible.
-	await db.insert(auditLogs).values(params).run();
+	await db.insert(auditLogs).values(params);
 }
 
 export async function deleteExpiredAuditLogs(
-	db: DrizzleD1Database,
-	cutoff: string,
+	db: Db,
+	cutoff: Date,
 ): Promise<number> {
 	const result = await db
 		.delete(auditLogs)
-		.where(lt(auditLogs.timestamp, cutoff))
-		.run();
-	return result.meta.changes ?? 0;
+		.where(lt(auditLogs.timestamp, cutoff));
+	return result.rowCount ?? 0;
 }

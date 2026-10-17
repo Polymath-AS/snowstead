@@ -15,16 +15,29 @@ scripts/              smoke-test.sh
 ## Setup
 
 ```bash
-nix develop # drops you into a shell with node, pnpm, wrangler
+nix develop # drops you into a shell with node, pnpm, wrangler, postgres
 pnpm install
 ```
 
 ## Develop
 
 ```bash
-pnpm dev   # runs the worker locally via wrangler
 pnpm check # type-check + tests across the workspace
 ```
+
+The worker's tests run against a throwaway Postgres that
+`scripts/with-postgres.sh` starts (or the server `HELIOS_TEST_DATABASE_URL`
+names). To run the worker locally against a database of your own:
+
+```bash
+export DATABASE_URL=postgres://USER:PASSWORD@localhost:5432/helios
+pnpm --filter @helios/cache-worker db:migrate
+CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" pnpm dev
+```
+
+After changing `workers/cache/src/db/schema.ts`, run
+`pnpm --filter @helios/cache-worker db:generate` and commit the migration.
+
 
 ## Deploy
 
@@ -32,14 +45,17 @@ See [docs.md](docs.md) for the full reference. Short version:
 
 ```bash
 wrangler r2 bucket create helios-cache
-wrangler d1 create helios-cache
-# update database_id in workers/cache/wrangler.jsonc
-wrangler d1 migrations apply helios-cache --remote
+# Postgres on PlanetScale, with a role holding pg_read_all_data and
+# pg_write_all_data. Query caching off: uploads must read their own writes.
+wrangler hyperdrive create helios-cache --caching-disabled \
+  --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
+# set the Hyperdrive id in wrangler.jsonc and workers/cache/wrangler.jsonc
 wrangler secret put JWT_SECRET
 wrangler secret put ADMIN_SECRET
 wrangler secret put SIGNING_PRIVATE_KEY
 wrangler secret put SIGNING_KEY_NAME
-pnpm deploy
+# migrates the database directly (not through Hyperdrive), then deploys
+DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
 
 ## Push store paths

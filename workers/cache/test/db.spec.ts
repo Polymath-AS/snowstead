@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { drizzle } from "drizzle-orm/d1";
+import { testDb } from "./db.js";
 import {
 	createCache,
 	findCacheByName,
@@ -19,14 +19,16 @@ import {
 	deleteGcMark,
 } from "../src/db/repository.js";
 
+const db = testDb();
+
 function getDb() {
-	return drizzle(env.CACHE_DB);
+	return db;
 }
 
 function makeSessionParams(overrides: {
 	readonly id: string;
 	readonly cacheId: number;
-	readonly expiresAt?: string;
+	readonly expiresAt?: Date;
 	readonly storePathHash?: string;
 }) {
 	return {
@@ -44,7 +46,7 @@ function makeSessionParams(overrides: {
 		system: null,
 		r2UploadKey: null,
 		r2UploadId: null,
-		expiresAt: overrides.expiresAt ?? "2099-01-01T00:00:00.000Z",
+		expiresAt: overrides.expiresAt ?? new Date("2099-01-01T00:00:00.000Z"),
 	};
 }
 
@@ -55,7 +57,7 @@ describe("caches", () => {
 
 		expect(row.name).toBe(name);
 		expect(typeof row.id).toBe("number");
-		expect(typeof row.createdAt).toBe("string");
+		expect(row.createdAt).toBeInstanceOf(Date);
 	});
 
 	it("findCacheByName returns a matching cache", async () => {
@@ -95,7 +97,7 @@ describe("blob_objects", () => {
 		expect(row.fileSize).toBe(2048);
 		expect(row.compression).toBe("zstd");
 		expect(typeof row.id).toBe("number");
-		expect(typeof row.createdAt).toBe("string");
+		expect(row.createdAt).toBeInstanceOf(Date);
 	});
 
 	it("findBlobObject returns a matching blob", async () => {
@@ -166,7 +168,36 @@ describe("published_paths", () => {
 		expect(row.blobObjectId).toBe(blob.id);
 		expect(row.system).toBe("x86_64-linux");
 		expect(typeof row.id).toBe("number");
-		expect(typeof row.createdAt).toBe("string");
+		expect(row.createdAt).toBeInstanceOf(Date);
+	});
+
+	it("keeps sizes past 2 GiB exact", async () => {
+		const cache = await createCache(getDb(), `pp-large-${crypto.randomUUID()}`);
+		const fileSize = 3 * 2 ** 30;
+		const narSize = 5 * 2 ** 30 + 1;
+		const blob = await createBlobObject(getDb(), {
+			fileHash: `sha256:${crypto.randomUUID()}`,
+			fileSize,
+			compression: "zstd",
+			r2Key: `blobs/${crypto.randomUUID()}`,
+		});
+		const storePathHash = crypto.randomUUID();
+		await createPublishedPath(getDb(), {
+			cacheId: cache.id,
+			storePathHash,
+			storePath: `/nix/store/${storePathHash}`,
+			narHash: `sha256:${crypto.randomUUID()}`,
+			narSize,
+			blobObjectId: blob.id,
+			referencesJson: "[]",
+			deriver: null,
+			system: null,
+			signaturesJson: "[]",
+		});
+
+		const found = await findPublishedPath(getDb(), cache.id, storePathHash);
+		expect(found?.narSize).toBe(narSize);
+		expect((await findBlobObject(getDb(), blob.fileHash, "zstd"))?.fileSize).toBe(fileSize);
 	});
 
 	it("findPublishedPath returns a matching path", async () => {
@@ -238,7 +269,7 @@ describe("upload_sessions", () => {
 		expect(row.id).toBe(sessionId);
 		expect(row.cacheId).toBe(cache.id);
 		expect(row.status).toBe("pending");
-		expect(typeof row.createdAt).toBe("string");
+		expect(row.createdAt).toBeInstanceOf(Date);
 	});
 
 	it("findUploadSession returns a matching session", async () => {
@@ -269,16 +300,16 @@ describe("upload_sessions", () => {
 		const expiredId = crypto.randomUUID();
 		await createUploadSession(
 			getDb(),
-			makeSessionParams({ id: expiredId, cacheId: cache.id, expiresAt: "2020-01-01T00:00:00.000Z" }),
+			makeSessionParams({ id: expiredId, cacheId: cache.id, expiresAt: new Date("2020-01-01T00:00:00.000Z") }),
 		);
 
 		const freshId = crypto.randomUUID();
 		await createUploadSession(
 			getDb(),
-			makeSessionParams({ id: freshId, cacheId: cache.id, expiresAt: "2099-01-01T00:00:00.000Z" }),
+			makeSessionParams({ id: freshId, cacheId: cache.id, expiresAt: new Date("2099-01-01T00:00:00.000Z") }),
 		);
 
-		const expired = await findExpiredSessions(getDb(), new Date().toISOString());
+		const expired = await findExpiredSessions(getDb(), new Date());
 		const expiredIds = expired.map((s) => s.id);
 
 		expect(expiredIds).toContain(expiredId);
@@ -291,11 +322,11 @@ describe("upload_sessions", () => {
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			getDb(),
-			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: "2020-01-01T00:00:00.000Z" }),
+			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2020-01-01T00:00:00.000Z") }),
 		);
 		await transitionSessionStatus(getDb(), sessionId, "pending", "completed");
 
-		const expired = await findExpiredSessions(getDb(), new Date().toISOString());
+		const expired = await findExpiredSessions(getDb(), new Date());
 		const expiredIds = expired.map((s) => s.id);
 
 		expect(expiredIds).not.toContain(sessionId);
@@ -353,7 +384,7 @@ describe("gc_marks", () => {
 		expect(row.targetId).toBe(targetId);
 		expect(row.reason).toBe("orphaned");
 		expect(typeof row.id).toBe("number");
-		expect(typeof row.markedAt).toBe("string");
+		expect(row.markedAt).toBeInstanceOf(Date);
 	});
 
 	it("findGcMarks returns only marks matching targetType", async () => {

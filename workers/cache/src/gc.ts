@@ -34,7 +34,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	let expiredAuditLogs = 0;
 
 	// Phase 1: Expire abandoned upload sessions
-	const now = new Date().toISOString();
+	const now = new Date();
 	const expired = await findExpiredSessions(config.db, now);
 
 	for (const session of expired) {
@@ -102,7 +102,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 	// Phase 4: Delete audit logs older than retention period
 	try {
-		const cutoff = new Date(Date.now() - AUDIT_LOG_RETENTION_DAYS * 86400_000).toISOString();
+		const cutoff = new Date(Date.now() - AUDIT_LOG_RETENTION_DAYS * 86400_000);
 		expiredAuditLogs = await deleteExpiredAuditLogs(config.db, cutoff);
 	} catch (err) {
 		errors.push(`Failed to delete expired audit logs: ${err instanceof Error ? err.message : String(err)}`);

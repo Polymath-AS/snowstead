@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { drizzle } from "drizzle-orm/d1";
+import { testDb } from "./db.js";
 import { createCache } from "../src/db/repository.js";
 import worker from "../src";
 
@@ -27,8 +27,9 @@ function postWithWorker(
 	return response;
 }
 
+const db = testDb();
+
 beforeAll(async () => {
-	const db = drizzle(env.CACHE_DB);
 	await createCache(db, CACHE_NAME);
 });
 

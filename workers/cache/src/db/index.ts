@@ -9,6 +9,9 @@ export {
 	auditLogs,
 } from './schema.js';
 
+export { connect } from "./connection.js";
+export type { Db, Connection } from "./connection.js";
+
 export type {
 	Cache,
 	BlobObject,

@@ -1,9 +1,13 @@
-import { drizzle } from "drizzle-orm/d1";
-import type { DrizzleD1Database } from "drizzle-orm/d1";
+import { connect } from "./db/connection.js";
+import type { Db } from "./db/connection.js";
 
 export interface WorkerConfig {
 	readonly bucket: R2Bucket;
-	readonly db: DrizzleD1Database;
+	readonly db: Db;
+	/** Database work that may outlive the response. */
+	readonly defer: (task: Promise<unknown>) => void;
+	/** Waits for deferred work, then releases the request's connections. */
+	readonly close: () => Promise<void>;
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
 	readonly authToken: string;
@@ -20,12 +24,15 @@ export function resolveConfig(env: Env): WorkerConfig {
 	if (!env.CACHE_BUCKET) {
 		throw new Error("Missing required binding: CACHE_BUCKET");
 	}
-	if (!env.CACHE_DB) {
-		throw new Error("Missing required binding: CACHE_DB");
+	if (!env.HYPERDRIVE) {
+		throw new Error("Missing required binding: HYPERDRIVE");
 	}
+	const { db, defer, close } = connect(env.HYPERDRIVE.connectionString);
 	return {
 		bucket: env.CACHE_BUCKET,
-		db: drizzle(env.CACHE_DB),
+		db,
+		defer,
+		close,
 		signingKeyName: env.SIGNING_KEY_NAME || "helios-cache-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		authToken: env.AUTH_TOKEN || "",

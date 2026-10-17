@@ -4,7 +4,9 @@ set -euo pipefail
 # Smoke test for the Helios Nix binary cache worker.
 #
 # Usage:
-#   ./scripts/smoke-test.sh <base-url> <auth-token>
+#   DATABASE_URL=postgres://... ./scripts/smoke-test.sh <base-url> <auth-token>
+#
+# DATABASE_URL reaches the worker's Postgres directly, to seed a cache.
 #
 # Example:
 #   ./scripts/smoke-test.sh https://helios-cache.your-subdomain.workers.dev "your-token"
@@ -12,13 +14,10 @@ set -euo pipefail
 
 BASE="${1:?usage: smoke-test.sh <base-url> <auth-token>}"
 TOKEN="${2:?usage: smoke-test.sh <base-url> <auth-token>}"
+: "${DATABASE_URL:?set DATABASE_URL to the Postgres database the worker uses, to seed a cache}"
 
 # Strip trailing slash
 BASE="${BASE%/}"
-
-# Resolve worker dir for wrangler d1 seeding
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKER_DIR="$(cd "$SCRIPT_DIR/../workers/cache" && pwd)"
 
 PASS=0
 FAIL=0
@@ -46,13 +45,11 @@ BODY=$(curl -s "$BASE/healthz")
 check "/healthz has ok=true" "true" "$(echo "$BODY" | grep -o '"ok" *: *true' | head -1 | grep -o 'true')"
 echo
 
-# ── 2. Seed a cache via D1 ──
-echo "2. Seeding test cache via D1"
+# ── 2. Seed a cache in Postgres ──
+echo "2. Seeding test cache in Postgres"
 CACHE_NAME="smoke-$(date +%s)"
-wrangler d1 execute helios-cache --remote --yes \
-  -c "$WORKER_DIR/wrangler.jsonc" \
-  --command "INSERT OR IGNORE INTO caches (name, is_public) VALUES ('$CACHE_NAME', 1)" \
-  > /dev/null 2>&1
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+  -c "INSERT INTO caches (name, is_public) VALUES ('$CACHE_NAME', true) ON CONFLICT (name) DO NOTHING"
 echo "  created cache: $CACHE_NAME"
 echo
 

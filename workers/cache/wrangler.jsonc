@@ -3,6 +3,8 @@
 	"name": "helios-cache",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-03-10",
+	// Required by the pg driver, which reaches Postgres through Hyperdrive.
+	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
 		"enabled": true
 	},
@@ -17,12 +19,15 @@
 			"bucket_name": "helios-cache"
 		}
 	],
-	"d1_databases": [
+	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
+	// caching off (`wrangler hyperdrive create helios-cache --caching-disabled
+	// --connection-string ...`): upload sessions and token revocation must
+	// read their own writes. Local runs connect directly via
+	// CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE.
+	"hyperdrive": [
 		{
-			"binding": "CACHE_DB",
-			"database_name": "helios-cache",
-			"database_id": "",
-			"migrations_dir": "migrations"
+			"binding": "HYPERDRIVE",
+			"id": "replace-with-hyperdrive-id"
 		}
 	],
 	"triggers": {

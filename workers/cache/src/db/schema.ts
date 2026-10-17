@@ -1,54 +1,57 @@
-import { sqliteTable, text, integer, uniqueIndex, index } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
+import { pgTable, text, integer, bigint, boolean, timestamp, uniqueIndex, index } from "drizzle-orm/pg-core";
 
-const timestamp = (name: string) =>
-	text(name).notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
+const timestamptz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
+const createdAt = (name: string) => timestamptz(name).notNull().defaultNow();
+// NAR and file sizes pass 2 GiB, beyond Postgres `integer`; JS numbers are
+// exact up to 2^53.
+const bytes = (name: string) => bigint(name, { mode: "number" });
+const id = () => bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity();
 
-export const caches = sqliteTable("caches", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
+export const caches = pgTable("caches", {
+	id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
 	name: text("name").notNull().unique(),
-	isPublic: integer("is_public").notNull().default(1),
-	createdAt: timestamp("created_at"),
+	isPublic: boolean("is_public").notNull().default(true),
+	createdAt: createdAt("created_at"),
 });
 
-export const blobObjects = sqliteTable("blob_objects", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
+export const blobObjects = pgTable("blob_objects", {
+	id: id(),
 	fileHash: text("file_hash").notNull(),
-	fileSize: integer("file_size").notNull(),
+	fileSize: bytes("file_size").notNull(),
 	compression: text("compression").notNull(),
 	r2Key: text("r2_key").notNull().unique(),
-	createdAt: timestamp("created_at"),
+	createdAt: createdAt("created_at"),
 }, (table) => [
 	uniqueIndex("blob_objects_file_hash_compression_unique").on(table.fileHash, table.compression),
 ]);
 
-export const publishedPaths = sqliteTable("published_paths", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
+export const publishedPaths = pgTable("published_paths", {
+	id: id(),
 	cacheId: integer("cache_id").notNull().references(() => caches.id),
 	storePathHash: text("store_path_hash").notNull(),
 	storePath: text("store_path").notNull(),
 	narHash: text("nar_hash").notNull(),
-	narSize: integer("nar_size").notNull(),
-	blobObjectId: integer("blob_object_id").notNull().references(() => blobObjects.id),
+	narSize: bytes("nar_size").notNull(),
+	blobObjectId: bigint("blob_object_id", { mode: "number" }).notNull().references(() => blobObjects.id),
 	referencesJson: text("references_json").notNull().default("[]"),
 	deriver: text("deriver"),
 	system: text("system"),
 	signaturesJson: text("signatures_json").notNull().default("[]"),
-	createdAt: timestamp("created_at"),
+	createdAt: createdAt("created_at"),
 }, (table) => [
 	uniqueIndex("published_paths_cache_store_unique").on(table.cacheId, table.storePathHash),
 	index("idx_published_paths_blob_object").on(table.blobObjectId),
 ]);
 
-export const uploadSessions = sqliteTable("upload_sessions", {
+export const uploadSessions = pgTable("upload_sessions", {
 	id: text("id").primaryKey(),
 	cacheId: integer("cache_id").notNull().references(() => caches.id),
 	storePathHash: text("store_path_hash").notNull(),
 	storePath: text("store_path").notNull(),
 	narHash: text("nar_hash").notNull(),
-	narSize: integer("nar_size").notNull(),
+	narSize: bytes("nar_size").notNull(),
 	fileHash: text("file_hash").notNull(),
-	fileSize: integer("file_size").notNull(),
+	fileSize: bytes("file_size").notNull(),
 	compression: text("compression").notNull(),
 	referencesJson: text("references_json").notNull().default("[]"),
 	deriver: text("deriver"),
@@ -56,48 +59,48 @@ export const uploadSessions = sqliteTable("upload_sessions", {
 	status: text("status").notNull().default("pending"),
 	r2UploadKey: text("r2_upload_key"),
 	r2UploadId: text("r2_upload_id"),
-	createdAt: timestamp("created_at"),
-	expiresAt: text("expires_at").notNull(),
+	createdAt: createdAt("created_at"),
+	expiresAt: timestamptz("expires_at").notNull(),
 }, (table) => [
 	index("idx_upload_sessions_status").on(table.status, table.expiresAt),
 ]);
 
-export const uploadParts = sqliteTable("upload_parts", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
+export const uploadParts = pgTable("upload_parts", {
+	id: id(),
 	sessionId: text("session_id").notNull().references(() => uploadSessions.id),
 	partNumber: integer("part_number").notNull(),
 	etag: text("etag").notNull(),
-	size: integer("size").notNull(),
+	size: bytes("size").notNull(),
 }, (table) => [
 	uniqueIndex("upload_parts_session_part_unique").on(table.sessionId, table.partNumber),
 ]);
 
-export const gcMarks = sqliteTable("gc_marks", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
+export const gcMarks = pgTable("gc_marks", {
+	id: id(),
 	targetType: text("target_type").notNull(),
 	targetId: text("target_id").notNull(),
 	reason: text("reason").notNull(),
-	markedAt: text("marked_at").notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+	markedAt: createdAt("marked_at"),
 }, (table) => [
 	uniqueIndex("gc_marks_target_unique").on(table.targetType, table.targetId),
 ]);
 
-export const apiTokens = sqliteTable("api_tokens", {
+export const apiTokens = pgTable("api_tokens", {
 	jti: text("jti").primaryKey(),
 	subject: text("subject").notNull(),
 	cachesJson: text("caches_json").notNull(),
 	permsJson: text("perms_json").notNull(),
-	createdAt: timestamp("created_at"),
-	expiresAt: text("expires_at").notNull(),
+	createdAt: createdAt("created_at"),
+	expiresAt: timestamptz("expires_at").notNull(),
 	createdBy: text("created_by").notNull(),
-	revokedAt: text("revoked_at"),
+	revokedAt: timestamptz("revoked_at"),
 	revokedBy: text("revoked_by"),
 	revocationReason: text("revocation_reason"),
 });
 
-export const auditLogs = sqliteTable("audit_logs", {
-	id: integer("id").primaryKey({ autoIncrement: true }),
-	timestamp: timestamp("timestamp"),
+export const auditLogs = pgTable("audit_logs", {
+	id: id(),
+	timestamp: createdAt("timestamp"),
 	actor: text("actor").notNull(),
 	action: text("action").notNull(),
 	cacheName: text("cache_name"),

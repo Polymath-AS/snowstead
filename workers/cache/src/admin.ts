@@ -91,7 +91,7 @@ export async function handleCreateToken(
 
 	const token = await signJwt(claims, config.jwtSecret);
 
-	const expiresAt = new Date(exp * 1000).toISOString();
+	const expiresAt = new Date(exp * 1000);
 
 	await createApiToken(config.db, {
 		jti,

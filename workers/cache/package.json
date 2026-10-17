@@ -5,13 +5,16 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "vitest run",
+    "test": "../../scripts/with-postgres.sh vitest run",
     "cf-typegen": "wrangler types",
-    "check": "tsc --noEmit && vitest run"
+    "check": "tsc --noEmit && ../../scripts/with-postgres.sh vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.6",
     "@types/node": "^26.1.1",
+    "@types/pg": "^8.23.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^7.0.2",
     "vitest": "~4.1.10",
@@ -20,6 +23,7 @@
   "dependencies": {
     "@helios/cache-domain": "workspace:*",
     "aws4fetch": "^1.0.20",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.23.1"
   }
 }

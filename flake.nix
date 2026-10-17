@@ -61,6 +61,8 @@
             pkgs.nodejs_22
             pkgs.pnpm
             pkgs.wrangler
+            # Tests run against a throwaway cluster (scripts/with-postgres.sh).
+            pkgs.postgresql
           ];
         };
       });

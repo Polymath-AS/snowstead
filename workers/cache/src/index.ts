@@ -1,4 +1,5 @@
 import { resolveConfig } from "./config.js";
+import type { WorkerConfig } from "./config.js";
 import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
 import { logRequest } from "./logging.js";
@@ -6,8 +7,9 @@ import { logRequest } from "./logging.js";
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		const start = Date.now();
+		let config: WorkerConfig | undefined;
 		try {
-			const config = { ...resolveConfig(env), ctx };
+			config = { ...resolveConfig(env), ctx };
 			const url = new URL(request.url);
 			const response = await handleRequest(request, config);
 			if (response.status >= 400 || url.pathname.startsWith("/_api/")) {
@@ -22,28 +24,29 @@ export default {
 			});
 			logRequest(request, response, start);
 			return response;
+		} finally {
+			// After the response: deferred writes finish, then the pool ends.
+			if (config) ctx.waitUntil(config.close());
 		}
 	},
 
 	async scheduled(event, env, ctx): Promise<void> {
 		const config = resolveConfig(env);
-		const result = await runGarbageCollection(config);
-
-		if (result.errors.length > 0) {
-			console.error("GC completed with errors", {
+		try {
+			const result = await runGarbageCollection(config);
+			const counts = {
 				expiredSessions: result.expiredSessions,
 				deletedBlobs: result.deletedBlobs,
 				expiredTokens: result.expiredTokens,
 				expiredAuditLogs: result.expiredAuditLogs,
-				errors: result.errors,
-				});
-				} else {
-				console.log("GC completed", {
-				expiredSessions: result.expiredSessions,
-				deletedBlobs: result.deletedBlobs,
-				expiredTokens: result.expiredTokens,
-				expiredAuditLogs: result.expiredAuditLogs,
-			});
+			};
+			if (result.errors.length > 0) {
+				console.error("GC completed with errors", { ...counts, errors: result.errors });
+			} else {
+				console.log("GC completed", counts);
+			}
+		} finally {
+			ctx.waitUntil(config.close());
 		}
 	},
 } satisfies ExportedHandler<Env>;

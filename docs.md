@@ -4,14 +4,17 @@
 
 ```bash
 wrangler r2 bucket create helios-cache
-wrangler d1 create helios-cache
-# set database_id in workers/cache/wrangler.jsonc
-wrangler d1 migrations apply helios-cache --remote
+# Postgres on PlanetScale, with a role holding pg_read_all_data and
+# pg_write_all_data. Query caching off: uploads must read their own writes.
+wrangler hyperdrive create helios-cache --caching-disabled \
+  --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
+# set the Hyperdrive id in wrangler.jsonc and workers/cache/wrangler.jsonc
 wrangler secret put JWT_SECRET
 wrangler secret put ADMIN_SECRET
 wrangler secret put SIGNING_PRIVATE_KEY
 wrangler secret put SIGNING_KEY_NAME
-pnpm deploy
+# migrates the database directly (not through Hyperdrive), then deploys
+DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
 
 | Secret | Purpose |
@@ -93,5 +96,5 @@ Use `--jobs <n>` to control parallelism (default 8).
 
 ## Audit logging
 
-All write operations and admin actions are logged to D1 with actor,
+All write operations and admin actions are logged to Postgres with actor,
 action, cache name, IP, and status code. Logs are retained for 30 days.

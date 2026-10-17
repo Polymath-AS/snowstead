@@ -1,25 +1,33 @@
-import path from 'node:path';
-import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
+import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 import { defineConfig } from 'vitest/config';
 
-export default defineConfig(async () => {
-	const migrationsPath = path.join(import.meta.dirname, 'migrations');
-	const migrations = await readD1Migrations(migrationsPath);
+// One fresh database per run on the server HELIOS_TEST_DATABASE_URL names
+// (scripts/with-postgres.sh starts one). test/global-setup.ts creates and
+// migrates it; the Worker reaches it through the Hyperdrive binding's local
+// connection string, as `wrangler dev` does.
+const server = process.env.HELIOS_TEST_DATABASE_URL;
+if (!server) {
+	throw new Error('HELIOS_TEST_DATABASE_URL is not set: run the tests through scripts/with-postgres.sh (pnpm test does)');
+}
+const database = new URL(server);
+database.pathname = `/helios_test_${process.pid}`;
+process.env.HELIOS_TEST_DATABASE = database.toString();
+process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = database.toString();
 
-	return {
-		plugins: [
-			cloudflareTest({
-				wrangler: { configPath: './wrangler.jsonc' },
-				miniflare: {
-					bindings: {
-						TEST_MIGRATIONS: migrations,
-						AUTH_TOKEN: "test-auth-token",
-					},
+export default defineConfig({
+	plugins: [
+		cloudflareTest({
+			wrangler: { configPath: './wrangler.jsonc' },
+			miniflare: {
+				bindings: {
+					AUTH_TOKEN: "test-auth-token",
 				},
-			}),
-		],
-		test: {
-			setupFiles: ['./test/apply-migrations.ts'],
-		},
-	};
+			},
+		}),
+	],
+	test: {
+		globalSetup: ['./test/global-setup.ts'],
+		// Files share the database, and GC sweeps all of it.
+		fileParallelism: false,
+	},
 });

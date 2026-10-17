@@ -7,7 +7,7 @@
   "description": "Cloudflare-native Nix binary cache",
   "scripts": {
     "build": "echo 'wrangler bundles at deploy time'",
-    "deploy": "pnpm exec wrangler d1 migrations apply CACHE_DB --remote && pnpm exec wrangler deploy",
+    "deploy": "pnpm --filter @helios/cache-worker db:migrate && pnpm exec wrangler deploy",
     "dev": "pnpm --filter @helios/cache-worker dev",
     "check": "pnpm -r check"
   },

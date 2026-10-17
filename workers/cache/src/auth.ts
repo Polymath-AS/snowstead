@@ -2,11 +2,11 @@ import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
 import { verifyJwt } from "./jwt.js";
 import { isTokenActive } from "./db/repository.js";
-import type { DrizzleD1Database } from "drizzle-orm/d1";
+import type { Db } from "./db/connection.js";
 
 // Module-scope cache of recently confirmed-active token IDs (jti → cache
 // entry deadline in ms). Workers isolates are reused across requests on the
-// same edge node, so this avoids a D1 revocation-check round trip on every
+// same edge node, so this avoids a database revocation-check round trip on every
 // write request. Tradeoff: a freshly revoked token keeps working for up to
 // TOKEN_ACTIVE_TTL_MS on warm isolates. Only positive results are cached;
 // revocation is permanent, so negative results gain nothing from caching.
@@ -14,7 +14,7 @@ const TOKEN_ACTIVE_TTL_MS = 30_000;
 const TOKEN_ACTIVE_CACHE_MAX_ENTRIES = 10_000;
 const tokenActiveUntil = new Map<string, number>();
 
-async function isTokenActiveCached(db: DrizzleD1Database, jti: string): Promise<boolean> {
+async function isTokenActiveCached(db: Db, jti: string): Promise<boolean> {
 	const now = Date.now();
 	const deadline = tokenActiveUntil.get(jti);
 	if (deadline !== undefined && deadline > now) {

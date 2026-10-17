@@ -87,7 +87,7 @@ export async function pushPaths(
     hashes.push(hash);
   }
 
-  // Check missing in sequential batches (server chunks internally for D1 limits)
+  // Check missing in sequential batches of the server's maximum size
   const missingSet = new Set<string>();
   for (let i = 0; i < hashes.length; i += 500) {
     const chunk = hashes.slice(i, i + 500);

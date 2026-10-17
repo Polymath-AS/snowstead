@@ -1,14 +1,16 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { drizzle } from "drizzle-orm/d1";
+import { testDb } from "./db.js";
 import { createCache, findPublishedPath, findCacheByName } from "../src/db/repository.js";
 
 const CACHE_NAME = "upload-test";
 const AUTH_TOKEN = "test-auth-token";
 const BLOB_DATA = new Uint8Array([1, 2, 3, 4]);
 
+const db = testDb();
+
 function getDb() {
-	return drizzle(env.CACHE_DB);
+	return db;
 }
 
 function post(path: string, body: unknown): Promise<Response> {

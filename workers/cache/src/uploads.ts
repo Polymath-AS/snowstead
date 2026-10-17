@@ -27,15 +27,15 @@ import {
 	parseStorePathHash,
 } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
-import type { DrizzleD1Database } from "drizzle-orm/d1";
+import type { Db } from "./db/connection.js";
 
 // Module-scope cache: cache ID → cache name. Cache rows are immutable today
-// (no rename or delete endpoints), so entries never go stale. Avoids a D1
+// (no rename or delete endpoints), so entries never go stale. Avoids a database
 // round trip on every session-scoped upload request made with a JWT.
 const cacheIdToName = new Map<number, string>();
 
 async function resolveCacheName(
-	db: DrizzleD1Database,
+	db: Db,
 	cacheId: number,
 ): Promise<string | undefined> {
 	const cached = cacheIdToName.get(cacheId);
@@ -66,7 +66,7 @@ async function loadSessionWithAuthCheck(
 	}
 
 	// Enforce session expiry at request time, not just via GC
-	if (session.expiresAt <= new Date().toISOString()) {
+	if (session.expiresAt <= new Date()) {
 		return { error: errorResponse("Not found", 404) };
 	}
 
@@ -91,7 +91,7 @@ export async function handleCreateSession(
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
 	}
-	// Seed the ID → name cache so session-scoped requests skip the D1 lookup.
+	// Seed the ID → name cache so session-scoped requests skip the database lookup.
 	cacheIdToName.set(cache.id, cache.name);
 
 	const body = await parseJsonBody<{
@@ -171,7 +171,7 @@ export async function handleCreateSession(
 
 	const r2Key = buildR2ObjectKey(fileHash, compression);
 	const sessionId = crypto.randomUUID();
-	const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+	const expiresAt = new Date(Date.now() + 3600_000);
 
 	const session = await createUploadSession(config.db, {
 		id: sessionId,

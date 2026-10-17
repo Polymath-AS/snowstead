@@ -1,6 +1,5 @@
 import { env } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
-import { drizzle } from "drizzle-orm/d1";
+import { describe, it, expect, afterAll } from "vitest";
 import {
 	createCache,
 	createUploadSession,
@@ -10,19 +9,20 @@ import {
 	findBlobObjectById,
 } from "../src/db/repository.js";
 import { runGarbageCollection } from "../src/gc.js";
+import { resolveConfig } from "../src/config.js";
 import type { WorkerConfig } from "../src/config.js";
 
+const config = resolveConfig(env);
+afterAll(() => config.close());
+
 function getConfig(): WorkerConfig {
-	return {
-		bucket: env.CACHE_BUCKET,
-		db: drizzle(env.CACHE_DB),
-	};
+	return config;
 }
 
 function makeSessionParams(overrides: {
 	readonly id: string;
 	readonly cacheId: number;
-	readonly expiresAt?: string;
+	readonly expiresAt?: Date;
 	readonly r2UploadKey?: string | null;
 }) {
 	return {
@@ -40,7 +40,7 @@ function makeSessionParams(overrides: {
 		system: null,
 		r2UploadKey: overrides.r2UploadKey ?? null,
 		r2UploadId: null,
-		expiresAt: overrides.expiresAt ?? "2099-01-01T00:00:00.000Z",
+		expiresAt: overrides.expiresAt ?? new Date("2099-01-01T00:00:00.000Z"),
 	};
 }
 
@@ -51,7 +51,7 @@ describe("gc: expire abandoned sessions", () => {
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			config.db,
-			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: "2020-01-01T00:00:00.000Z" }),
+			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2020-01-01T00:00:00.000Z") }),
 		);
 
 		const result = await runGarbageCollection(config);
@@ -122,7 +122,7 @@ describe("gc: keep active sessions", () => {
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			config.db,
-			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: "2099-01-01T00:00:00.000Z" }),
+			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2099-01-01T00:00:00.000Z") }),
 		);
 
 		const result = await runGarbageCollection(config);

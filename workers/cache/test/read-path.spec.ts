@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
-import { drizzle } from "drizzle-orm/d1";
+import { testDb } from "./db.js";
 import { createCache, createBlobObject, createPublishedPath } from "../src/db/repository.js";
 import { handleRequest } from "../src/router.js";
 import { resolveConfig } from "../src/config.js";
@@ -11,8 +11,10 @@ const NAR_HASH = `sha256:${"1".repeat(52)}`;
 const R2_KEY = `nars/sha256/${FILE_HASH}/zstd.nar`;
 const R2_BODY = new Uint8Array([1, 2, 3, 4]);
 
+const db = testDb();
+
 function getDb() {
-	return drizzle(env.CACHE_DB);
+	return db;
 }
 
 beforeAll(async () => {

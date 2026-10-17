@@ -29,9 +29,9 @@ const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
 const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 
-// Module-scope cache: cache name → D1 cache ID.
+// Module-scope cache: cache name → database cache ID.
 // Workers are short-lived isolates reused across requests on the same edge node,
-// so this avoids a ~20ms D1 round trip on every narinfo warm hit.
+// so this avoids a database round trip on every narinfo warm hit.
 const cacheNameToId = new Map<CacheName, number>();
 
 async function resolveCacheId(
@@ -92,12 +92,12 @@ export async function handleRequest(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// nix-cache-info is static — skip D1 lookup for the cache
+	// nix-cache-info is static — skip the database lookup for the cache
 	if (segments[1] === "nix-cache-info") {
 		return NIX_CACHE_INFO_RESPONSE();
 	}
 
-	// NAR downloads are content-addressed — skip cache name D1 lookup
+	// NAR downloads are content-addressed — skip the cache name lookup
 	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
 		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request, method);
 	}
@@ -131,8 +131,7 @@ function writeAuditLog(
 	detail: string,
 	ip: string | null,
 ): void {
-	if (!config.ctx) return;
-	config.ctx.waitUntil(
+	config.defer(
 		createAuditLog(config.db, {
 			actor: actorId(identity),
 			action,
@@ -169,7 +168,7 @@ function NIX_CACHE_INFO_RESPONSE(): Response {
 
 // Nix mass-queries every substituter for every store path in a build, so most
 // narinfo lookups are misses. Cache 404s briefly at the edge to keep that
-// negative-lookup storm off D1. Short TTL so newly published paths appear quickly.
+// negative-lookup storm off the database. Short TTL so newly published paths appear quickly.
 const NARINFO_NEGATIVE_TTL_SECONDS = 60;
 
 async function handleNarinfo(
@@ -266,7 +265,7 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// NAR keys are content-addressed, so we can skip the D1 lookup
+	// NAR keys are content-addressed, so we can skip the database lookup
 	// and go straight to R2 using the key derived from the URL
 	const r2Key = `nars/sha256/${fileHash}/${compression}.nar`;
 

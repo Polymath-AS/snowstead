@@ -19,7 +19,7 @@ Keep deployable runtime code inside `workers/`. Move shared protocol, parsing, a
 
 ## Cloudflare Rules
 
-- Before changing Workers, R2, D1, Durable Objects, Queues, or platform limits, fetch current Cloudflare docs.
+- Before changing Workers, R2, Hyperdrive, Durable Objects, Queues, or platform limits, fetch current Cloudflare docs.
 - Prefer platform-native APIs such as `fetch`, Web Streams, and Web Crypto.
 - Do not enable `nodejs_compat` unless a concrete dependency requires it.
 - After changing a worker's bindings in `wrangler.jsonc`, run that package's `cf-typegen` script.
