@@ -8,7 +8,9 @@ import {
 	revokeApiToken,
 	ensureCache,
 	listCaches,
+	listPublishedPathsAfter,
 } from "./db/repository.js";
+import { storeNarinfo } from "./narinfo.js";
 import { parseCacheName } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
@@ -180,4 +182,33 @@ export async function handleListCaches(
 ): Promise<Response> {
 	const caches = await listCaches(config.db);
 	return jsonResponse({ caches: caches.map((c) => ({ name: c.name, createdAt: c.createdAt })) });
+}
+
+const MAX_BACKFILL_BATCH = 1000;
+
+/**
+ * Renders and stores the narinfo of published paths after `after` (an id),
+ * for paths published before narinfo was stored at publish, or after the
+ * signing key changes. Call with each response's `next` until it is null.
+ */
+export async function handleBackfillNarinfo(
+	request: Request,
+	config: WorkerConfig,
+): Promise<Response> {
+	const body = await parseJsonBody<{ after?: number; limit?: number }>(request);
+	if (body instanceof Response) return body;
+
+	const after = body.after ?? 0;
+	const limit = body.limit ?? 500;
+	if (!Number.isInteger(after) || after < 0) {
+		return errorResponse("after must be a non-negative integer", 400);
+	}
+	if (!Number.isInteger(limit) || limit < 1 || limit > MAX_BACKFILL_BATCH) {
+		return errorResponse(`limit must be between 1 and ${MAX_BACKFILL_BATCH}`, 400);
+	}
+
+	const rows = await listPublishedPathsAfter(config.db, after, limit);
+	await Promise.all(rows.map((r) => storeNarinfo(config, r.cacheName, r.path, r.blob)));
+	const last = rows.at(-1);
+	return jsonResponse({ written: rows.length, next: rows.length === limit && last ? last.path.id : null });
 }

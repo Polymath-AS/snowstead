@@ -1,12 +1,11 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName, findPublishedPathWithBlob, createAuditLog } from "./db/repository.js";
-import { renderNarinfo } from "./narinfo.js";
+import { findCacheByName, createAuditLog } from "./db/repository.js";
+import { narinfoKey } from "./narinfo.js";
 import { authenticateWrite, authenticateAdmin, actorId } from "./auth.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
 import { errorResponse } from "./responses.js";
-import { computeFingerprint, signNarinfo } from "./signing.js";
-import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression, parseNarHash } from "@helios/cache-domain";
+import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@helios/cache-domain";
 import type { CacheName } from "@helios/cache-domain";
 import {
 	handleCreateSession,
@@ -18,7 +17,7 @@ import {
 	handleGetMissingPaths,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleBackfillNarinfo } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -28,25 +27,6 @@ const RE_BLOB = /^\/_api\/v1\/uploads\/([^/]+)\/blob$/;
 const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
 const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
-
-// Module-scope cache: cache name → database cache ID.
-// Workers are short-lived isolates reused across requests on the same edge node,
-// so this avoids a database round trip on every narinfo warm hit.
-const cacheNameToId = new Map<CacheName, number>();
-
-async function resolveCacheId(
-	db: WorkerConfig["db"],
-	name: CacheName,
-): Promise<number | undefined> {
-	const cached = cacheNameToId.get(name);
-	if (cached !== undefined) return cached;
-
-	const row = await findCacheByName(db, name);
-	if (!row) return undefined;
-
-	cacheNameToId.set(name, row.id);
-	return row.id;
-}
 
 export async function handleRequest(
 	request: Request,
@@ -193,12 +173,10 @@ async function handleNarinfo(
 		return cached;
 	}
 
-	// Unknown cache and unpublished path both produce a (negatively cached) 404.
-	const cacheId = await resolveCacheId(config.db, cacheName);
-	const result = cacheId === undefined
-		? undefined
-		: await findPublishedPathWithBlob(config.db, cacheId, storePathHash);
-	if (!result) {
+	// The narinfo was rendered and signed at publish. An unknown cache and an
+	// unpublished path are both a missing object: a (negatively cached) 404.
+	const object = await config.bucket.get(narinfoKey(cacheName, storePathHash));
+	if (!object) {
 		const notFoundHeaders = { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` };
 		if (config.ctx) {
 			// Fresh Response instead of clone(): a tee'd body whose sibling is
@@ -213,17 +191,7 @@ async function handleNarinfo(
 		return new Response("Not Found", { status: 404, headers: notFoundHeaders });
 	}
 
-	const refs: string[] = JSON.parse(result.path.referencesJson);
-	const storedSigs: string[] = JSON.parse(result.path.signaturesJson);
-	// Rows published before uploads canonicalised the hash may hold the SRI
-	// form, which Nix would not verify a signature over.
-	const narHash = parseNarHash(result.path.narHash);
-	const path = typeof narHash === "object" ? result.path : { ...result.path, narHash };
-	const fingerprint = computeFingerprint(path, refs);
-	const sig = await signNarinfo(fingerprint, config.signingKeyName, config.signingPrivateKey);
-	const signatures = sig ? [sig] : [];
-	const body = renderNarinfo(path, result.blob, refs, storedSigs, signatures);
-
+	const body = await object.text();
 	const response = new Response(body, {
 		headers: {
 			"content-type": "text/x-nix-narinfo",
@@ -367,6 +335,12 @@ async function handleAdminApi(
 
 	if (pathname === "/_api/v1/admin/caches" && request.method === "GET") {
 		return handleListCaches(config);
+	}
+
+	if (pathname === "/_api/v1/admin/narinfo/backfill" && request.method === "POST") {
+		const response = await handleBackfillNarinfo(request, config);
+		writeAuditLog(config, authResult.identity, "narinfo.backfill", null, response.status, "{}", ip);
+		return response;
 	}
 
 	const revokeMatch = pathname.match(RE_REVOKE);

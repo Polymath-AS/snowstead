@@ -35,7 +35,7 @@ export {
 	findBlobObjectById,
 	createBlobObject,
 	findPublishedPath,
-	findPublishedPathWithBlob,
+	listPublishedPathsAfter,
 	findPublishedHashes,
 	createPublishedPath,
 	findUploadSession,

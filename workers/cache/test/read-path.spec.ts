@@ -43,6 +43,14 @@ beforeAll(async () => {
 	});
 
 	await env.CACHE_BUCKET.put(R2_KEY, R2_BODY);
+
+	// Paths written straight to the database get their narinfo from the backfill.
+	const backfill = await SELF.fetch("http://example.com/_api/v1/admin/narinfo/backfill", {
+		method: "POST",
+		headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
+		body: JSON.stringify({ limit: 1000 }),
+	});
+	expect(backfill.status).toBe(200);
 });
 
 describe("nix-cache-info", () => {

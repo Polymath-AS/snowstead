@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt, isNull, sql } from "drizzle-orm";
+import { eq, and, notInArray, lt, gt, isNull, sql } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
 	caches,
@@ -105,27 +105,20 @@ export async function createBlobObject(
 	return returned(db.insert(blobObjects).values(params).returning());
 }
 
-export async function findPublishedPathWithBlob(
+/** Published paths after `afterId`, in id order, with what rendering their narinfo needs. */
+export async function listPublishedPathsAfter(
 	db: Db,
-	cacheId: number,
-	storePathHash: string,
-): Promise<{ path: PublishedPath; blob: BlobObject } | undefined> {
-	return first(
-		db
-			.select({
-				path: publishedPaths,
-				blob: blobObjects,
-			})
-			.from(publishedPaths)
-			.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
-			.where(
-				and(
-					eq(publishedPaths.cacheId, cacheId),
-					eq(publishedPaths.storePathHash, storePathHash),
-				),
-			)
-			.limit(1),
-	);
+	afterId: number,
+	limit: number,
+): Promise<{ path: PublishedPath; blob: BlobObject; cacheName: string }[]> {
+	return db
+		.select({ path: publishedPaths, blob: blobObjects, cacheName: caches.name })
+		.from(publishedPaths)
+		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
+		.where(gt(publishedPaths.id, afterId))
+		.orderBy(publishedPaths.id)
+		.limit(limit);
 }
 
 export async function findPublishedPath(

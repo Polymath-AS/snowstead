@@ -13,11 +13,13 @@ import {
 	findUploadParts,
 	createBlobObject,
 	findBlobObject,
+	findBlobObjectById,
 	createPublishedPath,
 	findPublishedPath,
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
+import { storeNarinfo } from "./narinfo.js";
 import {
 	buildR2ObjectKey,
 	parseFileHash,
@@ -359,9 +361,7 @@ export async function handleComplete(
  * rather than after the negative TTL. The Cache API is per data center: this
  * clears the one handling the publish, where the pusher's own lookups land.
  */
-async function forgetNarinfoMiss(config: WorkerConfig, origin: string, cacheId: number, storePathHash: string): Promise<void> {
-	const cacheName = await resolveCacheName(config.db, cacheId);
-	if (cacheName === undefined) return;
+async function forgetNarinfoMiss(origin: string, cacheName: string, storePathHash: string): Promise<void> {
 	const cache = await caches.open("helios-narinfo");
 	await cache.delete(new Request(`${origin}/${cacheName}/${storePathHash}.narinfo`));
 }
@@ -380,8 +380,17 @@ export async function handlePublish(
 		return errorResponse("Conflict", 409);
 	}
 
+	const cacheName = await resolveCacheName(config.db, session.cacheId);
+	if (cacheName === undefined) {
+		return errorResponse("Internal error", 500);
+	}
+
 	const existing = await findPublishedPath(config.db, session.cacheId, session.storePathHash);
 	if (existing) {
+		// Publishing again rewrites the narinfo, so a publish that failed
+		// between storing it and recording the row heals on retry.
+		const blob = await findBlobObjectById(config.db, existing.blobObjectId);
+		if (blob) await storeNarinfo(config, cacheName, existing, blob);
 		return jsonResponse({ published: true, storePathHash: session.storePathHash, alreadyExisted: true });
 	}
 
@@ -405,19 +414,25 @@ export async function handlePublish(
 		}
 	}
 
+	const path = {
+		cacheId: session.cacheId,
+		storePathHash: session.storePathHash,
+		storePath: session.storePath,
+		narHash: session.narHash,
+		narSize: session.narSize,
+		blobObjectId: blob.id,
+		referencesJson: session.referencesJson,
+		deriver: session.deriver,
+		system: session.system,
+		signaturesJson: "[]",
+	};
+	// The narinfo first: it only describes a NAR already uploaded and
+	// verified, so serving it before the row exists is harmless, while a row
+	// without its narinfo would be a path nobody can see.
+	await storeNarinfo(config, cacheName, path, blob);
+
 	try {
-		await createPublishedPath(config.db, {
-			cacheId: session.cacheId,
-			storePathHash: session.storePathHash,
-			storePath: session.storePath,
-			narHash: session.narHash,
-			narSize: session.narSize,
-			blobObjectId: blob.id,
-			referencesJson: session.referencesJson,
-			deriver: session.deriver,
-			system: session.system,
-			signaturesJson: "[]",
-		});
+		await createPublishedPath(config.db, path);
 	} catch {
 		const raced = await findPublishedPath(config.db, session.cacheId, session.storePathHash);
 		if (raced) {
@@ -426,7 +441,7 @@ export async function handlePublish(
 		return errorResponse("Internal error", 500);
 	}
 
-	await forgetNarinfoMiss(config, origin, session.cacheId, session.storePathHash);
+	await forgetNarinfoMiss(origin, cacheName, session.storePathHash);
 	return jsonResponse({ published: true, storePathHash: session.storePathHash });
 }
 
