@@ -66,7 +66,7 @@ echo
 
 echo "5. Upload, complete, publish, read"
 
-FILE_HASH="$(openssl rand -hex 32)"
+FILE_HASH="$(head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n')"
 STORE_PATH_HASH="00000000000000000000000000000000"
 NAR_HASH="sha256:1111111111111111111111111111111111111111111111111111"
 NAR_CONTENT="nix-archive-smoke-test-payload1234"
@@ -168,7 +168,8 @@ BAD_AUTH=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   -H "Authorization: Bearer wrong-token" \
   -H "Content-Type: application/json" \
   -d '{}')
-check "write with bad token returns 403" "403" "$BAD_AUTH"
+# 401 with JWT auth (the token is invalid), 403 with only the legacy token.
+check "write with bad token is refused" "refused" "$(case "$BAD_AUTH" in 401|403) echo refused ;; *) echo "$BAD_AUTH" ;; esac)"
 
 PUBLIC_READ=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$CACHE_NAME/nix-cache-info")
 check "read without auth returns 200" "200" "$PUBLIC_READ"
