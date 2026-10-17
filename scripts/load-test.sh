@@ -29,6 +29,11 @@ trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 HASH="$(basename "$TARGET" | cut -c1-32)"
 NAR="$(curl -sf "$BASE/$CACHE/$HASH.narinfo" | sed -n 's/^URL: //p')"
 [ -n "$NAR" ] || { echo "$TARGET is not in $CACHE" >&2; exit 1; }
+# Resolve the URL against the cache's, as Nix does: public caches point at ../nar/.
+case "$NAR" in
+  ../*) NAR_URL="$BASE/${NAR#../}" ;;
+  *) NAR_URL="$BASE/$CACHE/$NAR" ;;
+esac
 
 # A full get-missing-paths batch: the closure plus random hashes.
 {
@@ -52,7 +57,7 @@ run narinfo-hit "$CONCURRENCY" "$BASE/$CACHE/$HASH.narinfo"
 run narinfo-miss "$CONCURRENCY" --rand-regex-url "$HOST_RE/$CACHE/[0-9a-df-np-sv-z]{32}[.]narinfo"
 run missing-paths "$CONCURRENCY" -m POST -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
   -D "$WORK/missing.json" "$BASE/_api/v1/get-missing-paths"
-run nar 4 "$BASE/$CACHE/$NAR"
+run nar 4 "$NAR_URL"
 
 echo
 PATHS="$(nix path-info -r "$TARGET" | wc -l)"

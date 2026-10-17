@@ -24,6 +24,28 @@ DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm 
 | `SIGNING_PRIVATE_KEY` | Ed25519 key for narinfo signing |
 | `SIGNING_KEY_NAME` | Key name prefix for signatures |
 
+### Public caches on a custom domain
+
+Public caches are served straight from the `helios-public` bucket, not
+the Worker. The bucket needs a custom domain on a zone in the same
+account, the Worker routes for `/_api/*` and `/private/*` on it (in
+`wrangler.jsonc`), and a Cache Rule. Cloudflare caches only some file
+extensions by default, and `.narinfo` and `.nar` are not among them:
+
+```bash
+wrangler r2 bucket create helios-public
+wrangler r2 bucket domain add helios-public --domain cache.example.com --zone-id <zone id>
+```
+
+Cache Rule, on the zone:
+
+- Expression: `(http.host eq "cache.example.com" and not starts_with(http.request.uri.path, "/_api/") and not starts_with(http.request.uri.path, "/private/"))`
+- Cache eligibility: eligible; Edge TTL: use cache-control if present,
+  bypass if not; Browser TTL: respect origin.
+
+Stored objects carry their own `Cache-Control`; misses carry none, so
+they are not cached and a newly published path shows up at once.
+
 ## Setup
 
 Configure the CLI with your server URL and admin secret:
