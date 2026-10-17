@@ -63,6 +63,9 @@
             pkgs.wrangler
             # Tests run against a throwaway cluster (scripts/with-postgres.sh).
             pkgs.postgresql
+            # scripts/load-test.sh
+            pkgs.oha
+            pkgs.jq
           ];
         };
       });
