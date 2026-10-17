@@ -14,7 +14,7 @@
         pname = "helios";
         version = "0.0.0";
         src = self;
-        hash = "sha256-FsWEGFPLmT7jU7QIv2FGqVHOdNMUqvqmnWmog2Wpfuw=";
+        hash = "sha256-jsWRpoBwDISpCzmRvdePjzAVT40oM6BCWmtGfbKRBdI=";
         fetcherVersion = 3;
       };
     in
