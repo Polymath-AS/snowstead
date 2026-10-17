@@ -1,6 +1,6 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { Client } from "pg";
 
 export type Db = NodePgDatabase;
 
@@ -8,30 +8,41 @@ export interface Connection {
 	readonly db: Db;
 	/** Database work that may outlive the response, such as audit writes. */
 	defer(task: Promise<unknown>): void;
-	/** Waits for deferred work, then releases the connections. */
+	/** Waits for deferred work, then closes the connection if it was opened. */
 	close(): Promise<void>;
 }
 
 /**
- * A pool for one request. Hyperdrive pools connections to the database
- * across requests, so a Worker opens its own per request rather than
- * holding sockets between requests, which the runtime does not allow.
+ * One client per request: Hyperdrive pools the connections to the database,
+ * and a Worker may not hold sockets between requests. The client connects
+ * on its first query, so requests that never touch the database (cache
+ * hits, nix-cache-info, NARs) open no connection at all.
  */
 export function connect(connectionString: string): Connection {
-	const pool = new Pool({ connectionString, max: 5 });
-	// An idle connection that drops (its socket cancelled when a request
-	// ends) is replaced on next use; queries in flight report their own
-	// errors. Without a listener the event would surface as unhandled.
-	pool.on("error", () => {});
+	const client = new Client({ connectionString });
+	// A connection that drops is reported to the query using it; without a
+	// listener the event would also surface as unhandled.
+	client.on("error", () => {});
+	let connecting: Promise<unknown> | undefined;
+	const query = client.query.bind(client) as (...args: unknown[]) => Promise<unknown>;
+	(client as { query: unknown }).query = async (...args: unknown[]) => {
+		connecting ??= client.connect();
+		await connecting;
+		return query(...args);
+	};
+
 	const deferred: Promise<unknown>[] = [];
 	return {
-		db: drizzle(pool),
+		db: drizzle(client),
 		defer: (task) => {
 			deferred.push(task);
 		},
 		close: async () => {
 			await Promise.allSettled(deferred);
-			await pool.end();
+			if (connecting) {
+				await connecting.catch(() => {});
+				await client.end().catch(() => {});
+			}
 		},
 	};
 }
