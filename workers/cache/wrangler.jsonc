@@ -1,6 +1,8 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "helios-cache",
+	// Uzair's account, where the nix-cache Hyperdrive config lives.
+	"account_id": "7b87b6b8f96465d53ec6ce256410c194",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-03-10",
 	// Required by the pg driver, which reaches Postgres through Hyperdrive.
