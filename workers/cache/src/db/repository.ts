@@ -1,4 +1,4 @@
-import { eq, and, inArray, notInArray, lt, isNull, sql } from "drizzle-orm";
+import { eq, and, notInArray, lt, isNull, sql } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
 	caches,
@@ -162,15 +162,16 @@ export async function findPublishedHashes(
 ): Promise<string[]> {
 	if (storePathHashes.length === 0) return [];
 
-	// One round trip for the whole batch; callers cap it at 1000 hashes, far
-	// below Postgres's 65535 bound parameters.
+	// The hashes go as one array parameter: an IN list with a placeholder per
+	// hash costs Drizzle a type check per element to build, which profiling
+	// showed dominating the request. sql.param keeps the array whole.
 	const rows = await db
 		.select({ storePathHash: publishedPaths.storePathHash })
 		.from(publishedPaths)
 		.where(
 			and(
 				eq(publishedPaths.cacheId, cacheId),
-				inArray(publishedPaths.storePathHash, storePathHashes),
+				sql`${publishedPaths.storePathHash} = ANY(${sql.param(storePathHashes)}::text[])`,
 			),
 		);
 	return rows.map((r) => r.storePathHash);
