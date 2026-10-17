@@ -69,6 +69,10 @@ export async function ensureCache(
 	return { cache: existing, created: false };
 }
 
+export async function cacheHasPaths(db: Db, cacheId: number): Promise<boolean> {
+	return (await first(db.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1))) !== undefined;
+}
+
 export async function setCachePublic(db: Db, name: string, isPublic: boolean): Promise<void> {
 	await db.update(caches).set({ isPublic }).where(eq(caches.name, name));
 }

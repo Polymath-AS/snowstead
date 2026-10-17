@@ -2,23 +2,25 @@ import { parseNarHash } from "@helios/cache-domain";
 import type { PublishedPath, BlobObject } from "./db/types.js";
 import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
+import { IMMUTABLE, bucketFor, narinfoKey, narUrl, placeNar } from "./layout.js";
 
 export type NarinfoPath = Pick<
 	PublishedPath,
 	"storePath" | "storePathHash" | "narHash" | "narSize" | "referencesJson" | "deriver" | "system" | "signaturesJson"
 >;
-export type NarinfoBlob = Pick<BlobObject, "fileHash" | "fileSize" | "compression">;
+export type NarinfoBlob = Pick<BlobObject, "fileHash" | "fileSize" | "compression" | "r2Key">;
 
 export function renderNarinfo(
 	path: NarinfoPath,
-	blob: NarinfoBlob,
+	blob: Pick<NarinfoBlob, "fileHash" | "fileSize" | "compression">,
+	url: string,
 	refs: readonly string[],
 	storedSigs: readonly string[],
 	signatures: readonly string[] = [],
 ): string {
 	const lines: string[] = [
 		`StorePath: ${path.storePath}`,
-		`URL: nar/${blob.fileHash}/${blob.compression}.nar`,
+		`URL: ${url}`,
 		`Compression: ${blob.compression}`,
 		`FileHash: sha256:${blob.fileHash}`,
 		`FileSize: ${blob.fileSize}`,
@@ -48,13 +50,8 @@ export function renderNarinfo(
 	return lines.join("\n") + "\n";
 }
 
-/** Where a path's rendered narinfo lives in the bucket. */
-export function narinfoKey(cacheName: string, storePathHash: string): string {
-	return `narinfo/${cacheName}/${storePathHash}.narinfo`;
-}
-
 /** The narinfo for a path, signed with the cache's key. */
-export async function signedNarinfo(config: WorkerConfig, path: NarinfoPath, blob: NarinfoBlob): Promise<string> {
+export async function signedNarinfo(config: WorkerConfig, path: NarinfoPath, blob: NarinfoBlob, isPrivate: boolean): Promise<string> {
 	const refs: string[] = JSON.parse(path.referencesJson);
 	const storedSigs: string[] = JSON.parse(path.signaturesJson);
 	// Rows published before uploads canonicalised the hash may hold the SRI
@@ -62,17 +59,25 @@ export async function signedNarinfo(config: WorkerConfig, path: NarinfoPath, blo
 	const narHash = parseNarHash(path.narHash);
 	const canonical = typeof narHash === "object" ? path : { ...path, narHash };
 	const sig = await signNarinfo(computeFingerprint(canonical, refs), config.signingKeyName, config.signingPrivateKey);
-	return renderNarinfo(canonical, blob, refs, storedSigs, sig ? [sig] : []);
+	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate), refs, storedSigs, sig ? [sig] : []);
 }
 
 /**
  * Renders, signs and stores a path's narinfo once, at publish, so serving
  * it reads one object: no database connection and no signing per request.
+ * The NAR is placed first, so the narinfo never points at nothing.
  */
-export async function storeNarinfo(config: WorkerConfig, cacheName: string, path: NarinfoPath, blob: NarinfoBlob): Promise<void> {
-	const body = await signedNarinfo(config, path, blob);
-	await config.bucket.put(narinfoKey(cacheName, path.storePathHash), body, {
-		httpMetadata: { contentType: "text/x-nix-narinfo" },
+export async function storeNarinfo(
+	config: WorkerConfig,
+	cacheName: string,
+	path: NarinfoPath,
+	blob: NarinfoBlob,
+	isPrivate: boolean,
+): Promise<void> {
+	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
+	const body = await signedNarinfo(config, path, blob, isPrivate);
+	await bucketFor(config, isPrivate).put(narinfoKey(cacheName, path.storePathHash, isPrivate), body, {
+		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: IMMUTABLE },
 	});
 }
 

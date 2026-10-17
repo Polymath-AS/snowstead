@@ -1,6 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import { findCacheByName, createAuditLog } from "./db/repository.js";
-import { narinfoKey, narinfoCacheKey } from "./narinfo.js";
+import { narinfoCacheKey } from "./narinfo.js";
+import { bucketFor, narKey, narinfoKey } from "./layout.js";
 import { authenticateWrite, authenticateAdmin, authorizeRead, actorId } from "./auth.js";
 import { isPrivateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
@@ -68,6 +69,15 @@ export async function handleRequest(
 	}
 
 	const segments = url.pathname.split("/").filter(Boolean);
+	// On cache.polmath.no the Worker serves private caches under /private/;
+	// elsewhere (workers.dev) it serves every cache at the root.
+	if (segments[0] === "private") segments.shift();
+
+	// Public narinfo points at ../nar/..., shared by every public cache.
+	if (segments[0] === "nar" && segments.length === 3 && segments[2].endsWith(".nar")) {
+		return handleNarDownload(config, segments[1], segments[2].slice(0, -".nar".length), request, method, false);
+	}
+
 	if (segments.length < 2) {
 		return new Response("Not Found", { status: 404 });
 	}
@@ -194,7 +204,7 @@ async function handleNarinfo(
 
 	// The narinfo was rendered and signed at publish. An unknown cache and an
 	// unpublished path are both a missing object: a (negatively cached) 404.
-	const object = await config.bucket.get(narinfoKey(cacheName, storePathHash));
+	const object = await bucketFor(config, isPrivate).get(narinfoKey(cacheName, storePathHash, isPrivate));
 	if (!object) {
 		const notFound = () =>
 			new Response("Not Found", { status: 404, headers: { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` } });
@@ -238,12 +248,13 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
-	// NAR keys are content-addressed, so we can skip the database lookup
-	// and go straight to R2 using the key derived from the URL
-	const r2Key = `nars/sha256/${fileHash}/${compression}.nar`;
+	// NAR keys are content-addressed, so the key comes from the URL alone.
+	const r2Key = narKey(fileHash, compression, isPrivate);
+	const bucket = bucketFor(config, isPrivate);
 
-	// Presigned R2 redirect (bypasses Worker entirely)
-	if (config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
+	// Presigned R2 redirect (bypasses the Worker entirely); the credentials
+	// are for the private bucket, and public NARs have cache.polmath.no.
+	if (isPrivate && config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
 		const url = await createPresignedUrl(
 			config.r2Endpoint,
 			config.r2AccessKeyId,
@@ -273,7 +284,7 @@ async function handleNarDownload(
 	}
 
 	if (method === "HEAD") {
-		const head = await config.bucket.head(r2Key);
+		const head = await bucket.head(r2Key);
 		if (!head) {
 			return new Response("Not Found", { status: 404 });
 		}
@@ -291,7 +302,7 @@ async function handleNarDownload(
 		);
 	}
 
-	const object = await config.bucket.get(r2Key);
+	const object = await bucket.get(r2Key);
 	if (!object) {
 		return new Response("Not Found", { status: 404 });
 	}

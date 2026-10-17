@@ -9,10 +9,13 @@ import {
 	ensureCache,
 	listCaches,
 	setCachePublic,
+	findCacheByName,
+	cacheHasPaths,
 	listPublishedPathsAfter,
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
-import { setPrivateMarker } from "./visibility.js";
+import { setPrivateMarker, isPrivateCache } from "./visibility.js";
+import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
@@ -177,24 +180,37 @@ export async function handleCreateCache(
 	if (typeof name === "object") {
 		return errorResponse(name.message, 400);
 	}
+	if (RESERVED_CACHE_NAMES.has(name)) {
+		return errorResponse(`${name} is reserved`, 400);
+	}
 	if (body.private !== undefined && typeof body.private !== "boolean") {
 		return errorResponse("private must be a boolean", 400);
+	}
+
+	const existing = await findCacheByName(config.db, name);
+	const changing = existing !== undefined && body.private !== undefined && existing.isPublic === body.private;
+	// A published path's objects live in its visibility's bucket; moving them
+	// is not supported yet, so only an empty cache can change.
+	if (changing && existing && (await cacheHasPaths(config.db, existing.id))) {
+		return errorResponse("only a cache without published paths can change visibility", 409);
 	}
 
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
 	if (body.private === true) {
 		await setPrivateMarker(config, name, true);
+		await setPublicCacheInfo(config, name, false);
 	}
 	const { cache, created } = await ensureCache(config.db, name, body.private !== true);
 	let isPublic = cache.isPublic;
-	const changed = !created && body.private !== undefined && isPublic === body.private;
+	const changed = !created && changing;
 	if (changed) {
 		isPublic = !body.private;
 		await setCachePublic(config.db, name, isPublic);
 	}
-	if (body.private === false) {
+	if (isPublic) {
 		await setPrivateMarker(config, name, false);
+		await setPublicCacheInfo(config, name, true);
 	}
 
 	return jsonResponse({ name: cache.name, private: !isPublic, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
@@ -208,6 +224,7 @@ export async function handleListCaches(
 }
 
 const MAX_BACKFILL_BATCH = 1000;
+const BACKFILL_CONCURRENCY = 4;
 
 /**
  * Renders and stores the narinfo of published paths after `after` (an id),
@@ -231,7 +248,27 @@ export async function handleBackfillNarinfo(
 	}
 
 	const rows = await listPublishedPathsAfter(config.db, after, limit);
-	await Promise.all(rows.map((r) => storeNarinfo(config, r.cacheName, r.path, r.blob)));
+	const caches = [...new Set(rows.map((r) => r.cacheName))];
+	const visibility = new Map(await Promise.all(caches.map(async (c) => [c, await isPrivateCache(config, c)] as const)));
+	await Promise.all(caches.filter((c) => !visibility.get(c)).map((c) => setPublicCacheInfo(config, c, true)));
+	// A path whose NAR is missing is skipped: a narinfo pointing at nothing
+	// would be worse than none.
+	// A few at a time: copying a NAR holds two R2 streams open, and a Worker
+	// may only keep a handful of connections open at once.
+	const results: PromiseSettledResult<void>[] = [];
+	for (let i = 0; i < rows.length; i += BACKFILL_CONCURRENCY) {
+		const batch = rows.slice(i, i + BACKFILL_CONCURRENCY);
+		results.push(
+			...(await Promise.allSettled(
+				batch.map((r) => storeNarinfo(config, r.cacheName, r.path, r.blob, visibility.get(r.cacheName) ?? true)),
+			)),
+		);
+	}
+	const skipped = rows.filter((_, i) => results[i].status === "rejected").map((r) => `${r.cacheName}/${r.path.storePathHash}`);
 	const last = rows.at(-1);
-	return jsonResponse({ written: rows.length, next: rows.length === limit && last ? last.path.id : null });
+	return jsonResponse({
+		written: rows.length - skipped.length,
+		skipped,
+		next: rows.length === limit && last ? last.path.id : null,
+	});
 }

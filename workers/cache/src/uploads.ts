@@ -20,8 +20,9 @@ import {
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
+import { bucketForKey, narKey } from "./layout.js";
+import { isPrivateCache } from "./visibility.js";
 import {
-	buildR2ObjectKey,
 	parseFileHash,
 	parseCompression,
 	parseNarHash,
@@ -167,7 +168,8 @@ export async function handleCreateSession(
 		}
 	}
 
-	const r2Key = buildR2ObjectKey(fileHash, compression);
+	// Straight into the bucket the cache is served from.
+	const r2Key = narKey(fileHash, compression, await isPrivateCache(config, cacheName));
 	const sessionId = crypto.randomUUID();
 	const expiresAt = new Date(Date.now() + 3600_000);
 
@@ -214,7 +216,7 @@ export async function handleMultipart(
 		return errorResponse("Internal error", 500);
 	}
 
-	const multipart = await config.bucket.createMultipartUpload(session.r2UploadKey);
+	const multipart = await bucketForKey(config, session.r2UploadKey).createMultipartUpload(session.r2UploadKey);
 
 	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId);
 	if (!transitioned) {
@@ -251,7 +253,7 @@ export async function handleUploadPart(
 		return errorResponse("Request body is empty", 400);
 	}
 
-	const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+	const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
 	const uploadedPart = await multipart.uploadPart(partNumber, request.body);
 
 	await upsertUploadPart(config.db, {
@@ -299,7 +301,7 @@ export async function handleUploadBlob(
 		}
 	}
 
-	await config.bucket.put(session.r2UploadKey, request.body, {
+	await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
 		httpMetadata: { contentType: "application/x-nix-nar" },
 	});
 
@@ -335,11 +337,11 @@ export async function handleComplete(
 
 	if (session.r2UploadId) {
 		const parts = await findUploadParts(config.db, sessionId);
-		const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+		const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
 		await multipart.complete(parts.map(p => ({ partNumber: p.partNumber, etag: p.etag })));
 	}
 
-	const head = await config.bucket.head(session.r2UploadKey);
+	const head = await bucketForKey(config, session.r2UploadKey).head(session.r2UploadKey);
 	if (!head) {
 		return errorResponse("Upload incomplete", 400);
 	}
@@ -388,13 +390,14 @@ export async function handlePublish(
 	if (cacheName === undefined) {
 		return errorResponse("Internal error", 500);
 	}
+	const isPrivate = await isPrivateCache(config, cacheName);
 
 	const existing = await findPublishedPath(config.db, session.cacheId, session.storePathHash);
 	if (existing) {
 		// Publishing again rewrites the narinfo, so a publish that failed
 		// between storing it and recording the row heals on retry.
 		const blob = await findBlobObjectById(config.db, existing.blobObjectId);
-		if (blob) await storeNarinfo(config, cacheName, existing, blob);
+		if (blob) await storeNarinfo(config, cacheName, existing, blob, isPrivate);
 		return jsonResponse({ published: true, storePathHash: session.storePathHash, alreadyExisted: true });
 	}
 
@@ -433,7 +436,7 @@ export async function handlePublish(
 	// The narinfo first: it only describes a NAR already uploaded and
 	// verified, so serving it before the row exists is harmless, while a row
 	// without its narinfo would be a path nobody can see.
-	await storeNarinfo(config, cacheName, path, blob);
+	await storeNarinfo(config, cacheName, path, blob, isPrivate);
 
 	try {
 		await createPublishedPath(config.db, path);

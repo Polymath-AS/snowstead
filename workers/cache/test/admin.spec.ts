@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
 import { createCache, createBlobObject, createPublishedPath } from "../src/db/repository.js";
@@ -57,6 +57,7 @@ describe("admin narinfo backfill", () => {
 			compression: "zstd",
 			r2Key: `nars/${crypto.randomUUID()}`,
 		});
+		await env.CACHE_BUCKET.put(blob.r2Key, new Uint8Array(10));
 		const hash = "1".repeat(32);
 		await createPublishedPath(db, {
 			cacheId: cache.id,

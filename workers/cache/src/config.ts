@@ -2,7 +2,10 @@ import { connect } from "./db/connection.js";
 import type { Db } from "./db/connection.js";
 
 export interface WorkerConfig {
+	/** Private caches, and everything the Worker alone reads. */
 	readonly bucket: R2Bucket;
+	/** Public caches, served straight from R2 on cache.polmath.no. */
+	readonly publicBucket: R2Bucket;
 	readonly db: Db;
 	/** Database work that may outlive the response. */
 	readonly defer: (task: Promise<unknown>) => void;
@@ -24,12 +27,16 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	if (!env.CACHE_BUCKET) {
 		throw new Error("Missing required binding: CACHE_BUCKET");
 	}
+	if (!env.PUBLIC_BUCKET) {
+		throw new Error("Missing required binding: PUBLIC_BUCKET");
+	}
 	if (!env.HYPERDRIVE) {
 		throw new Error("Missing required binding: HYPERDRIVE");
 	}
 	const connection = connect(env.HYPERDRIVE.connectionString);
 	return {
 		bucket: env.CACHE_BUCKET,
+		publicBucket: env.PUBLIC_BUCKET,
 		// A getter, so the database client is only built for requests that use it.
 		get db() {
 			return connection.db;

@@ -81,7 +81,8 @@ describe("narinfo", () => {
 		expect(body).toContain("NarHash:");
 		expect(body).toContain("FileHash:");
 		expect(body).toContain("Compression: zstd");
-		expect(body).toContain("URL: nar/");
+		// A public cache shares its NARs: the narinfo points one level up.
+		expect(body).toContain("URL: ../nar/");
 	});
 
 	it("HEAD returns 200 with headers but no body", async () => {

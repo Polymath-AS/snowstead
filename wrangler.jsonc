@@ -19,6 +19,12 @@
 		{
 			"binding": "CACHE_BUCKET",
 			"bucket_name": "helios-cache"
+		},
+		// Public caches, served straight from R2 and the CDN on cache.polmath.no;
+		// every object in it is world-readable.
+		{
+			"binding": "PUBLIC_BUCKET",
+			"bucket_name": "helios-public"
 		}
 	],
 	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
@@ -31,6 +37,12 @@
 			"binding": "HYPERDRIVE",
 			"id": "fe5e1520e81649299506184e2116af05"
 		}
+	],
+	// cache.polmath.no itself is the public bucket; the Worker takes only the
+	// API and private caches there.
+	"routes": [
+		{ "pattern": "cache.polmath.no/_api/*", "zone_name": "polmath.no" },
+		{ "pattern": "cache.polmath.no/private/*", "zone_name": "polmath.no" }
 	],
 	"triggers": {
 		"crons": ["0 */6 * * *"]

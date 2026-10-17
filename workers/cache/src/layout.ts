@@ -1,0 +1,82 @@
+import type { WorkerConfig } from "./config.js";
+
+/**
+ * Where a cache's objects live. Public caches are laid out in the public
+ * bucket exactly as Nix requests them, so cache.polmath.no serves them
+ * straight from R2 and the CDN:
+ *
+ *   <cache>/nix-cache-info
+ *   <cache>/<hash>.narinfo
+ *   nar/<file hash>/<compression>.nar      shared by every public cache
+ *
+ * Their narinfo points at ../nar/..., which Nix resolves against the
+ * cache's URL (older Nix leaves it to curl, which does the same). Private
+ * caches stay in the private bucket, which only the Worker reads.
+ */
+
+export const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
+
+/** Content-addressed objects never change. */
+export const IMMUTABLE = "public, max-age=31536000, immutable";
+
+/** Names that would collide with the paths around public caches. */
+export const RESERVED_CACHE_NAMES: ReadonlySet<string> = new Set(["nar", "private"]);
+
+export function bucketFor(config: WorkerConfig, isPrivate: boolean): R2Bucket {
+	return isPrivate ? config.bucket : config.publicBucket;
+}
+
+export function narKey(fileHash: string, compression: string, isPrivate: boolean): string {
+	return isPrivate ? `nars/sha256/${fileHash}/${compression}.nar` : `nar/${fileHash}/${compression}.nar`;
+}
+
+/** The bucket an upload's key belongs to, from its layout. */
+export function bucketForKey(config: WorkerConfig, key: string): R2Bucket {
+	return bucketFor(config, !key.startsWith("nar/"));
+}
+
+export function narinfoKey(cacheName: string, storePathHash: string, isPrivate: boolean): string {
+	return isPrivate ? `narinfo/${cacheName}/${storePathHash}.narinfo` : `${cacheName}/${storePathHash}.narinfo`;
+}
+
+/** The narinfo's URL field, relative to the cache's URL. */
+export function narUrl(fileHash: string, compression: string, isPrivate: boolean): string {
+	return isPrivate ? `nar/${fileHash}/${compression}.nar` : `../nar/${fileHash}/${compression}.nar`;
+}
+
+export function cacheInfoKey(cacheName: string): string {
+	return `${cacheName}/nix-cache-info`;
+}
+
+/** Publishes or withdraws a cache's nix-cache-info in the public bucket. */
+export async function setPublicCacheInfo(config: WorkerConfig, cacheName: string, isPublic: boolean): Promise<void> {
+	if (isPublic) {
+		await config.publicBucket.put(cacheInfoKey(cacheName), NIX_CACHE_INFO, {
+			httpMetadata: { contentType: "text/x-nix-cache-info", cacheControl: "public, max-age=3600" },
+		});
+	} else {
+		await config.publicBucket.delete(cacheInfoKey(cacheName));
+	}
+}
+
+/**
+ * Makes sure the NAR stored at `fromKey` also exists where the cache's
+ * narinfo will point. A NAR first uploaded for a cache of the other
+ * visibility is copied; this is the only time the Worker moves NAR bytes.
+ */
+export async function placeNar(
+	config: WorkerConfig,
+	fromKey: string,
+	fileHash: string,
+	compression: string,
+	isPrivate: boolean,
+): Promise<void> {
+	const target = narKey(fileHash, compression, isPrivate);
+	const targetBucket = bucketFor(config, isPrivate);
+	if (target === fromKey || (await targetBucket.head(target))) return;
+	const source = await bucketForKey(config, fromKey).get(fromKey);
+	if (!source) throw new Error(`NAR ${fromKey} is missing`);
+	await targetBucket.put(target, source.body, {
+		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
+	});
+}

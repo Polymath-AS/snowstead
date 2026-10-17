@@ -32,6 +32,7 @@ export {
 	ensureCache,
 	listCaches,
 	setCachePublic,
+	cacheHasPaths,
 	findBlobObject,
 	findBlobObjectById,
 	createBlobObject,

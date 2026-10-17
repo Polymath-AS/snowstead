@@ -1,3 +1,4 @@
+import { bucketForKey, narKey } from "./layout.js";
 import type { WorkerConfig } from "./config.js";
 import {
 	findExpiredSessions,
@@ -52,7 +53,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 			if (session.r2UploadId && session.r2UploadKey) {
 				try {
-					const multipart = config.bucket.resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
+					const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
 					await multipart.abort();
 				} catch {
 					// Multipart may already be completed or aborted
@@ -61,7 +62,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 			if (session.r2UploadKey) {
 				try {
-					await config.bucket.delete(session.r2UploadKey);
+					await bucketForKey(config, session.r2UploadKey).delete(session.r2UploadKey);
 				} catch {
 					// R2 object may not exist
 				}
@@ -81,7 +82,12 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			// Delete DB record first to prevent re-referencing during R2 delete
 			await deleteBlobObject(config.db, blob.id);
 			try {
-				await config.bucket.delete(blob.r2Key);
+				// Both layouts: publishing may have copied it to the other bucket.
+				await Promise.all([
+					config.bucket.delete(narKey(blob.fileHash, blob.compression, true)),
+					config.publicBucket.delete(narKey(blob.fileHash, blob.compression, false)),
+					bucketForKey(config, blob.r2Key).delete(blob.r2Key),
+				]);
 			} catch {
 				// R2 object may already be gone
 			}
