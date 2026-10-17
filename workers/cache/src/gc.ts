@@ -33,7 +33,6 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	let expiredTokens = 0;
 	let expiredAuditLogs = 0;
 
-	// Phase 1: Expire abandoned upload sessions
 	const now = new Date();
 	const expired = await findExpiredSessions(config.db, now);
 
@@ -75,7 +74,6 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 		}
 	}
 
-	// Phase 2: Delete unreferenced blob objects
 	const unreferenced = await findUnreferencedBlobObjects(config.db);
 
 	for (const blob of unreferenced) {
@@ -93,14 +91,12 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 		}
 	}
 
-	// Phase 3: Delete expired API tokens
 	try {
 		expiredTokens = await deleteExpiredApiTokens(config.db, now);
 	} catch (err) {
 		errors.push(`Failed to delete expired tokens: ${err instanceof Error ? err.message : String(err)}`);
 	}
 
-	// Phase 4: Delete audit logs older than retention period
 	try {
 		const cutoff = new Date(Date.now() - AUDIT_LOG_RETENTION_DAYS * 86400_000);
 		expiredAuditLogs = await deleteExpiredAuditLogs(config.db, cutoff);

@@ -6,15 +6,16 @@ import {
 	createApiToken,
 	listApiTokens,
 	revokeApiToken,
+	ensureCache,
+	listCaches,
 } from "./db/repository.js";
+import { parseCacheName } from "@helios/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
 const MAX_TOKEN_LIFETIME_DAYS = 365;
 const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
 const MAX_SUBJECT_LENGTH = 256;
 const MAX_REASON_LENGTH = 512;
-
-// ── Create Token ──
 
 export async function handleCreateToken(
 	request: Request,
@@ -112,8 +113,6 @@ export async function handleCreateToken(
 	}, 201);
 }
 
-// ── List Tokens ──
-
 export async function handleListTokens(
 	config: WorkerConfig,
 ): Promise<Response> {
@@ -132,8 +131,6 @@ export async function handleListTokens(
 	}));
 	return jsonResponse({ tokens: result });
 }
-
-// ── Revoke Token ──
 
 export async function handleRevokeToken(
 	request: Request,
@@ -159,4 +156,28 @@ export async function handleRevokeToken(
 	}
 
 	return jsonResponse({ revoked: true, jti });
+}
+
+export async function handleCreateCache(
+	request: Request,
+	config: WorkerConfig,
+): Promise<Response> {
+	const body = await parseJsonBody<{ name: string }>(request);
+	if (body instanceof Response) return body;
+
+	const name = parseCacheName(String(body.name ?? ""));
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+
+	// Idempotent, so setup scripts can declare caches on every run.
+	const { cache, created } = await ensureCache(config.db, name);
+	return jsonResponse({ name: cache.name, createdAt: cache.createdAt, created }, created ? 201 : 200);
+}
+
+export async function handleListCaches(
+	config: WorkerConfig,
+): Promise<Response> {
+	const caches = await listCaches(config.db);
+	return jsonResponse({ caches: caches.map((c) => ({ name: c.name, createdAt: c.createdAt })) });
 }

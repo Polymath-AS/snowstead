@@ -21,6 +21,7 @@ export default defineConfig({
 			miniflare: {
 				bindings: {
 					AUTH_TOKEN: "test-auth-token",
+					ADMIN_SECRET: "test-admin-secret",
 				},
 			},
 		}),

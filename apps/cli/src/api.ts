@@ -212,8 +212,6 @@ export async function publishPath(
   return jsonBody<{ published: boolean; alreadyExisted?: boolean }>(resp);
 }
 
-// ── Token Management (Admin API) ──
-
 export interface TokenInfo {
   readonly jti: string;
   readonly subject: string;
@@ -275,4 +273,33 @@ export async function revokeToken(
     const text = await resp.text();
     throw new Error(`token revoke failed (${resp.status}): ${text}`);
   }
+}
+
+export interface CacheInfo {
+  readonly name: string;
+  readonly createdAt: string;
+}
+
+export async function createCache(
+  client: ApiClient,
+  name: string,
+): Promise<CacheInfo & { readonly created: boolean }> {
+  const resp = await request(client, "POST", "/_api/v1/admin/caches", { name });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`cache create failed (${resp.status}): ${text}`);
+  }
+  return jsonBody<CacheInfo & { created: boolean }>(resp);
+}
+
+export async function listCaches(
+  client: ApiClient,
+): Promise<CacheInfo[]> {
+  const resp = await request(client, "GET", "/_api/v1/admin/caches");
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`cache list failed (${resp.status}): ${text}`);
+  }
+  const data = await jsonBody<{ caches: CacheInfo[] }>(resp);
+  return data.caches;
 }

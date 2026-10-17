@@ -35,8 +35,6 @@ async function returned<T>(rows: Promise<T[]>): Promise<T> {
 	return row;
 }
 
-// ── Caches ──
-
 export async function findCacheByName(
 	db: Db,
 	name: string,
@@ -58,7 +56,21 @@ export async function createCache(
 	return returned(db.insert(caches).values({ name }).returning());
 }
 
-// ── Blob Objects ──
+/** Creates `name` unless it exists; returns the cache and whether it is new. */
+export async function ensureCache(
+	db: Db,
+	name: string,
+): Promise<{ cache: Cache; created: boolean }> {
+	const inserted = await first(db.insert(caches).values({ name }).onConflictDoNothing().returning());
+	if (inserted) return { cache: inserted, created: true };
+	const existing = await findCacheByName(db, name);
+	if (!existing) throw new Error(`cache ${name} vanished`);
+	return { cache: existing, created: false };
+}
+
+export async function listCaches(db: Db): Promise<Cache[]> {
+	return db.select().from(caches).orderBy(caches.name);
+}
 
 export async function findBlobObject(
 	db: Db,
@@ -92,8 +104,6 @@ export async function createBlobObject(
 ): Promise<BlobObject> {
 	return returned(db.insert(blobObjects).values(params).returning());
 }
-
-// ── Published Paths ──
 
 export async function findPublishedPathWithBlob(
 	db: Db,
@@ -177,8 +187,6 @@ export async function findPublishedHashes(
 	return rows.map((r) => r.storePathHash);
 }
 
-// ── Upload Sessions ──
-
 export async function findUploadSession(
 	db: Db,
 	sessionId: string,
@@ -253,8 +261,6 @@ export async function findExpiredSessions(
 		);
 }
 
-// ── Upload Parts ──
-
 export async function upsertUploadPart(
 	db: Db,
 	params: {
@@ -307,8 +313,6 @@ export async function findUploadParts(
 		.orderBy(uploadParts.partNumber);
 }
 
-// ── Blob Object Cleanup ──
-
 export async function findUnreferencedBlobObjects(
 	db: Db,
 ): Promise<BlobObject[]> {
@@ -329,8 +333,6 @@ export async function deleteBlobObject(
 	await db.delete(blobObjects).where(eq(blobObjects.id, id));
 }
 
-// ── Upload Session Cleanup ──
-
 export async function deleteUploadSession(
 	db: Db,
 	sessionId: string,
@@ -340,8 +342,6 @@ export async function deleteUploadSession(
 		await tx.delete(uploadSessions).where(eq(uploadSessions.id, sessionId));
 	});
 }
-
-// ── GC Marks ──
 
 export async function createGcMark(
 	db: Db,
@@ -373,8 +373,6 @@ export async function deleteGcMark(
 		.delete(gcMarks)
 		.where(and(eq(gcMarks.targetType, targetType), eq(gcMarks.targetId, targetId)));
 }
-
-// ── API Tokens ──
 
 export async function createApiToken(
 	db: Db,
@@ -445,8 +443,6 @@ export async function deleteExpiredApiTokens(
 		.where(lt(apiTokens.expiresAt, now));
 	return result.rowCount ?? 0;
 }
-
-// ── Audit Logs ──
 
 export async function createAuditLog(
 	db: Db,

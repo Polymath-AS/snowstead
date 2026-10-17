@@ -4,17 +4,16 @@ set -euo pipefail
 # Smoke test for the Helios Nix binary cache worker.
 #
 # Usage:
-#   DATABASE_URL=postgres://... ./scripts/smoke-test.sh <base-url> <auth-token>
+#   ADMIN_SECRET=... ./scripts/smoke-test.sh <base-url> <auth-token>
 #
-# DATABASE_URL reaches the worker's Postgres directly, to seed a cache.
+# ADMIN_SECRET creates the test cache through the admin API.
 #
 # Example:
-#   ./scripts/smoke-test.sh https://helios-cache.your-subdomain.workers.dev "your-token"
-#   ./scripts/smoke-test.sh https://cache.polmath.no "your-token"
+#   ADMIN_SECRET=... ./scripts/smoke-test.sh https://helios-cache.your-subdomain.workers.dev "your-token"
 
 BASE="${1:?usage: smoke-test.sh <base-url> <auth-token>}"
 TOKEN="${2:?usage: smoke-test.sh <base-url> <auth-token>}"
-: "${DATABASE_URL:?set DATABASE_URL to the Postgres database the worker uses, to seed a cache}"
+: "${ADMIN_SECRET:?set ADMIN_SECRET to create the test cache}"
 
 # Strip trailing slash
 BASE="${BASE%/}"
@@ -36,7 +35,6 @@ check() {
 echo "=== Smoke test against $BASE ==="
 echo
 
-# ── 1. Health check ──
 echo "1. Health check"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/healthz")
 check "/healthz returns 200" "200" "$STATUS"
@@ -45,15 +43,14 @@ BODY=$(curl -s "$BASE/healthz")
 check "/healthz has ok=true" "true" "$(echo "$BODY" | grep -o '"ok" *: *true' | head -1 | grep -o 'true')"
 echo
 
-# ── 2. Seed a cache in Postgres ──
-echo "2. Seeding test cache in Postgres"
+echo "2. Creating a test cache"
 CACHE_NAME="smoke-$(date +%s)"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
-  -c "INSERT INTO caches (name, is_public) VALUES ('$CACHE_NAME', true) ON CONFLICT (name) DO NOTHING"
-echo "  created cache: $CACHE_NAME"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+  -H "authorization: Bearer $ADMIN_SECRET" -H "content-type: application/json" \
+  -d "{\"name\":\"$CACHE_NAME\"}" "$BASE/_api/v1/admin/caches")
+check "admin creates cache $CACHE_NAME" "201" "$STATUS"
 echo
 
-# ── 3. Cache info ──
 echo "3. nix-cache-info"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$CACHE_NAME/nix-cache-info")
 check "returns 200" "200" "$STATUS"
@@ -62,13 +59,11 @@ BODY=$(curl -s "$BASE/$CACHE_NAME/nix-cache-info")
 check "contains StoreDir" "StoreDir: /nix/store" "$(echo "$BODY" | head -1)"
 echo
 
-# ── 4. 404 for missing narinfo ──
 echo "4. Missing narinfo returns 404"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$CACHE_NAME/00000000000000000000000000000000.narinfo")
 check "returns 404" "404" "$STATUS"
 echo
 
-# ── 5. Full upload → publish → read flow ──
 echo "5. Upload, complete, publish, read"
 
 FILE_HASH="$(openssl rand -hex 32)"
@@ -161,7 +156,6 @@ else
 fi
 echo
 
-# ── 6. Auth enforcement ──
 echo "6. Auth enforcement"
 UNAUTH=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   "$BASE/_api/v1/caches/$CACHE_NAME/upload-sessions" \
@@ -180,7 +174,6 @@ PUBLIC_READ=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/$CACHE_NAME/nix-cach
 check "read without auth returns 200" "200" "$PUBLIC_READ"
 echo
 
-# ── 7. get-missing-paths ──
 echo "7. get-missing-paths"
 MISSING_RESP=$(curl -s -X POST "$BASE/_api/v1/get-missing-paths" \
   -H "Authorization: Bearer $TOKEN" \
@@ -192,7 +185,6 @@ check "unknown hash is in missing" '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
   "$(echo "$MISSING_RESP" | grep -o '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' | head -1)"
 echo
 
-# ── Summary ──
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   exit 1

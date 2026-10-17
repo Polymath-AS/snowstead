@@ -48,8 +48,6 @@ async function resolveCacheName(
 	return row.name;
 }
 
-// ── Session Auth Helper ──
-
 /**
  * Load an upload session and verify the caller has access to its cache.
  * Bearer-token callers are trusted implicitly; JWT callers must hold
@@ -79,8 +77,6 @@ async function loadSessionWithAuthCheck(
 
 	return { session };
 }
-
-// ── Create Upload Session ──
 
 export async function handleCreateSession(
 	request: Request,
@@ -199,8 +195,6 @@ export async function handleCreateSession(
 	}, 201);
 }
 
-// ── Initiate Multipart Upload ──
-
 export async function handleMultipart(
 	config: WorkerConfig,
 	sessionId: string,
@@ -231,8 +225,6 @@ export async function handleMultipart(
 		r2Key: session.r2UploadKey,
 	});
 }
-
-// ── Upload Part (Multipart) ──
 
 export async function handleUploadPart(
 	request: Request,
@@ -269,8 +261,6 @@ export async function handleUploadPart(
 
 	return jsonResponse({ partNumber, etag: uploadedPart.etag });
 }
-
-// ── Upload Blob ──
 
 export async function handleUploadBlob(
 	request: Request,
@@ -313,8 +303,6 @@ export async function handleUploadBlob(
 
 	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
 }
-
-// ── Complete Upload ──
 
 export async function handleComplete(
 	request: Request,
@@ -365,8 +353,6 @@ export async function handleComplete(
 
 	return jsonResponse({ status: "completed" });
 }
-
-// ── Publish Path ──
 
 export async function handlePublish(
 	config: WorkerConfig,
@@ -429,8 +415,6 @@ export async function handlePublish(
 
 	return jsonResponse({ published: true, storePathHash: session.storePathHash });
 }
-
-// ── Get Missing Paths ──
 
 const MAX_MISSING_PATHS_BATCH = 1000;
 

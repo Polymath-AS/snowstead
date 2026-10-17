@@ -29,6 +29,8 @@ export {
 	findCacheByName,
 	findCacheById,
 	createCache,
+	ensureCache,
+	listCaches,
 	findBlobObject,
 	findBlobObjectById,
 	createBlobObject,

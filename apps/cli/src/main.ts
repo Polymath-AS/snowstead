@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { login, getServer } from "./config.js";
-import { createClient, createToken, listTokens, revokeToken } from "./api.js";
+import { createClient, createToken, listTokens, revokeToken, createCache, listCaches } from "./api.js";
 import { pushPaths } from "./push.js";
 import { getClosurePaths } from "./nix.js";
 
@@ -11,6 +11,8 @@ Commands:
   helios login <name> <server-url> <token>   Save server credentials
   helios push <cache> <paths...>             Push store paths to a cache
   helios push <cache> --closure <path>       Push a store path and its closure
+  helios cache create <name>                 Create a cache (admin)
+  helios cache list                          List caches (admin)
   helios token create <subject>              Create a new API token
   helios token list                          List all API tokens
   helios token revoke <jti> <reason>         Revoke an API token
@@ -205,6 +207,38 @@ async function main(): Promise<void> {
     }
 
     console.error("Usage: helios token <create|list|revoke>");
+    process.exit(1);
+  }
+
+  if (command === "cache") {
+    const subcommand = args[1];
+    let serverName: string | undefined;
+    const serverIdx = args.indexOf("--server");
+    if (serverIdx !== -1 && serverIdx + 1 < args.length) {
+      serverName = args[serverIdx + 1];
+    }
+    const serverConfig = await getServer(serverName);
+    const client = createClient(serverConfig.server, serverConfig.token);
+
+    if (subcommand === "create") {
+      const name = args[2];
+      if (!name) {
+        console.error("Usage: helios cache create <name>");
+        process.exit(1);
+      }
+      const result = await createCache(client, name);
+      console.log(result.created ? `Cache '${result.name}' created` : `Cache '${result.name}' already exists`);
+      return;
+    }
+
+    if (subcommand === "list") {
+      for (const c of await listCaches(client)) {
+        console.log(`${c.name}  created=${c.createdAt}`);
+      }
+      return;
+    }
+
+    console.error("Usage: helios cache <create|list>");
     process.exit(1);
   }
 
