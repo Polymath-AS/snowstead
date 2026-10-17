@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCacheByName, revokeApiToken } from "../src/db/repository.js";
+import { createBlobObject, createPublishedPath, findCacheByName, revokeApiToken, setCachePublic } from "../src/db/repository.js";
 
 const db = testDb();
 const PRIVATE = "private-test";
@@ -120,9 +120,30 @@ describe("private caches", () => {
 		await revokeApiToken(db, jti, "admin", "revoked in the database only");
 		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(old))).status).toBe(200);
 
-		const sync = await admin("/revocations/sync", {});
+		const sync = await admin("/auth/sync", {});
 		expect(sync.status).toBe(200);
 		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(old))).status).toBe(401);
+	});
+
+	it("refuse writes with a revoked token too", async () => {
+		const { token: push, jti } = await token([PRIVATE], ["push"]);
+		expect((await admin(`/tokens/${jti}/revoke`, { reason: "test" })).status).toBe(200);
+		const res = await SELF.fetch("http://example.com/_api/v1/get-missing-paths", {
+			method: "POST",
+			headers: { authorization: `Bearer ${push}`, "content-type": "application/json" },
+			body: JSON.stringify({ cache: PRIVATE, storePathHashes: [HASH] }),
+		});
+		expect(res.status).toBe(401);
+	});
+
+	it("pick up visibility set only in the database once synced", async () => {
+		const name = `synced-${crypto.randomUUID().slice(0, 8)}`;
+		expect((await admin("/caches", { name })).status).toBe(201);
+		await setCachePublic(db, name, false);
+		expect((await read(`/${name}/nix-cache-info`)).status).toBe(200);
+
+		expect((await admin("/auth/sync", {})).status).toBe(200);
+		expect((await read(`/${name}/nix-cache-info`)).status).toBe(401);
 	});
 
 	it("leave public caches open", async () => {

@@ -16,7 +16,7 @@ import {
 	listPublishedPathsAfter,
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
-import { setPrivateMarker, isPrivateCache } from "./visibility.js";
+import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName } from "@helios/cache-domain";
@@ -206,7 +206,7 @@ export async function handleCreateCache(
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
 	if (body.private === true) {
-		await setPrivateMarker(config, name, true);
+		await setPrivate(config, name, true);
 		await setPublicCacheInfo(config, name, false);
 	}
 	const { cache, created } = await ensureCache(config.db, name, body.private !== true);
@@ -217,7 +217,7 @@ export async function handleCreateCache(
 		await setCachePublic(config.db, name, isPublic);
 	}
 	if (isPublic) {
-		await setPrivateMarker(config, name, false);
+		await setPrivate(config, name, false);
 		await setPublicCacheInfo(config, name, true);
 	}
 
@@ -281,11 +281,19 @@ export async function handleBackfillNarinfo(
 	});
 }
 
-/** Writes the database's revocations of unexpired tokens to KV, for tokens revoked before KV held them. */
-export async function handleSyncRevocations(config: WorkerConfig): Promise<Response> {
+/**
+ * Writes the database's authorization state to KV, where requests read it:
+ * which caches are private, and revocations of unexpired tokens. For state
+ * from before KV held it; changes made through the API write both.
+ */
+export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
+	const caches = await listCaches(config.db);
+	for (const cache of caches) {
+		await setPrivate(config, cache.name, !cache.isPublic);
+	}
 	const revoked = await listRevokedTokens(config.db, new Date());
 	for (const token of revoked) {
 		await recordRevocation(config, token.jti, token.expiresAt);
 	}
-	return jsonResponse({ synced: revoked.length });
+	return jsonResponse({ caches: caches.length, private: caches.filter((c) => !c.isPublic).length, revocations: revoked.length });
 }

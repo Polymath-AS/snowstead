@@ -429,20 +429,6 @@ export async function listRevokedTokens(db: Db, now: Date): Promise<ApiToken[]> 
 		.where(and(isNotNull(apiTokens.revokedAt), gt(apiTokens.expiresAt, now)));
 }
 
-export async function isTokenActive(
-	db: Db,
-	jti: string,
-): Promise<boolean> {
-	const row = await first(
-		db
-			.select({ jti: apiTokens.jti })
-			.from(apiTokens)
-			.where(and(eq(apiTokens.jti, jti), isNull(apiTokens.revokedAt)))
-			.limit(1),
-	);
-	return row !== undefined;
-}
-
 export async function deleteExpiredApiTokens(
 	db: Db,
 	now: Date,

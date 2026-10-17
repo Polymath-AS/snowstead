@@ -19,7 +19,7 @@ import {
 	handleGetMissingPaths,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleBackfillNarinfo, handleSyncRevocations } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleBackfillNarinfo, handleSyncAuth } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -357,9 +357,9 @@ async function handleAdminApi(
 		return handleListCaches(config);
 	}
 
-	if (pathname === "/_api/v1/admin/revocations/sync" && request.method === "POST") {
-		const response = await handleSyncRevocations(config);
-		writeAuditLog(config, authResult.identity, "revocations.sync", null, response.status, "{}", ip);
+	if (pathname === "/_api/v1/admin/auth/sync" && request.method === "POST") {
+		const response = await handleSyncAuth(config);
+		writeAuditLog(config, authResult.identity, "auth.sync", null, response.status, "{}", ip);
 		return response;
 	}
 

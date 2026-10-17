@@ -2,38 +2,6 @@ import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
 import { verifyJwt, hasPermission, hasCacheAccess } from "./jwt.js";
 import { isRevoked } from "./revocations.js";
-import { isTokenActive } from "./db/repository.js";
-import type { Db } from "./db/connection.js";
-
-// Module-scope cache of recently confirmed-active token IDs (jti → cache
-// entry deadline in ms). Workers isolates are reused across requests on the
-// same edge node, so this avoids a database revocation-check round trip on every
-// write request. Tradeoff: a freshly revoked token keeps working for up to
-// TOKEN_ACTIVE_TTL_MS on warm isolates. Only positive results are cached;
-// revocation is permanent, so negative results gain nothing from caching.
-const TOKEN_ACTIVE_TTL_MS = 30_000;
-const TOKEN_ACTIVE_CACHE_MAX_ENTRIES = 10_000;
-const tokenActiveUntil = new Map<string, number>();
-
-async function isTokenActiveCached(db: Db, jti: string): Promise<boolean> {
-	const now = Date.now();
-	const deadline = tokenActiveUntil.get(jti);
-	if (deadline !== undefined && deadline > now) {
-		return true;
-	}
-
-	const active = await isTokenActive(db, jti);
-	if (active) {
-		// Bound memory: reset rather than evict; the cache refills on demand.
-		if (tokenActiveUntil.size >= TOKEN_ACTIVE_CACHE_MAX_ENTRIES) {
-			tokenActiveUntil.clear();
-		}
-		tokenActiveUntil.set(jti, now + TOKEN_ACTIVE_TTL_MS);
-	} else {
-		tokenActiveUntil.delete(jti);
-	}
-	return active;
-}
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
 function authError(message: string, status: number): Response {
@@ -177,8 +145,7 @@ export async function authenticateWrite(
 	if (config.jwtSecret) {
 		const result = await verifyJwt(bearer, config.jwtSecret);
 		if (result.kind === "ok") {
-			const active = await isTokenActiveCached(config.db, result.claims.jti);
-			if (!active) {
+			if (await isRevoked(config, result.claims.jti)) {
 				return { kind: "error", response: authError("Unauthorized", 401) };
 			}
 			return { kind: "ok", identity: { kind: "jwt", claims: result.claims } };
