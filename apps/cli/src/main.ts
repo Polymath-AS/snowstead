@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { parseArgs } from "node:util";
 import { login, getServer } from "./config.js";
 import { createClient, createToken, listTokens, revokeToken, createCache, listCaches } from "./api.js";
 import { pushPaths } from "./push.js";
@@ -38,11 +39,31 @@ Examples:
 `;
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
 
-  if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
+  if (rawArgs.length === 0) {
     console.log(USAGE);
     process.exit(0);
+  }
+
+  const { values, positionals: args } = parseArgs({
+    args: rawArgs,
+    allowPositionals: true,
+    options: {
+      help: { type: "boolean", short: "h" },
+      server: { type: "string" },
+      jobs: { type: "string" },
+      closure: { type: "string" },
+      caches: { type: "string" },
+      perms: { type: "string" },
+      expires: { type: "string" },
+      private: { type: "boolean" },
+      public: { type: "boolean" },
+    },
+  });
+  if (values.help) {
+    console.log(USAGE);
+    return;
   }
 
   const command = args[0];
@@ -58,37 +79,20 @@ async function main(): Promise<void> {
   }
 
   if (command === "push") {
-    if (args.length < 3) {
+    if (args.length < 2 || (args.length < 3 && values.closure === undefined)) {
       console.error("Usage: helios push <cache> <paths...> | helios push <cache> --closure <path>");
       process.exit(1);
     }
 
-    const filteredArgs = [...args];
-
-    // Extract --server flag
-    let serverName: string | undefined;
-    const serverIdx = filteredArgs.indexOf("--server");
-    if (serverIdx !== -1 && serverIdx + 1 < filteredArgs.length) {
-      serverName = filteredArgs[serverIdx + 1];
-      filteredArgs.splice(serverIdx, 2);
-    }
-
-    // Extract --jobs flag
-    let concurrency: number | undefined;
-    const jobsIdx = filteredArgs.indexOf("--jobs");
-    if (jobsIdx !== -1 && jobsIdx + 1 < filteredArgs.length) {
-      concurrency = parseInt(filteredArgs[jobsIdx + 1], 10);
-      filteredArgs.splice(jobsIdx, 2);
-    }
-
+    const concurrency = values.jobs === undefined ? undefined : Number(values.jobs);
     if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 1)) {
       console.error("--jobs must be a positive integer");
       process.exit(1);
     }
 
-    const serverConfig = await getServer(serverName);
+    const serverConfig = await getServer(values.server);
     const client = createClient(serverConfig.server, serverConfig.token);
-    const cache = filteredArgs[1];
+    const cache = args[1];
 
     const progress = (current: number, total: number, name: string, status: string) => {
       console.log(`[${String(current)}/${String(total)}] ${name}  ${status}`);
@@ -96,20 +100,15 @@ async function main(): Promise<void> {
 
     const pushOpts = { concurrency, onProgress: progress };
 
-    const closureIdx = filteredArgs.indexOf("--closure");
     let result;
-    if (closureIdx !== -1) {
-      const rootPath = filteredArgs[closureIdx + 1];
-      if (!rootPath) {
-        console.error("--closure requires a store path or installable");
-        process.exit(1);
-      }
+    if (values.closure !== undefined) {
+      const rootPath = values.closure;
       console.log(`Resolving closure for ${rootPath}...`);
       const paths = await getClosurePaths(rootPath);
       console.log(`Found ${String(paths.length)} paths in closure`);
       result = await pushPaths(client, cache, paths, pushOpts);
     } else {
-      const paths = filteredArgs.slice(2);
+      const paths = args.slice(2);
       if (paths.length === 0) {
         console.error("No paths specified");
         process.exit(1);
@@ -129,14 +128,7 @@ async function main(): Promise<void> {
   if (command === "token") {
     const subcommand = args[1];
 
-    // Extract --server flag
-    let serverName: string | undefined;
-    const serverIdx = args.indexOf("--server");
-    if (serverIdx !== -1 && serverIdx + 1 < args.length) {
-      serverName = args[serverIdx + 1];
-    }
-
-    const serverConfig = await getServer(serverName);
+    const serverConfig = await getServer(values.server);
     const client = createClient(serverConfig.server, serverConfig.token);
 
     if (subcommand === "create") {
@@ -146,30 +138,14 @@ async function main(): Promise<void> {
         process.exit(1);
       }
 
-      let cachesStr = "*";
-      const cachesIdx = args.indexOf("--caches");
-      if (cachesIdx !== -1 && cachesIdx + 1 < args.length) {
-        cachesStr = args[cachesIdx + 1];
+      const expiresInDays = values.expires === undefined ? undefined : Number(values.expires);
+      if (expiresInDays !== undefined && (!Number.isInteger(expiresInDays) || expiresInDays < 1)) {
+        console.error("--expires must be a positive integer");
+        process.exit(1);
       }
 
-      let permsStr = "push";
-      const permsIdx = args.indexOf("--perms");
-      if (permsIdx !== -1 && permsIdx + 1 < args.length) {
-        permsStr = args[permsIdx + 1];
-      }
-
-      let expiresInDays: number | undefined;
-      const expiresIdx = args.indexOf("--expires");
-      if (expiresIdx !== -1 && expiresIdx + 1 < args.length) {
-        expiresInDays = parseInt(args[expiresIdx + 1], 10);
-        if (!Number.isInteger(expiresInDays) || expiresInDays < 1) {
-          console.error("--expires must be a positive integer");
-          process.exit(1);
-        }
-      }
-
-      const caches = cachesStr.split(",").map(s => s.trim()).filter(Boolean);
-      const perms = permsStr.split(",").map(s => s.trim()).filter(Boolean);
+      const caches = (values.caches ?? "*").split(",").map(s => s.trim()).filter(Boolean);
+      const perms = (values.perms ?? "push").split(",").map(s => s.trim()).filter(Boolean);
 
       const result = await createToken(client, { subject, caches, perms, expiresInDays });
       console.log(`Token created for '${result.subject}'`);
@@ -213,17 +189,12 @@ async function main(): Promise<void> {
 
   if (command === "cache") {
     const subcommand = args[1];
-    let serverName: string | undefined;
-    const serverIdx = args.indexOf("--server");
-    if (serverIdx !== -1 && serverIdx + 1 < args.length) {
-      serverName = args[serverIdx + 1];
-    }
-    const serverConfig = await getServer(serverName);
+    const serverConfig = await getServer(values.server);
     const client = createClient(serverConfig.server, serverConfig.token);
 
     if (subcommand === "create" || subcommand === "set") {
       const name = args[2];
-      const wantPrivate = args.includes("--private") ? true : args.includes("--public") ? false : undefined;
+      const wantPrivate = values.private ? true : values.public ? false : undefined;
       if (!name || (subcommand === "set" && wantPrivate === undefined)) {
         console.error(subcommand === "set" ? "Usage: helios cache set <name> --private|--public" : "Usage: helios cache create <name> [--private]");
         process.exit(1);

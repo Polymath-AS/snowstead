@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "check": "tsc --noEmit"
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "check": "pnpm test"
   },
   "dependencies": {
     "@helios/cache-domain": "workspace:*"
