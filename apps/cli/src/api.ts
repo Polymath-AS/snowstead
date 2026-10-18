@@ -144,6 +144,41 @@ export async function uploadPresigned(
   }
 }
 
+/** Sessions for many paths of one cache, in the order given. */
+export async function createUploadSessions(
+  client: ApiClient,
+  cache: string,
+  paths: readonly Parameters<typeof createUploadSession>[2][],
+): Promise<SessionResponse[]> {
+  const resp = await request(client, "POST", `/_api/v1/caches/${cache}/upload-sessions/batch`, { paths });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`create-sessions failed (${resp.status}): ${text}`);
+  }
+  return (await jsonBody<{ sessions: SessionResponse[] }>(resp)).sessions;
+}
+
+export interface CommitResult {
+  readonly sessionId: string;
+  readonly published?: boolean;
+  readonly alreadyExisted?: boolean;
+  readonly error?: string;
+  readonly status?: number;
+}
+
+/** Completes and publishes uploaded sessions; one result per session, in order. */
+export async function commitUploads(
+  client: ApiClient,
+  sessionIds: readonly string[],
+): Promise<CommitResult[]> {
+  const resp = await request(client, "POST", "/_api/v1/uploads/commit", { sessionIds });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`commit failed (${resp.status}): ${text}`);
+  }
+  return (await jsonBody<{ results: CommitResult[] }>(resp)).results;
+}
+
 export async function completeUpload(
   client: ApiClient,
   sessionId: string,

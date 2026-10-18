@@ -1,22 +1,29 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ApiClient } from "./api.js";
 import {
   getMissingPaths,
-  createUploadSession,
+  createUploadSessions,
+  commitUploads,
   uploadBlob,
   shouldUseMultipart,
   uploadPresigned,
   uploadBlobMultipart,
   completeUpload,
-  publishPath,
 } from "./api.js";
+import { batcher, limiter } from "./batch.js";
 import { getPathInfos, dumpAndCompress } from "./nix.js";
 import type { PathInfo } from "./nix.js";
 import { runPool } from "./pool.js";
 
-const DEFAULT_CONCURRENCY = 8;
+// Paths in flight at once. Most are small, so a push waits on round trips
+// far more than on bandwidth; compression has its own, CPU-sized limit.
+const DEFAULT_CONCURRENCY = 32;
+// The server takes up to 100 per batch; a batch goes once it is full or
+// once its first path has waited BATCH_DELAY_MS.
+const BATCH_SIZE = 100;
+const BATCH_DELAY_MS = 50;
 
 export interface PushResult {
   readonly pushed: number;
@@ -30,46 +37,59 @@ interface PushOptions {
   readonly onProgress?: (current: number, total: number, name: string, status: string) => void;
 }
 
-async function pushSinglePath(
-  client: ApiClient,
-  cache: string,
-  storePath: string,
-  info: PathInfo,
-): Promise<{ sizeKb: number }> {
-  const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
-  const narFile = join(narDir, "nar.zst");
+/**
+ * Pushes one path: its session and its publish join those of the other
+ * paths in flight, so a push makes two API requests per batch of paths
+ * rather than several per path.
+ */
+function pathPusher(client: ApiClient, cache: string) {
+  const compress = limiter(availableParallelism());
+  const createSession = batcher(BATCH_SIZE, BATCH_DELAY_MS, (paths: Parameters<typeof createUploadSessions>[2][number][]) =>
+    createUploadSessions(client, cache, paths),
+  );
+  const commit = batcher(BATCH_SIZE, BATCH_DELAY_MS, (ids: string[]) => commitUploads(client, ids));
 
-  try {
-    // Hash and size are computed while the compressed NAR is written,
-    // avoiding a second full read of the file.
-    const { fileHash, fileSize } = await dumpAndCompress(storePath, narFile);
+  return async (storePath: string, info: PathInfo): Promise<{ sizeKb: number }> => {
+    const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
+    const narFile = join(narDir, "nar.zst");
 
-    const session = await createUploadSession(client, cache, {
-      storePath: info.storePath,
-      storePathHash: info.storePathHash,
-      narHash: info.narHash,
-      narSize: info.narSize,
-      fileHash,
-      fileSize,
-      compression: "zstd",
-      references: info.references,
-    });
+    try {
+      // Hash and size are computed while the compressed NAR is written,
+      // avoiding a second full read of the file.
+      const { fileHash, fileSize } = await compress(() => dumpAndCompress(storePath, narFile));
 
-    if (session.uploadMethod === "presigned" && session.uploadUrl) {
-      // Straight to R2; the API never handles the NAR.
-      await uploadPresigned(session.uploadUrl, session.uploadHeaders ?? {}, narFile);
-    } else if (shouldUseMultipart(fileSize)) {
-      await uploadBlobMultipart(client, session.sessionId, narFile);
-    } else {
-      await uploadBlob(client, session.sessionId, narFile);
+      const session = await createSession({
+        storePath: info.storePath,
+        storePathHash: info.storePathHash,
+        narHash: info.narHash,
+        narSize: info.narSize,
+        fileHash,
+        fileSize,
+        compression: "zstd",
+        references: info.references,
+      });
+
+      if (session.uploadMethod === "presigned" && session.uploadUrl) {
+        // Straight to R2; the API never handles the NAR.
+        await uploadPresigned(session.uploadUrl, session.uploadHeaders ?? {}, narFile);
+      } else if (shouldUseMultipart(fileSize)) {
+        await uploadBlobMultipart(client, session.sessionId, narFile);
+        // A commit takes multipart sessions only once completed.
+        await completeUpload(client, session.sessionId);
+      } else {
+        await uploadBlob(client, session.sessionId, narFile);
+      }
+
+      const result = await commit(session.sessionId);
+      if (!result.published) {
+        throw new Error(`publish failed (${String(result.status)}): ${result.error ?? "unknown error"}`);
+      }
+
+      return { sizeKb: Math.round(fileSize / 1024) };
+    } finally {
+      await rm(narDir, { recursive: true, force: true });
     }
-    await completeUpload(client, session.sessionId);
-    await publishPath(client, session.sessionId);
-
-    return { sizeKb: Math.round(fileSize / 1024) };
-  } finally {
-    await rm(narDir, { recursive: true, force: true });
-  }
+  };
 }
 
 export async function pushPaths(
@@ -122,6 +142,7 @@ export async function pushPaths(
     if (storePath) missingPaths.push(storePath);
   }
   const pathInfos = await getPathInfos(missingPaths);
+  const pushPath = pathPusher(client, cache);
 
   await runPool(missingHashes, concurrency, async (hash) => {
     const storePath = hashToPath.get(hash);
@@ -133,7 +154,7 @@ export async function pushPaths(
       if (!info) {
         throw new Error(`missing path info for ${storePath}`);
       }
-      const result = await pushSinglePath(client, cache, storePath, info);
+      const result = await pushPath(storePath, info);
       completed++;
       onProgress?.(completed, total, name, `ok (${String(result.sizeKb)}KB)`);
       pushed++;
@@ -148,4 +169,3 @@ export async function pushPaths(
 
   return { pushed, skipped, failed, errors };
 }
-

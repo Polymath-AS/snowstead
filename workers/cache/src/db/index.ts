@@ -62,4 +62,11 @@ export {
 	deleteExpiredApiTokens,
 	createAuditLog,
 	deleteExpiredAuditLogs,
+	createUploadSessions,
+	findUploadSessions,
+	completeUploadSessions,
+	findPublishedPaths,
+	findBlobObjectsByIds,
+	ensureBlobObjects,
+	createPublishedPaths,
 } from './repository.js';

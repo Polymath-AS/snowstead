@@ -464,3 +464,92 @@ export async function deleteExpiredAuditLogs(
 		.where(lt(auditLogs.timestamp, cutoff));
 	return result.rowCount ?? 0;
 }
+
+export async function createUploadSessions(
+	db: Db,
+	rows: ReadonlyArray<Parameters<typeof createUploadSession>[1]>,
+): Promise<void> {
+	if (rows.length === 0) return;
+	await db.insert(uploadSessions).values([...rows]);
+}
+
+export async function findUploadSessions(db: Db, ids: readonly string[]): Promise<UploadSession[]> {
+	if (ids.length === 0) return [];
+	return db
+		.select()
+		.from(uploadSessions)
+		.where(sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`);
+}
+
+/**
+ * Marks uploaded single-object sessions completed: presigned ones are still
+ * pending, direct ones uploading. Returns the ids that moved.
+ */
+export async function completeUploadSessions(db: Db, ids: readonly string[]): Promise<string[]> {
+	if (ids.length === 0) return [];
+	const rows = await db
+		.update(uploadSessions)
+		.set({ status: "completed" })
+		.where(
+			and(
+				sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`,
+				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
+				isNull(uploadSessions.r2UploadId),
+			),
+		)
+		.returning({ id: uploadSessions.id });
+	return rows.map((r) => r.id);
+}
+
+export async function findPublishedPaths(
+	db: Db,
+	cacheId: number,
+	storePathHashes: readonly string[],
+): Promise<PublishedPath[]> {
+	if (storePathHashes.length === 0) return [];
+	return db
+		.select()
+		.from(publishedPaths)
+		.where(
+			and(
+				eq(publishedPaths.cacheId, cacheId),
+				sql`${publishedPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
+			),
+		);
+}
+
+export async function findBlobObjectsByIds(db: Db, ids: readonly number[]): Promise<BlobObject[]> {
+	if (ids.length === 0) return [];
+	return db
+		.select()
+		.from(blobObjects)
+		.where(sql`${blobObjects.id} = ANY(${sql.param([...ids])}::bigint[])`);
+}
+
+/** Records blobs not yet recorded, and returns every one of them. */
+export async function ensureBlobObjects(
+	db: Db,
+	rows: ReadonlyArray<Parameters<typeof createBlobObject>[1]>,
+): Promise<BlobObject[]> {
+	if (rows.length === 0) return [];
+	await db.insert(blobObjects).values([...rows]).onConflictDoNothing();
+	const found = await db
+		.select()
+		.from(blobObjects)
+		.where(sql`${blobObjects.fileHash} = ANY(${sql.param(rows.map((r) => r.fileHash))}::text[])`);
+	return found.filter((b) => rows.some((r) => r.fileHash === b.fileHash && r.compression === b.compression));
+}
+
+/** Inserts paths not yet published; returns the store path hashes inserted. */
+export async function createPublishedPaths(
+	db: Db,
+	rows: ReadonlyArray<Parameters<typeof createPublishedPath>[1]>,
+): Promise<string[]> {
+	if (rows.length === 0) return [];
+	const inserted = await db
+		.insert(publishedPaths)
+		.values([...rows])
+		.onConflictDoNothing()
+		.returning({ storePathHash: publishedPaths.storePathHash });
+	return inserted.map((r) => r.storePathHash);
+}

@@ -20,7 +20,7 @@ Commands:
 
 Options:
   --server <name>    Use a specific server (default: last logged-in)
-  --jobs <n>         Number of parallel uploads (default: 8)
+  --jobs <n>         Paths in flight at once (default: 32)
   --help             Show this help
 
 Token create options:

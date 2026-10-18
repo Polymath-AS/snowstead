@@ -17,12 +17,15 @@ import {
 	handleComplete,
 	handlePublish,
 	handleGetMissingPaths,
+	handleCreateSessions,
+	handleCommit,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
 import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleBackfillNarinfo, handleSyncAuth } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
+const RE_SESSION_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions\/batch$/;
 const RE_MULTIPART = /^\/_api\/v1\/uploads\/([^/]+)\/multipart$/;
 const RE_PART_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/;
 const RE_BLOB = /^\/_api\/v1\/uploads\/([^/]+)\/blob$/;
@@ -405,7 +408,8 @@ async function handleWriteApi(
 		return response;
 	}
 
-	const sessionCreate = pathname.match(RE_SESSION_CREATE);
+	const sessionBatch = pathname.match(RE_SESSION_BATCH);
+	const sessionCreate = sessionBatch ?? pathname.match(RE_SESSION_CREATE);
 	if (sessionCreate) {
 		const cacheName = sessionCreate[1];
 		if (identity.kind === "jwt" && !hasCacheAccess(identity.claims, cacheName)) {
@@ -413,8 +417,16 @@ async function handleWriteApi(
 			writeAuditLog(config, identity, "push", cacheName, 403, '{"reason":"cache access denied"}', ip);
 			return response;
 		}
-		const response = await handleCreateSession(request, config, cacheName);
-		writeAuditLog(config, identity, "push", cacheName, response.status, '{"endpoint":"create-session"}', ip);
+		const response = sessionBatch
+			? await handleCreateSessions(request, config, cacheName)
+			: await handleCreateSession(request, config, cacheName);
+		writeAuditLog(config, identity, "push", cacheName, response.status, sessionBatch ? '{"endpoint":"create-sessions"}' : '{"endpoint":"create-session"}', ip);
+		return response;
+	}
+
+	if (pathname === "/_api/v1/uploads/commit") {
+		const response = await handleCommit(request, config, identity, new URL(request.url).origin);
+		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"commit"}', ip);
 		return response;
 	}
 

@@ -312,3 +312,87 @@ describe("get-missing-paths", () => {
 		expect(res.status).toBe(404);
 	});
 });
+
+describe("batches", () => {
+	async function createBatch(paths: unknown[]) {
+		return post(`/_api/v1/caches/${CACHE_NAME}/upload-sessions/batch`, { paths });
+	}
+
+	async function putBlob(sessionId: string, fileHash: string) {
+		const res = await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, {
+			method: "PUT",
+			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
+			body: blob(fileHash),
+		});
+		expect(res.status).toBe(200);
+	}
+
+	type CommitResult = { sessionId: string; published?: boolean; alreadyExisted?: boolean; error?: string; status?: number };
+
+	async function commit(sessionIds: string[]) {
+		const res = await post("/_api/v1/uploads/commit", { sessionIds });
+		expect(res.status).toBe(200);
+		return (await res.json<{ results: CommitResult[] }>()).results;
+	}
+
+	it("creates sessions in the order asked", async () => {
+		const bodies = await Promise.all([1, 2, 3].map(async () => sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() })));
+		const res = await createBatch(bodies);
+		expect(res.status).toBe(201);
+		const { sessions } = await res.json<{ sessions: Array<{ sessionId: string; r2Key: string; uploadMethod: string }> }>();
+		expect(sessions.map((s) => s.r2Key)).toEqual(bodies.map((b) => `nar/${b.fileHash}/zstd.nar`));
+		expect(new Set(sessions.map((s) => s.sessionId)).size).toBe(3);
+	});
+
+	it("refuses a batch with an invalid path, naming it", async () => {
+		const good = sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() });
+		const res = await createBatch([good, { ...good, narSize: "big" }]);
+		expect(res.status).toBe(400);
+		expect(await res.text()).toContain("paths[1]");
+	});
+
+	it("refuses empty and oversized batches", async () => {
+		expect((await createBatch([])).status).toBe(400);
+		const body = sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() });
+		expect((await createBatch(Array.from({ length: 101 }, () => body))).status).toBe(400);
+	});
+
+	it("completes and publishes uploaded sessions, and reports the rest per session", async () => {
+		const bodies = await Promise.all([1, 2, 3, 4].map(async () => sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() })));
+		const { sessions } = await (await createBatch(bodies)).json<{ sessions: Array<{ sessionId: string }> }>();
+		await Promise.all(sessions.slice(0, 3).map((s, i) => putBlob(s.sessionId, bodies[i].fileHash)));
+
+		const unknown = crypto.randomUUID();
+		const results = await commit([...sessions.map((s) => s.sessionId), unknown]);
+		expect(results.slice(0, 3).map((r) => r.published)).toEqual([true, true, true]);
+		expect(results[3]).toMatchObject({ error: "Upload incomplete", status: 400 });
+		expect(results[4]).toMatchObject({ sessionId: unknown, status: 404 });
+
+		for (const b of bodies.slice(0, 3)) {
+			const res = await SELF.fetch(`http://example.com/${CACHE_NAME}/${b.storePathHash}.narinfo`);
+			expect(res.status).toBe(200);
+			expect(await res.text()).toContain(`FileHash: sha256:${b.fileHash}`);
+		}
+		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		expect(await findPublishedPath(getDb(), cache!.id, bodies[3].storePathHash)).toBeUndefined();
+
+		// Committing again publishes nothing new.
+		const again = await commit([sessions[0].sessionId]);
+		expect(again[0]).toMatchObject({ published: true, alreadyExisted: true });
+	});
+
+	it("publishes a path once when a batch carries it twice", async () => {
+		const storePathHash = uniqueStorePathHash();
+		const bodies = [
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash }),
+			sessionBody({ fileHash: await uniqueFileHash(), storePathHash }),
+		];
+		const { sessions } = await (await createBatch(bodies)).json<{ sessions: Array<{ sessionId: string }> }>();
+		await Promise.all(sessions.map((s, i) => putBlob(s.sessionId, bodies[i].fileHash)));
+
+		const results = await commit(sessions.map((s) => s.sessionId));
+		expect(results.every((r) => r.published)).toBe(true);
+		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		expect(await findPublishedPath(getDb(), cache!.id, storePathHash)).toBeDefined();
+	});
+});

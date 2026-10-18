@@ -142,7 +142,7 @@ helios push main --closure /run/current-system
 helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
 ```
 
-Use `--jobs <n>` to control parallelism (default 8).
+Use `--jobs <n>` to control how many paths are in flight (default 32).
 
 ## Migrating from AUTH_TOKEN
 
