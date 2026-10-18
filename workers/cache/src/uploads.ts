@@ -20,6 +20,7 @@ import {
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { Cache, UploadSession } from "./db/types.js";
+import type { SessionResponse } from "@helios/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
@@ -187,22 +188,6 @@ function parseSessionParams(input: unknown): SessionParams | string {
 	};
 }
 
-interface CreatedSession {
-	readonly sessionId: string;
-	readonly r2Key: string;
-	/**
-	 * "presigned": PUT the NAR to uploadUrl with uploadHeaders;
-	 * "presigned-parts": PUT each partSize slice of it to its part's url, in
-	 * parallel, and commit with the parts' ETags; "direct": through the API.
-	 */
-	readonly uploadMethod: "presigned" | "presigned-parts" | "direct";
-	readonly uploadUrl?: string;
-	readonly uploadHeaders?: Record<string, string>;
-	readonly partSize?: number;
-	readonly parts?: ReadonlyArray<{ readonly partNumber: number; readonly url: string }>;
-	readonly expiresAt: Date;
-}
-
 /**
  * Large NARs upload in parallel parts: one connection carries far less than
  * several. The parts go to a staging key of their own, never to the NAR's
@@ -220,7 +205,7 @@ async function createSessions(
 	config: WorkerConfig,
 	cache: Cache,
 	items: readonly SessionParams[],
-): Promise<CreatedSession[]> {
+): Promise<SessionResponse[]> {
 	// Seed the ID → name cache so session-scoped requests skip the database lookup.
 	cacheIdToName.set(cache.id, cache.name);
 	// Straight into the bucket the cache is served from.
@@ -254,7 +239,8 @@ async function createSessions(
 	}));
 	await createUploadSessions(config.db, rows);
 
-	return Promise.all(rows.map(async (row): Promise<CreatedSession> => {
+	return Promise.all(rows.map(async (row): Promise<SessionResponse> => {
+		const expiresAt = row.expiresAt.toISOString();
 		if (!config.r2AccessKeyId || !config.r2SecretAccessKey || !config.r2Endpoint || row.fileSize > PRESIGNED_PUT_MAX_BYTES) {
 			return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "direct", expiresAt };
 		}

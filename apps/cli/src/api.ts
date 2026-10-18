@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import type { SessionResponse } from "@helios/cache-domain";
 import { runPool } from "./pool.js";
 
 export interface ApiClient {
@@ -41,22 +42,6 @@ async function request(
 // We trust the shape of our own API responses at this boundary.
 async function jsonBody<T>(resp: Response): Promise<T> {
   return resp.json() as Promise<T>;
-}
-
-export interface SessionResponse {
-  readonly sessionId: string;
-  readonly r2Key: string;
-  /**
-   * "presigned": PUT the NAR to uploadUrl with uploadHeaders;
-   * "presigned-parts": PUT each partSize slice to its part's url and commit
-   * with their ETags; "direct": through the API.
-   */
-  readonly uploadMethod: string;
-  readonly uploadUrl?: string;
-  readonly uploadHeaders?: Record<string, string>;
-  readonly partSize?: number;
-  readonly parts?: ReadonlyArray<{ readonly partNumber: number; readonly url: string }>;
-  readonly expiresAt: string;
 }
 
 export async function getMissingPaths(

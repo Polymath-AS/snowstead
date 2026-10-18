@@ -171,6 +171,10 @@ importers:
         version: 4.151.1(@types/node@26.6.5)
 
   apps/cli:
+    dependencies:
+      '@helios/cache-domain':
+        specifier: workspace:*
+        version: link:../../packages/cache-domain
     devDependencies:
       '@types/node':
         specifier: ^26.6.5

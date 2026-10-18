@@ -90,15 +90,15 @@ function pathPusher(client: ApiClient, cache: string) {
       });
 
       let result;
-      if (session.uploadMethod === "presigned-parts" && session.parts && session.partSize) {
+      if (session.uploadMethod === "presigned-parts") {
         const parts = await uploadPresignedParts(session.parts, session.partSize, narFile, partSlot);
         // On its own: the server assembles and checks the NAR, which would
         // hold up a batch of small paths.
         [result] = await commitUploads(client, [session.sessionId], { [session.sessionId]: parts });
-      } else if (session.uploadMethod === "presigned" && session.uploadUrl) {
+      } else if (session.uploadMethod === "presigned") {
         // Straight to R2; the API never handles the NAR.
         const { uploadUrl, uploadHeaders } = session;
-        await uploadOnce(fileHash, () => uploadPresigned(uploadUrl, uploadHeaders ?? {}, narFile));
+        await uploadOnce(fileHash, () => uploadPresigned(uploadUrl, uploadHeaders, narFile));
       } else if (shouldUseMultipart(fileSize)) {
         await uploadBlobMultipart(client, session.sessionId, narFile);
         // A commit takes multipart sessions only once completed.

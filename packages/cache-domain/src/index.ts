@@ -7,6 +7,7 @@ export type {
   Compression,
   NarInfoFields,
   ParseError,
+  SessionResponse,
 } from './types.js';
 
 export {
