@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "snowstead",
 	// Uzair's account, where the nix-cache Hyperdrive config lives.
-	"account_id": "7b87b6b8f96465d53ec6ce256410c194",
+	"account_id": "a5af70f803f5950f325622198dbd50a2",
 	"main": "workers/cache/src/index.ts",
 	"compatibility_date": "2026-03-10",
 	// Required by the pg driver, which reaches Postgres through Hyperdrive.
@@ -22,7 +22,7 @@
 			"binding": "CACHE_BUCKET",
 			"bucket_name": "snowstead-private"
 		},
-		// Public caches, served straight from R2 and the CDN on cache.polmath.no;
+		// Public caches, served straight from R2 and the CDN on cache.snowstead.com;
 		// every object in it is world-readable.
 		{
 			"binding": "PUBLIC_BUCKET",
@@ -34,7 +34,7 @@
 	"kv_namespaces": [
 		{
 			"binding": "AUTH_KV",
-			"id": "d2e64836d5fa4888957d15bdd3370067"
+			"id": "5600f9fcae284ef6b92a0d809068d44d"
 		}
 	],
 	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
@@ -45,14 +45,14 @@
 	"hyperdrive": [
 		{
 			"binding": "HYPERDRIVE",
-			"id": "fe5e1520e81649299506184e2116af05"
+			"id": "9c99efdbc9964220995416b4ea44e111"
 		}
 	],
-	// cache.polmath.no itself is the public bucket; the Worker takes only the
+	// cache.snowstead.com itself is the public bucket; the Worker takes only the
 	// API and private caches there.
 	"routes": [
-		{ "pattern": "cache.polmath.no/_api/*", "zone_name": "polmath.no" },
-		{ "pattern": "cache.polmath.no/private/*", "zone_name": "polmath.no" }
+		{ "pattern": "cache.snowstead.com/_api/*", "zone_name": "snowstead.com" },
+		{ "pattern": "cache.snowstead.com/private/*", "zone_name": "snowstead.com" }
 	],
 	"triggers": {
 		"crons": ["0 */6 * * *"]

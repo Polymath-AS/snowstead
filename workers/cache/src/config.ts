@@ -4,7 +4,7 @@ import type { Db } from "./db/connection.js";
 export interface WorkerConfig {
 	/** Private caches, and everything the Worker alone reads. */
 	readonly bucket: R2Bucket;
-	/** Public caches, served straight from R2 on cache.polmath.no. */
+	/** Public caches, served straight from R2 on cache.snowstead.com. */
 	readonly publicBucket: R2Bucket;
 	/** Authorization state read per request: token revocations. */
 	readonly authKv: KVNamespace;

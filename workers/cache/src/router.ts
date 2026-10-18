@@ -72,7 +72,7 @@ export async function handleRequest(
 	}
 
 	const segments = url.pathname.split("/").filter(Boolean);
-	// On cache.polmath.no the Worker serves private caches under /private/;
+	// On cache.snowstead.com the Worker serves private caches under /private/;
 	// elsewhere (workers.dev) it serves every cache at the root.
 	if (segments[0] === "private") segments.shift();
 
@@ -256,7 +256,7 @@ async function handleNarDownload(
 	const bucket = bucketFor(config, isPrivate);
 
 	// Presigned R2 redirect (bypasses the Worker entirely); the credentials
-	// are for the private bucket, and public NARs have cache.polmath.no.
+	// are for the private bucket, and public NARs have cache.snowstead.com.
 	if (isPrivate && config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
 		const url = await createPresignedUrl(
 			config.r2Endpoint,

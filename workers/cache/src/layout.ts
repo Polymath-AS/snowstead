@@ -2,7 +2,7 @@ import type { WorkerConfig } from "./config.js";
 
 /**
  * Where a cache's objects live. Public caches are laid out in the public
- * bucket exactly as Nix requests them, so cache.polmath.no serves them
+ * bucket exactly as Nix requests them, so cache.snowstead.com serves them
  * straight from R2 and the CDN:
  *
  *   <cache>/nix-cache-info
