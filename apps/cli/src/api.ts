@@ -134,7 +134,7 @@ export async function uploadPresigned(
   filePath: string,
 ): Promise<void> {
   const fileInfo = await stat(filePath);
-  const resp = await fetch(url, {
+  const resp = await putRetrying(url, () => ({
     method: "PUT",
     headers: {
       ...headers,
@@ -143,10 +143,25 @@ export async function uploadPresigned(
     },
     body: ReadableStream.from(createReadStream(filePath)),
     duplex: "half",
-  });
+  }));
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`presigned upload failed (${resp.status}): ${text}`);
+  }
+}
+
+const PUT_ATTEMPTS = 4;
+
+/**
+ * A PUT to R2, retried with backoff while R2 asks for a slower rate (429)
+ * or is briefly unavailable (503). init() makes a fresh body each attempt.
+ */
+async function putRetrying(url: string, init: () => RequestInit): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    const resp = await fetch(url, init());
+    if ((resp.status !== 429 && resp.status !== 503) || attempt === PUT_ATTEMPTS) return resp;
+    await resp.body?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt * (0.5 + Math.random())));
   }
 }
 
@@ -400,12 +415,12 @@ export async function uploadPresignedParts(
   return Promise.all(parts.map((part) => limit(async () => {
     const start = (part.partNumber - 1) * partSize;
     const end = Math.min(start + partSize, fileSize);
-    const resp = await fetch(part.url, {
+    const resp = await putRetrying(part.url, () => ({
       method: "PUT",
       headers: { "content-length": String(end - start) },
       body: ReadableStream.from(createReadStream(filePath, { start, end: end - 1 })),
       duplex: "half",
-    });
+    }));
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(`part ${String(part.partNumber)} upload failed (${resp.status}): ${text}`);

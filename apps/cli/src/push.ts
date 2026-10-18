@@ -53,6 +53,19 @@ function pathPusher(client: ApiClient, cache: string) {
   );
   const commit = batcher(BATCH_SIZE, BATCH_DELAY_MS, (ids: string[]) => commitUploads(client, ids));
   const partSlot = limiter(PART_CONCURRENCY);
+  // Identical files share one NAR key, and R2 refuses concurrent PUTs to
+  // one key: each distinct NAR uploads once per push, and paths sharing it
+  // wait for that upload. Staged uploads have keys of their own.
+  const uploads = new Map<string, Promise<void>>();
+  const uploadOnce = (fileHash: string, upload: () => Promise<void>): Promise<void> => {
+    let pending = uploads.get(fileHash);
+    if (!pending) {
+      pending = upload();
+      uploads.set(fileHash, pending);
+      pending.catch(() => uploads.delete(fileHash));
+    }
+    return pending;
+  };
 
   return async (storePath: string, info: PathInfo): Promise<{ sizeKb: number }> => {
     const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
@@ -82,13 +95,14 @@ function pathPusher(client: ApiClient, cache: string) {
         [result] = await commitUploads(client, [session.sessionId], { [session.sessionId]: parts });
       } else if (session.uploadMethod === "presigned" && session.uploadUrl) {
         // Straight to R2; the API never handles the NAR.
-        await uploadPresigned(session.uploadUrl, session.uploadHeaders ?? {}, narFile);
+        const { uploadUrl, uploadHeaders } = session;
+        await uploadOnce(fileHash, () => uploadPresigned(uploadUrl, uploadHeaders ?? {}, narFile));
       } else if (shouldUseMultipart(fileSize)) {
         await uploadBlobMultipart(client, session.sessionId, narFile);
         // A commit takes multipart sessions only once completed.
         await completeUpload(client, session.sessionId);
       } else {
-        await uploadBlob(client, session.sessionId, narFile);
+        await uploadOnce(fileHash, () => uploadBlob(client, session.sessionId, narFile));
       }
       result ??= await commit(session.sessionId);
       if (!result.published) {
