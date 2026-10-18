@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
-import { createCache, findPublishedPath, findCacheByName } from "../src/db/repository.js";
+import { createCache, findPublishedPath, findCacheByName, createUploadSessions, findUploadSession } from "../src/db/repository.js";
 
 const CACHE_NAME = "upload-test";
 const AUTH_TOKEN = "test-auth-token";
@@ -394,5 +394,74 @@ describe("batches", () => {
 		expect(results.every((r) => r.published)).toBe(true);
 		const cache = await findCacheByName(getDb(), CACHE_NAME);
 		expect(await findPublishedPath(getDb(), cache!.id, storePathHash)).toBeDefined();
+	});
+});
+
+describe("staged uploads", () => {
+	// What session creation does for a large NAR when presigning is configured;
+	// the test Worker has no R2 credentials, so the parts go through the binding.
+	async function stagedSession(fileHash: string, body: Uint8Array) {
+		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		const id = crypto.randomUUID();
+		const key = `staging/${id}`;
+		const multipart = await env.CACHE_BUCKET.createMultipartUpload(key);
+		const storePathHash = uniqueStorePathHash();
+		await createUploadSessions(getDb(), [{
+			id,
+			cacheId: cache!.id,
+			storePathHash,
+			storePath: `/nix/store/${storePathHash}-big`,
+			narHash: `sha256:${"1".repeat(52)}`,
+			narSize: 4096,
+			fileHash,
+			fileSize: body.byteLength,
+			compression: "zstd",
+			referencesJson: "[]",
+			deriver: null,
+			system: null,
+			status: "uploading",
+			r2UploadKey: key,
+			r2UploadId: multipart.uploadId,
+			expiresAt: new Date(Date.now() + 3600_000),
+		}]);
+		const part = await multipart.uploadPart(1, body);
+		return { id, key, storePathHash, parts: [{ partNumber: 1, etag: part.etag }] };
+	}
+
+	async function commitStaged(id: string, parts: unknown) {
+		const res = await post("/_api/v1/uploads/commit", { sessionIds: [id], parts: { [id]: parts } });
+		expect(res.status).toBe(200);
+		return (await res.json<{ results: Array<{ published?: boolean; error?: string; status?: number }> }>()).results[0];
+	}
+
+	it("assembles the parts, moves the NAR to its key and publishes it", async () => {
+		const fileHash = await uniqueFileHash();
+		const staged = await stagedSession(fileHash, blob(fileHash));
+
+		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ published: true });
+		const nar = await env.PUBLIC_BUCKET.get(`nar/${fileHash}/zstd.nar`);
+		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(blob(fileHash));
+		expect(await env.CACHE_BUCKET.head(staged.key)).toBeNull();
+		const res = await SELF.fetch(`http://example.com/${CACHE_NAME}/${staged.storePathHash}.narinfo`);
+		expect(res.status).toBe(200);
+	});
+
+	it("refuses parts that are not the file the session names", async () => {
+		const fileHash = await uniqueFileHash();
+		const staged = await stagedSession(fileHash, crypto.getRandomValues(new Uint8Array(BLOB_SIZE)));
+
+		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ error: "File hash mismatch", status: 400 });
+		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
+		expect(await env.CACHE_BUCKET.head(staged.key)).toBeNull();
+		expect((await findUploadSession(getDb(), staged.id))?.status).toBe("uploading");
+	});
+
+	it("needs the parts to commit, and a commit to complete", async () => {
+		const fileHash = await uniqueFileHash();
+		const staged = await stagedSession(fileHash, blob(fileHash));
+
+		const res = await post("/_api/v1/uploads/commit", { sessionIds: [staged.id] });
+		expect((await res.json<{ results: Array<{ status?: number }> }>()).results[0].status).toBe(409);
+		expect((await post(`/_api/v1/uploads/${staged.id}/complete`, {})).status).toBe(409);
 	});
 });

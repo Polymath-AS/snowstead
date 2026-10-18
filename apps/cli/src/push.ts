@@ -9,6 +9,7 @@ import {
   uploadBlob,
   shouldUseMultipart,
   uploadPresigned,
+  uploadPresignedParts,
   uploadBlobMultipart,
   completeUpload,
 } from "./api.js";
@@ -24,6 +25,9 @@ const DEFAULT_CONCURRENCY = 32;
 // once its first path has waited BATCH_DELAY_MS.
 const BATCH_SIZE = 100;
 const BATCH_DELAY_MS = 50;
+// Part uploads in flight across the push: a few large NARs at once would
+// otherwise open far more connections than the uplink can use.
+const PART_CONCURRENCY = 16;
 
 export interface PushResult {
   readonly pushed: number;
@@ -48,6 +52,7 @@ function pathPusher(client: ApiClient, cache: string) {
     createUploadSessions(client, cache, paths),
   );
   const commit = batcher(BATCH_SIZE, BATCH_DELAY_MS, (ids: string[]) => commitUploads(client, ids));
+  const partSlot = limiter(PART_CONCURRENCY);
 
   return async (storePath: string, info: PathInfo): Promise<{ sizeKb: number }> => {
     const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
@@ -69,7 +74,13 @@ function pathPusher(client: ApiClient, cache: string) {
         references: info.references,
       });
 
-      if (session.uploadMethod === "presigned" && session.uploadUrl) {
+      let result;
+      if (session.uploadMethod === "presigned-parts" && session.parts && session.partSize) {
+        const parts = await uploadPresignedParts(session.parts, session.partSize, narFile, partSlot);
+        // On its own: the server assembles and checks the NAR, which would
+        // hold up a batch of small paths.
+        [result] = await commitUploads(client, [session.sessionId], { [session.sessionId]: parts });
+      } else if (session.uploadMethod === "presigned" && session.uploadUrl) {
         // Straight to R2; the API never handles the NAR.
         await uploadPresigned(session.uploadUrl, session.uploadHeaders ?? {}, narFile);
       } else if (shouldUseMultipart(fileSize)) {
@@ -79,8 +90,7 @@ function pathPusher(client: ApiClient, cache: string) {
       } else {
         await uploadBlob(client, session.sessionId, narFile);
       }
-
-      const result = await commit(session.sessionId);
+      result ??= await commit(session.sessionId);
       if (!result.published) {
         throw new Error(`publish failed (${String(result.status)}): ${result.error ?? "unknown error"}`);
       }
@@ -142,6 +152,9 @@ export async function pushPaths(
     if (storePath) missingPaths.push(storePath);
   }
   const pathInfos = await getPathInfos(missingPaths);
+  // Largest first: a big NAR started late is what a push ends waiting on.
+  const narSize = (hash: string) => pathInfos.get(hashToPath.get(hash) ?? "")?.narSize ?? 0;
+  missingHashes.sort((a, b) => narSize(b) - narSize(a));
   const pushPath = pathPusher(client, cache);
 
   await runPool(missingHashes, concurrency, async (hash) => {

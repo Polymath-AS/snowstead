@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createPresignedPut } from "../src/presign.js";
+import { createPresignedPartPut, createPresignedPut } from "../src/presign.js";
 
 describe("presigned uploads", () => {
 	it("sign the checksum and the cache header the CDN serves", async () => {
@@ -23,5 +23,24 @@ describe("presigned uploads", () => {
 		// The base64 form of the file hash, as R2 checks it.
 		expect(headers["x-amz-checksum-sha256"]).toBe("L5spLmHxo4zwWB8LQ5ZMgJqzfnjpt/GDVZ0nnobVmQk=");
 		expect(headers["cache-control"]).toContain("immutable");
+	});
+});
+
+describe("presigned parts", () => {
+	it("name the multipart upload and the part", async () => {
+		const url = new URL(await createPresignedPartPut(
+			"https://acct.r2.cloudflarestorage.com",
+			"key-id",
+			"secret",
+			"helios-cache",
+			"staging/abc",
+			"upload-1",
+			3,
+			3600,
+		));
+		expect(url.pathname).toBe("/helios-cache/staging/abc");
+		expect(url.searchParams.get("partNumber")).toBe("3");
+		expect(url.searchParams.get("uploadId")).toBe("upload-1");
+		expect(url.searchParams.get("X-Amz-Signature")).toBeTruthy();
 	});
 });

@@ -467,7 +467,7 @@ export async function deleteExpiredAuditLogs(
 
 export async function createUploadSessions(
 	db: Db,
-	rows: ReadonlyArray<Parameters<typeof createUploadSession>[1]>,
+	rows: ReadonlyArray<Parameters<typeof createUploadSession>[1] & { readonly status?: UploadSessionStatus }>,
 ): Promise<void> {
 	if (rows.length === 0) return;
 	await db.insert(uploadSessions).values([...rows]);
@@ -482,8 +482,8 @@ export async function findUploadSessions(db: Db, ids: readonly string[]): Promis
 }
 
 /**
- * Marks uploaded single-object sessions completed: presigned ones are still
- * pending, direct ones uploading. Returns the ids that moved.
+ * Marks uploaded sessions completed: presigned ones are still pending,
+ * the others uploading. Returns the ids that moved.
  */
 export async function completeUploadSessions(db: Db, ids: readonly string[]): Promise<string[]> {
 	if (ids.length === 0) return [];
@@ -494,7 +494,6 @@ export async function completeUploadSessions(db: Db, ids: readonly string[]): Pr
 			and(
 				sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`,
 				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
-				isNull(uploadSessions.r2UploadId),
 			),
 		)
 		.returning({ id: uploadSessions.id });

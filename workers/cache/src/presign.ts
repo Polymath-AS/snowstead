@@ -75,3 +75,29 @@ function hexToBase64(hex: string): string {
 	}
 	return btoa(binary);
 }
+
+/**
+ * A presigned PUT for one part of an R2 multipart upload. The parts carry
+ * no checksum the server could know in advance; the assembled object is
+ * checked against the file hash when it is committed.
+ */
+export async function createPresignedPartPut(
+	endpoint: string,
+	accessKeyId: string,
+	secretAccessKey: string,
+	bucket: string,
+	key: string,
+	uploadId: string,
+	partNumber: number,
+	expiresIn: number,
+): Promise<string> {
+	const client = getClient(accessKeyId, secretAccessKey);
+	const url = new URL(`/${bucket}/${key}`, endpoint);
+	url.searchParams.set("partNumber", String(partNumber));
+	url.searchParams.set("uploadId", uploadId);
+	url.searchParams.set("X-Amz-Expires", String(expiresIn));
+	const signed = await client.sign(new Request(url, { method: "PUT" }), {
+		aws: { signQuery: true },
+	});
+	return signed.url;
+}

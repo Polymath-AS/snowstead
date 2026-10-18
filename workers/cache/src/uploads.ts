@@ -21,8 +21,8 @@ import {
 } from "./db/repository.js";
 import type { Cache, UploadSession } from "./db/types.js";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
-import { IMMUTABLE, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
-import { createPresignedPut } from "./presign.js";
+import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
+import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { isPrivateCache } from "./visibility.js";
 import {
 	parseFileHash,
@@ -189,11 +189,29 @@ function parseSessionParams(input: unknown): SessionParams | string {
 interface CreatedSession {
 	readonly sessionId: string;
 	readonly r2Key: string;
-	/** "presigned": PUT the NAR to uploadUrl with uploadHeaders; "direct": through the API. */
-	readonly uploadMethod: "presigned" | "direct";
+	/**
+	 * "presigned": PUT the NAR to uploadUrl with uploadHeaders;
+	 * "presigned-parts": PUT each partSize slice of it to its part's url, in
+	 * parallel, and commit with the parts' ETags; "direct": through the API.
+	 */
+	readonly uploadMethod: "presigned" | "presigned-parts" | "direct";
 	readonly uploadUrl?: string;
 	readonly uploadHeaders?: Record<string, string>;
+	readonly partSize?: number;
+	readonly parts?: ReadonlyArray<{ readonly partNumber: number; readonly url: string }>;
 	readonly expiresAt: Date;
+}
+
+/**
+ * Large NARs upload in parallel parts: one connection carries far less than
+ * several. The parts go to a staging key of their own, never to the NAR's
+ * shared key, until the assembled object has been checked against the file
+ * hash.
+ */
+const STAGING_PREFIX = "staging/";
+
+function isStaged(session: Pick<UploadSession, "r2UploadKey">): boolean {
+	return session.r2UploadKey?.startsWith(STAGING_PREFIX) ?? false;
 }
 
 /** Records sessions for paths of one cache in one statement, and says where each NAR goes. */
@@ -207,49 +225,74 @@ async function createSessions(
 	// Straight into the bucket the cache is served from.
 	const isPrivate = await isPrivateCache(config, cache.name);
 	const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
+	const presigning = Boolean(config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint);
 
-	const rows = items.map((p) => ({
-		id: crypto.randomUUID(),
-		cacheId: cache.id,
-		storePathHash: p.storePathHash,
-		storePath: p.storePath,
-		narHash: p.narHash,
-		narSize: p.narSize,
-		fileHash: p.fileHash,
-		fileSize: p.fileSize,
-		compression: p.compression,
-		referencesJson: JSON.stringify(p.references),
-		deriver: p.deriver,
-		system: p.system,
-		r2UploadKey: narKey(p.fileHash, p.compression, isPrivate),
-		r2UploadId: null,
-		expiresAt,
+	const rows = await Promise.all(items.map(async (p) => {
+		const id = crypto.randomUUID();
+		const inParts = presigning && p.fileSize > PRESIGNED_PARTS_MIN_BYTES && p.fileSize <= PRESIGNED_PUT_MAX_BYTES;
+		const r2UploadKey = inParts ? `${STAGING_PREFIX}${id}` : narKey(p.fileHash, p.compression, isPrivate);
+		const multipart = inParts ? await config.bucket.createMultipartUpload(r2UploadKey) : undefined;
+		return {
+			id,
+			cacheId: cache.id,
+			storePathHash: p.storePathHash,
+			storePath: p.storePath,
+			narHash: p.narHash,
+			narSize: p.narSize,
+			fileHash: p.fileHash,
+			fileSize: p.fileSize,
+			compression: p.compression,
+			referencesJson: JSON.stringify(p.references),
+			deriver: p.deriver,
+			system: p.system,
+			status: multipart ? ("uploading" as const) : ("pending" as const),
+			r2UploadKey,
+			r2UploadId: multipart?.uploadId ?? null,
+			expiresAt,
+		};
 	}));
 	await createUploadSessions(config.db, rows);
 
 	return Promise.all(rows.map(async (row): Promise<CreatedSession> => {
-		// Straight to R2 when presigning is configured and one PUT can carry it;
-		// R2 then checks the bytes against the file hash itself.
-		if (config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint && row.fileSize <= PRESIGNED_PUT_MAX_BYTES) {
-			const put = await createPresignedPut(
-				config.r2Endpoint,
-				config.r2AccessKeyId,
-				config.r2SecretAccessKey,
-				bucketNameForKey(config, row.r2UploadKey),
-				row.r2UploadKey,
-				row.fileHash,
-				SESSION_TTL_SECONDS,
-			);
-			return {
-				sessionId: row.id,
-				r2Key: row.r2UploadKey,
-				uploadMethod: "presigned",
-				uploadUrl: put.url,
-				uploadHeaders: put.headers,
-				expiresAt,
-			};
+		if (!config.r2AccessKeyId || !config.r2SecretAccessKey || !config.r2Endpoint || row.fileSize > PRESIGNED_PUT_MAX_BYTES) {
+			return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "direct", expiresAt };
 		}
-		return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "direct", expiresAt };
+		if (row.r2UploadId) {
+			const { r2Endpoint, r2AccessKeyId, r2SecretAccessKey } = config;
+			const count = Math.ceil(row.fileSize / PART_SIZE_BYTES);
+			const parts = await Promise.all(Array.from({ length: count }, async (_, i) => ({
+				partNumber: i + 1,
+				url: await createPresignedPartPut(
+					r2Endpoint,
+					r2AccessKeyId,
+					r2SecretAccessKey,
+					config.r2BucketName,
+					row.r2UploadKey,
+					row.r2UploadId ?? "",
+					i + 1,
+					SESSION_TTL_SECONDS,
+				),
+			})));
+			return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "presigned-parts", partSize: PART_SIZE_BYTES, parts, expiresAt };
+		}
+		// One PUT; R2 checks the bytes against the file hash itself.
+		const put = await createPresignedPut(
+			config.r2Endpoint,
+			config.r2AccessKeyId,
+			config.r2SecretAccessKey,
+			bucketNameForKey(config, row.r2UploadKey),
+			row.r2UploadKey,
+			row.fileHash,
+			SESSION_TTL_SECONDS,
+		);
+		return {
+			sessionId: row.id,
+			r2Key: row.r2UploadKey,
+			uploadMethod: "presigned",
+			uploadUrl: put.url,
+			uploadHeaders: put.headers,
+			expiresAt,
+		};
 	}));
 }
 
@@ -452,8 +495,9 @@ export async function handleComplete(
 	const session = result.session;
 
 	// A presigned upload goes straight to R2, so its session is still pending.
+	// Staged parts are checked and moved into place only by a commit.
 	const presigned = session.status === "pending" && !session.r2UploadId;
-	if (session.status !== "uploading" && !presigned) {
+	if ((session.status !== "uploading" && !presigned) || isStaged(session)) {
 		return errorResponse("Conflict", 409);
 	}
 
@@ -528,12 +572,12 @@ async function publishSessions(
 	const existing = new Map(
 		(await findPublishedPaths(config.db, cacheId, sessions.map((s) => s.storePathHash))).map((p) => [p.storePathHash, p]),
 	);
-	const fresh = sessions.filter((s) => !existing.has(s.storePathHash) && s.r2UploadKey);
+	const fresh = sessions.filter((s) => !existing.has(s.storePathHash));
 	const blobs = await ensureBlobObjects(config.db, fresh.map((s) => ({
 		fileHash: s.fileHash,
 		fileSize: s.fileSize,
 		compression: s.compression,
-		r2Key: s.r2UploadKey ?? "",
+		r2Key: narKey(s.fileHash, s.compression, isPrivate),
 	})));
 	const existingBlobs = await findBlobObjectsByIds(config.db, [...existing.values()].map((p) => p.blobObjectId));
 	const blobFor = (fileHash: string, compression: string) =>
@@ -610,11 +654,73 @@ export async function handlePublish(
 	return jsonResponse({ published: true, storePathHash: published.storePathHash, alreadyExisted: published.alreadyExisted });
 }
 
+type Part = { readonly partNumber: number; readonly etag: string };
+
+function parseParts(value: unknown): Map<string, Part[]> | string {
+	const parts = new Map<string, Part[]>();
+	if (value === undefined) return parts;
+	if (typeof value !== "object" || value === null) return "parts must map session ids to their parts";
+	for (const [sessionId, list] of Object.entries(value)) {
+		if (
+			!Array.isArray(list) ||
+			!list.every((p: { partNumber?: unknown; etag?: unknown }) => Number.isInteger(p?.partNumber) && typeof p?.etag === "string")
+		) {
+			return `parts of ${sessionId} must be {partNumber, etag} objects`;
+		}
+		// S3 quotes ETags; the binding takes them bare.
+		parts.set(sessionId, list.map((p: Part) => ({ partNumber: p.partNumber, etag: p.etag.replace(/^"(.*)"$/, "$1") })));
+	}
+	return parts;
+}
+
+/**
+ * Assembles a staged upload's parts, checks the object against the file
+ * hash and moves it to the NAR's key: R2 refuses a put whose body does not
+ * hash to it. The staging object goes either way.
+ */
+async function promoteStaged(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<string | undefined> {
+	const key = session.r2UploadKey ?? "";
+	const cacheName = await resolveCacheName(config.db, session.cacheId);
+	if (!session.r2UploadId || cacheName === undefined) return "Internal error";
+	try {
+		await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
+	} catch (err) {
+		return `Upload incomplete: ${err instanceof Error ? err.message : String(err)}`;
+	}
+	try {
+		const staged = await config.bucket.get(key);
+		if (!staged) return "Upload incomplete";
+		if (staged.size !== session.fileSize) {
+			await staged.body.cancel();
+			return "File size mismatch";
+		}
+		const isPrivate = await isPrivateCache(config, cacheName);
+		const target = narKey(session.fileHash, session.compression, isPrivate);
+		const bucket = bucketFor(config, isPrivate);
+		if (await bucket.head(target)) {
+			await staged.body.cancel();
+			return undefined;
+		}
+		try {
+			await bucket.put(target, staged.body, {
+				sha256: session.fileHash,
+				httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
+			});
+		} catch {
+			return "File hash mismatch";
+		}
+		return undefined;
+	} finally {
+		await config.bucket.delete(key);
+	}
+}
+
 /**
  * Completes and publishes many uploaded sessions in one request: what
  * /complete then /publish do for each, with a few statements for all of
- * them. Multipart sessions must be completed first. Results come in the
- * order asked, each a publish's response or an error with its status.
+ * them. Staged sessions name their parts in `parts`; other multipart
+ * sessions must be completed first. Results come in the order asked, each
+ * a publish's response or an error with its status.
  */
 export async function handleCommit(
 	request: Request,
@@ -622,7 +728,7 @@ export async function handleCommit(
 	identity: AuthIdentity,
 	origin: string,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ sessionIds?: unknown }>(request);
+	const body = await parseJsonBody<{ sessionIds?: unknown; parts?: unknown }>(request);
 	if (body instanceof Response) return body;
 
 	const ids = body.sessionIds;
@@ -630,6 +736,10 @@ export async function handleCommit(
 		return errorResponse(`sessionIds must be an array of 1 to ${MAX_BATCH} session ids`, 400);
 	}
 	const sessionIds = [...new Set(ids as string[])];
+	const parts = parseParts(body.parts);
+	if (typeof parts === "string") {
+		return errorResponse(parts, 400);
+	}
 
 	const results = new Map<string, PublishResult>();
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, error, status });
@@ -641,7 +751,11 @@ export async function handleCommit(
 		const denied = await sessionAccessError(config, session, identity);
 		if (denied || !session) {
 			fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
-		} else if (session.status === "completed" || ((session.status === "pending" || session.status === "uploading") && !session.r2UploadId)) {
+		} else if (
+			session.status === "completed" ||
+			((session.status === "pending" || session.status === "uploading") && !session.r2UploadId) ||
+			(session.status === "uploading" && isStaged(session) && parts.has(sessionId))
+		) {
 			usable.push(session);
 		} else {
 			fail(sessionId, "Conflict", 409);
@@ -649,7 +763,9 @@ export async function handleCommit(
 	}
 
 	const uploaded = usable.filter((s) => s.status !== "completed");
-	const invalid = await Promise.all(uploaded.map((s) => uploadError(config, s)));
+	const invalid = await Promise.all(uploaded.map((s) =>
+		isStaged(s) ? promoteStaged(config, s, parts.get(s.id) ?? []) : uploadError(config, s),
+	));
 	const verified = uploaded.filter((s, i) => {
 		const error = invalid[i];
 		if (error) fail(s.id, error, error === "Internal error" ? 500 : 400);
@@ -674,8 +790,14 @@ export async function handleCommit(
 	return jsonResponse({ results: sessionIds.map((id) => results.get(id)) });
 }
 
-// R2 takes single PUTs up to 5 GiB; larger NARs go through the Worker in parts.
+// R2 takes single PUTs up to 5 GiB; larger NARs go through the Worker in
+// parts. A staged upload is moved into place with one such PUT, so it has
+// the same limit.
 const PRESIGNED_PUT_MAX_BYTES = 5 * 1024 ** 3 - (1 << 20);
+// Above this a NAR uploads in presigned parts of PART_SIZE_BYTES; R2 wants
+// every part but the last the same size, and at least 5 MiB.
+const PRESIGNED_PARTS_MIN_BYTES = 64 * 1024 ** 2;
+const PART_SIZE_BYTES = 32 * 1024 ** 2;
 const SESSION_TTL_SECONDS = 3600;
 // Each path publishes with a handful of R2 and Cache API calls; 100 keeps a
 // batch well inside a request's subrequest and Cache API limits.

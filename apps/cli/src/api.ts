@@ -46,10 +46,16 @@ async function jsonBody<T>(resp: Response): Promise<T> {
 export interface SessionResponse {
   readonly sessionId: string;
   readonly r2Key: string;
-  /** "presigned": PUT the NAR to uploadUrl with uploadHeaders; "direct": through the API. */
+  /**
+   * "presigned": PUT the NAR to uploadUrl with uploadHeaders;
+   * "presigned-parts": PUT each partSize slice to its part's url and commit
+   * with their ETags; "direct": through the API.
+   */
   readonly uploadMethod: string;
   readonly uploadUrl?: string;
   readonly uploadHeaders?: Record<string, string>;
+  readonly partSize?: number;
+  readonly parts?: ReadonlyArray<{ readonly partNumber: number; readonly url: string }>;
   readonly expiresAt: string;
 }
 
@@ -166,12 +172,16 @@ export interface CommitResult {
   readonly status?: number;
 }
 
-/** Completes and publishes uploaded sessions; one result per session, in order. */
+/**
+ * Completes and publishes uploaded sessions; one result per session, in
+ * order. Sessions uploaded in presigned parts name their parts.
+ */
 export async function commitUploads(
   client: ApiClient,
   sessionIds: readonly string[],
+  parts?: Record<string, readonly UploadedPart[]>,
 ): Promise<CommitResult[]> {
-  const resp = await request(client, "POST", "/_api/v1/uploads/commit", { sessionIds });
+  const resp = await request(client, "POST", "/_api/v1/uploads/commit", { sessionIds, parts });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`commit failed (${resp.status}): ${text}`);
@@ -369,4 +379,39 @@ export async function listCaches(
   }
   const data = await jsonBody<{ caches: CacheInfo[] }>(resp);
   return data.caches;
+}
+
+export interface UploadedPart {
+  readonly partNumber: number;
+  readonly etag: string;
+}
+
+/**
+ * Uploads a file in presigned parts, partSize bytes each but the last, at
+ * most `limit` of them at once across the whole push; returns their ETags.
+ */
+export async function uploadPresignedParts(
+  parts: ReadonlyArray<{ readonly partNumber: number; readonly url: string }>,
+  partSize: number,
+  filePath: string,
+  limit: <R>(fn: () => Promise<R>) => Promise<R>,
+): Promise<UploadedPart[]> {
+  const fileSize = Number((await stat(filePath)).size);
+  return Promise.all(parts.map((part) => limit(async () => {
+    const start = (part.partNumber - 1) * partSize;
+    const end = Math.min(start + partSize, fileSize);
+    const resp = await fetch(part.url, {
+      method: "PUT",
+      headers: { "content-length": String(end - start) },
+      body: ReadableStream.from(createReadStream(filePath, { start, end: end - 1 })),
+      duplex: "half",
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`part ${String(part.partNumber)} upload failed (${resp.status}): ${text}`);
+    }
+    const etag = resp.headers.get("etag");
+    if (!etag) throw new Error(`part ${String(part.partNumber)} upload returned no ETag`);
+    return { partNumber: part.partNumber, etag };
+  })));
 }
