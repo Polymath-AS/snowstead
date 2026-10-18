@@ -1,4 +1,4 @@
-import { parseNarHash } from "@helios/cache-domain";
+import { parseNarHash } from "@snowstead/cache-domain";
 import type { PublishedPath, BlobObject } from "./db/types.js";
 import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
@@ -86,6 +86,6 @@ export async function storeNarinfo(
  * their own, so their entries can never answer a request for a public URL.
  */
 export function narinfoCacheKey(origin: string, cacheName: string, storePathHash: string, isPrivate: boolean): Request {
-	const base = isPrivate ? "https://private.helios-cache.internal" : origin;
+	const base = isPrivate ? "https://private.snowstead.internal" : origin;
 	return new Request(`${base}/${cacheName}/${storePathHash}.narinfo`, { method: "GET" });
 }

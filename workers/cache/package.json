@@ -1,5 +1,5 @@
 {
-  "name": "@helios/cache-worker",
+  "name": "@snowstead/cache-worker",
   "version": "0.0.0",
   "private": true,
   "scripts": {
@@ -21,7 +21,7 @@
     "wrangler": "^4.151.1"
   },
   "dependencies": {
-    "@helios/cache-domain": "workspace:*",
+    "@snowstead/cache-domain": "workspace:*",
     "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.4",
     "pg": "^8.23.1"

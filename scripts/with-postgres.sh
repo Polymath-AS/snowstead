@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Runs a command with HELIOS_TEST_DATABASE_URL pointing at a Postgres server.
+# Runs a command with SNOWSTEAD_TEST_DATABASE_URL pointing at a Postgres server.
 # When it is already set, that server is used; otherwise a throwaway
 # cluster is started on a free local port and removed afterwards.
 #
 # Usage: scripts/with-postgres.sh <command> [args...]
 set -euo pipefail
 
-if [ -n "${HELIOS_TEST_DATABASE_URL:-}" ]; then
+if [ -n "${SNOWSTEAD_TEST_DATABASE_URL:-}" ]; then
   exec "$@"
 fi
 
 for tool in initdb pg_ctl; do
-  command -v "$tool" >/dev/null || { echo "$tool not found: run inside 'nix develop' or set HELIOS_TEST_DATABASE_URL" >&2; exit 1; }
+  command -v "$tool" >/dev/null || { echo "$tool not found: run inside 'nix develop' or set SNOWSTEAD_TEST_DATABASE_URL" >&2; exit 1; }
 done
 
 DIR="$(mktemp -d)"
@@ -27,5 +27,5 @@ printf postgres >"$DIR/pw"
 initdb -D "$DIR/data" -U postgres --pwfile="$DIR/pw" --auth=scram-sha-256 --no-sync >/dev/null
 pg_ctl -D "$DIR/data" -l "$DIR/log" -w -o "-c listen_addresses=127.0.0.1 -p $PORT -k $DIR -c fsync=off" start >/dev/null
 
-export HELIOS_TEST_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PORT/postgres"
+export SNOWSTEAD_TEST_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PORT/postgres"
 "$@"

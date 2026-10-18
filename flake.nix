@@ -1,5 +1,5 @@
 {
-  description = "Helios – Cloudflare-native Nix binary cache";
+  description = "Snowstead – Cloudflare-native Nix binary cache";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,7 +11,7 @@
       forAllSystems = fn: nixpkgs.lib.genAttrs systems (system: fn nixpkgs.legacyPackages.${system});
 
       pnpmDepsFor = pkgs: pkgs.fetchPnpmDeps {
-        pname = "helios";
+        pname = "snowstead";
         version = "0.0.0";
         src = self;
         hash = "sha256-jsWRpoBwDISpCzmRvdePjzAVT40oM6BCWmtGfbKRBdI=";
@@ -21,7 +21,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
-          pname = "helios";
+          pname = "snowstead";
           version = "0.0.0";
           src = self;
 
@@ -35,21 +35,21 @@
           pnpmDeps = pnpmDepsFor pkgs;
 
           buildPhase = ''
-            pnpm --filter @helios/cli exec tsc
+            pnpm --filter @snowstead/cli exec tsc
           '';
 
           installPhase = ''
-            mkdir -p $out/lib/helios $out/bin
+            mkdir -p $out/lib/snowstead $out/bin
 
             # Copy the full workspace structure so pnpm symlinks resolve
-            cp -r apps $out/lib/helios/apps
-            cp -r packages $out/lib/helios/packages
-            cp -r workers $out/lib/helios/workers
-            cp -r node_modules $out/lib/helios/node_modules
-            cp package.json $out/lib/helios/package.json
+            cp -r apps $out/lib/snowstead/apps
+            cp -r packages $out/lib/snowstead/packages
+            cp -r workers $out/lib/snowstead/workers
+            cp -r node_modules $out/lib/snowstead/node_modules
+            cp package.json $out/lib/snowstead/package.json
 
-            makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/helios \
-              --add-flags "$out/lib/helios/apps/cli/dist/main.js" \
+            makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/snowstead \
+              --add-flags "$out/lib/snowstead/apps/cli/dist/main.js" \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix pkgs.zstd ]}
           '';
         };
@@ -72,7 +72,7 @@
 
       checks = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
-          name = "helios-check";
+          name = "snowstead-check";
           src = self;
 
           nativeBuildInputs = [
@@ -85,10 +85,10 @@
 
           buildPhase = ''
             # Domain package: full check (tsc + unit tests)
-            pnpm --filter @helios/cache-domain check
+            pnpm --filter @snowstead/cache-domain check
 
             # Worker: type-check only (integration tests need workerd runtime)
-            pnpm --filter @helios/cache-worker exec tsc --noEmit
+            pnpm --filter @snowstead/cache-worker exec tsc --noEmit
           '';
 
           installPhase = ''

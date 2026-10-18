@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import type { SessionResponse } from "@helios/cache-domain";
+import type { SessionResponse } from "@snowstead/cache-domain";
 import { runPool } from "./pool.js";
 
 export interface ApiClient {

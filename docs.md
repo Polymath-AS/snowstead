@@ -1,15 +1,15 @@
-# Helios Documentation
+# Snowstead Documentation
 
 ## Deployment
 
 ```bash
-wrangler r2 bucket create helios-cache
+wrangler r2 bucket create snowstead-private
 # Uploads land near the pusher and replicate to the bucket; reads stay
 # consistent. Free, and only faster for pushers far from the bucket.
-wrangler r2 bucket local-uploads enable helios-cache
+wrangler r2 bucket local-uploads enable snowstead-private
 # Postgres on PlanetScale, with a role holding pg_read_all_data and
 # pg_write_all_data. Query caching off: uploads must read their own writes.
-wrangler hyperdrive create helios-cache --caching-disabled \
+wrangler hyperdrive create snowstead --caching-disabled \
   --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
 # set the Hyperdrive id in wrangler.jsonc and workers/cache/wrangler.jsonc
 wrangler secret put JWT_SECRET
@@ -36,16 +36,16 @@ DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm 
 
 ### Public caches on a custom domain
 
-Public caches are served straight from the `helios-public` bucket, not
+Public caches are served straight from the `snowstead-public` bucket, not
 the Worker. The bucket needs a custom domain on a zone in the same
 account, the Worker routes for `/_api/*` and `/private/*` on it (in
 `wrangler.jsonc`), and a Cache Rule. Cloudflare caches only some file
 extensions by default, and `.narinfo` and `.nar` are not among them:
 
 ```bash
-wrangler r2 bucket create helios-public
-wrangler r2 bucket local-uploads enable helios-public
-wrangler r2 bucket domain add helios-public --domain cache.example.com --zone-id <zone id>
+wrangler r2 bucket create snowstead-public
+wrangler r2 bucket local-uploads enable snowstead-public
+wrangler r2 bucket domain add snowstead-public --domain cache.example.com --zone-id <zone id>
 ```
 
 Cache Rule, on the zone:
@@ -62,7 +62,7 @@ they are not cached and a newly published path shows up at once.
 Configure the CLI with your server URL and admin secret:
 
 ```bash
-helios login prod https://your-worker.workers.dev $ADMIN_SECRET
+snowstead login prod https://your-worker.workers.dev $ADMIN_SECRET
 ```
 
 ## Using as a substituter
@@ -79,8 +79,8 @@ bearer token or as the password of HTTP Basic auth, which is what Nix sends
 from a netrc file.
 
 ```bash
-helios cache create team --private        # or: helios cache set team --private
-helios token create builders --caches team --perms pull
+snowstead cache create team --private        # or: snowstead cache set team --private
+snowstead token create builders --caches team --perms pull
 ```
 
 On the machines that substitute from it:
@@ -107,16 +107,16 @@ returned once on creation and never stored. Save it immediately.
 
 ```bash
 # Create a token scoped to the "main" cache with push access
-helios token create ci-runner --caches main --perms push --expires 90
+snowstead token create ci-runner --caches main --perms push --expires 90
 
 # Create a token with access to all caches
-helios token create admin-bot --caches "*" --perms push,pull
+snowstead token create admin-bot --caches "*" --perms push,pull
 
 # List all tokens
-helios token list
+snowstead token list
 
 # Revoke a token
-helios token revoke $JTI "employee offboarded"
+snowstead token revoke $JTI "employee offboarded"
 ```
 
 | Option | Default | Description |
@@ -130,20 +130,20 @@ helios token revoke $JTI "employee offboarded"
 Log in with a push token (not the admin secret):
 
 ```bash
-helios login prod https://your-worker.workers.dev $PUSH_TOKEN
+snowstead login prod https://your-worker.workers.dev $PUSH_TOKEN
 ```
 
 Then push:
 
 ```bash
 # Single path
-helios push main /nix/store/abc...-hello
+snowstead push main /nix/store/abc...-hello
 
 # Full closure
-helios push main --closure /run/current-system
+snowstead push main --closure /run/current-system
 
 # Flake output closure
-helios push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+snowstead push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
 ```
 
 Use `--jobs <n>` to control how many paths are in flight (default 32).
@@ -157,8 +157,8 @@ The server remembers paths found upstream, so each is looked up there once.
 ## Migrating from AUTH_TOKEN
 
 1. Set `JWT_SECRET` and `ADMIN_SECRET` via `wrangler secret put`
-2. Log in with the admin secret: `helios login prod $URL $ADMIN_SECRET`
-3. Create scoped tokens: `helios token create ci-runner --caches main`
+2. Log in with the admin secret: `snowstead login prod $URL $ADMIN_SECRET`
+3. Create scoped tokens: `snowstead token create ci-runner --caches main`
 4. Update publishers to log in with their JWT
 5. Remove `AUTH_TOKEN` to disable legacy auth
 

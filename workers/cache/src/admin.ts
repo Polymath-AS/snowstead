@@ -19,7 +19,7 @@ import { storeNarinfo } from "./narinfo.js";
 import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
-import { parseCacheName } from "@helios/cache-domain";
+import { parseCacheName } from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
 const MAX_TOKEN_LIFETIME_DAYS = 365;

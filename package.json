@@ -1,14 +1,14 @@
 {
   "packageManager": "pnpm@12.14.0",
   "type": "module",
-  "name": "helios",
+  "name": "snowstead",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "description": "Cloudflare-native Nix binary cache",
   "scripts": {
     "build": "echo 'wrangler bundles at deploy time'",
-    "deploy": "pnpm --filter @helios/cache-worker db:migrate && pnpm exec wrangler deploy",
-    "dev": "pnpm --filter @helios/cache-worker dev",
+    "deploy": "pnpm --filter @snowstead/cache-worker db:migrate && pnpm exec wrangler deploy",
+    "dev": "pnpm --filter @snowstead/cache-worker dev",
     "check": "pnpm -r check"
   },
   "cloudflare": {

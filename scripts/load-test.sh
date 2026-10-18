@@ -2,7 +2,7 @@
 # Load test for a deployed (or `wrangler dev`) cache worker.
 #
 # Usage:
-#   TOKEN=... PUBLIC_KEY=helios-cache-1:... ./scripts/load-test.sh <base-url> <cache> <store-path>
+#   TOKEN=... PUBLIC_KEY=snowstead-1:... ./scripts/load-test.sh <base-url> <cache> <store-path>
 #
 # <store-path> must already be pushed to <cache> with its closure. TOKEN is
 # a push token (for get-missing-paths); PUBLIC_KEY is the cache's signing

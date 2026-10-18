@@ -82,7 +82,7 @@ function readAuthError(message: string, status: number): Response {
 	};
 	if (status === 401) {
 		// Basic, so Nix and curl answer with their netrc credentials.
-		headers["www-authenticate"] = 'Basic realm="helios-cache"';
+		headers["www-authenticate"] = 'Basic realm="snowstead"';
 	}
 	return new Response(JSON.stringify({ error: message }), { status, headers });
 }

@@ -1,17 +1,17 @@
 import { cloudflareTest } from '@cloudflare/vitest-plugin';
 import { defineConfig } from 'vitest/config';
 
-// One fresh database per run on the server HELIOS_TEST_DATABASE_URL names
+// One fresh database per run on the server SNOWSTEAD_TEST_DATABASE_URL names
 // (scripts/with-postgres.sh starts one). test/global-setup.ts creates and
 // migrates it; the Worker reaches it through the Hyperdrive binding's local
 // connection string, as `wrangler dev` does.
-const server = process.env.HELIOS_TEST_DATABASE_URL;
+const server = process.env.SNOWSTEAD_TEST_DATABASE_URL;
 if (!server) {
-	throw new Error('HELIOS_TEST_DATABASE_URL is not set: run the tests through scripts/with-postgres.sh (pnpm test does)');
+	throw new Error('SNOWSTEAD_TEST_DATABASE_URL is not set: run the tests through scripts/with-postgres.sh (pnpm test does)');
 }
 const database = new URL(server);
-database.pathname = `/helios_test_${process.pid}`;
-process.env.HELIOS_TEST_DATABASE = database.toString();
+database.pathname = `/snowstead_test_${process.pid}`;
+process.env.SNOWSTEAD_TEST_DATABASE = database.toString();
 process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = database.toString();
 
 export default defineConfig({

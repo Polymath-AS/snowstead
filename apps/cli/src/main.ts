@@ -6,18 +6,18 @@ import { createClient, createToken, listTokens, revokeToken, createCache, listCa
 import { pushPaths } from "./push.js";
 import { getClosurePaths } from "./nix.js";
 
-const USAGE = `helios - Nix binary cache CLI
+const USAGE = `snowstead - Nix binary cache CLI
 
 Commands:
-  helios login <name> <server-url> <token>   Save server credentials
-  helios push <cache> <paths...>             Push store paths to a cache
-  helios push <cache> --closure <path>       Push a store path and its closure
-  helios cache create <name> [--private]     Create a cache (admin)
-  helios cache set <name> --private|--public Change who can read a cache (admin)
-  helios cache list                          List caches (admin)
-  helios token create <subject>              Create a new API token
-  helios token list                          List all API tokens
-  helios token revoke <jti> <reason>         Revoke an API token
+  snowstead login <name> <server-url> <token>   Save server credentials
+  snowstead push <cache> <paths...>             Push store paths to a cache
+  snowstead push <cache> --closure <path>       Push a store path and its closure
+  snowstead cache create <name> [--private]     Create a cache (admin)
+  snowstead cache set <name> --private|--public Change who can read a cache (admin)
+  snowstead cache list                          List caches (admin)
+  snowstead token create <subject>              Create a new API token
+  snowstead token list                          List all API tokens
+  snowstead token revoke <jti> <reason>         Revoke an API token
 
 Options:
   --server <name>    Use a specific server (default: last logged-in)
@@ -30,12 +30,12 @@ Token create options:
   --expires <days>   Token lifetime in days (default: 90)
 
 Examples:
-  helios login prod https://cache.example.com my-admin-secret
-  helios push main /nix/store/abc...-hello
-  helios push main --closure /run/current-system
-  helios token create ci-runner --caches main --perms push --expires 90
-  helios token list
-  helios token revoke a1b2c3d4-... "employee offboarded"
+  snowstead login prod https://cache.example.com my-admin-secret
+  snowstead push main /nix/store/abc...-hello
+  snowstead push main --closure /run/current-system
+  snowstead token create ci-runner --caches main --perms push --expires 90
+  snowstead token list
+  snowstead token revoke a1b2c3d4-... "employee offboarded"
 `;
 
 async function main(): Promise<void> {
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
 
   if (command === "login") {
     if (args.length < 4) {
-      console.error("Usage: helios login <name> <server-url> <token>");
+      console.error("Usage: snowstead login <name> <server-url> <token>");
       process.exit(1);
     }
     await login(args[1], args[2], args[3]);
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
 
   if (command === "push") {
     if (args.length < 2 || (args.length < 3 && values.closure === undefined)) {
-      console.error("Usage: helios push <cache> <paths...> | helios push <cache> --closure <path>");
+      console.error("Usage: snowstead push <cache> <paths...> | snowstead push <cache> --closure <path>");
       process.exit(1);
     }
 
@@ -134,7 +134,7 @@ async function main(): Promise<void> {
     if (subcommand === "create") {
       const subject = args[2];
       if (!subject) {
-        console.error("Usage: helios token create <subject> [--caches ...] [--perms ...] [--expires <days>]");
+        console.error("Usage: snowstead token create <subject> [--caches ...] [--perms ...] [--expires <days>]");
         process.exit(1);
       }
 
@@ -175,7 +175,7 @@ async function main(): Promise<void> {
       const jti = args[2];
       const reason = args.slice(3).join(" ");
       if (!jti || !reason) {
-        console.error("Usage: helios token revoke <jti> <reason>");
+        console.error("Usage: snowstead token revoke <jti> <reason>");
         process.exit(1);
       }
       await revokeToken(client, jti, reason);
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    console.error("Usage: helios token <create|list|revoke>");
+    console.error("Usage: snowstead token <create|list|revoke>");
     process.exit(1);
   }
 
@@ -196,7 +196,7 @@ async function main(): Promise<void> {
       const name = args[2];
       const wantPrivate = values.private ? true : values.public ? false : undefined;
       if (!name || (subcommand === "set" && wantPrivate === undefined)) {
-        console.error(subcommand === "set" ? "Usage: helios cache set <name> --private|--public" : "Usage: helios cache create <name> [--private]");
+        console.error(subcommand === "set" ? "Usage: snowstead cache set <name> --private|--public" : "Usage: snowstead cache create <name> [--private]");
         process.exit(1);
       }
       const result = await createCache(client, name, wantPrivate);
@@ -218,12 +218,12 @@ async function main(): Promise<void> {
       return;
     }
 
-    console.error("Usage: helios cache <create|set|list>");
+    console.error("Usage: snowstead cache <create|set|list>");
     process.exit(1);
   }
 
   console.error(`Unknown command: ${command}`);
-  console.error("Run 'helios --help' for usage");
+  console.error("Run 'snowstead --help' for usage");
   process.exit(1);
 }
 

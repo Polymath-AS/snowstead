@@ -172,7 +172,7 @@ importers:
 
   apps/cli:
     dependencies:
-      '@helios/cache-domain':
+      '@snowstead/cache-domain':
         specifier: workspace:*
         version: link:../../packages/cache-domain
     devDependencies:
@@ -194,7 +194,7 @@ importers:
 
   workers/cache:
     dependencies:
-      '@helios/cache-domain':
+      '@snowstead/cache-domain':
         specifier: workspace:*
         version: link:../../packages/cache-domain
       aws4fetch:

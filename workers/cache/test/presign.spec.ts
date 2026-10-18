@@ -8,13 +8,13 @@ describe("presigned uploads", () => {
 			"https://acct.r2.cloudflarestorage.com",
 			"key-id",
 			"secret",
-			"helios-public",
+			"snowstead-public",
 			"nar/abc/zstd.nar",
 			sha256,
 			3600,
 		);
 		const parsed = new URL(url);
-		expect(parsed.pathname).toBe("/helios-public/nar/abc/zstd.nar");
+		expect(parsed.pathname).toBe("/snowstead-public/nar/abc/zstd.nar");
 		expect(parsed.searchParams.get("X-Amz-Expires")).toBe("3600");
 		// aws4fetch never signs content-type; Nix does not read it anyway.
 		expect(parsed.searchParams.get("X-Amz-SignedHeaders")?.split(";")).toEqual(
@@ -32,13 +32,13 @@ describe("presigned parts", () => {
 			"https://acct.r2.cloudflarestorage.com",
 			"key-id",
 			"secret",
-			"helios-cache",
+			"snowstead-private",
 			"staging/abc",
 			"upload-1",
 			3,
 			3600,
 		));
-		expect(url.pathname).toBe("/helios-cache/staging/abc");
+		expect(url.pathname).toBe("/snowstead-private/staging/abc");
 		expect(url.searchParams.get("partNumber")).toBe("3");
 		expect(url.searchParams.get("uploadId")).toBe("upload-1");
 		expect(url.searchParams.get("X-Amz-Signature")).toBeTruthy();

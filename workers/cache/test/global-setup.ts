@@ -6,7 +6,7 @@ import { Client } from "pg";
 // Runs in Node, before any Worker starts: creates this run's database from
 // the migrations, and drops it afterwards.
 export async function setup(): Promise<() => Promise<void>> {
-	const url = new URL(process.env.HELIOS_TEST_DATABASE ?? "");
+	const url = new URL(process.env.SNOWSTEAD_TEST_DATABASE ?? "");
 	const name = url.pathname.slice(1);
 	const server = new URL(url);
 	server.pathname = "/postgres";

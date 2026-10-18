@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "helios-cache",
+	"name": "snowstead",
 	// Uzair's account, where the nix-cache Hyperdrive config lives.
 	"account_id": "7b87b6b8f96465d53ec6ce256410c194",
 	"main": "src/index.ts",
@@ -13,20 +13,20 @@
 	"upload_source_maps": true,
 	"workers_dev": true,
 	"vars": {
-		"SIGNING_KEY_NAME": "helios-cache-1",
+		"SIGNING_KEY_NAME": "snowstead-1",
 		// Space-separated binary caches whose paths pushes skip; empty pushes everything.
 		"UPSTREAM_CACHES": "https://cache.nixos.org"
 	},
 	"r2_buckets": [
 		{
 			"binding": "CACHE_BUCKET",
-			"bucket_name": "helios-cache"
+			"bucket_name": "snowstead-private"
 		},
 		// Public caches, served straight from R2 and the CDN on cache.polmath.no;
 		// every object in it is world-readable.
 		{
 			"binding": "PUBLIC_BUCKET",
-			"bucket_name": "helios-public"
+			"bucket_name": "snowstead-public"
 		}
 	],
 	// What authorization reads per request, cached at the edge: token
@@ -38,7 +38,7 @@
 		}
 	],
 	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
-	// caching off (`wrangler hyperdrive create helios-cache --caching-disabled
+	// caching off (`wrangler hyperdrive create snowstead --caching-disabled
 	// --connection-string ...`): upload sessions and token revocation must
 	// read their own writes. Local runs connect directly via
 	// CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE.

@@ -1,10 +1,10 @@
 {
-  "name": "@helios/cli",
+  "name": "@snowstead/cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "bin": {
-    "helios": "./dist/main.js"
+    "snowstead": "./dist/main.js"
   },
   "scripts": {
     "build": "tsc",
@@ -12,7 +12,7 @@
     "check": "pnpm test"
   },
   "dependencies": {
-    "@helios/cache-domain": "workspace:*"
+    "@snowstead/cache-domain": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

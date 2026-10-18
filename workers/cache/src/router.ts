@@ -7,8 +7,8 @@ import { isPrivateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
 import { errorResponse } from "./responses.js";
-import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@helios/cache-domain";
-import type { CacheName } from "@helios/cache-domain";
+import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@snowstead/cache-domain";
+import type { CacheName } from "@snowstead/cache-domain";
 import {
 	handleCreateSession,
 	handleMultipart,
@@ -41,7 +41,7 @@ export async function handleRequest(
 	const method = request.method;
 
 	if (url.pathname === "/") {
-		return json({ service: "helios-cache", status: "ok" });
+		return json({ service: "snowstead", status: "ok" });
 	}
 
 	if (url.pathname === "/healthz") {
@@ -149,9 +149,9 @@ function writeAuditLog(
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
 	try {
 		await findCacheByName(config.db, "__healthz_probe__");
-		return json({ ok: true, service: "helios-cache" });
+		return json({ ok: true, service: "snowstead" });
 	} catch {
-		return json({ ok: false, service: "helios-cache" }, 503);
+		return json({ ok: false, service: "snowstead" }, 503);
 	}
 }
 
@@ -199,7 +199,7 @@ async function handleNarinfo(
 
 	// HEAD and GET share the entry.
 	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cacheName, storePathHash, isPrivate);
-	const cache = await caches.open("helios-narinfo");
+	const cache = await caches.open("snowstead-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
 		return forClient(cached, isPrivate, method);
@@ -279,8 +279,8 @@ async function handleNarDownload(
 	// HEAD and GET share the entry; private caches' entries live under a host
 	// of their own, as narinfo's do.
 	const cacheUrl = new URL(request.url);
-	const cacheRequest = new Request(isPrivate ? `https://private.helios-cache.internal${cacheUrl.pathname}` : cacheUrl, { method: "GET" });
-	const cache = await caches.open("helios-nar");
+	const cacheRequest = new Request(isPrivate ? `https://private.snowstead.internal${cacheUrl.pathname}` : cacheUrl, { method: "GET" });
+	const cache = await caches.open("snowstead-nar");
 	const cached = await cache.match(cacheRequest);
 	if (cached) {
 		return forClient(cached, isPrivate, method);

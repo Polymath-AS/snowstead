@@ -22,7 +22,7 @@ function run(...args) {
 }
 
 before(async () => {
-  home = await mkdtemp(join(tmpdir(), "helios-cli-test-"));
+  home = await mkdtemp(join(tmpdir(), "snowstead-cli-test-"));
   server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smoke test for the Helios Nix binary cache worker.
+# Smoke test for the Snowstead Nix binary cache worker.
 #
 # Usage:
 #   ADMIN_SECRET=... ./scripts/smoke-test.sh <base-url> <auth-token>
@@ -9,7 +9,7 @@ set -euo pipefail
 # ADMIN_SECRET creates the test cache through the admin API.
 #
 # Example:
-#   ADMIN_SECRET=... ./scripts/smoke-test.sh https://helios-cache.your-subdomain.workers.dev "your-token"
+#   ADMIN_SECRET=... ./scripts/smoke-test.sh https://snowstead.your-subdomain.workers.dev "your-token"
 
 BASE="${1:?usage: smoke-test.sh <base-url> <auth-token>}"
 TOKEN="${2:?usage: smoke-test.sh <base-url> <auth-token>}"

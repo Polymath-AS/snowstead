@@ -20,7 +20,7 @@ import {
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { Cache, UploadSession } from "./db/types.js";
-import type { SessionResponse } from "@helios/cache-domain";
+import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
@@ -32,7 +32,7 @@ import {
 	parseNarHash,
 	parseStorePathBasename,
 	parseStorePathHash,
-} from "@helios/cache-domain";
+} from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 import type { Db } from "./db/connection.js";
 
@@ -526,7 +526,7 @@ export async function handleComplete(
  * clears the one handling the publish, where the pusher's own lookups land.
  */
 async function forgetNarinfoMiss(origin: string, cacheName: string, storePathHash: string): Promise<void> {
-	const cache = await caches.open("helios-narinfo");
+	const cache = await caches.open("snowstead-narinfo");
 	// Both keys: cheaper than looking up whether the cache is private.
 	await Promise.all([
 		cache.delete(narinfoCacheKey(origin, cacheName, storePathHash, false)),

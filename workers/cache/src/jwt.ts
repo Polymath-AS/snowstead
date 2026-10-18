@@ -63,8 +63,8 @@ async function getKey(secret: string): Promise<CryptoKey> {
 
 const EXPECTED_HEADER_JSON = '{"alg":"HS256","typ":"JWT"}';
 const HEADER_B64 = base64UrlEncode(encoder.encode(EXPECTED_HEADER_JSON));
-export const TOKEN_ISSUER = "helios-cache";
-export const TOKEN_AUDIENCE = "helios-cache";
+export const TOKEN_ISSUER = "snowstead";
+export const TOKEN_AUDIENCE = "snowstead";
 const MAX_TOKEN_BYTES = 4096;
 const MAX_CLOCK_SKEW_SECONDS = 60;
 export const MAX_CACHES_PER_TOKEN = 50;

@@ -70,7 +70,7 @@ function pathPusher(client: ApiClient, cache: string) {
   };
 
   return async (storePath: string, info: PathInfo): Promise<{ sizeKb: number }> => {
-    const narDir = await mkdtemp(join(tmpdir(), "helios-nar-"));
+    const narDir = await mkdtemp(join(tmpdir(), "snowstead-nar-"));
     const narFile = join(narDir, "nar.zst");
 
     try {
