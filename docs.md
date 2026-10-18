@@ -4,6 +4,9 @@
 
 ```bash
 wrangler r2 bucket create helios-cache
+# Uploads land near the pusher and replicate to the bucket; reads stay
+# consistent. Free, and only faster for pushers far from the bucket.
+wrangler r2 bucket local-uploads enable helios-cache
 # Postgres on PlanetScale, with a role holding pg_read_all_data and
 # pg_write_all_data. Query caching off: uploads must read their own writes.
 wrangler hyperdrive create helios-cache --caching-disabled \
@@ -41,6 +44,7 @@ extensions by default, and `.narinfo` and `.nar` are not among them:
 
 ```bash
 wrangler r2 bucket create helios-public
+wrangler r2 bucket local-uploads enable helios-public
 wrangler r2 bucket domain add helios-public --domain cache.example.com --zone-id <zone id>
 ```
 
