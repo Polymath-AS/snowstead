@@ -144,6 +144,12 @@ helios push main --closure .#nixosConfigurations.myhost.config.system.build.topl
 
 Use `--jobs <n>` to control how many paths are in flight (default 32).
 
+Paths that an upstream cache already serves are not pushed: whoever
+substitutes from a cache has its upstreams too. The upstreams are the
+`UPSTREAM_CACHES` var in `wrangler.jsonc`, space-separated
+(`https://cache.nixos.org` by default); set it empty to push everything.
+The server remembers paths found upstream, so each is looked up there once.
+
 ## Migrating from AUTH_TOKEN
 
 1. Set `JWT_SECRET` and `ADMIN_SECRET` via `wrangler secret put`

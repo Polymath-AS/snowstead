@@ -9,6 +9,7 @@ import {
 	gcMarks,
 	apiTokens,
 	auditLogs,
+	upstreamPaths,
 } from "./schema.js";
 import type {
 	Cache,
@@ -551,4 +552,31 @@ export async function createPublishedPaths(
 		.onConflictDoNothing()
 		.returning({ storePathHash: publishedPaths.storePathHash });
 	return inserted.map((r) => r.storePathHash);
+}
+
+/** The hashes among `storePathHashes` known to be served by one of `upstreams`. */
+export async function findUpstreamHashes(
+	db: Db,
+	storePathHashes: readonly string[],
+	upstreams: readonly string[],
+): Promise<string[]> {
+	if (storePathHashes.length === 0 || upstreams.length === 0) return [];
+	const rows = await db
+		.select({ storePathHash: upstreamPaths.storePathHash })
+		.from(upstreamPaths)
+		.where(
+			and(
+				sql`${upstreamPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
+				sql`${upstreamPaths.upstream} = ANY(${sql.param([...upstreams])}::text[])`,
+			),
+		);
+	return rows.map((r) => r.storePathHash);
+}
+
+export async function recordUpstreamPaths(
+	db: Db,
+	rows: ReadonlyArray<{ readonly storePathHash: string; readonly upstream: string }>,
+): Promise<void> {
+	if (rows.length === 0) return;
+	await db.insert(upstreamPaths).values([...rows]).onConflictDoNothing();
 }

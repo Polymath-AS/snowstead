@@ -32,6 +32,8 @@ const PART_CONCURRENCY = 16;
 export interface PushResult {
   readonly pushed: number;
   readonly skipped: number;
+  /** Of the skipped, those an upstream cache serves. */
+  readonly upstream: number;
   readonly failed: number;
   readonly errors: string[];
 }
@@ -137,9 +139,11 @@ export async function pushPaths(
 
   // Check missing in sequential batches of the server's maximum size
   const missingSet = new Set<string>();
+  let upstream = 0;
   for (let i = 0; i < hashes.length; i += 500) {
     const chunk = hashes.slice(i, i + 500);
-    const missing = await getMissingPaths(client, cache, chunk);
+    const { missing, upstream: served } = await getMissingPaths(client, cache, chunk);
+    upstream += served.length;
     for (const h of missing) {
       missingSet.add(h);
     }
@@ -155,7 +159,7 @@ export async function pushPaths(
   const total = missingHashes.length;
 
   if (total === 0) {
-    return { pushed: 0, skipped, failed: 0, errors: [] };
+    return { pushed: 0, skipped, upstream, failed: 0, errors: [] };
   }
 
   // One batched nix path-info call for all missing paths, instead of one
@@ -194,5 +198,5 @@ export async function pushPaths(
     }
   });
 
-  return { pushed, skipped, failed, errors };
+  return { pushed, skipped, upstream, failed, errors };
 }

@@ -24,6 +24,7 @@ import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { isPrivateCache } from "./visibility.js";
+import { servedUpstream } from "./upstream.js";
 import {
 	parseFileHash,
 	parseCompression,
@@ -835,9 +836,14 @@ export async function handleGetMissingPaths(
 
 	const existingHashes = await findPublishedHashes(config.db, cache.id, body.storePathHashes);
 	const existingSet = new Set(existingHashes);
-	const missing = body.storePathHashes.filter((h) => !existingSet.has(h));
+	const absent = body.storePathHashes.filter((h) => !existingSet.has(h));
+	// What an upstream serves is not missing: substituters have it already.
+	const served = await servedUpstream(config, absent);
 
-	return jsonResponse({ missing });
+	return jsonResponse({
+		missing: absent.filter((h) => !served.has(h)),
+		upstream: absent.filter((h) => served.has(h)),
+	});
 }
 
 function hex(bytes: ArrayBuffer): string {

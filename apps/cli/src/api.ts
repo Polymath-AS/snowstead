@@ -63,7 +63,7 @@ export async function getMissingPaths(
   client: ApiClient,
   cache: string,
   storePathHashes: string[],
-): Promise<string[]> {
+): Promise<{ missing: string[]; upstream: string[] }> {
   const resp = await request(client, "POST", "/_api/v1/get-missing-paths", {
     cache,
     storePathHashes,
@@ -72,8 +72,9 @@ export async function getMissingPaths(
     const text = await resp.text();
     throw new Error(`get-missing-paths failed (${resp.status}): ${text}`);
   }
-  const data = await jsonBody<{ missing: string[] }>(resp);
-  return data.missing;
+  // upstream: paths an upstream cache serves, which the server leaves out of missing.
+  const data = await jsonBody<{ missing: string[]; upstream?: string[] }>(resp);
+  return { missing: data.missing, upstream: data.upstream ?? [] };
 }
 
 export async function createUploadSession(

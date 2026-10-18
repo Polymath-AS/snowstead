@@ -13,7 +13,9 @@
 	"upload_source_maps": true,
 	"workers_dev": true,
 	"vars": {
-		"SIGNING_KEY_NAME": "helios-cache-1"
+		"SIGNING_KEY_NAME": "helios-cache-1",
+		// Space-separated binary caches whose paths pushes skip; empty pushes everything.
+		"UPSTREAM_CACHES": "https://cache.nixos.org"
 	},
 	"r2_buckets": [
 		{

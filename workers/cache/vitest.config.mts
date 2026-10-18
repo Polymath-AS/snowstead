@@ -23,6 +23,9 @@ export default defineConfig({
 					AUTH_TOKEN: "test-auth-token",
 					ADMIN_SECRET: "test-admin-secret",
 					JWT_SECRET: "test-jwt-secret-0123456789abcdef",
+					// No upstream: tests never reach the network. test/upstream.spec.ts
+					// checks one with a stand-in fetch.
+					UPSTREAM_CACHES: "",
 				},
 			},
 		}),

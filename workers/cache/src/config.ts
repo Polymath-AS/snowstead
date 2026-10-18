@@ -23,6 +23,8 @@ export interface WorkerConfig {
 	readonly r2PublicBucketName: string;
 	readonly jwtSecret: string;
 	readonly adminSecret: string;
+	/** Binary caches whose paths pushes skip, as Nix substituter URLs. */
+	readonly upstreams: readonly string[];
 	readonly ctx?: ExecutionContext;
 }
 
@@ -61,5 +63,6 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 		r2PublicBucketName: env.R2_PUBLIC_BUCKET_NAME || "helios-public",
 		jwtSecret: env.JWT_SECRET || "",
 		adminSecret: env.ADMIN_SECRET || "",
+		upstreams: (env.UPSTREAM_CACHES ?? "").split(/\s+/).filter(Boolean).map((u) => u.replace(/\/$/, "")),
 	};
 }

@@ -118,7 +118,7 @@ async function main(): Promise<void> {
     }
 
     console.log("");
-    console.log(`Done: ${String(result.pushed)} pushed, ${String(result.skipped)} skipped, ${String(result.failed)} failed`);
+    console.log(`Done: ${String(result.pushed)} pushed, ${String(result.skipped)} skipped (${String(result.upstream)} served upstream), ${String(result.failed)} failed`);
 
     if (result.failed > 0) {
       process.exit(1);

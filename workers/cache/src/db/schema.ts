@@ -112,3 +112,14 @@ export const auditLogs = pgTable("audit_logs", {
 	index("idx_audit_logs_cache").on(table.cacheName),
 	index("idx_audit_logs_time").on(table.timestamp),
 ]);
+
+/**
+ * Paths an upstream cache was found to serve, so pushes skip them without
+ * asking it again. Only positive answers: an upstream may build a path
+ * later, but does not drop one.
+ */
+export const upstreamPaths = pgTable("upstream_paths", {
+	storePathHash: text("store_path_hash").primaryKey(),
+	upstream: text("upstream").notNull(),
+	foundAt: createdAt("found_at"),
+});
