@@ -5,7 +5,6 @@ export type StorePathHash = Brand<string, "StorePathHash">;
 export type NarHash = Brand<string, "NarHash">;
 export type FileHash = Brand<string, "FileHash">;
 export type Compression = "zstd" | "xz" | "bzip2" | "none";
-export type R2ObjectKey = Brand<string, "R2ObjectKey">;
 
 export interface NarInfoFields {
   readonly storePath: string;

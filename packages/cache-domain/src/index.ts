@@ -5,7 +5,6 @@ export type {
   NarHash,
   FileHash,
   Compression,
-  R2ObjectKey,
   NarInfoFields,
   ParseError,
 } from './types.js';
@@ -18,5 +17,4 @@ export {
   nix32Encode,
   parseFileHash,
   parseCompression,
-  buildR2ObjectKey,
 } from './parsers.js';

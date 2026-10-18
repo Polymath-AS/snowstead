@@ -6,9 +6,7 @@ import {
   parseStorePathBasename,
   parseFileHash,
   parseCompression,
-  buildR2ObjectKey,
 } from '../src/index.js';
-import type { FileHash, Compression } from '../src/index.js';
 
 function isParseError(result: unknown): result is { kind: 'ParseError'; message: string } {
   return (
@@ -143,19 +141,5 @@ describe('parseCompression', () => {
   ])('rejects $label', ({ input }) => {
     const result = parseCompression(input);
     expect(isParseError(result)).toBe(true);
-  });
-});
-
-describe('buildR2ObjectKey', () => {
-  const fileHash = 'a'.repeat(64) as FileHash;
-
-  it('builds key with zstd compression', () => {
-    const result = buildR2ObjectKey(fileHash, 'zstd' as Compression);
-    expect(result).toBe(`nars/sha256/${'a'.repeat(64)}/zstd.nar`);
-  });
-
-  it('builds key with none compression', () => {
-    const result = buildR2ObjectKey(fileHash, 'none' as Compression);
-    expect(result).toBe(`nars/sha256/${'a'.repeat(64)}/none.nar`);
   });
 });

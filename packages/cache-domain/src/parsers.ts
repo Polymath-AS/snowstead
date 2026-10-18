@@ -4,7 +4,6 @@ import type {
   FileHash,
   NarHash,
   ParseError,
-  R2ObjectKey,
   StorePathHash,
 } from './types.js';
 
@@ -145,8 +144,4 @@ export function parseCompression(raw: string): Compression | ParseError {
     return err(`Compression must be one of: ${[...VALID_COMPRESSIONS].join(", ")}`);
   }
   return raw as Compression;
-}
-
-export function buildR2ObjectKey(fileHash: FileHash, compression: Compression): R2ObjectKey {
-  return `nars/sha256/${fileHash}/${compression}.nar` as R2ObjectKey;
 }
