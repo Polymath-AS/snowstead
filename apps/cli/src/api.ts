@@ -77,33 +77,17 @@ export async function getMissingPaths(
   return { missing: data.missing, upstream: data.upstream ?? [] };
 }
 
-export async function createUploadSession(
-  client: ApiClient,
-  cache: string,
-  params: {
-    storePath: string;
-    storePathHash: string;
-    narHash: string;
-    narSize: number;
-    fileHash: string;
-    fileSize: number;
-    compression: string;
-    references: string[];
-    deriver?: string;
-    system?: string;
-  },
-): Promise<SessionResponse> {
-  const resp = await request(
-    client,
-    "POST",
-    `/_api/v1/caches/${cache}/upload-sessions`,
-    params,
-  );
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`create-session failed (${resp.status}): ${text}`);
-  }
-  return jsonBody<SessionResponse>(resp);
+interface SessionParams {
+  storePath: string;
+  storePathHash: string;
+  narHash: string;
+  narSize: number;
+  fileHash: string;
+  fileSize: number;
+  compression: string;
+  references: string[];
+  deriver?: string;
+  system?: string;
 }
 
 export async function uploadBlob(
@@ -170,7 +154,7 @@ async function putRetrying(url: string, init: () => RequestInit): Promise<Respon
 export async function createUploadSessions(
   client: ApiClient,
   cache: string,
-  paths: readonly Parameters<typeof createUploadSession>[2][],
+  paths: readonly SessionParams[],
 ): Promise<SessionResponse[]> {
   const resp = await request(client, "POST", `/_api/v1/caches/${cache}/upload-sessions/batch`, { paths });
   if (!resp.ok) {
@@ -288,18 +272,6 @@ export async function uploadBlobMultipart(
 
     await uploadPart(client, sessionId, partNumber, webStream, length);
   });
-}
-
-export async function publishPath(
-  client: ApiClient,
-  sessionId: string,
-): Promise<{ published: boolean; alreadyExisted?: boolean }> {
-  const resp = await request(client, "POST", `/_api/v1/uploads/${sessionId}/publish`, {});
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`publish failed (${resp.status}): ${text}`);
-  }
-  return jsonBody<{ published: boolean; alreadyExisted?: boolean }>(resp);
 }
 
 export interface TokenInfo {
