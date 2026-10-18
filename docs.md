@@ -11,7 +11,7 @@ wrangler r2 bucket local-uploads enable snowstead-private
 # pg_write_all_data. Query caching off: uploads must read their own writes.
 wrangler hyperdrive create snowstead --caching-disabled \
   --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
-# set the Hyperdrive id in wrangler.jsonc and workers/cache/wrangler.jsonc
+# set the Hyperdrive id in wrangler.jsonc
 wrangler secret put JWT_SECRET
 wrangler secret put ADMIN_SECRET
 wrangler secret put SIGNING_PRIVATE_KEY

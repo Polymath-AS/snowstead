@@ -13,11 +13,14 @@ const database = new URL(server);
 database.pathname = `/snowstead_test_${process.pid}`;
 process.env.SNOWSTEAD_TEST_DATABASE = database.toString();
 process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = database.toString();
+// The repository's .env (beside the root wrangler.jsonc) holds deploy
+// credentials, not Worker variables: keep it out of the test Worker.
+process.env.CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV = 'false';
 
 export default defineConfig({
 	plugins: [
 		cloudflareTest({
-			wrangler: { configPath: './wrangler.jsonc' },
+			wrangler: { configPath: '../../wrangler.jsonc' },
 			miniflare: {
 				bindings: {
 					AUTH_TOKEN: "test-auth-token",

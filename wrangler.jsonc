@@ -1,7 +1,8 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "snowstead",
-	// Uzair's account, where the nix-cache Hyperdrive config lives.
+	// The account that owns snowstead.com: R2 custom domains and Worker routes
+	// need the zone in the same account.
 	"account_id": "a5af70f803f5950f325622198dbd50a2",
 	"main": "workers/cache/src/index.ts",
 	"compatibility_date": "2026-03-10",

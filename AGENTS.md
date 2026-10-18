@@ -22,7 +22,7 @@ Keep deployable runtime code inside `workers/`. Move shared protocol, parsing, a
 - Before changing Workers, R2, Hyperdrive, Durable Objects, Queues, or platform limits, fetch current Cloudflare docs.
 - Prefer platform-native APIs such as `fetch`, Web Streams, and Web Crypto.
 - Do not enable `nodejs_compat` unless a concrete dependency requires it.
-- After changing a worker's bindings in `wrangler.jsonc`, run that package's `cf-typegen` script.
+- The cache worker has one Wrangler config, the root `wrangler.jsonc`: the Deploy to Cloudflare button needs it there, and the worker's scripts and tests point at it. After changing its bindings, run `pnpm --filter @snowstead/cache-worker cf-typegen`.
 
 ## Verification
 

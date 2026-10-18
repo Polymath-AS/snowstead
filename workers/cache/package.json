@@ -3,10 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --config ../../wrangler.jsonc",
+    "dev": "CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false wrangler dev --config ../../wrangler.jsonc",
     "test": "../../scripts/with-postgres.sh vitest run",
-    "cf-typegen": "wrangler types",
+    "cf-typegen": "CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false wrangler types --config ../../wrangler.jsonc",
     "check": "tsc --noEmit && ../../scripts/with-postgres.sh vitest run",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"
