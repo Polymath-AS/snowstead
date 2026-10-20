@@ -2,6 +2,8 @@ import type { WorkerConfig } from "./config.js";
 import { signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
 import type { TokenClaims } from "./jwt.js";
 import type { TokenPermission } from "./db/types.js";
+import type { CacheStats } from "./db/repository.js";
+import { signingPublicKey } from "./signing.js";
 import {
 	createApiToken,
 	listApiTokens,
@@ -10,6 +12,8 @@ import {
 	listRevokedTokens,
 	ensureCache,
 	listCaches,
+	listCacheStats,
+	listRecentPaths,
 	setCachePublic,
 	findCacheByName,
 	cacheHasPaths,
@@ -224,11 +228,49 @@ export async function handleCreateCache(
 	return jsonResponse({ name: cache.name, private: !isPublic, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
 }
 
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const RECENT_PATHS = 10;
+
+function cacheSummary(stats: CacheStats) {
+	return {
+		name: stats.cache.name,
+		private: !stats.cache.isPublic,
+		createdAt: stats.cache.createdAt,
+		paths: stats.paths,
+		size: stats.size,
+		addedLastWeek: stats.addedSince,
+		lastAddedAt: stats.lastAddedAt,
+	};
+}
+
 export async function handleListCaches(
 	config: WorkerConfig,
 ): Promise<Response> {
-	const caches = await listCaches(config.db);
-	return jsonResponse({ caches: caches.map((c) => ({ name: c.name, private: !c.isPublic, createdAt: c.createdAt })) });
+	const stats = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS));
+	return jsonResponse({ caches: stats.map(cacheSummary) });
+}
+
+/** One cache's numbers, its newest paths, and the public key to trust it with. */
+export async function handleGetCache(
+	config: WorkerConfig,
+	rawName: string,
+): Promise<Response> {
+	const name = parseCacheName(rawName);
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+
+	const [stats] = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), name);
+	if (stats === undefined) {
+		return errorResponse(`no cache named ${name}`, 404);
+	}
+
+	const recent = await listRecentPaths(config.db, stats.cache.id, RECENT_PATHS);
+	return jsonResponse({
+		...cacheSummary(stats),
+		publicKey: await signingPublicKey(config.signingKeyName, config.signingPrivateKey),
+		recentPaths: recent.map((p) => ({ storePath: p.storePath, size: p.fileSize, addedAt: p.createdAt })),
+	});
 }
 
 const MAX_BACKFILL_BATCH = 1000;

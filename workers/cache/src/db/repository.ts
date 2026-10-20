@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt, gt, isNull, isNotNull, sql } from "drizzle-orm";
+import { eq, and, notInArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
 	caches,
@@ -80,6 +80,48 @@ export async function setCachePublic(db: Db, name: string, isPublic: boolean): P
 
 export async function listCaches(db: Db): Promise<Cache[]> {
 	return db.select().from(caches).orderBy(caches.name);
+}
+
+export interface CacheStats {
+	readonly cache: Cache;
+	readonly paths: number;
+	/** Bytes of the compressed NARs its paths point at; a NAR shared with another cache counts in both. */
+	readonly size: number;
+	readonly addedSince: number;
+	readonly lastAddedAt: Date | null;
+}
+
+/** Every cache with its published paths counted, or just the one named. */
+export async function listCacheStats(db: Db, since: Date, name?: string): Promise<CacheStats[]> {
+	return db
+		.select({
+			cache: caches,
+			paths: sql`count(${publishedPaths.id})`.mapWith(Number),
+			size: sql`coalesce(sum(${blobObjects.fileSize}), 0)`.mapWith(Number),
+			addedSince: sql`count(${publishedPaths.id}) filter (where ${publishedPaths.createdAt} >= ${since.toISOString()}::timestamptz)`.mapWith(Number),
+			lastAddedAt: sql<Date | null>`max(${publishedPaths.createdAt})`.mapWith(publishedPaths.createdAt),
+		})
+		.from(caches)
+		.leftJoin(publishedPaths, eq(publishedPaths.cacheId, caches.id))
+		.leftJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.where(name === undefined ? undefined : eq(caches.name, name))
+		.groupBy(caches.id)
+		.orderBy(caches.name);
+}
+
+/** A cache's most recently published paths, newest first. */
+export async function listRecentPaths(
+	db: Db,
+	cacheId: number,
+	limit: number,
+): Promise<{ storePath: string; fileSize: number; createdAt: Date }[]> {
+	return db
+		.select({ storePath: publishedPaths.storePath, fileSize: blobObjects.fileSize, createdAt: publishedPaths.createdAt })
+		.from(publishedPaths)
+		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.where(eq(publishedPaths.cacheId, cacheId))
+		.orderBy(desc(publishedPaths.createdAt), desc(publishedPaths.id))
+		.limit(limit);
 }
 
 export async function findBlobObject(

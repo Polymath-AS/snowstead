@@ -41,6 +41,34 @@ async function getSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
 	return key;
 }
 
+/**
+ * The `name:base64` public key Nix needs in trusted-public-keys, or null when
+ * no signing key is set. A Nix secret key holds the seed and then the public
+ * key; a bare 32-byte seed has its public key derived.
+ */
+export async function signingPublicKey(keyName: string, privateKeyBase64: string): Promise<string | null> {
+	if (!privateKeyBase64) {
+		return null;
+	}
+
+	const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
+	if (keyBytes.length === 64) {
+		return `${keyName}:${btoa(String.fromCharCode(...keyBytes.slice(32)))}`;
+	}
+
+	const pkcs8 = new Uint8Array(PKCS8_ED25519_PREFIX.length + 32);
+	pkcs8.set(PKCS8_ED25519_PREFIX);
+	pkcs8.set(keyBytes.slice(0, 32), PKCS8_ED25519_PREFIX.length);
+	const key = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+	const jwk = await crypto.subtle.exportKey("jwk", key);
+	if (jwk.x === undefined) {
+		throw new Error("Ed25519 key exported without a public part");
+	}
+	const publicBase64 = jwk.x.replaceAll("-", "+").replaceAll("_", "/").padEnd(44, "=");
+
+	return `${keyName}:${publicBase64}`;
+}
+
 export async function signNarinfo(
 	fingerprint: string,
 	keyName: string,
