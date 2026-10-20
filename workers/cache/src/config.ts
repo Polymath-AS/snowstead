@@ -1,5 +1,5 @@
 import { connect } from "./db/connection.js";
-import type { Db } from "./db/connection.js";
+import type { Connection, Db } from "./db/connection.js";
 import type { CdnConfig } from "./cdn.js";
 
 export interface WorkerConfig {
@@ -12,8 +12,8 @@ export interface WorkerConfig {
 	readonly db: Db;
 	/** Database work that may outlive the response. */
 	readonly defer: (task: Promise<unknown>) => void;
-	/** Waits for deferred work, then releases the request's connections. */
-	readonly close: () => Promise<void>;
+	/** Waits for deferred work, then releases the request's connection; nothing to wait for if it never opened one. */
+	readonly close: () => Promise<void> | undefined;
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
 	/** Seals each cache's own signing key; without it every cache signs with signingPrivateKey. */
@@ -33,7 +33,34 @@ export interface WorkerConfig {
 	readonly ctx?: ExecutionContext;
 }
 
+type Settings = Omit<WorkerConfig, "db" | "defer" | "close" | "ctx">;
+
+/**
+ * What a config takes from env, worked out once per env rather than per
+ * request: the isolate keeps one env, and reading its bindings and parsing
+ * its vars on every request was a twelfth of a cache read's CPU.
+ */
+const settingsByEnv = new WeakMap<Env, Settings>();
+
 export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
+	const settings = settingsByEnv.get(env) ?? readSettings(env);
+	settingsByEnv.set(env, settings);
+	// Built on first use: most requests (cache hits, nix-cache-info, NARs)
+	// never touch the database.
+	let connection: Connection | undefined;
+	const open = () => (connection ??= connect(env.HYPERDRIVE.connectionString));
+	return {
+		...settings,
+		get db() {
+			return open().db;
+		},
+		defer: (task) => open().defer(task),
+		close: () => connection?.close(),
+		ctx,
+	};
+}
+
+function readSettings(env: Env): Settings {
 	if (!env.CACHE_BUCKET) {
 		throw new Error("Missing required binding: CACHE_BUCKET");
 	}
@@ -46,18 +73,10 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	if (!env.HYPERDRIVE) {
 		throw new Error("Missing required binding: HYPERDRIVE");
 	}
-	const connection = connect(env.HYPERDRIVE.connectionString);
 	return {
 		bucket: env.CACHE_BUCKET,
 		publicBucket: env.PUBLIC_BUCKET,
 		authKv: env.AUTH_KV,
-		// A getter, so the database client is only built for requests that use it.
-		get db() {
-			return connection.db;
-		},
-		defer: connection.defer,
-		close: connection.close,
-		ctx,
 		signingKeyName: env.SIGNING_KEY_NAME || "snowstead-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		signingMasterKey: env.SIGNING_MASTER_KEY || "",

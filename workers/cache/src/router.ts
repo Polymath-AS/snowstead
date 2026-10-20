@@ -167,6 +167,9 @@ const NARINFO_NEGATIVE_TTL_SECONDS = 60;
  * Worker, after authorization.
  */
 function forClient(response: Response, isPrivate: boolean, method: string): Response {
+	// A public GET's response needs nothing changed; copying it anyway was a
+	// twentieth of a cache read's CPU.
+	if (!isPrivate && method !== "HEAD") return response;
 	const headers = new Headers(response.headers);
 	if (isPrivate) headers.set("cache-control", "private, no-cache");
 	return new Response(method === "HEAD" ? null : response.body, { status: response.status, headers });

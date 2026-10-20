@@ -30,6 +30,9 @@
 	},
 	// Source-mapped stack traces in logs and Issues.
 	"upload_source_maps": true,
+	// esbuild otherwise wraps every function the code creates to keep its name,
+	// a twenty-fifth of a cache read's CPU; nothing reads those names.
+	"keep_names": false,
 	"workers_dev": true,
 	"vars": {
 		"SIGNING_KEY_NAME": "snowstead-1",

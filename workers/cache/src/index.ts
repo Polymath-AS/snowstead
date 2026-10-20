@@ -11,10 +11,12 @@ export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(request.url);
-		const route = routeOf(request.method, url.pathname);
+		const route = () => routeOf(request.method, url.pathname);
 		// On the runtime's span for the request, which carries its CPU and wall
-		// time: traces then group those by route.
-		tracing.getActiveSpan()?.setAttribute("snowstead.route", route);
+		// time: traces then group those by route. Worked out only for traced
+		// requests: on every request it was a twentieth of a cache read's CPU.
+		const span = tracing.getActiveSpan();
+		if (span?.isTraced) span.setAttribute("snowstead.route", route());
 		let config: WorkerConfig | undefined;
 		try {
 			config = resolveConfig(env, ctx);
@@ -23,7 +25,7 @@ export default {
 			// cost a quarter of a miss's CPU. Workers records every request anyway.
 			const expectedMiss = response.status === 404 && url.pathname.endsWith(".narinfo");
 			if ((response.status >= 400 && !expectedMiss) || url.pathname.startsWith("/_api/")) {
-				logRequest(request, response, start, route);
+				logRequest(request, response, start, route());
 			}
 			return response;
 		} catch (err) {
@@ -32,11 +34,12 @@ export default {
 				status: 500,
 				headers: { "content-type": "application/json" },
 			});
-			logRequest(request, response, start, route);
+			logRequest(request, response, start, route());
 			return response;
 		} finally {
-			// After the response: deferred writes finish, then the pool ends.
-			if (config) ctx.waitUntil(config.close());
+			// After the response: deferred writes finish, then the connection ends.
+			const closing = config?.close();
+			if (closing) ctx.waitUntil(closing);
 		}
 	},
 
@@ -65,7 +68,8 @@ export default {
 				console.log("GC completed", counts);
 			}
 		} finally {
-			ctx.waitUntil(config.close());
+			const closing = config.close();
+			if (closing) ctx.waitUntil(closing);
 		}
 	},
 } satisfies ExportedHandler<Env>;

@@ -167,7 +167,31 @@ function validateClaims(obj: Record<string, unknown>): JwtVerifyResult {
 	};
 }
 
+// Tokens verified recently, so a client sending one with every request pays
+// for its HMAC once per isolate: verifying was a third of a private cache
+// read's CPU. An entry lasts as long as the token would verify, at most
+// VERIFIED_MAX_MS; revocation is checked apart from this, on every request.
+const VERIFIED_MAX_MS = 5 * 60_000;
+// Tokens run to MAX_TOKEN_BYTES; this keeps the memo to a few megabytes.
+const VERIFIED_MAX_ENTRIES = 1_000;
+const verified = new Map<string, { readonly claims: TokenClaims; readonly secret: string; readonly until: number }>();
+
 export async function verifyJwt(token: string, secret: string): Promise<JwtVerifyResult> {
+	const now = Date.now();
+	const known = verified.get(token);
+	if (known && known.secret === secret && known.until > now) {
+		return { kind: "ok", claims: known.claims };
+	}
+	const result = await verifyToken(token, secret);
+	if (result.kind === "ok") {
+		if (verified.size >= VERIFIED_MAX_ENTRIES) verified.clear();
+		const expires = (result.claims.exp + MAX_CLOCK_SKEW_SECONDS) * 1000;
+		verified.set(token, { claims: result.claims, secret, until: Math.min(expires, now + VERIFIED_MAX_MS) });
+	}
+	return result;
+}
+
+async function verifyToken(token: string, secret: string): Promise<JwtVerifyResult> {
 	if (token.length > MAX_TOKEN_BYTES) {
 		return { kind: "error", reason: "invalid token" };
 	}
