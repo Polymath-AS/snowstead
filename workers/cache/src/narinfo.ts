@@ -84,10 +84,21 @@ export async function storeNarinfo(
 }
 
 /**
- * The Cache API key for a narinfo response. Private caches use a host of
- * their own, so their entries can never answer a request for a public URL.
+ * The Cache API key for a narinfo response: for a public cache its URL, for
+ * a private one a key under privateCacheBase. A URL string rather than a
+ * Request: the Cache API takes either, and building a Request for every
+ * lookup showed in profiles of cache reads.
  */
-export function narinfoCacheKey(origin: string, cachePath: string, storePathHash: string, isPrivate: boolean): Request {
-	const base = isPrivate ? "https://private.snowstead.internal" : origin;
-	return new Request(`${base}/${cachePath}/${storePathHash}.narinfo`, { method: "GET" });
+export function narinfoCacheKey(origin: string, cachePath: string, storePathHash: string, privateGen?: number): string {
+	const base = privateGen === undefined ? `${origin}/${cachePath}` : privateCacheBase(cachePath, privateGen);
+	return `${base}/${storePathHash}.narinfo`;
+}
+
+/**
+ * Where a private cache's entries live in the Cache API: a host of their
+ * own, so they never answer a request for a public URL, and the cache's
+ * generation (visibility.ts), so deleting paths retires every copy.
+ */
+export function privateCacheBase(cachePath: string, gen: number): string {
+	return `https://private.snowstead.internal/${cachePath}/g${gen}`;
 }

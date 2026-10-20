@@ -859,3 +859,16 @@ export async function recordUpstreamPaths(
 	if (rows.length === 0) return;
 	await db.insert(upstreamPaths).values([...rows]).onConflictDoNothing();
 }
+
+/** Whether a path of the cache uses the NAR with this file hash. */
+export async function cacheHasNar(db: Db, cacheId: number, fileHash: string, compression: string): Promise<boolean> {
+	const row = await first(
+		db
+			.select({ id: publishedPaths.id })
+			.from(publishedPaths)
+			.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+			.where(and(eq(publishedPaths.cacheId, cacheId), eq(blobObjects.fileHash, fileHash), eq(blobObjects.compression, compression)))
+			.limit(1),
+	);
+	return row !== undefined;
+}

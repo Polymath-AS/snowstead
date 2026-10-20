@@ -28,7 +28,7 @@ import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { inBackground, purgeNarinfo } from "./cdn.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
-import { isPrivateCache } from "./visibility.js";
+import { isPrivateCache, privateCache } from "./visibility.js";
 import { servedUpstream } from "./upstream.js";
 import {
 	parseFileHash,
@@ -620,13 +620,9 @@ export async function handleComplete(
  * rather than after the negative TTL. The Cache API is per data center: this
  * clears the one handling the publish, where the pusher's own lookups land.
  */
-async function forgetNarinfoMiss(origin: string, cachePath: string, storePathHash: string): Promise<void> {
+async function forgetNarinfoMiss(origin: string, cachePath: string, storePathHash: string, privateGen: number | undefined): Promise<void> {
 	const cache = await caches.open("snowstead-narinfo");
-	// Both keys: cheaper than looking up whether the cache is private.
-	await Promise.all([
-		cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, false)),
-		cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, true)),
-	]);
+	await cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, privateGen));
 }
 
 type PublishResult =
@@ -649,7 +645,9 @@ async function publishSessions(
 	if (cache === undefined) {
 		return sessions.map((s) => ({ sessionId: s.id, error: "Internal error", status: 500 }));
 	}
-	const isPrivate = await isPrivateCache(config, cache.path);
+	const visibility = await privateCache(config, cache.path);
+	const isPrivate = visibility.isPrivate;
+	const privateGen = visibility.isPrivate ? visibility.gen : undefined;
 
 	const existing = new Map(
 		(await findPublishedPaths(config.db, cacheId, sessions.map((s) => s.storePathHash))).map((p) => [p.storePathHash, p]),
@@ -704,7 +702,7 @@ async function publishSessions(
 	}));
 
 	const inserted = new Set(await createPublishedPaths(config.db, rows));
-	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cache.path, hash)));
+	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cache.path, hash, privateGen)));
 	// The CDN may hold a miss for a public path from before it was published.
 	if (!isPrivate) await inBackground(config, purgeNarinfo(config, cache.path, [...inserted]));
 	for (const session of sessions) {

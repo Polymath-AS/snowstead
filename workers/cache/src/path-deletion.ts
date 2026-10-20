@@ -4,7 +4,7 @@ import { deletePublishedPaths } from "./db/repository.js";
 import { bucketFor, narinfoKey } from "./layout.js";
 import { narinfoCacheKey } from "./narinfo.js";
 import { inBackground, purgeNarinfo } from "./cdn.js";
-import { isPrivateCache } from "./visibility.js";
+import { isPrivateCache, nextGeneration } from "./visibility.js";
 
 /**
  * Deletes paths from a cache, which frees their bytes from its org's usage
@@ -32,12 +32,15 @@ export async function deleteCachePaths(
 		if (keys.length > 0) await bucket.delete(keys);
 	});
 
-	// The Cache API is per data center: this clears the one handling the
-	// request, when there is one. Elsewhere a narinfo already served stays
-	// cached until evicted.
-	if (origin !== undefined) {
+	if (isPrivate) {
+		// The Cache API can only be cleared where a request runs: moving the
+		// generation on retires the cache's copies everywhere instead.
+		if (deleted.length > 0 || named.length > 0) await nextGeneration(config, cache.path);
+	} else if (origin !== undefined) {
+		// The Worker's own copies of public narinfo (served on workers.dev),
+		// in the one data center it can clear.
 		const narinfos = await caches.open("snowstead-narinfo");
-		await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, cache.path, h, isPrivate))));
+		await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, cache.path, h))));
 	}
 	// A public narinfo served before stays cached by the CDN for a year: the
 	// path would stay downloadable after its NAR is gone.

@@ -18,25 +18,6 @@ function getClient(accessKeyId: string, secretAccessKey: string): AwsClient {
 	return cachedClient;
 }
 
-export async function createPresignedUrl(
-	endpoint: string,
-	accessKeyId: string,
-	secretAccessKey: string,
-	bucket: string,
-	key: string,
-	expiresIn: number,
-): Promise<string> {
-	const client = getClient(accessKeyId, secretAccessKey);
-	const url = new URL(`/${bucket}/${key}`, endpoint);
-	url.searchParams.set("X-Amz-Expires", String(expiresIn));
-
-	const signed = await client.sign(new Request(url, { method: "GET" }), {
-		aws: { signQuery: true },
-	});
-
-	return signed.url;
-}
-
 /**
  * A presigned PUT that only accepts the body whose SHA-256 is `sha256Hex`:
  * the checksum header is signed, and R2 rejects a body that does not match

@@ -1,12 +1,12 @@
 import type { WorkerConfig } from "./config.js";
-import { findOrg } from "./db/repository.js";
+import { cacheHasNar, findCacheByPath, findOrg } from "./db/repository.js";
 import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { handleOrgApi } from "./org-api.js";
-import { narinfoCacheKey } from "./narinfo.js";
+import { narinfoCacheKey, privateCacheBase } from "./narinfo.js";
 import { bucketFor, narKey, narinfoKey } from "./layout.js";
 import { authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
-import { isPrivateCache } from "./visibility.js";
+import { privateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission } from "./jwt.js";
 import { errorResponse } from "./responses.js";
@@ -22,7 +22,6 @@ import {
 	handleCreateSessions,
 	handleCommit,
 } from "./uploads.js";
-import { createPresignedUrl } from "./presign.js";
 import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths, handlePurgeCache } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
@@ -87,7 +86,7 @@ export async function handleRequest(
 
 	// Public narinfo points at ../nar/..., shared by every public cache.
 	if (segments[0] === "nar" && segments.length === 3 && segments[2].endsWith(".nar")) {
-		return handleNarDownload(config, segments[1], segments[2].slice(0, -".nar".length), request, method, false);
+		return handleNarDownload(config, segments[1], segments[2].slice(0, -".nar".length), request, method);
 	}
 
 	// /<cache>/... is a default-org cache, /<slug>/<cache>/... another org's.
@@ -102,7 +101,8 @@ export async function handleRequest(
 
 	// Before any cache lookup, so a response one caller was allowed to see
 	// is never served to another.
-	const isPrivate = await isPrivateCache(config, path);
+	const visibility = await privateCache(config, path);
+	const isPrivate = visibility.isPrivate;
 	if (isPrivate) {
 		const denied = await authorizeRead(request, config, path, cacheName);
 		if (denied) return denied;
@@ -114,13 +114,14 @@ export async function handleRequest(
 		return response;
 	}
 
+	const scope = visibility.isPrivate ? { path, gen: visibility.gen, id: visibility.id, slug, name: cacheName } : undefined;
 	if (rest[0] === "nar" && rest.length === 3 && rest[2].endsWith(".nar")) {
-		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, isPrivate);
+		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, scope);
 	}
 
 	if (rest[0]?.endsWith(".narinfo") && rest.length === 1) {
 		const hashStr = rest[0].slice(0, -".narinfo".length);
-		return handleNarinfo(config, path, hashStr, method, request, isPrivate);
+		return handleNarinfo(config, path, hashStr, method, request, scope?.gen);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -177,15 +178,16 @@ async function handleNarinfo(
 	hashStr: string,
 	method: string,
 	request: Request,
-	isPrivate: boolean,
+	privateGen: number | undefined,
 ): Promise<Response> {
+	const isPrivate = privateGen !== undefined;
 	const storePathHash = parseStorePathHash(hashStr);
 	if (typeof storePathHash === "object") {
 		return new Response("Not Found", { status: 404 });
 	}
 
 	// HEAD and GET share the entry.
-	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cachePath, storePathHash, isPrivate);
+	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cachePath, storePathHash, privateGen);
 	const cache = await caches.open("snowstead-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
@@ -220,13 +222,27 @@ async function handleNarinfo(
 	return forClient(response, isPrivate, method);
 }
 
+/** The private cache a NAR is asked for through, past authorization. */
+interface PrivateScope {
+	readonly path: string;
+	readonly gen: number;
+	readonly id?: number;
+	readonly slug: string;
+	readonly name: string;
+}
+
+// Larger NARs are streamed without a cached copy: caching one splits its
+// stream, and a copy that falls behind the client is buffered in the
+// Worker's memory.
+const CACHED_NAR_MAX_BYTES = 100 * 1024 ** 2;
+
 async function handleNarDownload(
 	config: WorkerConfig,
 	rawFileHash: string,
 	rawCompression: string,
 	request: Request,
 	method: string,
-	isPrivate: boolean,
+	scope?: PrivateScope,
 ): Promise<Response> {
 	const fileHash = parseFileHash(rawFileHash);
 	if (typeof fileHash === "object") {
@@ -238,39 +254,28 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
+	const isPrivate = scope !== undefined;
 	// NAR keys are content-addressed, so the key comes from the URL alone.
 	const r2Key = narKey(fileHash, compression, isPrivate);
 	const bucket = bucketFor(config, isPrivate);
 
-	// Presigned R2 redirect (bypasses the Worker entirely); the credentials
-	// are for the private bucket, and public NARs have cache.snowstead.com.
-	if (isPrivate && config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint) {
-		const url = await createPresignedUrl(
-			config.r2Endpoint,
-			config.r2AccessKeyId,
-			config.r2SecretAccessKey,
-			config.r2BucketName,
-			r2Key,
-			3600,
-		);
-		return new Response(null, {
-			status: 302,
-			headers: {
-				location: url,
-				// The URL is a credential for an hour; a private cache's must not be shared.
-				"cache-control": isPrivate ? "private, max-age=3600" : "public, max-age=3600",
-			},
-		});
-	}
-
-	// HEAD and GET share the entry; private caches' entries live under a host
-	// of their own, as narinfo's do.
-	const cacheUrl = new URL(request.url);
-	const cacheRequest = new Request(isPrivate ? `https://private.snowstead.internal${cacheUrl.pathname}` : cacheUrl, { method: "GET" });
+	// HEAD and GET share the entry. A private cache's entry is its own, at its
+	// generation, and stored only once the check below has passed for it.
+	const url = new URL(request.url);
+	const cacheKey = scope
+		? `${privateCacheBase(scope.path, scope.gen)}/nar/${fileHash}/${compression}.nar`
+		: `${url.origin}${url.pathname}`;
 	const cache = await caches.open("snowstead-nar");
-	const cached = await cache.match(cacheRequest);
+	const cached = await cache.match(cacheKey);
 	if (cached) {
 		return forClient(cached, isPrivate, method);
+	}
+
+	// Private NARs are stored once by their hash for every private cache, so
+	// a cache serves one only when one of its paths uses it: otherwise a
+	// token for one cache could read another's NARs by their hashes.
+	if (scope && !(await privateCacheHasNar(config, scope, fileHash, compression))) {
+		return new Response("Not Found", { status: 404, headers: { "cache-control": "private, no-cache" } });
 	}
 
 	if (method === "HEAD") {
@@ -297,6 +302,8 @@ async function handleNarDownload(
 		return new Response("Not Found", { status: 404 });
 	}
 
+	// Private NARs too: through the Worker, which checked the caller, rather
+	// than by a presigned R2 URL, which anyone holding it could use.
 	const response = new Response(object.body, {
 		headers: {
 			"content-type": "application/x-nix-nar",
@@ -304,13 +311,15 @@ async function handleNarDownload(
 			"cache-control": "public, max-age=31536000, immutable",
 		},
 	});
-
-	// Store in CF edge cache (non-blocking)
-	if (config.ctx) {
-		config.ctx.waitUntil(cache.put(cacheRequest, response.clone()));
+	if (config.ctx && object.size <= CACHED_NAR_MAX_BYTES) {
+		config.ctx.waitUntil(cache.put(cacheKey, response.clone()).catch(() => {}));
 	}
-
 	return forClient(response, isPrivate, method);
+}
+
+async function privateCacheHasNar(config: WorkerConfig, scope: PrivateScope, fileHash: string, compression: string): Promise<boolean> {
+	const id = scope.id ?? (await findCacheByPath(config.db, scope.slug, scope.name))?.id;
+	return id !== undefined && (await cacheHasNar(config.db, id, fileHash, compression));
 }
 
 async function handleAdminApi(

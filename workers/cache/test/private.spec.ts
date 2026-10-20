@@ -170,3 +170,51 @@ describe("private caches", () => {
 		expect(caches.find((c) => c.name === name)?.private).toBe(false);
 	});
 });
+
+describe("private NARs", () => {
+	it("come from the Worker itself, not a link to R2", async () => {
+		const res = await read(nar(PRIVATE), `Bearer ${pull}`);
+		expect(res.status).toBe(200);
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(NAR);
+		expect(res.headers.get("cache-control")).toBe("private, no-cache");
+	});
+
+	it("are refused through a cache none of whose paths uses them", async () => {
+		const other = (await token([OTHER], ["pull"])).token;
+		// The NAR exists, under PRIVATE; asked for through OTHER by its hash.
+		const res = await read(`/${OTHER}/nar/${fileHash(PRIVATE)}/zstd.nar`, `Bearer ${other}`);
+		expect(res.status).toBe(404);
+	});
+
+	it("stop being served once their path is deleted, though cached", async () => {
+		const name = "private-deleted";
+		const hash = "4".repeat(32);
+		const file = `e0${FILE_HASH.slice(2)}`;
+		expect((await admin("/caches", { name, private: true })).status).toBe(201);
+		const cache = await findCache(db, "default", name);
+		const blob = await createBlobObject(db, { fileHash: file, fileSize: NAR.byteLength, compression: "zstd", r2Key: `nars/sha256/${file}/zstd.nar` });
+		await createPublishedPath(db, {
+			cacheId: cache!.id,
+			storePathHash: hash,
+			storePath: `/nix/store/${hash}-gone`,
+			narHash: `sha256:${"1".repeat(52)}`,
+			narSize: 8,
+			blobObjectId: blob.id,
+			referencesJson: "[]",
+			deriver: null,
+			system: null,
+			signaturesJson: "[]",
+		});
+		await env.CACHE_BUCKET.put(blob.r2Key, NAR);
+		expect((await admin("/narinfo/backfill", { limit: 1000 })).status).toBe(200);
+		const auth = `Bearer ${(await token([name], ["pull"])).token}`;
+
+		// Read once each, so both are in the Cache API.
+		expect((await read(`/${name}/${hash}.narinfo`, auth)).status).toBe(200);
+		expect((await read(`/${name}/nar/${file}/zstd.nar`, auth)).status).toBe(200);
+
+		expect((await admin(`/caches/${name}/paths/delete`, { storePathHashes: [hash] })).status).toBe(200);
+		expect((await read(`/${name}/${hash}.narinfo`, auth)).status).toBe(404);
+		expect((await read(`/${name}/nar/${file}/zstd.nar`, auth)).status).toBe(404);
+	});
+});
