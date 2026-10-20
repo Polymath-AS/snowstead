@@ -1,15 +1,19 @@
+/**
+ * One line per request worth recording. Logged as an object, not a string,
+ * so Workers Logs indexes its fields and can group requests by route.
+ */
 export function logRequest(
 	request: Request,
 	response: Response,
 	startTime: number,
+	route: string,
 ): void {
-	const duration = Date.now() - startTime;
-	const url = new URL(request.url);
-	console.log(JSON.stringify({
+	console.log({
+		route,
 		method: request.method,
-		path: url.pathname,
+		path: new URL(request.url).pathname,
 		status: response.status,
-		duration_ms: duration,
+		duration_ms: Date.now() - startTime,
 		cf_ray: request.headers.get("cf-ray") ?? undefined,
-	}));
+	});
 }
