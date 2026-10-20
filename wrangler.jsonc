@@ -34,7 +34,11 @@
 	"vars": {
 		"SIGNING_KEY_NAME": "snowstead-1",
 		// Space-separated binary caches whose paths pushes skip; empty pushes everything.
-		"UPSTREAM_CACHES": "https://cache.nixos.org"
+		"UPSTREAM_CACHES": "https://cache.nixos.org",
+		// The CDN in front of the public bucket, purged when paths are published
+		// or deleted; with the secret CDN_PURGE_TOKEN. Unset, nothing is purged.
+		"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
+		"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
 	},
 	"r2_buckets": [
 		{

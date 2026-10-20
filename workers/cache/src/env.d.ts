@@ -10,6 +10,8 @@ interface Secrets {
 	R2_PUBLIC_BUCKET_NAME?: string;
 	JWT_SECRET?: string;
 	ADMIN_SECRET?: string;
+	// Cache Purge permission on the zone serving the public bucket.
+	CDN_PURGE_TOKEN?: string;
 }
 
 interface Env extends Secrets {}

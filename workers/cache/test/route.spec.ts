@@ -11,6 +11,7 @@ describe("routes", () => {
 		["POST", "/_api/v1/admin/tokens/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/revoke", "POST /_api/v1/admin/tokens/:jti/revoke"],
 		["GET", "/_api/v1/admin/caches/team", "GET /_api/v1/admin/caches/:cache"],
 		["POST", "/_api/v1/admin/caches/team/paths/delete", "POST /_api/v1/admin/caches/:cache/paths/delete"],
+		["POST", "/_api/v1/admin/caches/team/purge", "POST /_api/v1/admin/caches/:cache/purge"],
 		["PUT", "/_api/v1/orgs/org_01ABC", "PUT /_api/v1/orgs/:org"],
 		["GET", "/acme/main/nix-cache-info", "GET /:org/:cache/nix-cache-info"],
 		["GET", "/acme/main/0c5a8bvbj6ld1jdk7k1w5p4f5l9jwq8x.narinfo", "GET /:org/:cache/:hash.narinfo"],

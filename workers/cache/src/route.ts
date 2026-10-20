@@ -39,6 +39,7 @@ const API_ROUTES = new Set([
 	"admin/caches",
 	"admin/caches/:cache",
 	"admin/caches/:cache/paths/delete",
+	"admin/caches/:cache/purge",
 	"admin/auth/sync",
 	"admin/narinfo/backfill",
 	"orgs/:org",

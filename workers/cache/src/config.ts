@@ -1,5 +1,6 @@
 import { connect } from "./db/connection.js";
 import type { Db } from "./db/connection.js";
+import type { CdnConfig } from "./cdn.js";
 
 export interface WorkerConfig {
 	/** Private caches, and everything the Worker alone reads. */
@@ -27,6 +28,8 @@ export interface WorkerConfig {
 	readonly adminSecret: string;
 	/** Binary caches whose paths pushes skip, as Nix substituter URLs. */
 	readonly upstreams: readonly string[];
+	/** The CDN in front of the public bucket, when purges are configured. */
+	readonly cdn: CdnConfig | undefined;
 	readonly ctx?: ExecutionContext;
 }
 
@@ -67,5 +70,8 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 		jwtSecret: env.JWT_SECRET || "",
 		adminSecret: env.ADMIN_SECRET || "",
 		upstreams: (env.UPSTREAM_CACHES ?? "").split(/\s+/).filter(Boolean).map((u) => u.replace(/\/$/, "")),
+		cdn: env.CDN_ZONE_ID && env.CDN_PURGE_TOKEN && env.PUBLIC_CACHE_ORIGIN
+			? { zoneId: env.CDN_ZONE_ID, token: env.CDN_PURGE_TOKEN, origin: env.PUBLIC_CACHE_ORIGIN.replace(/\/$/, "") }
+			: undefined,
 	};
 }

@@ -25,6 +25,7 @@ import type { CacheAt, OrgUsage } from "./db/repository.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
 import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
+import { inBackground, purgeNarinfo } from "./cdn.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { isPrivateCache } from "./visibility.js";
@@ -704,6 +705,8 @@ async function publishSessions(
 
 	const inserted = new Set(await createPublishedPaths(config.db, rows));
 	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cache.path, hash)));
+	// The CDN may hold a miss for a public path from before it was published.
+	if (!isPrivate) await inBackground(config, purgeNarinfo(config, cache.path, [...inserted]));
 	for (const session of sessions) {
 		if (results.has(session.id)) continue;
 		// A path that is not inserted was published by someone else meanwhile.

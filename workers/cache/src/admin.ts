@@ -6,6 +6,7 @@ import type { CacheStats, PathSelection } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
 import { deleteCachePaths } from "./path-deletion.js";
+import { purgeCache, purgeNarinfo } from "./cdn.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
 import { cachePath, parseOrgSlug } from "./cache-path.js";
 import {
@@ -577,4 +578,56 @@ export async function handleDeletePaths(
 		notFound: named.filter((h) => !gone.has(h)),
 		more: "before" in which && deleted.length === which.limit,
 	});
+}
+
+/**
+ * Purges what the CDN holds for a public cache: the narinfo of the paths
+ * named, or everything under the cache. Publishing and deleting purge on
+ * their own; this is for when the CDN holds something it should not.
+ */
+export async function handlePurgeCache(
+	request: Request,
+	config: WorkerConfig,
+	rawName: string,
+	scope?: string,
+): Promise<Response> {
+	const name = parseCacheName(rawName);
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+	if (!config.cdn) {
+		return errorResponse("no CDN is configured to purge", 400);
+	}
+	const body = await parseJsonBody<{ storePathHashes?: unknown }>(request);
+	if (body instanceof Response) return body;
+
+	let hashes: string[] | undefined;
+	if (body.storePathHashes !== undefined) {
+		if (!Array.isArray(body.storePathHashes) || body.storePathHashes.length === 0 || body.storePathHashes.length > MAX_DELETE_BATCH) {
+			return errorResponse(`storePathHashes must be an array of 1 to ${MAX_DELETE_BATCH} hashes`, 400);
+		}
+		hashes = [];
+		for (const raw of body.storePathHashes) {
+			const hash = parseStorePathHash(String(raw));
+			if (typeof hash === "object") {
+				return errorResponse(`${String(raw)}: ${hash.message}`, 400);
+			}
+			hashes.push(hash);
+		}
+	}
+
+	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
+	if (!cache) {
+		return errorResponse(`no cache named ${name}`, 404);
+	}
+	if (await isPrivateCache(config, cache.path)) {
+		return errorResponse("private caches are not on the CDN", 400);
+	}
+	try {
+		await (hashes ? purgeNarinfo(config, cache.path, hashes) : purgeCache(config, cache.path));
+	} catch (err) {
+		console.error("CDN purge failed", err);
+		return errorResponse("the CDN refused the purge; try again shortly", 502);
+	}
+	return jsonResponse({ purged: hashes ?? "all" });
 }

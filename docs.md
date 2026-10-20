@@ -52,10 +52,20 @@ Cache Rule, on the zone:
 
 - Expression: `(http.host eq "cache.example.com" and not starts_with(http.request.uri.path, "/_api/") and not starts_with(http.request.uri.path, "/private/"))`
 - Cache eligibility: eligible; Edge TTL: use cache-control if present,
-  bypass if not; Browser TTL: respect origin.
+  bypass if not, and 60 seconds for status 404; Browser TTL: respect origin.
 
-Stored objects carry their own `Cache-Control`; misses carry none, so
-they are not cached and a newly published path shows up at once.
+Stored objects carry their own `Cache-Control` and are cached for a year.
+Misses are cached for a minute, so the many lookups Nix makes for paths a
+cache lacks are answered by the CDN. Publishing and deleting a path purge
+its narinfo from the CDN, so neither waits for a cached answer to expire.
+Purging needs the vars `CDN_ZONE_ID` and `PUBLIC_CACHE_ORIGIN` and the
+secret `CDN_PURGE_TOKEN`, an API token with Cache Purge on the zone;
+without them nothing is purged. To purge by hand:
+
+```bash
+curl -X POST https://cache.example.com/_api/v1/admin/caches/main/purge \
+  -H "authorization: Bearer $ADMIN_SECRET" -d '{}'   # or {"storePathHashes": [...]}
+```
 
 ## Setup
 
