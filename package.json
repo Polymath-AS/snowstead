@@ -9,6 +9,7 @@
     "build": "echo 'wrangler bundles at deploy time'",
     "deploy": "pnpm --filter @snowstead/cache-worker db:migrate && pnpm exec wrangler deploy",
     "dev": "scripts/dev.sh",
+    "dev:profile": "scripts/dev-profile.sh",
     "check": "pnpm -r check"
   },
   "cloudflare": {
