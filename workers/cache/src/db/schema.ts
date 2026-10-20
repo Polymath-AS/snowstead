@@ -31,6 +31,8 @@ export const caches = pgTable("caches", {
 	signingKeyName: text("signing_key_name"),
 	signingPublicKey: text("signing_public_key"),
 	signingKeySealed: text("signing_key_sealed"),
+	/** Days a path stays after its last push, or null to keep paths until deleted. */
+	retentionDays: integer("retention_days"),
 	createdAt: createdAt("created_at"),
 }, (table) => [
 	index("idx_caches_org").on(table.orgId),
@@ -60,7 +62,13 @@ export const publishedPaths = pgTable("published_paths", {
 	system: text("system"),
 	signaturesJson: text("signatures_json").notNull().default("[]"),
 	createdAt: createdAt("created_at"),
+	/**
+	 * When a push last included the path, to the day: what retention counts
+	 * from. Pulls can't count, since public NARs are served without the Worker.
+	 */
+	lastPushedAt: timestamptz("last_pushed_at").notNull().defaultNow(),
 }, (table) => [
+	index("idx_published_paths_cache_pushed").on(table.cacheId, table.lastPushedAt),
 	uniqueIndex("published_paths_cache_store_unique").on(table.cacheId, table.storePathHash),
 	index("idx_published_paths_blob_object").on(table.blobObjectId),
 ]);

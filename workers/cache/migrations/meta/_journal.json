@@ -50,6 +50,13 @@
       "when": 1792533217675,
       "tag": "0006_default_org",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1792535130245,
+      "tag": "0007_retention",
+      "breakpoints": true
     }
   ]
 }

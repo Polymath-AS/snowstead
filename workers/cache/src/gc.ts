@@ -7,7 +7,9 @@ import {
 	deleteUnreferencedBlobObjects,
 	deleteExpiredApiTokens,
 	deleteExpiredAuditLogs,
+	listCachesWithRetention,
 } from "./db/repository.js";
+import { deleteCachePaths } from "./path-deletion.js";
 import type { BlobObject, UploadSessionStatus } from "./db/types.js";
 
 const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading"]);
@@ -20,6 +22,11 @@ const AUDIT_LOG_RETENTION_DAYS = 30;
 const R2_DELETE_MAX_KEYS = 1000;
 const GC_BLOB_BATCH = 1000;
 const GC_BLOB_BATCHES = 20;
+// Paths a cache's retention deletes per run: a cache with more expiring
+// is caught up over runs, as the blob sweep is.
+const RETENTION_BATCH = 500;
+const RETENTION_BATCHES_PER_RUN = 20;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function chunks<T>(items: readonly T[], size: number): T[][] {
 	const out: T[][] = [];
@@ -29,6 +36,7 @@ function chunks<T>(items: readonly T[], size: number): T[][] {
 
 export interface GcResult {
 	readonly expiredSessions: number;
+	readonly expiredPaths: number;
 	readonly deletedBlobs: number;
 	readonly expiredTokens: number;
 	readonly expiredAuditLogs: number;
@@ -38,6 +46,7 @@ export interface GcResult {
 export async function runGarbageCollection(config: WorkerConfig): Promise<GcResult> {
 	const errors: string[] = [];
 	let expiredSessions = 0;
+	let expiredPaths = 0;
 	let deletedBlobs = 0;
 	let expiredTokens = 0;
 	let expiredAuditLogs = 0;
@@ -80,6 +89,29 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			expiredSessions++;
 		} catch (err) {
 			errors.push(`Failed to expire session ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	// Before the blob sweep, so the NARs retention frees go in the same run.
+	let caches: Awaited<ReturnType<typeof listCachesWithRetention>> = [];
+	try {
+		caches = await listCachesWithRetention(config.db);
+	} catch (err) {
+		errors.push(`Failed to list caches with retention: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	let retentionBudget = RETENTION_BATCHES_PER_RUN;
+	for (const cache of caches) {
+		const lastPushedBefore = new Date(now.getTime() - (cache.retentionDays ?? 0) * DAY_MS);
+		while (retentionBudget > 0) {
+			retentionBudget--;
+			try {
+				const deleted = await deleteCachePaths(config, cache, { lastPushedBefore, limit: RETENTION_BATCH });
+				expiredPaths += deleted.length;
+				if (deleted.length < RETENTION_BATCH) break;
+			} catch (err) {
+				errors.push(`Failed to expire paths of ${cache.name}: ${err instanceof Error ? err.message : String(err)}`);
+				break;
+			}
 		}
 	}
 
@@ -127,5 +159,5 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 		errors.push(`Failed to delete expired audit logs: ${err instanceof Error ? err.message : String(err)}`);
 	}
 
-	return { expiredSessions, deletedBlobs, expiredTokens, expiredAuditLogs, errors };
+	return { expiredSessions, expiredPaths, deletedBlobs, expiredTokens, expiredAuditLogs, errors };
 }

@@ -18,6 +18,7 @@ import {
 	createPublishedPaths,
 	findPublishedPaths,
 	findPublishedHashes,
+	touchPublishedPaths,
 } from "./db/repository.js";
 import type { Cache, UploadSession } from "./db/types.js";
 import type { OrgUsage } from "./db/repository.js";
@@ -912,6 +913,10 @@ export async function handleGetMissingPaths(
 	}
 
 	const existingHashes = await findPublishedHashes(config.db, cache.id, body.storePathHashes);
+	// A push that still has these paths keeps them from retention.
+	config.defer(touchPublishedPaths(config.db, cache.id, existingHashes, new Date()).catch((err) => {
+		console.error("Failed to mark paths pushed", err);
+	}));
 	const existingSet = new Set(existingHashes);
 	const absent = body.storePathHashes.filter((h) => !existingSet.has(h));
 	// What an upstream serves is not missing: substituters have it already.

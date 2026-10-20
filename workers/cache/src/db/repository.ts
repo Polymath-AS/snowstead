@@ -499,21 +499,52 @@ export async function deleteUnreferencedBlobObjects(
  * before a time, and returns the hashes it deleted. `withdraw` runs with the
  * rows deleted but not committed: if it fails, they stay.
  */
+/** Which of a cache's paths to delete: named ones, or the oldest published or pushed before a time. */
+export type PathSelection =
+	| { readonly storePathHashes: readonly string[] }
+	| { readonly before: Date; readonly limit: number }
+	| { readonly lastPushedBefore: Date; readonly limit: number };
+
+/**
+ * Marks paths a push included as pushed today, which keeps them from
+ * retention. Once a day at most per path, so pushes rarely write.
+ */
+export async function touchPublishedPaths(db: Db, cacheId: number, storePathHashes: readonly string[], now: Date): Promise<void> {
+	if (storePathHashes.length === 0) return;
+	await db.update(publishedPaths)
+		.set({ lastPushedAt: now })
+		.where(and(
+			eq(publishedPaths.cacheId, cacheId),
+			sql`${publishedPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
+			lt(publishedPaths.lastPushedAt, new Date(now.getTime() - 24 * 60 * 60 * 1000)),
+		));
+}
+
+export async function listCachesWithRetention(db: Db): Promise<Cache[]> {
+	return db.select().from(caches).where(isNotNull(caches.retentionDays)).orderBy(caches.id);
+}
+
+export async function setCacheRetention(db: Db, cacheId: number, retentionDays: number | null): Promise<void> {
+	await db.update(caches).set({ retentionDays }).where(eq(caches.id, cacheId));
+}
+
 export async function deletePublishedPaths(
 	db: Db,
 	cacheId: number,
-	which: { readonly storePathHashes: readonly string[] } | { readonly before: Date; readonly limit: number },
+	which: PathSelection,
 	withdraw: (storePathHashes: readonly string[]) => Promise<void>,
 ): Promise<string[]> {
 	return db.transaction(async (tx) => {
+		const column = "lastPushedBefore" in which ? publishedPaths.lastPushedAt : publishedPaths.createdAt;
+		const before = "lastPushedBefore" in which ? which.lastPushedBefore : "before" in which ? which.before : undefined;
 		const match = "storePathHashes" in which
 			? sql`${publishedPaths.storePathHash} = ANY(${sql.param([...which.storePathHashes])}::text[])`
 			: inArray(
 				publishedPaths.id,
 				tx.select({ id: publishedPaths.id })
 					.from(publishedPaths)
-					.where(and(eq(publishedPaths.cacheId, cacheId), lt(publishedPaths.createdAt, which.before)))
-					.orderBy(publishedPaths.createdAt, publishedPaths.id)
+					.where(and(eq(publishedPaths.cacheId, cacheId), lt(column, before ?? new Date(0))))
+					.orderBy(column, publishedPaths.id)
 					.limit(which.limit),
 			);
 		const rows = await tx

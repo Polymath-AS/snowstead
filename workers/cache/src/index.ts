@@ -45,6 +45,7 @@ export default {
 			const result = await runGarbageCollection(config);
 			const counts = {
 				expiredSessions: result.expiredSessions,
+				expiredPaths: result.expiredPaths,
 				deletedBlobs: result.deletedBlobs,
 				expiredTokens: result.expiredTokens,
 				expiredAuditLogs: result.expiredAuditLogs,

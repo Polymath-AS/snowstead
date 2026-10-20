@@ -2,9 +2,10 @@ import type { WorkerConfig } from "./config.js";
 import { signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
 import type { TokenClaims } from "./jwt.js";
 import type { TokenPermission } from "./db/types.js";
-import type { CacheStats } from "./db/repository.js";
+import type { CacheStats, PathSelection } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
+import { deleteCachePaths } from "./path-deletion.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
 import {
 	createApiToken,
@@ -17,18 +18,18 @@ import {
 	listCacheStats,
 	listRecentPaths,
 	setCachePublic,
+	setCacheRetention,
 	findCacheByName,
 	cacheHasPaths,
 	listPublishedPathsAfter,
 	findOrg,
 	putOrg,
 	orgUsage,
-	deletePublishedPaths,
 } from "./db/repository.js";
-import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
+import { storeNarinfo } from "./narinfo.js";
 import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
-import { RESERVED_CACHE_NAMES, setPublicCacheInfo, bucketFor, narinfoKey } from "./layout.js";
+import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
@@ -233,17 +234,27 @@ export async function handleRevokeToken(
 	return jsonResponse({ revoked: true, jti });
 }
 
+const MAX_RETENTION_DAYS = 3650;
+
 /**
  * Creates a cache, or sets an existing one's visibility when `private` is
- * given. Idempotent, so setup can declare its caches on every run.
+ * given and its retention when `retentionDays` is: days a path stays after
+ * its last push, or null to keep paths until they're deleted. Idempotent,
+ * so setup can declare its caches on every run.
  */
 export async function handleCreateCache(
 	request: Request,
 	config: WorkerConfig,
 	scope?: string,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ name: string; private?: boolean; org?: string }>(request);
+	const body = await parseJsonBody<{ name: string; private?: boolean; org?: string; retentionDays?: unknown }>(request);
 	if (body instanceof Response) return body;
+
+	const retention = body.retentionDays;
+	if (retention !== undefined && retention !== null
+		&& !(typeof retention === "number" && Number.isInteger(retention) && retention >= 1 && retention <= MAX_RETENTION_DAYS)) {
+		return errorResponse(`retentionDays must be a whole number of days from 1 to ${MAX_RETENTION_DAYS}, or null`, 400);
+	}
 
 	const org = scope ?? (body.org === undefined ? DEFAULT_ORG_ID : parseOrgId(body.org));
 	if (org === undefined) {
@@ -300,7 +311,13 @@ export async function handleCreateCache(
 		await setPublicCacheInfo(config, name, true);
 	}
 
-	return jsonResponse({ name: cache.name, private: !isPublic, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
+	let retentionDays = cache.retentionDays;
+	if (retention !== undefined && retention !== retentionDays) {
+		retentionDays = retention;
+		await setCacheRetention(config.db, cache.id, retentionDays);
+	}
+
+	return jsonResponse({ name: cache.name, private: !isPublic, retentionDays, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -311,6 +328,7 @@ function cacheSummary(stats: CacheStats) {
 		name: stats.cache.name,
 		private: !stats.cache.isPublic,
 		org: stats.cache.orgId,
+		retentionDays: stats.cache.retentionDays,
 		createdAt: stats.cache.createdAt,
 		paths: stats.paths,
 		size: stats.size,
@@ -495,7 +513,7 @@ export async function handleDeletePaths(
 	if ((body.storePathHashes === undefined) === (body.before === undefined)) {
 		return errorResponse("give one of storePathHashes or before", 400);
 	}
-	let which: Parameters<typeof deletePublishedPaths>[2];
+	let which: PathSelection;
 	let named: string[] = [];
 	if (body.storePathHashes !== undefined) {
 		const hashes = body.storePathHashes;
@@ -523,24 +541,7 @@ export async function handleDeletePaths(
 	if (!cache || (scope !== undefined && cache.orgId !== scope)) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
-	const isPrivate = await isPrivateCache(config, name);
-	const bucket = bucketFor(config, isPrivate);
-
-	// The narinfo goes while the rows are deleted but not committed: if that
-	// fails, the rows stay and a retry finishes, whereas a narinfo outliving
-	// its row would point at a NAR that GC is free to delete. Named hashes
-	// lose their narinfo even without a row, as a publish that stored one but
-	// failed to record its row would leave.
-	const deleted = await deletePublishedPaths(config.db, cache.id, which, async (hashes) => {
-		const keys = [...new Set([...named, ...hashes])].map((h) => narinfoKey(name, h, isPrivate));
-		if (keys.length > 0) await bucket.delete(keys);
-	});
-
-	// The Cache API is per data center: this clears the one handling the
-	// request. Elsewhere a narinfo already served stays cached until evicted,
-	// and a public cache's is also cached by the CDN in front of its bucket.
-	const narinfos = await caches.open("snowstead-narinfo");
-	await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, name, h, isPrivate))));
+	const deleted = await deleteCachePaths(config, cache, which, origin);
 
 	const gone = new Set(deleted);
 	return jsonResponse({
