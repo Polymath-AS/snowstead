@@ -1,4 +1,4 @@
-import { eq, and, notInArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
+import { eq, and, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
 	orgs,
@@ -434,24 +434,58 @@ export async function findUploadParts(
 		.orderBy(uploadParts.partNumber);
 }
 
-export async function findUnreferencedBlobObjects(
+/**
+ * Deletes blobs no published path points at and no live upload session
+ * names, up to `limit`, and returns them. A session's NAR may already sit at
+ * its blob's key, about to be published: deleting the blob would take that
+ * NAR from under the narinfo publishing writes.
+ */
+export async function deleteUnreferencedBlobObjects(
 	db: Db,
+	now: Date,
+	limit: number,
 ): Promise<BlobObject[]> {
-	const referenced = db
-		.select({ id: publishedPaths.blobObjectId })
-		.from(publishedPaths);
-
-	return db
-		.select()
+	const unreferenced = db
+		.select({ id: blobObjects.id })
 		.from(blobObjects)
-		.where(notInArray(blobObjects.id, referenced));
+		.where(and(
+			sql`not exists (select 1 from ${publishedPaths} where ${publishedPaths.blobObjectId} = ${blobObjects.id})`,
+			sql`not exists (select 1 from ${uploadSessions} where ${uploadSessions.fileHash} = ${blobObjects.fileHash} and ${uploadSessions.compression} = ${blobObjects.compression} and ${uploadSessions.expiresAt} > ${now.toISOString()}::timestamptz)`,
+		))
+		.limit(limit);
+	return db.delete(blobObjects).where(inArray(blobObjects.id, unreferenced)).returning();
 }
 
-export async function deleteBlobObject(
+/**
+ * Deletes a cache's published paths, the ones named or the oldest published
+ * before a time, and returns the hashes it deleted. `withdraw` runs with the
+ * rows deleted but not committed: if it fails, they stay.
+ */
+export async function deletePublishedPaths(
 	db: Db,
-	id: number,
-): Promise<void> {
-	await db.delete(blobObjects).where(eq(blobObjects.id, id));
+	cacheId: number,
+	which: { readonly storePathHashes: readonly string[] } | { readonly before: Date; readonly limit: number },
+	withdraw: (storePathHashes: readonly string[]) => Promise<void>,
+): Promise<string[]> {
+	return db.transaction(async (tx) => {
+		const match = "storePathHashes" in which
+			? sql`${publishedPaths.storePathHash} = ANY(${sql.param([...which.storePathHashes])}::text[])`
+			: inArray(
+				publishedPaths.id,
+				tx.select({ id: publishedPaths.id })
+					.from(publishedPaths)
+					.where(and(eq(publishedPaths.cacheId, cacheId), lt(publishedPaths.createdAt, which.before)))
+					.orderBy(publishedPaths.createdAt, publishedPaths.id)
+					.limit(which.limit),
+			);
+		const rows = await tx
+			.delete(publishedPaths)
+			.where(and(eq(publishedPaths.cacheId, cacheId), match))
+			.returning({ storePathHash: publishedPaths.storePathHash });
+		const deleted = rows.map((r) => r.storePathHash);
+		await withdraw(deleted);
+		return deleted;
+	});
 }
 
 export async function deleteUploadSession(

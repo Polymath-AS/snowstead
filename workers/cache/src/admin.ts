@@ -21,12 +21,13 @@ import {
 	findOrg,
 	putOrg,
 	orgUsage,
+	deletePublishedPaths,
 } from "./db/repository.js";
-import { storeNarinfo } from "./narinfo.js";
+import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
-import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
-import { parseCacheName } from "@snowstead/cache-domain";
+import { RESERVED_CACHE_NAMES, setPublicCacheInfo, bucketFor, narinfoKey } from "./layout.js";
+import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
 const MAX_TOKEN_LIFETIME_DAYS = 365;
@@ -431,4 +432,87 @@ export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 		await recordRevocation(config, token.jti, token.expiresAt);
 	}
 	return jsonResponse({ caches: caches.length, private: caches.filter((c) => !c.isPublic).length, revocations: revoked.length });
+}
+
+const MAX_DELETE_BATCH = 500;
+
+/**
+ * Deletes published paths from a cache, which frees their bytes from its
+ * org's usage at once. The body names the paths, `{ storePathHashes }` with
+ * 1 to 500 hashes, or asks for every path published before a time,
+ * `{ before: "<ISO 8601>" }`, deleted oldest first 500 at a time. Answers
+ * `{ deleted, notFound, more }`: the hashes deleted, the hashes named that
+ * the cache did not have (so a repeat is not an error), and whether paths
+ * before the time are left for another call. The NARs stay for GC, which
+ * deletes one once no cache's path points at it.
+ */
+export async function handleDeletePaths(
+	request: Request,
+	config: WorkerConfig,
+	rawName: string,
+	origin: string,
+): Promise<Response> {
+	const name = parseCacheName(rawName);
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+	const body = await parseJsonBody<{ storePathHashes?: unknown; before?: unknown }>(request);
+	if (body instanceof Response) return body;
+
+	if ((body.storePathHashes === undefined) === (body.before === undefined)) {
+		return errorResponse("give one of storePathHashes or before", 400);
+	}
+	let which: Parameters<typeof deletePublishedPaths>[2];
+	let named: string[] = [];
+	if (body.storePathHashes !== undefined) {
+		const hashes = body.storePathHashes;
+		if (!Array.isArray(hashes) || hashes.length === 0 || hashes.length > MAX_DELETE_BATCH) {
+			return errorResponse(`storePathHashes must be an array of 1 to ${MAX_DELETE_BATCH} hashes`, 400);
+		}
+		for (const raw of hashes) {
+			const hash = parseStorePathHash(String(raw));
+			if (typeof hash === "object") {
+				return errorResponse(`${String(raw)}: ${hash.message}`, 400);
+			}
+			named.push(hash);
+		}
+		named = [...new Set(named)];
+		which = { storePathHashes: named };
+	} else {
+		const before = typeof body.before === "string" ? new Date(body.before) : undefined;
+		if (before === undefined || Number.isNaN(before.getTime())) {
+			return errorResponse("before must be an ISO 8601 time", 400);
+		}
+		which = { before, limit: MAX_DELETE_BATCH };
+	}
+
+	const cache = await findCacheByName(config.db, name);
+	if (!cache) {
+		return errorResponse(`no cache named ${name}`, 404);
+	}
+	const isPrivate = await isPrivateCache(config, name);
+	const bucket = bucketFor(config, isPrivate);
+
+	// The narinfo goes while the rows are deleted but not committed: if that
+	// fails, the rows stay and a retry finishes, whereas a narinfo outliving
+	// its row would point at a NAR that GC is free to delete. Named hashes
+	// lose their narinfo even without a row, as a publish that stored one but
+	// failed to record its row would leave.
+	const deleted = await deletePublishedPaths(config.db, cache.id, which, async (hashes) => {
+		const keys = [...new Set([...named, ...hashes])].map((h) => narinfoKey(name, h, isPrivate));
+		if (keys.length > 0) await bucket.delete(keys);
+	});
+
+	// The Cache API is per data center: this clears the one handling the
+	// request. Elsewhere a narinfo already served stays cached until evicted,
+	// and a public cache's is also cached by the CDN in front of its bucket.
+	const narinfos = await caches.open("snowstead-narinfo");
+	await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, name, h, isPrivate))));
+
+	const gone = new Set(deleted);
+	return jsonResponse({
+		deleted: "before" in which ? deleted : named.filter((h) => gone.has(h)),
+		notFound: named.filter((h) => !gone.has(h)),
+		more: "before" in which && deleted.length === which.limit,
+	});
 }

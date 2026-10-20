@@ -34,6 +34,7 @@ const API_ROUTES = new Set([
 	"admin/tokens/:jti/revoke",
 	"admin/caches",
 	"admin/caches/:cache",
+	"admin/caches/:cache/paths/delete",
 	"admin/auth/sync",
 	"admin/narinfo/backfill",
 ]);

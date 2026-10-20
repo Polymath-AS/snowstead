@@ -10,6 +10,7 @@ describe("routes", () => {
 		["PUT", "/_api/v1/uploads/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/part/7", "PUT /_api/v1/uploads/:session/part/:part"],
 		["POST", "/_api/v1/admin/tokens/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/revoke", "POST /_api/v1/admin/tokens/:jti/revoke"],
 		["GET", "/_api/v1/admin/caches/team", "GET /_api/v1/admin/caches/:cache"],
+		["POST", "/_api/v1/admin/caches/team/paths/delete", "POST /_api/v1/admin/caches/:cache/paths/delete"],
 		["GET", "/uzaaft/nix-cache-info", "GET /:cache/nix-cache-info"],
 		["HEAD", `/private/team/${"a".repeat(32)}.narinfo`, "HEAD /private/:cache/:hash.narinfo"],
 		["GET", `/team/nar/${"f".repeat(64)}/zstd.nar`, "GET /:cache/nar/:file"],

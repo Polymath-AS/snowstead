@@ -4,12 +4,11 @@ import {
 	findExpiredSessions,
 	transitionSessionStatus,
 	deleteUploadSession,
-	findUnreferencedBlobObjects,
-	deleteBlobObject,
+	deleteUnreferencedBlobObjects,
 	deleteExpiredApiTokens,
 	deleteExpiredAuditLogs,
 } from "./db/repository.js";
-import type { UploadSessionStatus } from "./db/types.js";
+import type { BlobObject, UploadSessionStatus } from "./db/types.js";
 
 const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading"]);
 
@@ -18,6 +17,15 @@ function isTransitionableStatus(s: string): s is UploadSessionStatus {
 }
 
 const AUDIT_LOG_RETENTION_DAYS = 30;
+const R2_DELETE_MAX_KEYS = 1000;
+const GC_BLOB_BATCH = 1000;
+const GC_BLOB_BATCHES = 20;
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+	const out: T[][] = [];
+	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+	return out;
+}
 
 export interface GcResult {
 	readonly expiredSessions: number;
@@ -75,26 +83,35 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 		}
 	}
 
-	const unreferenced = await findUnreferencedBlobObjects(config.db);
-
-	for (const blob of unreferenced) {
+	// R2 deletes up to 1000 keys a call, so a batch costs a few subrequests
+	// however many blobs it holds; a cache emptied at once is swept over runs.
+	for (let batch = 0; batch < GC_BLOB_BATCHES; batch++) {
+		let blobs: BlobObject[];
 		try {
-			// Delete DB record first to prevent re-referencing during R2 delete
-			await deleteBlobObject(config.db, blob.id);
-			try {
-				// Both layouts: publishing may have copied it to the other bucket.
-				await Promise.all([
-					config.bucket.delete(narKey(blob.fileHash, blob.compression, true)),
-					config.publicBucket.delete(narKey(blob.fileHash, blob.compression, false)),
-					bucketForKey(config, blob.r2Key).delete(blob.r2Key),
-				]);
-			} catch {
-				// R2 object may already be gone
-			}
-			deletedBlobs++;
+			// Rows first, so nothing is published against a blob whose NAR is going.
+			blobs = await deleteUnreferencedBlobObjects(config.db, new Date(), GC_BLOB_BATCH);
 		} catch (err) {
-			errors.push(`Failed to delete blob ${blob.id}: ${err instanceof Error ? err.message : String(err)}`);
+			errors.push(`Failed to delete blobs: ${err instanceof Error ? err.message : String(err)}`);
+			break;
 		}
+		// Both layouts: publishing may have copied a NAR to the other bucket.
+		const privateKeys = new Set<string>();
+		const publicKeys = new Set<string>();
+		for (const blob of blobs) {
+			privateKeys.add(narKey(blob.fileHash, blob.compression, true));
+			publicKeys.add(narKey(blob.fileHash, blob.compression, false));
+			(bucketForKey(config, blob.r2Key) === config.bucket ? privateKeys : publicKeys).add(blob.r2Key);
+		}
+		try {
+			await Promise.all([
+				...chunks([...privateKeys], R2_DELETE_MAX_KEYS).map((keys) => config.bucket.delete(keys)),
+				...chunks([...publicKeys], R2_DELETE_MAX_KEYS).map((keys) => config.publicBucket.delete(keys)),
+			]);
+		} catch (err) {
+			errors.push(`Failed to delete the NARs of ${blobs.length} blobs: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		deletedBlobs += blobs.length;
+		if (blobs.length < GC_BLOB_BATCH) break;
 	}
 
 	try {

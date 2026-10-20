@@ -21,7 +21,7 @@ import {
 	handleCommit,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleGetOrg, handlePutOrg } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleGetOrg, handlePutOrg, handleDeletePaths } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -33,6 +33,7 @@ const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
 const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 const RE_ADMIN_CACHE = /^\/_api\/v1\/admin\/caches\/([^/]+)$/;
+const RE_ADMIN_CACHE_PATHS_DELETE = /^\/_api\/v1\/admin\/caches\/([^/]+)\/paths\/delete$/;
 const RE_ADMIN_ORG = /^\/_api\/v1\/admin\/orgs\/([^/]+)$/;
 
 export async function handleRequest(
@@ -365,6 +366,15 @@ async function handleAdminApi(
 	const cacheMatch = pathname.match(RE_ADMIN_CACHE);
 	if (cacheMatch && request.method === "GET") {
 		return handleGetCache(config, decodeURIComponent(cacheMatch[1]));
+	}
+
+	const deleteMatch = pathname.match(RE_ADMIN_CACHE_PATHS_DELETE);
+	if (deleteMatch && request.method === "POST") {
+		const name = decodeURIComponent(deleteMatch[1]);
+		const response = await handleDeletePaths(request, config, name, new URL(request.url).origin);
+		const detail = response.ok ? JSON.stringify({ deleted: (await response.clone().json<{ deleted: string[] }>()).deleted }) : "{}";
+		writeAuditLog(config, authResult.identity, "paths.delete", name, response.status, detail, ip);
+		return response;
 	}
 
 	const orgMatch = pathname.match(RE_ADMIN_ORG);
