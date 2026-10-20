@@ -21,7 +21,7 @@ import {
 	handleCommit,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleGetOrg, handlePutOrg } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -33,6 +33,7 @@ const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
 const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 const RE_ADMIN_CACHE = /^\/_api\/v1\/admin\/caches\/([^/]+)$/;
+const RE_ADMIN_ORG = /^\/_api\/v1\/admin\/orgs\/([^/]+)$/;
 
 export async function handleRequest(
 	request: Request,
@@ -346,7 +347,7 @@ async function handleAdminApi(
 	}
 
 	if (pathname === "/_api/v1/admin/tokens" && request.method === "GET") {
-		const response = await handleListTokens(config);
+		const response = await handleListTokens(config, new URL(request.url));
 		writeAuditLog(config, authResult.identity, "token.list", null, response.status, "{}", ip);
 		return response;
 	}
@@ -358,12 +359,22 @@ async function handleAdminApi(
 	}
 
 	if (pathname === "/_api/v1/admin/caches" && request.method === "GET") {
-		return handleListCaches(config);
+		return handleListCaches(config, new URL(request.url));
 	}
 
 	const cacheMatch = pathname.match(RE_ADMIN_CACHE);
 	if (cacheMatch && request.method === "GET") {
 		return handleGetCache(config, decodeURIComponent(cacheMatch[1]));
+	}
+
+	const orgMatch = pathname.match(RE_ADMIN_ORG);
+	if (orgMatch && request.method === "GET") {
+		return handleGetOrg(config, decodeURIComponent(orgMatch[1]));
+	}
+	if (orgMatch && request.method === "PUT") {
+		const response = await handlePutOrg(request, config, decodeURIComponent(orgMatch[1]));
+		writeAuditLog(config, authResult.identity, "org.put", null, response.status, JSON.stringify({ org: decodeURIComponent(orgMatch[1]) }), ip);
+		return response;
 	}
 
 	if (pathname === "/_api/v1/admin/auth/sync" && request.method === "POST") {
@@ -424,8 +435,8 @@ async function handleWriteApi(
 			return response;
 		}
 		const response = sessionBatch
-			? await handleCreateSessions(request, config, cacheName)
-			: await handleCreateSession(request, config, cacheName);
+			? await handleCreateSessions(request, config, cacheName, identity)
+			: await handleCreateSession(request, config, cacheName, identity);
 		writeAuditLog(config, identity, "push", cacheName, response.status, sessionBatch ? '{"endpoint":"create-sessions"}' : '{"endpoint":"create-session"}', ip);
 		return response;
 	}

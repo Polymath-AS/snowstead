@@ -1,6 +1,7 @@
 import { eq, and, notInArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import {
+	orgs,
 	caches,
 	blobObjects,
 	publishedPaths,
@@ -12,6 +13,7 @@ import {
 	upstreamPaths,
 } from "./schema.js";
 import type {
+	Org,
 	Cache,
 	BlobObject,
 	PublishedPath,
@@ -62,8 +64,9 @@ export async function ensureCache(
 	db: Db,
 	name: string,
 	isPublic = true,
+	orgId: string | null = null,
 ): Promise<{ cache: Cache; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name, isPublic }).onConflictDoNothing().returning());
+	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning());
 	if (inserted) return { cache: inserted, created: true };
 	const existing = await findCacheByName(db, name);
 	if (!existing) throw new Error(`cache ${name} vanished`);
@@ -91,8 +94,8 @@ export interface CacheStats {
 	readonly lastAddedAt: Date | null;
 }
 
-/** Every cache with its published paths counted, or just the one named. */
-export async function listCacheStats(db: Db, since: Date, name?: string): Promise<CacheStats[]> {
+/** Every cache with its published paths counted, or just the one named, or an org's. */
+export async function listCacheStats(db: Db, since: Date, filter: { name?: string; orgId?: string } = {}): Promise<CacheStats[]> {
 	return db
 		.select({
 			cache: caches,
@@ -104,9 +107,82 @@ export async function listCacheStats(db: Db, since: Date, name?: string): Promis
 		.from(caches)
 		.leftJoin(publishedPaths, eq(publishedPaths.cacheId, caches.id))
 		.leftJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
-		.where(name === undefined ? undefined : eq(caches.name, name))
+		.where(and(
+			filter.name === undefined ? undefined : eq(caches.name, filter.name),
+			filter.orgId === undefined ? undefined : eq(caches.orgId, filter.orgId),
+		))
 		.groupBy(caches.id)
 		.orderBy(caches.name);
+}
+
+export async function findOrg(db: Db, id: string): Promise<Org | undefined> {
+	return first(db.select().from(orgs).where(eq(orgs.id, id)).limit(1));
+}
+
+/** Creates the org, or changes its storage limit. */
+export async function putOrg(db: Db, id: string, storageLimit: number | null): Promise<Org> {
+	return returned(
+		db.insert(orgs).values({ id, storageLimit })
+			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit } })
+			.returning(),
+	);
+}
+
+export interface OrgUsage {
+	/** Bytes its caches hold, counted as in CacheStats.size. */
+	readonly used: number;
+	/** Bytes of uploads under way that would add to it. */
+	readonly pending: number;
+}
+
+export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsage> {
+	const [used, pending] = await Promise.all([
+		first(
+			db.select({ bytes: sql`coalesce(sum(${blobObjects.fileSize}), 0)`.mapWith(Number) })
+				.from(publishedPaths)
+				.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
+				.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+				.where(eq(caches.orgId, orgId)),
+		),
+		first(
+			db.select({ bytes: sql`coalesce(sum(${uploadSessions.fileSize}), 0)`.mapWith(Number) })
+				.from(uploadSessions)
+				.innerJoin(caches, eq(uploadSessions.cacheId, caches.id))
+				.where(and(
+					eq(caches.orgId, orgId),
+					sql`${uploadSessions.status} in ('pending', 'uploading')`,
+					gt(uploadSessions.expiresAt, now),
+				)),
+		),
+	]);
+	return { used: used?.bytes ?? 0, pending: pending?.bytes ?? 0 };
+}
+
+/**
+ * Records upload sessions for an org's cache unless they would take it past
+ * its storage limit; returns the usage that refused them, or undefined once
+ * they are recorded. Locked per org, so concurrent pushes can't both fit
+ * into the same space.
+ */
+export async function createUploadSessionsWithinLimit(
+	db: Db,
+	orgId: string,
+	rows: Parameters<typeof createUploadSessions>[1],
+): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
+	return db.transaction(async (tx) => {
+		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + orgId}, 0))`);
+		const org = await findOrg(tx, orgId);
+		const limit = org?.storageLimit ?? null;
+		if (limit !== null) {
+			const usage = await orgUsage(tx, orgId, new Date());
+			const requested = rows.reduce((sum, r) => sum + r.fileSize, 0);
+			if (usage.used + usage.pending + requested > limit) {
+				return { ...usage, limit, requested };
+			}
+		}
+		await createUploadSessions(tx, rows);
+		return undefined;
+	});
 }
 
 /** A cache's most recently published paths, newest first. */
@@ -428,6 +504,7 @@ export async function createApiToken(
 		readonly permsJson: string;
 		readonly expiresAt: Date;
 		readonly createdBy: string;
+		readonly orgId?: string | null;
 	},
 ): Promise<ApiToken> {
 	return returned(db.insert(apiTokens).values(params).returning());
@@ -442,8 +519,9 @@ export async function findApiToken(
 
 export async function listApiTokens(
 	db: Db,
+	orgId?: string,
 ): Promise<ApiToken[]> {
-	return db.select().from(apiTokens);
+	return db.select().from(apiTokens).where(orgId === undefined ? undefined : eq(apiTokens.orgId, orgId));
 }
 
 export async function revokeApiToken(

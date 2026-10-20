@@ -7,6 +7,8 @@ export type TokenClaims = {
 	readonly aud: string;
 	readonly caches: readonly string[];
 	readonly perms: readonly TokenPermission[];
+	/** The org the token's caches belong to; it may push to no other org's. */
+	readonly org?: string;
 	readonly exp: number;
 	readonly iat: number;
 };
@@ -153,9 +155,14 @@ function validateClaims(obj: Record<string, unknown>): JwtVerifyResult {
 		validatedPerms.push(perm);
 	}
 
+	const org = obj["org"];
+	if (org !== undefined && (typeof org !== "string" || org.length === 0)) {
+		return { kind: "error", reason: "invalid token" };
+	}
+
 	return {
 		kind: "ok",
-		claims: { jti, sub, iss, aud, caches: validatedCaches, perms: validatedPerms, exp, iat },
+		claims: { jti, sub, iss, aud, caches: validatedCaches, perms: validatedPerms, ...(org === undefined ? {} : { org }), exp, iat },
 	};
 }
 

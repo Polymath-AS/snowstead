@@ -7,12 +7,27 @@ const createdAt = (name: string) => timestamptz(name).notNull().defaultNow();
 const bytes = (name: string) => bigint(name, { mode: "number" });
 const id = () => bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity();
 
+/**
+ * The tenants of a hosted service, each with its caches and a storage limit.
+ * Their members and plans live with whatever runs the service; a cache
+ * without an org, as on a self-hosted install, has no limit.
+ */
+export const orgs = pgTable("orgs", {
+	id: text("id").primaryKey(),
+	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
+	storageLimit: bytes("storage_limit"),
+	createdAt: createdAt("created_at"),
+});
+
 export const caches = pgTable("caches", {
 	id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
 	name: text("name").notNull().unique(),
 	isPublic: boolean("is_public").notNull().default(true),
+	orgId: text("org_id").references(() => orgs.id),
 	createdAt: createdAt("created_at"),
-});
+}, (table) => [
+	index("idx_caches_org").on(table.orgId),
+]);
 
 export const blobObjects = pgTable("blob_objects", {
 	id: id(),
@@ -96,6 +111,7 @@ export const apiTokens = pgTable("api_tokens", {
 	revokedAt: timestamptz("revoked_at"),
 	revokedBy: text("revoked_by"),
 	revocationReason: text("revocation_reason"),
+	orgId: text("org_id"),
 });
 
 export const auditLogs = pgTable("audit_logs", {

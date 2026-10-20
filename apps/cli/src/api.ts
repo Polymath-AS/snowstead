@@ -142,6 +142,10 @@ export async function createUploadSessions(
   paths: readonly SessionParams[],
 ): Promise<SessionResponse[]> {
   const resp = await request(client, "POST", `/_api/v1/caches/${cache}/upload-sessions/batch`, { paths });
+  // Out of storage: the service says how much the push needed and what's left.
+  if (resp.status === 507) {
+    throw new Error((await jsonBody<{ error: string }>(resp)).error);
+  }
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`create-sessions failed (${resp.status}): ${text}`);

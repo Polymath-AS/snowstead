@@ -1,5 +1,6 @@
 import type { InferSelectModel } from "drizzle-orm";
 import type {
+	orgs,
 	caches,
 	blobObjects,
 	publishedPaths,
@@ -9,6 +10,8 @@ import type {
 	apiTokens,
 	auditLogs,
 } from "./schema.js";
+
+export type Org = InferSelectModel<typeof orgs>;
 
 export type Cache = InferSelectModel<typeof caches>;
 

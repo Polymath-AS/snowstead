@@ -5,6 +5,7 @@ import {
 	findCacheByName,
 	findCacheById,
 	createUploadSessions,
+	createUploadSessionsWithinLimit,
 	findUploadSession,
 	findUploadSessions,
 	transitionSessionStatus,
@@ -20,6 +21,7 @@ import {
 	findPublishedHashes,
 } from "./db/repository.js";
 import type { Cache, UploadSession } from "./db/types.js";
+import type { OrgUsage } from "./db/repository.js";
 import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
@@ -200,12 +202,41 @@ function isStaged(session: Pick<UploadSession, "r2UploadKey">): boolean {
 	return session.r2UploadKey?.startsWith(STAGING_PREFIX) ?? false;
 }
 
-/** Records sessions for paths of one cache in one statement, and says where each NAR goes. */
+function formatBytes(bytes: number): string {
+	const units = ["bytes", "KB", "MB", "GB", "TB"];
+	let value = bytes;
+	let unit = 0;
+	while (value >= 1000 && unit < units.length - 1) {
+		value /= 1000;
+		unit++;
+	}
+	return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+/** Why a push was refused, in terms its pusher can act on. */
+function storageFullResponse(usage: OrgUsage & { readonly limit: number; readonly requested: number }): Response {
+	const inUse = usage.used + usage.pending;
+	const left = Math.max(0, usage.limit - inUse);
+	return errorResponse(
+		`Not enough storage: this push needs ${formatBytes(usage.requested)}, and ${formatBytes(left)} of your ${formatBytes(usage.limit)} is left.`,
+		507,
+	);
+}
+
+/** Whether a token tied to an org may push to this cache. */
+function orgAllows(identity: AuthIdentity, cache: Cache): boolean {
+	return identity.kind !== "jwt" || identity.claims.org === undefined || identity.claims.org === cache.orgId;
+}
+
+/**
+ * Records sessions for paths of one cache in one statement, and says where
+ * each NAR goes; a cache's org must have room for all of them.
+ */
 async function createSessions(
 	config: WorkerConfig,
 	cache: Cache,
 	items: readonly SessionParams[],
-): Promise<SessionResponse[]> {
+): Promise<SessionResponse[] | Response> {
 	// Seed the ID → name cache so session-scoped requests skip the database lookup.
 	cacheIdToName.set(cache.id, cache.name);
 	// Straight into the bucket the cache is served from.
@@ -237,7 +268,17 @@ async function createSessions(
 			expiresAt,
 		};
 	}));
-	await createUploadSessions(config.db, rows);
+	if (cache.orgId === null) {
+		await createUploadSessions(config.db, rows);
+	} else {
+		const refused = await createUploadSessionsWithinLimit(config.db, cache.orgId, rows);
+		if (refused) {
+			await Promise.allSettled(rows.flatMap((r) =>
+				r.r2UploadId ? [config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()] : [],
+			));
+			return storageFullResponse(refused);
+		}
+	}
 
 	return Promise.all(rows.map(async (row): Promise<SessionResponse> => {
 		const expiresAt = row.expiresAt.toISOString();
@@ -287,10 +328,14 @@ export async function handleCreateSession(
 	request: Request,
 	config: WorkerConfig,
 	cacheName: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
 	const cache = await findCacheByName(config.db, cacheName);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
+	}
+	if (!orgAllows(identity, cache)) {
+		return errorResponse("Forbidden", 403);
 	}
 
 	const body = await parseJsonBody<unknown>(request);
@@ -301,8 +346,9 @@ export async function handleCreateSession(
 		return errorResponse(params, 400);
 	}
 
-	const [session] = await createSessions(config, cache, [params]);
-	return jsonResponse(session, 201);
+	const sessions = await createSessions(config, cache, [params]);
+	if (sessions instanceof Response) return sessions;
+	return jsonResponse(sessions[0], 201);
 }
 
 /**
@@ -313,10 +359,14 @@ export async function handleCreateSessions(
 	request: Request,
 	config: WorkerConfig,
 	cacheName: string,
+	identity: AuthIdentity,
 ): Promise<Response> {
 	const cache = await findCacheByName(config.db, cacheName);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
+	}
+	if (!orgAllows(identity, cache)) {
+		return errorResponse("Forbidden", 403);
 	}
 
 	const body = await parseJsonBody<{ paths?: unknown }>(request);
@@ -335,7 +385,9 @@ export async function handleCreateSessions(
 		items.push(params);
 	}
 
-	return jsonResponse({ sessions: await createSessions(config, cache, items) }, 201);
+	const sessions = await createSessions(config, cache, items);
+	if (sessions instanceof Response) return sessions;
+	return jsonResponse({ sessions }, 201);
 }
 
 export async function handleMultipart(
