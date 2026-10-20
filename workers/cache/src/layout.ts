@@ -1,15 +1,17 @@
 import type { WorkerConfig } from "./config.js";
+import { pathDepth } from "./cache-path.js";
 
 /**
  * Where a cache's objects live. Public caches are laid out in the public
  * bucket exactly as Nix requests them, so cache.snowstead.com serves them
  * straight from R2 and the CDN:
  *
- *   <cache>/nix-cache-info
- *   <cache>/<hash>.narinfo
+ *   <path>/nix-cache-info
+ *   <path>/<hash>.narinfo
  *   nar/<file hash>/<compression>.nar      shared by every public cache
  *
- * Their narinfo points at ../nar/..., which Nix resolves against the
+ * where a cache's path is its name, or <org slug>/<name> (cache-path.ts).
+ * Their narinfo points back up to nar/, which Nix resolves against the
  * cache's URL (older Nix leaves it to curl, which does the same). Private
  * caches stay in the private bucket, which only the Worker reads.
  */
@@ -20,7 +22,7 @@ export const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority:
 export const IMMUTABLE = "public, max-age=31536000, immutable";
 
 /** Names that would collide with the paths around public caches. */
-export const RESERVED_CACHE_NAMES: ReadonlySet<string> = new Set(["nar", "private"]);
+export const RESERVED_CACHE_NAMES: ReadonlySet<string> = new Set(["nar", "private", "nix-cache-info"]);
 
 export function bucketFor(config: WorkerConfig, isPrivate: boolean): R2Bucket {
 	return isPrivate ? config.bucket : config.publicBucket;
@@ -35,27 +37,30 @@ export function bucketForKey(config: WorkerConfig, key: string): R2Bucket {
 	return bucketFor(config, !key.startsWith("nar/"));
 }
 
-export function narinfoKey(cacheName: string, storePathHash: string, isPrivate: boolean): string {
-	return isPrivate ? `narinfo/${cacheName}/${storePathHash}.narinfo` : `${cacheName}/${storePathHash}.narinfo`;
+export function narinfoKey(cachePath: string, storePathHash: string, isPrivate: boolean): string {
+	return isPrivate ? `narinfo/${cachePath}/${storePathHash}.narinfo` : `${cachePath}/${storePathHash}.narinfo`;
 }
 
-/** The narinfo's URL field, relative to the cache's URL. */
-export function narUrl(fileHash: string, compression: string, isPrivate: boolean): string {
-	return isPrivate ? `nar/${fileHash}/${compression}.nar` : `../nar/${fileHash}/${compression}.nar`;
+/**
+ * The narinfo's URL field, relative to the cache's URL: a private cache
+ * serves its NARs under itself, and public NARs are shared at the root.
+ */
+export function narUrl(fileHash: string, compression: string, isPrivate: boolean, cachePath: string): string {
+	return isPrivate ? `nar/${fileHash}/${compression}.nar` : `${"../".repeat(pathDepth(cachePath))}nar/${fileHash}/${compression}.nar`;
 }
 
-export function cacheInfoKey(cacheName: string): string {
-	return `${cacheName}/nix-cache-info`;
+export function cacheInfoKey(cachePath: string): string {
+	return `${cachePath}/nix-cache-info`;
 }
 
 /** Publishes or withdraws a cache's nix-cache-info in the public bucket. */
-export async function setPublicCacheInfo(config: WorkerConfig, cacheName: string, isPublic: boolean): Promise<void> {
+export async function setPublicCacheInfo(config: WorkerConfig, cachePath: string, isPublic: boolean): Promise<void> {
 	if (isPublic) {
-		await config.publicBucket.put(cacheInfoKey(cacheName), NIX_CACHE_INFO, {
+		await config.publicBucket.put(cacheInfoKey(cachePath), NIX_CACHE_INFO, {
 			httpMetadata: { contentType: "text/x-nix-cache-info", cacheControl: "public, max-age=3600" },
 		});
 	} else {
-		await config.publicBucket.delete(cacheInfoKey(cacheName));
+		await config.publicBucket.delete(cacheInfoKey(cachePath));
 	}
 }
 

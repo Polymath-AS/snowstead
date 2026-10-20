@@ -16,7 +16,7 @@ function orgApi(path: string, credential: string, method = "GET", body?: unknown
 async function orgWithKey() {
 	const org = unique("org");
 	const cache = unique("cache");
-	expect((await orgApi(`/${org}`, OPERATOR, "PUT", { storageLimit: null })).status).toBe(200);
+	expect((await orgApi(`/${org}`, OPERATOR, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
 	expect((await orgApi(`/${org}/caches`, OPERATOR, "POST", { name: cache })).status).toBe(201);
 	const res = await orgApi(`/${org}/keys`, OPERATOR, "POST", { name: "terraform" });
 	expect(res.status).toBe(201);
@@ -57,8 +57,8 @@ describe("org API keys", () => {
 		expect((await orgApi(`/${a.org}/caches/${b.cache}`, a.key)).status).toBe(404);
 		const del = await orgApi(`/${a.org}/caches/${b.cache}/paths/delete`, a.key, "POST", { before: new Date().toISOString() });
 		expect(del.status).toBe(404);
-		// Nor can it take the name.
-		expect((await orgApi(`/${a.org}/caches`, a.key, "POST", { name: b.cache })).status).toBe(409);
+		// A cache of the same name in its own org is its own.
+		expect(await (await orgApi(`/${a.org}/caches`, a.key, "POST", { name: b.cache })).json()).toMatchObject({ created: true, path: `${a.org}/${b.cache}` });
 	});
 
 	it("can't set the storage limit or make keys", async () => {

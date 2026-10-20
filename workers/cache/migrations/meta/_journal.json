@@ -57,6 +57,13 @@
       "when": 1792535130245,
       "tag": "0007_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1792535705395,
+      "tag": "0008_org_slugs",
+      "breakpoints": true
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { eq, and, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
+import { cachePath } from "../cache-path.js";
 import {
 	orgs,
 	orgApiKeys,
@@ -42,56 +43,81 @@ async function returned<T>(rows: Promise<T[]>): Promise<T> {
 	return row;
 }
 
-export async function findCacheByName(
-	db: Db,
-	name: string,
-): Promise<Cache | undefined> {
-	return first(db.select().from(caches).where(eq(caches.name, name)).limit(1));
+/** A cache, with the path it's served at (cache-path.ts). */
+export type CacheAt = Cache & { readonly path: string };
+
+function located(row: { cache: Cache; slug: string }): CacheAt {
+	return { ...row.cache, path: cachePath(row.slug, row.cache.name) };
 }
 
-export async function findCacheById(
-	db: Db,
-	id: number,
-): Promise<Cache | undefined> {
-	return first(db.select().from(caches).where(eq(caches.id, id)).limit(1));
+function selectCachesAt(db: Db) {
+	return db.select({ cache: caches, slug: orgs.slug }).from(caches).innerJoin(orgs, eq(caches.orgId, orgs.id));
 }
 
+/** An org's cache by its name. */
+export async function findCache(db: Db, orgId: string, name: string): Promise<CacheAt | undefined> {
+	const row = await first(selectCachesAt(db).where(and(eq(caches.orgId, orgId), eq(caches.name, name))).limit(1));
+	return row && located(row);
+}
+
+/** The cache at a path, as a read names it. */
+export async function findCacheByPath(db: Db, slug: string, name: string): Promise<CacheAt | undefined> {
+	const row = await first(selectCachesAt(db).where(and(eq(orgs.slug, slug), eq(caches.name, name))).limit(1));
+	return row && located(row);
+}
+
+export async function findCacheById(db: Db, id: number): Promise<CacheAt | undefined> {
+	const row = await first(selectCachesAt(db).where(eq(caches.id, id)).limit(1));
+	return row && located(row);
+}
+
+/** A cache of the default org, as a self-hosted install has them. */
 export async function createCache(
 	db: Db,
 	name: string,
-): Promise<Cache> {
-	return returned(db.insert(caches).values({ name }).returning());
+): Promise<CacheAt> {
+	await db.insert(caches).values({ name });
+	const cache = await findCache(db, DEFAULT_ORG_ID, name);
+	if (!cache) throw new Error(`cache ${name} vanished`);
+	return cache;
 }
 
-/** Creates `name` unless it exists; returns the cache and whether it is new. */
+/** Creates the org's cache `name` unless it exists; returns the cache and whether it is new. */
 export async function ensureCache(
 	db: Db,
 	name: string,
 	isPublic = true,
 	orgId: string = DEFAULT_ORG_ID,
-	signingKey: Pick<Cache, "signingKeyName" | "signingPublicKey" | "signingKeySealed"> | null = null,
-): Promise<{ cache: Cache; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId, ...signingKey }).onConflictDoNothing().returning());
-	if (inserted) return { cache: inserted, created: true };
-	const existing = await findCacheByName(db, name);
-	if (!existing) throw new Error(`cache ${name} vanished`);
-	return { cache: existing, created: false };
+): Promise<{ cache: CacheAt; created: boolean }> {
+	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning({ id: caches.id }));
+	const cache = await findCache(db, orgId, name);
+	if (!cache) throw new Error(`cache ${name} vanished`);
+	return { cache, created: inserted !== undefined };
+}
+
+/** Gives a cache its own signing key, once. */
+export async function setCacheSigningKey(
+	db: Db,
+	cacheId: number,
+	key: Pick<Cache, "signingKeyName" | "signingPublicKey" | "signingKeySealed">,
+): Promise<void> {
+	await db.update(caches).set(key).where(and(eq(caches.id, cacheId), isNull(caches.signingKeySealed)));
 }
 
 export async function cacheHasPaths(db: Db, cacheId: number): Promise<boolean> {
 	return (await first(db.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1))) !== undefined;
 }
 
-export async function setCachePublic(db: Db, name: string, isPublic: boolean): Promise<void> {
-	await db.update(caches).set({ isPublic }).where(eq(caches.name, name));
+export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean): Promise<void> {
+	await db.update(caches).set({ isPublic }).where(eq(caches.id, cacheId));
 }
 
-export async function listCaches(db: Db): Promise<Cache[]> {
-	return db.select().from(caches).orderBy(caches.name);
+export async function listCaches(db: Db): Promise<CacheAt[]> {
+	return (await selectCachesAt(db).orderBy(caches.id)).map(located);
 }
 
 export interface CacheStats {
-	readonly cache: Cache;
+	readonly cache: CacheAt;
 	readonly paths: number;
 	/** Bytes of the compressed NARs its paths point at; a NAR shared with another cache counts in both. */
 	readonly size: number;
@@ -101,36 +127,54 @@ export interface CacheStats {
 
 /** Every cache with its published paths counted, or just the one named, or an org's. */
 export async function listCacheStats(db: Db, since: Date, filter: { name?: string; orgId?: string } = {}): Promise<CacheStats[]> {
-	return db
+	const rows = await db
 		.select({
 			cache: caches,
+			slug: orgs.slug,
 			paths: sql`count(${publishedPaths.id})`.mapWith(Number),
 			size: sql`coalesce(sum(${blobObjects.fileSize}), 0)`.mapWith(Number),
 			addedSince: sql`count(${publishedPaths.id}) filter (where ${publishedPaths.createdAt} >= ${since.toISOString()}::timestamptz)`.mapWith(Number),
 			lastAddedAt: sql<Date | null>`max(${publishedPaths.createdAt})`.mapWith(publishedPaths.createdAt),
 		})
 		.from(caches)
+		.innerJoin(orgs, eq(caches.orgId, orgs.id))
 		.leftJoin(publishedPaths, eq(publishedPaths.cacheId, caches.id))
 		.leftJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
 		.where(and(
 			filter.name === undefined ? undefined : eq(caches.name, filter.name),
 			filter.orgId === undefined ? undefined : eq(caches.orgId, filter.orgId),
 		))
-		.groupBy(caches.id)
+		.groupBy(caches.id, orgs.slug)
 		.orderBy(caches.name);
+	return rows.map(({ slug, ...stats }) => ({ ...stats, cache: located({ cache: stats.cache, slug }) }));
 }
 
 export async function findOrg(db: Db, id: string): Promise<Org | undefined> {
 	return first(db.select().from(orgs).where(eq(orgs.id, id)).limit(1));
 }
 
-/** Creates the org, or changes its storage limit. */
-export async function putOrg(db: Db, id: string, storageLimit: number | null): Promise<Org> {
+export async function findOrgBySlug(db: Db, slug: string): Promise<Org | undefined> {
+	return first(db.select().from(orgs).where(eq(orgs.slug, slug)).limit(1));
+}
+
+/** Creates the org, or changes its storage limit and slug. */
+export async function putOrg(db: Db, id: string, storageLimit: number | null, slug: string): Promise<Org> {
 	return returned(
-		db.insert(orgs).values({ id, storageLimit })
-			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit } })
+		db.insert(orgs).values({ id, storageLimit, slug })
+			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit, slug } })
 			.returning(),
 	);
+}
+
+/** Whether any of an org's caches has a published path. */
+export async function orgHasPaths(db: Db, orgId: string): Promise<boolean> {
+	const row = await first(
+		db.select({ id: publishedPaths.id }).from(publishedPaths)
+			.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
+			.where(eq(caches.orgId, orgId))
+			.limit(1),
+	);
+	return row !== undefined;
 }
 
 export async function createOrgApiKey(
@@ -275,15 +319,17 @@ export async function listPublishedPathsAfter(
 	db: Db,
 	afterId: number,
 	limit: number,
-): Promise<{ path: PublishedPath; blob: BlobObject; cacheName: string }[]> {
-	return db
-		.select({ path: publishedPaths, blob: blobObjects, cacheName: caches.name })
+): Promise<{ path: PublishedPath; blob: BlobObject; cache: CacheAt }[]> {
+	const rows = await db
+		.select({ path: publishedPaths, blob: blobObjects, cache: caches, slug: orgs.slug })
 		.from(publishedPaths)
 		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
 		.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
+		.innerJoin(orgs, eq(caches.orgId, orgs.id))
 		.where(gt(publishedPaths.id, afterId))
 		.orderBy(publishedPaths.id)
 		.limit(limit);
+	return rows.map((r) => ({ path: r.path, blob: r.blob, cache: located(r) }));
 }
 
 export async function findPublishedPath(
@@ -520,8 +566,8 @@ export async function touchPublishedPaths(db: Db, cacheId: number, storePathHash
 		));
 }
 
-export async function listCachesWithRetention(db: Db): Promise<Cache[]> {
-	return db.select().from(caches).where(isNotNull(caches.retentionDays)).orderBy(caches.id);
+export async function listCachesWithRetention(db: Db): Promise<CacheAt[]> {
+	return (await selectCachesAt(db).where(isNotNull(caches.retentionDays)).orderBy(caches.id)).map(located);
 }
 
 export async function setCacheRetention(db: Db, cacheId: number, retentionDays: number | null): Promise<void> {

@@ -17,6 +17,8 @@ export const DEFAULT_ORG_ID = "default";
 
 export const orgs = pgTable("orgs", {
 	id: text("id").primaryKey(),
+	/** Its caches' path in URLs: /<slug>/<cache>. See cache-path.ts. */
+	slug: text("slug").notNull().unique(),
 	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
 	storageLimit: bytes("storage_limit"),
 	createdAt: createdAt("created_at"),
@@ -24,7 +26,8 @@ export const orgs = pgTable("orgs", {
 
 export const caches = pgTable("caches", {
 	id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
-	name: text("name").notNull().unique(),
+	/** Unique within its org; see cache-path.ts for where it's served. */
+	name: text("name").notNull(),
 	isPublic: boolean("is_public").notNull().default(true),
 	orgId: text("org_id").notNull().default(DEFAULT_ORG_ID).references(() => orgs.id),
 	/** Its own signing key (see cache-keys.ts), or null to sign with the service's. */
@@ -35,7 +38,7 @@ export const caches = pgTable("caches", {
 	retentionDays: integer("retention_days"),
 	createdAt: createdAt("created_at"),
 }, (table) => [
-	index("idx_caches_org").on(table.orgId),
+	uniqueIndex("caches_org_name_unique").on(table.orgId, table.name),
 ]);
 
 export const blobObjects = pgTable("blob_objects", {

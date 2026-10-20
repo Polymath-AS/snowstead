@@ -7,6 +7,7 @@ import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
 import { deleteCachePaths } from "./path-deletion.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
+import { cachePath, parseOrgSlug } from "./cache-path.js";
 import {
 	createApiToken,
 	listApiTokens,
@@ -19,7 +20,10 @@ import {
 	listRecentPaths,
 	setCachePublic,
 	setCacheRetention,
-	findCacheByName,
+	findCache,
+	findOrgBySlug,
+	orgHasPaths,
+	setCacheSigningKey,
 	cacheHasPaths,
 	listPublishedPathsAfter,
 	findOrg,
@@ -38,9 +42,10 @@ const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
 const MAX_SUBJECT_LENGTH = 256;
 const MAX_REASON_LENGTH = 512;
 
-// Handlers that take `scope` serve both the operator's admin API, where it's
-// undefined and every org is in reach, and one org's API, where it's that
-// org: anything of another org then answers as missing.
+// Handlers that take `scope` serve both the admin API, where it's undefined
+// and they act on the default org (a self-hosted install's), and one org's
+// API, where it's that org. Cache names are an org's own, so a cache of
+// another org is never in reach.
 
 /** An org id as the service running Snowstead names it, such as a WorkOS organization id. */
 export function parseOrgId(value: unknown): string | undefined {
@@ -112,27 +117,12 @@ export async function handleCreateToken(
 	const dedupedCaches = [...new Set(body.caches)];
 	const dedupedPerms = [...new Set(validatedPerms)];
 
-	// Without an org named, a token takes its caches' org; it can't span
-	// orgs, since it reaches only caches of the org it carries.
-	let tokenOrg = org;
-	if (tokenOrg === undefined && !dedupedCaches.includes("*")) {
-		const orgs = new Set<string>();
-		for (const name of dedupedCaches) {
-			orgs.add((await findCacheByName(config.db, name))?.orgId ?? DEFAULT_ORG_ID);
-		}
-		if (orgs.size > 1) {
-			return errorResponse("a token's caches must all be of one org", 400);
-		}
-		tokenOrg = [...orgs][0];
-	}
-
-	// An org's token names its caches: a wildcard would reach other orgs'.
-	if (org !== undefined) {
-		for (const name of dedupedCaches) {
-			const cache = name === "*" ? undefined : await findCacheByName(config.db, name);
-			if (cache?.orgId !== org) {
-				return errorResponse(`${name} is not a cache of ${org}`, 400);
-			}
+	// A token is one org's, and names that org's caches; * is all of them,
+	// since it can reach no other org's.
+	const tokenOrg = org ?? DEFAULT_ORG_ID;
+	for (const name of dedupedCaches) {
+		if (name !== "*" && !(await findCache(config.db, tokenOrg, name))) {
+			return errorResponse(`${name} is not a cache of ${tokenOrg}`, 400);
 		}
 	}
 
@@ -260,10 +250,6 @@ export async function handleCreateCache(
 	if (org === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
-	if (!(await findOrg(config.db, org))) {
-		return errorResponse(`no org ${org}`, 404);
-	}
-
 	const name = parseCacheName(String(body.name ?? ""));
 	if (typeof name === "object") {
 		return errorResponse(name.message, 400);
@@ -275,11 +261,12 @@ export async function handleCreateCache(
 		return errorResponse("private must be a boolean", 400);
 	}
 
-	const existing = await findCacheByName(config.db, name);
-	// Names are shared by every org; one can't reach into another's cache.
-	if (existing !== undefined && existing.orgId !== org) {
-		return errorResponse(`${name} is taken`, 409);
+	const orgRow = await findOrg(config.db, org);
+	if (!orgRow) {
+		return errorResponse(`no org ${org}`, 404);
 	}
+	const existing = await findCache(config.db, org, name);
+	const path = cachePath(orgRow.slug, name);
 	const changing = existing !== undefined && body.private !== undefined && existing.isPublic === body.private;
 	// A published path's objects live in its visibility's bucket; moving them
 	// is not supported yet, so only an empty cache can change.
@@ -290,25 +277,23 @@ export async function handleCreateCache(
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
 	if (body.private === true) {
-		await setPrivate(config, name, true, org);
-		await setPublicCacheInfo(config, name, false);
+		await setPrivate(config, path, true, org);
+		await setPublicCacheInfo(config, path, false);
 	}
-	const { cache, created } = await ensureCache(
-		config.db,
-		name,
-		body.private !== true,
-		org,
-		existing === undefined ? await newCacheKey(config, name) : null,
-	);
+	const { cache, created } = await ensureCache(config.db, name, body.private !== true, org);
+	if (created) {
+		const key = await newCacheKey(config, cache);
+		if (key) await setCacheSigningKey(config.db, cache.id, key);
+	}
 	let isPublic = cache.isPublic;
 	const changed = !created && changing;
 	if (changed) {
 		isPublic = !body.private;
-		await setCachePublic(config.db, name, isPublic);
+		await setCachePublic(config.db, cache.id, isPublic);
 	}
 	if (isPublic) {
-		await setPrivate(config, name, false, org);
-		await setPublicCacheInfo(config, name, true);
+		await setPrivate(config, path, false, org);
+		await setPublicCacheInfo(config, path, true);
 	}
 
 	let retentionDays = cache.retentionDays;
@@ -317,7 +302,7 @@ export async function handleCreateCache(
 		await setCacheRetention(config.db, cache.id, retentionDays);
 	}
 
-	return jsonResponse({ name: cache.name, private: !isPublic, retentionDays, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
+	return jsonResponse({ name: cache.name, path, private: !isPublic, retentionDays, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -326,6 +311,7 @@ const RECENT_PATHS = 10;
 function cacheSummary(stats: CacheStats) {
 	return {
 		name: stats.cache.name,
+		path: stats.cache.path,
 		private: !stats.cache.isPublic,
 		org: stats.cache.orgId,
 		retentionDays: stats.cache.retentionDays,
@@ -367,8 +353,8 @@ export async function handleGetCache(
 		return errorResponse(name.message, 400);
 	}
 
-	const [stats] = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { name });
-	if (stats === undefined || (scope !== undefined && stats.cache.orgId !== scope)) {
+	const [stats] = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { name, orgId: scope ?? DEFAULT_ORG_ID });
+	if (stats === undefined) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
 
@@ -386,7 +372,7 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		return errorResponse(`no org ${id}`, 404);
 	}
 	const usage = await orgUsage(config.db, id, new Date());
-	return jsonResponse({ id: org.id, storageLimit: org.storageLimit, used: usage.used, pending: usage.pending }, status);
+	return jsonResponse({ id: org.id, slug: org.slug, storageLimit: org.storageLimit, used: usage.used, pending: usage.pending }, status);
 }
 
 /** An org's storage limit and what its caches hold. */
@@ -399,21 +385,44 @@ export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise
 }
 
 /**
- * Creates an org or sets its storage limit, in bytes or null for none. A
- * lower limit than its caches hold refuses new pushes until they fit again.
+ * Creates an org or sets its storage limit, in bytes or null for none, and
+ * its slug, which its caches are served under (cache-path.ts). A lower limit
+ * than its caches hold refuses new pushes until they fit again. Creating an
+ * org needs a slug. Changing one moves every cache's URL, and public caches
+ * are stored at theirs, so it's refused once the org has published paths.
  */
 export async function handlePutOrg(request: Request, config: WorkerConfig, rawId: string): Promise<Response> {
 	const id = parseOrgId(rawId);
 	if (id === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
-	const body = await parseJsonBody<{ storageLimit?: unknown }>(request);
+	const body = await parseJsonBody<{ storageLimit?: unknown; slug?: unknown }>(request);
 	if (body instanceof Response) return body;
 	const limit = body.storageLimit;
 	if (limit !== null && !(typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0)) {
 		return errorResponse("storageLimit must be a whole number of bytes, or null", 400);
 	}
-	await putOrg(config.db, id, limit);
+
+	const existing = await findOrg(config.db, id);
+	let slug = existing?.slug;
+	if (body.slug !== undefined && body.slug !== slug) {
+		const parsed = id === DEFAULT_ORG_ID ? { message: "the default org's slug can't change" } : parseOrgSlug(body.slug);
+		if (typeof parsed === "object") {
+			return errorResponse(parsed.message, 400);
+		}
+		const holder = await findOrgBySlug(config.db, parsed);
+		if (holder && holder.id !== id) {
+			return errorResponse(`${parsed} is taken`, 409);
+		}
+		if (existing && (await orgHasPaths(config.db, id))) {
+			return errorResponse("an org's slug can't change once its caches have paths", 409);
+		}
+		slug = parsed;
+	}
+	if (slug === undefined) {
+		return errorResponse("slug is needed to create an org", 400);
+	}
+	await putOrg(config.db, id, limit, slug);
 	return orgResponse(config, id);
 }
 
@@ -442,7 +451,7 @@ export async function handleBackfillNarinfo(
 	}
 
 	const rows = await listPublishedPathsAfter(config.db, after, limit);
-	const caches = [...new Set(rows.map((r) => r.cacheName))];
+	const caches = [...new Set(rows.map((r) => r.cache.path))];
 	const visibility = new Map(await Promise.all(caches.map(async (c) => [c, await isPrivateCache(config, c)] as const)));
 	await Promise.all(caches.filter((c) => !visibility.get(c)).map((c) => setPublicCacheInfo(config, c, true)));
 	// A path whose NAR is missing is skipped: a narinfo pointing at nothing
@@ -454,11 +463,11 @@ export async function handleBackfillNarinfo(
 		const batch = rows.slice(i, i + BACKFILL_CONCURRENCY);
 		results.push(
 			...(await Promise.allSettled(
-				batch.map((r) => storeNarinfo(config, r.cacheName, r.path, r.blob, visibility.get(r.cacheName) ?? true)),
+				batch.map((r) => storeNarinfo(config, r.cache, r.path, r.blob, visibility.get(r.cache.path) ?? true)),
 			)),
 		);
 	}
-	const skipped = rows.filter((_, i) => results[i].status === "rejected").map((r) => `${r.cacheName}/${r.path.storePathHash}`);
+	const skipped = rows.filter((_, i) => results[i].status === "rejected").map((r) => `${r.cache.path}/${r.path.storePathHash}`);
 	const last = rows.at(-1);
 	return jsonResponse({
 		written: rows.length - skipped.length,
@@ -475,7 +484,7 @@ export async function handleBackfillNarinfo(
 export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 	const caches = await listCaches(config.db);
 	for (const cache of caches) {
-		await setPrivate(config, cache.name, !cache.isPublic, cache.orgId);
+		await setPrivate(config, cache.path, !cache.isPublic, cache.orgId);
 	}
 	const revoked = await listRevokedTokens(config.db, new Date());
 	for (const token of revoked) {
@@ -537,8 +546,8 @@ export async function handleDeletePaths(
 		which = { before, limit: MAX_DELETE_BATCH };
 	}
 
-	const cache = await findCacheByName(config.db, name);
-	if (!cache || (scope !== undefined && cache.orgId !== scope)) {
+	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
+	if (!cache) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
 	const deleted = await deleteCachePaths(config, cache, which, origin);

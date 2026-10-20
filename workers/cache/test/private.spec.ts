@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCacheByName, revokeApiToken, setCachePublic } from "../src/db/repository.js";
+import { createBlobObject, createPublishedPath, findCache, revokeApiToken, setCachePublic } from "../src/db/repository.js";
 
 const db = testDb();
 const PRIVATE = "private-test";
@@ -41,7 +41,7 @@ beforeAll(async () => {
 	expect((await admin("/caches", { name: PUBLIC })).status).toBe(201);
 
 	for (const name of [PRIVATE, PUBLIC]) {
-		const cache = await findCacheByName(db, name);
+		const cache = await findCache(db, "default", name);
 		const blob = await createBlobObject(db, {
 			fileHash: fileHash(name),
 			fileSize: NAR.byteLength,
@@ -139,7 +139,7 @@ describe("private caches", () => {
 	it("pick up visibility set only in the database once synced", async () => {
 		const name = `synced-${crypto.randomUUID().slice(0, 8)}`;
 		expect((await admin("/caches", { name })).status).toBe(201);
-		await setCachePublic(db, name, false);
+		await setCachePublic(db, (await findCache(db, "default", name))?.id ?? 0, false);
 		expect((await read(`/${name}/nix-cache-info`)).status).toBe(200);
 
 		expect((await admin("/auth/sync", {})).status).toBe(200);

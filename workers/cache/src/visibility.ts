@@ -1,7 +1,8 @@
 import type { WorkerConfig } from "./config.js";
 
 /**
- * Whether a cache is private, answered without the database: a private
+ * Whether the cache at a path (cache-path.ts) is private, answered without
+ * the database: a private
  * cache has an entry in KV, and no entry means public, as every cache was
  * before private caches existed. The database's is_public is the source of
  * truth; the entry is written before it when a cache turns private and
@@ -37,34 +38,34 @@ function parseEntry(value: string | null): PrivateCache {
 	}
 }
 
-function privateKey(cacheName: string): string {
-	return `private/${cacheName}`;
+function privateKey(cachePath: string): string {
+	return `private/${cachePath}`;
 }
 
-export async function privateCache(config: WorkerConfig, cacheName: string): Promise<PrivateCache> {
+export async function privateCache(config: WorkerConfig, cachePath: string): Promise<PrivateCache> {
 	const now = Date.now();
-	const known = visibility.get(cacheName);
+	const known = visibility.get(cachePath);
 	if (known && known.until > now) {
 		return known;
 	}
-	const entry = parseEntry(await config.authKv.get(privateKey(cacheName), { cacheTtl: KV_CACHE_TTL_SECONDS }));
+	const entry = parseEntry(await config.authKv.get(privateKey(cachePath), { cacheTtl: KV_CACHE_TTL_SECONDS }));
 	if (visibility.size >= MEMO_MAX_ENTRIES) {
 		visibility.clear();
 	}
-	visibility.set(cacheName, { ...entry, until: now + KV_CACHE_TTL_SECONDS * 1000 });
+	visibility.set(cachePath, { ...entry, until: now + KV_CACHE_TTL_SECONDS * 1000 });
 	return entry;
 }
 
-export async function isPrivateCache(config: WorkerConfig, cacheName: string): Promise<boolean> {
-	return (await privateCache(config, cacheName)).isPrivate;
+export async function isPrivateCache(config: WorkerConfig, cachePath: string): Promise<boolean> {
+	return (await privateCache(config, cachePath)).isPrivate;
 }
 
 /** Writes or removes the entry; call before (private) or after (public) the database. */
-export async function setPrivate(config: WorkerConfig, cacheName: string, isPrivate: boolean, org: string | null): Promise<void> {
+export async function setPrivate(config: WorkerConfig, cachePath: string, isPrivate: boolean, org: string | null): Promise<void> {
 	if (isPrivate) {
-		await config.authKv.put(privateKey(cacheName), JSON.stringify({ org }));
+		await config.authKv.put(privateKey(cachePath), JSON.stringify({ org }));
 	} else {
-		await config.authKv.delete(privateKey(cacheName));
+		await config.authKv.delete(privateKey(cachePath));
 	}
-	visibility.delete(cacheName);
+	visibility.delete(cachePath);
 }

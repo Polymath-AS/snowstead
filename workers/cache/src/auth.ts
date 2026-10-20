@@ -90,10 +90,11 @@ function readAuthError(message: string, status: number): Response {
 }
 
 /**
- * Authorizes a read of a private cache: a token granting `pull` on it.
- * Returns the response to send instead, or undefined to proceed.
+ * Authorizes a read of the private cache at `cachePath`: a token of its org
+ * granting `pull` on it by name. Returns the response to send instead, or
+ * undefined to proceed.
  */
-export async function authorizeRead(request: Request, config: WorkerConfig, cacheName: string): Promise<Response | undefined> {
+export async function authorizeRead(request: Request, config: WorkerConfig, cachePath: string, cacheName: string): Promise<Response | undefined> {
 	const token = extractCredential(request);
 	if (!token) {
 		return readAuthError("Unauthorized", 401);
@@ -112,7 +113,7 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 	}
 	// The cache's org is in its private entry; one from before orgs names
 	// none to check against until the entries are synced.
-	const cache = await privateCache(config, cacheName);
+	const cache = await privateCache(config, cachePath);
 	if (cache.isPrivate && cache.org !== undefined && !isOrgsToken(result.claims, cache.org)) {
 		return readAuthError("Forbidden", 403);
 	}

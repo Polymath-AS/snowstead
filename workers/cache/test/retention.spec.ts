@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCacheByName } from "../src/db/repository.js";
+import { createBlobObject, createPublishedPath, findCache } from "../src/db/repository.js";
 import { runGarbageCollection } from "../src/gc.js";
 import { resolveConfig } from "../src/config.js";
 
@@ -19,7 +19,7 @@ function orgApi(path: string, method = "GET", body?: unknown): Promise<Response>
 
 /** A path published straight to the database, last pushed `daysAgo`, with its narinfo stored. */
 async function pathPushed(cacheName: string, hash: string, daysAgo: number): Promise<void> {
-	const cache = await findCacheByName(db, cacheName);
+	const cache = await findCache(db, "default", cacheName);
 	if (!cache) throw new Error(`no cache ${cacheName}`);
 	const blob = await createBlobObject(db, {
 		fileHash: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),

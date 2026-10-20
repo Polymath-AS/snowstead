@@ -180,15 +180,19 @@ A self-hosted install doesn't need to know about any of this: everything
 belongs to the `default` org, which has no storage limit, and tokens made
 without an org are its tokens.
 
-- **Cache names are global.** Every cache is `<host>/<name>` whichever
-  org has it, so substituter URLs stay short. Creating a cache whose name
-  another org has answers 409.
+- **Cache names are an org's own.** Each org has a slug, and its caches
+  are served at `<host>/<slug>/<name>`, so every org can have a `main`.
+  The default org's caches stay at `<host>/<name>`. An org's slug can
+  change only while its caches have no paths, since public caches are
+  stored at their URL for the CDN to serve.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
   operator sets the storage limit and makes API keys.
 - **Tokens reach only their org's caches,** for pushing and for pulling
-  from a private cache.
+  from a private cache, and name them by name; `*` is all of them. A
+  push names its cache the same way, so `snowstead push main` pushes to
+  the token's org's `main`.
 - **Storage limits.** A push that would take an org's caches past its
   limit is refused with 507 before anything uploads.
 - **Signing keys.** With `SIGNING_MASTER_KEY` set, each new cache signs

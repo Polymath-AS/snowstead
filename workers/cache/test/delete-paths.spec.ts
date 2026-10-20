@@ -42,20 +42,20 @@ function orgApi(path: string, method = "GET", body?: unknown): Promise<Response>
 	});
 }
 
-function api(path: string, body: unknown): Promise<Response> {
+function api(path: string, body: unknown, token = "test-auth-token"): Promise<Response> {
 	return SELF.fetch(`http://example.com/_api/v1${path}`, {
 		method: "POST",
-		headers: { authorization: "Bearer test-auth-token", "content-type": "application/json" },
+		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
 }
 
-function deletePaths(cache: string, body: unknown): Promise<Response> {
-	return admin(`/caches/${cache}/paths/delete`, "POST", body);
+function deletePaths(cache: string, body: unknown, org?: string): Promise<Response> {
+	return org === undefined ? admin(`/caches/${cache}/paths/delete`, "POST", body) : orgApi(`/${org}/caches/${cache}/paths/delete`, "POST", body);
 }
 
 /** Pushes one path as the client does, and returns the sessions' status. */
-async function push(cache: string, hash: string, { body, fileHash }: { body: Uint8Array; fileHash: string }): Promise<number> {
+async function push(cache: string, hash: string, { body, fileHash }: { body: Uint8Array; fileHash: string }, token = "test-auth-token"): Promise<number> {
 	const res = await api(`/caches/${cache}/upload-sessions/batch`, {
 		paths: [{
 			storePath: `/nix/store/${hash}-hello`,
@@ -66,16 +66,16 @@ async function push(cache: string, hash: string, { body, fileHash }: { body: Uin
 			fileSize: body.byteLength,
 			compression: "zstd",
 		}],
-	});
+	}, token);
 	if (res.status !== 201) return res.status;
 	const { sessions: [session] } = await res.json<{ sessions: { sessionId: string }[] }>();
 	const put = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 		method: "PUT",
-		headers: { authorization: "Bearer test-auth-token" },
+		headers: { authorization: `Bearer ${token}` },
 		body,
 	});
 	expect(put.status).toBe(200);
-	const commit = await api("/uploads/commit", { sessionIds: [session.sessionId] });
+	const commit = await api("/uploads/commit", { sessionIds: [session.sessionId] }, token);
 	expect(await commit.json()).toMatchObject({ results: [{ published: true }] });
 	return 201;
 }
@@ -93,18 +93,20 @@ describe("deleting published paths", () => {
 	it("frees its org's storage, so a push that was refused fits", async () => {
 		const org = unique("org");
 		const cache = unique("cache");
-		expect((await orgApi(`/${org}`, "PUT", { storageLimit: 100 })).status).toBe(200);
-		expect((await admin("/caches", "POST", { name: cache, org })).status).toBe(201);
+		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 100 })).status).toBe(200);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		const made = await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] });
+		const { token } = await made.json<{ token: string }>();
 		const a = storePathHash();
-		expect(await push(cache, a, await nar(40))).toBe(201);
-		expect(await push(cache, storePathHash(), await nar(40))).toBe(201);
+		expect(await push(cache, a, await nar(40), token)).toBe(201);
+		expect(await push(cache, storePathHash(), await nar(40), token)).toBe(201);
 		expect(await used(org)).toBe(80);
-		expect(await push(cache, storePathHash(), await nar(40))).toBe(507);
+		expect(await push(cache, storePathHash(), await nar(40), token)).toBe(507);
 
-		const res = await deletePaths(cache, { storePathHashes: [a] });
+		const res = await deletePaths(cache, { storePathHashes: [a] }, org);
 		expect(await res.json()).toEqual({ deleted: [a], notFound: [], more: false });
 		expect(await used(org)).toBe(40);
-		expect(await push(cache, storePathHash(), await nar(40))).toBe(201);
+		expect(await push(cache, storePathHash(), await nar(40), token)).toBe(201);
 	});
 
 	it("withdraws the narinfo, and a repeat is not an error", async () => {

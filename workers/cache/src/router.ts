@@ -1,5 +1,6 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName } from "./db/repository.js";
+import { findOrg } from "./db/repository.js";
+import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { handleOrgApi } from "./org-api.js";
 import { narinfoCacheKey } from "./narinfo.js";
@@ -10,7 +11,6 @@ import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
 import { errorResponse } from "./responses.js";
 import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@snowstead/cache-domain";
-import type { CacheName } from "@snowstead/cache-domain";
 import {
 	handleCreateSession,
 	handleMultipart,
@@ -89,36 +89,37 @@ export async function handleRequest(
 		return handleNarDownload(config, segments[1], segments[2].slice(0, -".nar".length), request, method, false);
 	}
 
-	if (segments.length < 2) {
+	// /<cache>/... is a default-org cache, /<slug>/<cache>/... another org's.
+	const at = splitReadPath(segments);
+	const cacheName = at === undefined ? undefined : parseCacheName(at.cache);
+	const slug = at === undefined || at.slug === DEFAULT_ORG_SLUG ? at?.slug : parseOrgSlug(at.slug);
+	if (at === undefined || typeof cacheName !== "string" || typeof slug !== "string") {
 		return new Response("Not Found", { status: 404 });
 	}
-
-	const cacheName = parseCacheName(segments[0]);
-	if (typeof cacheName === "object") {
-		return new Response("Not Found", { status: 404 });
-	}
+	const path = cachePath(slug, cacheName);
+	const rest = at.rest;
 
 	// Before any cache lookup, so a response one caller was allowed to see
 	// is never served to another.
-	const isPrivate = await isPrivateCache(config, cacheName);
+	const isPrivate = await isPrivateCache(config, path);
 	if (isPrivate) {
-		const denied = await authorizeRead(request, config, cacheName);
+		const denied = await authorizeRead(request, config, path, cacheName);
 		if (denied) return denied;
 	}
 
-	if (segments[1] === "nix-cache-info" && segments.length === 2) {
+	if (rest[0] === "nix-cache-info" && rest.length === 1) {
 		const response = NIX_CACHE_INFO_RESPONSE();
 		if (isPrivate) response.headers.set("cache-control", "private, no-cache");
 		return response;
 	}
 
-	if (segments[1] === "nar" && segments.length === 4 && segments[3].endsWith(".nar")) {
-		return handleNarDownload(config, segments[2], segments[3].slice(0, -".nar".length), request, method, isPrivate);
+	if (rest[0] === "nar" && rest.length === 3 && rest[2].endsWith(".nar")) {
+		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, isPrivate);
 	}
 
-	if (segments[1].endsWith(".narinfo") && segments.length === 2) {
-		const hashStr = segments[1].slice(0, -".narinfo".length);
-		return handleNarinfo(config, cacheName, hashStr, method, request, isPrivate);
+	if (rest[0]?.endsWith(".narinfo") && rest.length === 1) {
+		const hashStr = rest[0].slice(0, -".narinfo".length);
+		return handleNarinfo(config, path, hashStr, method, request, isPrivate);
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -133,7 +134,7 @@ function json(body: Record<string, string | boolean | number>, status = 200): Re
 
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
 	try {
-		await findCacheByName(config.db, "__healthz_probe__");
+		await findOrg(config.db, "__healthz_probe__");
 		return json({ ok: true, service: "snowstead" });
 	} catch {
 		return json({ ok: false, service: "snowstead" }, 503);
@@ -171,7 +172,7 @@ function forClient(response: Response, isPrivate: boolean, method: string): Resp
 
 async function handleNarinfo(
 	config: WorkerConfig,
-	cacheName: CacheName,
+	cachePath: string,
 	hashStr: string,
 	method: string,
 	request: Request,
@@ -183,7 +184,7 @@ async function handleNarinfo(
 	}
 
 	// HEAD and GET share the entry.
-	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cacheName, storePathHash, isPrivate);
+	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cachePath, storePathHash, isPrivate);
 	const cache = await caches.open("snowstead-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
@@ -192,7 +193,7 @@ async function handleNarinfo(
 
 	// The narinfo was rendered and signed at publish. An unknown cache and an
 	// unpublished path are both a missing object: a (negatively cached) 404.
-	const object = await bucketFor(config, isPrivate).get(narinfoKey(cacheName, storePathHash, isPrivate));
+	const object = await bucketFor(config, isPrivate).get(narinfoKey(cachePath, storePathHash, isPrivate));
 	if (!object) {
 		const notFound = () =>
 			new Response("Not Found", { status: 404, headers: { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` } });

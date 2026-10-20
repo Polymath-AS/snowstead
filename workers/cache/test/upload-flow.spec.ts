@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
-import { createCache, findPublishedPath, findCacheByName, createUploadSessions, findUploadSession } from "../src/db/repository.js";
+import { createCache, findPublishedPath, findCache, createUploadSessions, findUploadSession } from "../src/db/repository.js";
 
 const CACHE_NAME = "upload-test";
 const AUTH_TOKEN = "test-auth-token";
@@ -238,7 +238,7 @@ describe("publish", () => {
 		expect(publishBody.storePathHash).toBe(storePathHash);
 
 		const db = getDb();
-		const cache = await findCacheByName(db, CACHE_NAME);
+		const cache = await findCache(db, "default", CACHE_NAME);
 		expect(cache).toBeDefined();
 		const published = await findPublishedPath(db, cache!.id, storePathHash);
 		expect(published).toBeDefined();
@@ -373,7 +373,7 @@ describe("batches", () => {
 			expect(res.status).toBe(200);
 			expect(await res.text()).toContain(`FileHash: sha256:${b.fileHash}`);
 		}
-		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		const cache = await findCache(getDb(), "default", CACHE_NAME);
 		expect(await findPublishedPath(getDb(), cache!.id, bodies[3].storePathHash)).toBeUndefined();
 
 		// Committing again publishes nothing new.
@@ -392,7 +392,7 @@ describe("batches", () => {
 
 		const results = await commit(sessions.map((s) => s.sessionId));
 		expect(results.every((r) => r.published)).toBe(true);
-		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		const cache = await findCache(getDb(), "default", CACHE_NAME);
 		expect(await findPublishedPath(getDb(), cache!.id, storePathHash)).toBeDefined();
 	});
 });
@@ -401,7 +401,7 @@ describe("staged uploads", () => {
 	// What session creation does for a large NAR when presigning is configured;
 	// the test Worker has no R2 credentials, so the parts go through the binding.
 	async function stagedSession(fileHash: string, body: Uint8Array) {
-		const cache = await findCacheByName(getDb(), CACHE_NAME);
+		const cache = await findCache(getDb(), "default", CACHE_NAME);
 		const id = crypto.randomUUID();
 		const key = `staging/${id}`;
 		const multipart = await env.CACHE_BUCKET.createMultipartUpload(key);

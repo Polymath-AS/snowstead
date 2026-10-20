@@ -1,11 +1,11 @@
 import type { WorkerConfig } from "./config.js";
 import type { Cache } from "./db/types.js";
-import { findCacheByName } from "./db/repository.js";
+import { findCacheById } from "./db/repository.js";
 
 /**
  * Each cache signs its paths with a key of its own, so one leaking or being
  * revoked touches only that cache. The secret half is sealed with AES-GCM
- * under SIGNING_MASTER_KEY, bound to the cache's name, and the public half
+ * under SIGNING_MASTER_KEY, bound to the cache's id, and the public half
  * is kept in the clear for showing. Caches from before this, and every
  * cache when no master key is set (self-hosting with one key), sign with
  * SIGNING_PRIVATE_KEY.
@@ -49,14 +49,22 @@ async function importMasterKey(material: string): Promise<CryptoKey> {
 	return key;
 }
 
-/** A cache's key name: the service's, such as snowstead-1, with the cache in it. */
-export function cacheKeyName(serviceKeyName: string, cacheName: string): string {
+/**
+ * A cache's key name: the service's, such as snowstead-1, with the cache's
+ * path in it (snowstead-acme/main-1). Nix picks a trusted key by its name,
+ * so names must not repeat across orgs, and a path doesn't.
+ */
+export function cacheKeyName(serviceKeyName: string, cachePath: string): string {
 	const match = /^(.*)-(\d+)$/.exec(serviceKeyName);
-	return match ? `${match[1]}-${cacheName}-${match[2]}` : `${serviceKeyName}-${cacheName}`;
+	return match ? `${match[1]}-${cachePath}-${match[2]}` : `${serviceKeyName}-${cachePath}`;
+}
+
+function boundTo(cacheId: number): Uint8Array<ArrayBuffer> {
+	return encoder.encode(`cache:${cacheId}`);
 }
 
 /** A key for a new cache, or null when no master key is set to seal one. */
-export async function newCacheKey(config: WorkerConfig, cacheName: string): Promise<NewCacheKey | null> {
+export async function newCacheKey(config: WorkerConfig, cache: { readonly id: number; readonly path: string }): Promise<NewCacheKey | null> {
 	if (!config.signingMasterKey) return null;
 
 	const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
@@ -70,7 +78,7 @@ export async function newCacheKey(config: WorkerConfig, cacheName: string): Prom
 
 	const iv = crypto.getRandomValues(new Uint8Array(12));
 	const sealed = new Uint8Array(await crypto.subtle.encrypt(
-		{ name: "AES-GCM", iv, additionalData: encoder.encode(cacheName) },
+		{ name: "AES-GCM", iv, additionalData: boundTo(cache.id) },
 		await importMasterKey(config.signingMasterKey),
 		secret,
 	));
@@ -78,7 +86,7 @@ export async function newCacheKey(config: WorkerConfig, cacheName: string): Prom
 	box.set(iv);
 	box.set(sealed, iv.length);
 
-	const name = cacheKeyName(config.signingKeyName, cacheName);
+	const name = cacheKeyName(config.signingKeyName, cache.path);
 	return {
 		signingKeyName: name,
 		signingPublicKey: `${name}:${base64(publicKey)}`,
@@ -95,7 +103,7 @@ async function unseal(config: WorkerConfig, cache: Cache): Promise<SigningKey | 
 	}
 	const box = unbase64(cache.signingKeySealed.slice(SEALED_VERSION.length));
 	const secret = await crypto.subtle.decrypt(
-		{ name: "AES-GCM", iv: box.slice(0, 12), additionalData: encoder.encode(cache.name) },
+		{ name: "AES-GCM", iv: box.slice(0, 12), additionalData: boundTo(cache.id) },
 		await importMasterKey(config.signingMasterKey),
 		box.slice(12),
 	);
@@ -103,20 +111,20 @@ async function unseal(config: WorkerConfig, cache: Cache): Promise<SigningKey | 
 }
 
 // Keys never change once a cache has one, so isolates keep them.
-const keys = new Map<string, SigningKey>();
+const keys = new Map<number, SigningKey>();
 const MAX_KEYS = 10_000;
 
 /** The key a cache's narinfo is signed with. */
-export async function signingKeyFor(config: WorkerConfig, cacheName: string): Promise<SigningKey> {
-	const known = keys.get(cacheName);
+export async function signingKeyFor(config: WorkerConfig, cacheId: number): Promise<SigningKey> {
+	const known = keys.get(cacheId);
 	if (known) return known;
 
-	const cache = await findCacheByName(config.db, cacheName);
+	const cache = await findCacheById(config.db, cacheId);
 	const own = cache ? await unseal(config, cache) : undefined;
 	const key = own ?? { name: config.signingKeyName, secret: config.signingPrivateKey };
 	if (own) {
 		if (keys.size >= MAX_KEYS) keys.clear();
-		keys.set(cacheName, own);
+		keys.set(cacheId, own);
 	}
 	return key;
 }

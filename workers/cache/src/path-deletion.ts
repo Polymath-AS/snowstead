@@ -1,6 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import type { Cache } from "./db/types.js";
-import type { PathSelection } from "./db/repository.js";
+import type { CacheAt, PathSelection } from "./db/repository.js";
 import { deletePublishedPaths } from "./db/repository.js";
 import { bucketFor, narinfoKey } from "./layout.js";
 import { narinfoCacheKey } from "./narinfo.js";
@@ -19,16 +18,16 @@ import { isPrivateCache } from "./visibility.js";
  */
 export async function deleteCachePaths(
 	config: WorkerConfig,
-	cache: Pick<Cache, "id" | "name">,
+	cache: Pick<CacheAt, "id" | "path">,
 	which: PathSelection,
 	origin?: string,
 ): Promise<string[]> {
-	const isPrivate = await isPrivateCache(config, cache.name);
+	const isPrivate = await isPrivateCache(config, cache.path);
 	const bucket = bucketFor(config, isPrivate);
 	const named = "storePathHashes" in which ? which.storePathHashes : [];
 
 	const deleted = await deletePublishedPaths(config.db, cache.id, which, async (hashes) => {
-		const keys = [...new Set([...named, ...hashes])].map((h) => narinfoKey(cache.name, h, isPrivate));
+		const keys = [...new Set([...named, ...hashes])].map((h) => narinfoKey(cache.path, h, isPrivate));
 		if (keys.length > 0) await bucket.delete(keys);
 	});
 
@@ -38,7 +37,7 @@ export async function deleteCachePaths(
 	// in front of its bucket.
 	if (origin !== undefined) {
 		const narinfos = await caches.open("snowstead-narinfo");
-		await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, cache.name, h, isPrivate))));
+		await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, cache.path, h, isPrivate))));
 	}
 	return deleted;
 }

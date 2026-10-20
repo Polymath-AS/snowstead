@@ -1,3 +1,5 @@
+import { splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
+
 /**
  * The route a request takes, as a template such as
  * `POST /_api/v1/uploads/:session/publish`: what traces and logs group by.
@@ -65,8 +67,12 @@ function readTemplate(pathname: string): string | undefined {
 	const prefix = segments[0] === "private" ? "/private" : "";
 	if (prefix) segments.shift();
 	if (segments[0] === "nar" && segments.length === 3) return `${prefix}/nar/:file`;
-	if (segments.length === 2 && segments[1] === "nix-cache-info") return `${prefix}/:cache/nix-cache-info`;
-	if (segments.length === 2 && segments[1].endsWith(".narinfo")) return `${prefix}/:cache/:hash.narinfo`;
-	if (segments.length === 4 && segments[1] === "nar") return `${prefix}/:cache/nar/:file`;
+	const at = splitReadPath(segments);
+	if (!at) return undefined;
+	const cache = at.slug === DEFAULT_ORG_SLUG ? `${prefix}/:cache` : `${prefix}/:org/:cache`;
+	const { rest } = at;
+	if (rest.length === 1 && rest[0] === "nix-cache-info") return `${cache}/nix-cache-info`;
+	if (rest.length === 1 && rest[0].endsWith(".narinfo")) return `${cache}/:hash.narinfo`;
+	if (rest.length === 3 && rest[0] === "nar") return `${cache}/nar/:file`;
 	return undefined;
 }

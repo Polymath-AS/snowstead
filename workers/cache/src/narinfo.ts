@@ -53,7 +53,7 @@ export function renderNarinfo(
 }
 
 /** The narinfo for a path, signed with the cache's key. */
-export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: NarinfoBlob, isPrivate: boolean): Promise<string> {
+export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: NarinfoBlob, isPrivate: boolean, cachePath: string): Promise<string> {
 	const refs: string[] = JSON.parse(path.referencesJson);
 	const storedSigs: string[] = JSON.parse(path.signaturesJson);
 	// Rows published before uploads canonicalised the hash may hold the SRI
@@ -61,7 +61,7 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
 	const narHash = parseNarHash(path.narHash);
 	const canonical = typeof narHash === "object" ? path : { ...path, narHash };
 	const sig = await signNarinfo(computeFingerprint(canonical, refs), key.name, key.secret);
-	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate), refs, storedSigs, sig ? [sig] : []);
+	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate, cachePath), refs, storedSigs, sig ? [sig] : []);
 }
 
 /**
@@ -71,14 +71,14 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
  */
 export async function storeNarinfo(
 	config: WorkerConfig,
-	cacheName: string,
+	cache: { readonly id: number; readonly path: string },
 	path: NarinfoPath,
 	blob: NarinfoBlob,
 	isPrivate: boolean,
 ): Promise<void> {
 	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
-	const body = await signedNarinfo(await signingKeyFor(config, cacheName), path, blob, isPrivate);
-	await bucketFor(config, isPrivate).put(narinfoKey(cacheName, path.storePathHash, isPrivate), body, {
+	const body = await signedNarinfo(await signingKeyFor(config, cache.id), path, blob, isPrivate, cache.path);
+	await bucketFor(config, isPrivate).put(narinfoKey(cache.path, path.storePathHash, isPrivate), body, {
 		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: IMMUTABLE },
 	});
 }
@@ -87,7 +87,7 @@ export async function storeNarinfo(
  * The Cache API key for a narinfo response. Private caches use a host of
  * their own, so their entries can never answer a request for a public URL.
  */
-export function narinfoCacheKey(origin: string, cacheName: string, storePathHash: string, isPrivate: boolean): Request {
+export function narinfoCacheKey(origin: string, cachePath: string, storePathHash: string, isPrivate: boolean): Request {
 	const base = isPrivate ? "https://private.snowstead.internal" : origin;
-	return new Request(`${base}/${cacheName}/${storePathHash}.narinfo`, { method: "GET" });
+	return new Request(`${base}/${cachePath}/${storePathHash}.narinfo`, { method: "GET" });
 }

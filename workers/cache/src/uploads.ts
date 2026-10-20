@@ -2,7 +2,7 @@ import type { WorkerConfig } from "./config.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasCacheAccess, isOrgsToken } from "./jwt.js";
 import {
-	findCacheByName,
+	findCache,
 	findCacheById,
 	createUploadSessionsWithinLimit,
 	findUploadSession,
@@ -20,8 +20,9 @@ import {
 	findPublishedHashes,
 	touchPublishedPaths,
 } from "./db/repository.js";
-import type { Cache, UploadSession } from "./db/types.js";
-import type { OrgUsage } from "./db/repository.js";
+import type { UploadSession } from "./db/types.js";
+import type { CacheAt, OrgUsage } from "./db/repository.js";
+import { DEFAULT_ORG_ID } from "./db/schema.js";
 import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
@@ -38,23 +39,29 @@ import {
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 import type { Db } from "./db/connection.js";
 
-// Module-scope cache: cache ID → cache name. Cache rows are immutable today
-// (no rename or delete endpoints), so entries never go stale. Avoids a database
-// round trip on every session-scoped upload request made with a JWT.
-const cacheIdToName = new Map<number, string>();
+// Module-scope cache: cache ID → cache, with its path. Neither changes once
+// the cache has paths (no rename or delete endpoints; an org's slug only
+// changes while it has none), so entries don't go stale where it matters.
+// Avoids a database round trip on every session-scoped upload request.
+const cacheById = new Map<number, CacheAt>();
 
-async function resolveCacheName(
+async function resolveCache(
 	db: Db,
 	cacheId: number,
-): Promise<string | undefined> {
-	const cached = cacheIdToName.get(cacheId);
+): Promise<CacheAt | undefined> {
+	const cached = cacheById.get(cacheId);
 	if (cached !== undefined) return cached;
 
 	const row = await findCacheById(db, cacheId);
 	if (!row) return undefined;
 
-	cacheIdToName.set(cacheId, row.name);
-	return row.name;
+	cacheById.set(cacheId, row);
+	return row;
+}
+
+/** The org whose caches a pusher's names refer to: its token's, or the default org's. */
+function orgOfPusher(identity: AuthIdentity): string {
+	return identity.kind === "jwt" ? (identity.claims.org ?? DEFAULT_ORG_ID) : DEFAULT_ORG_ID;
 }
 
 /** Why the caller may not use a loaded session, if they may not. */
@@ -68,8 +75,8 @@ async function sessionAccessError(
 		return { error: "Not found", status: 404 };
 	}
 	if (identity.kind === "jwt") {
-		const cacheName = await resolveCacheName(config.db, session.cacheId);
-		if (cacheName === undefined || !hasCacheAccess(identity.claims, cacheName)) {
+		const cache = await resolveCache(config.db, session.cacheId);
+		if (cache === undefined || !hasCacheAccess(identity.claims, cache.name) || !isOrgsToken(identity.claims, cache.orgId)) {
 			return { error: "Forbidden", status: 403 };
 		}
 	}
@@ -234,7 +241,7 @@ function storageFullResponse(usage: OrgUsage & { readonly limit: number; readonl
 	);
 }
 
-function orgAllows(identity: AuthIdentity, cache: Cache): boolean {
+function orgAllows(identity: AuthIdentity, cache: CacheAt): boolean {
 	return identity.kind !== "jwt" || isOrgsToken(identity.claims, cache.orgId);
 }
 
@@ -244,13 +251,13 @@ function orgAllows(identity: AuthIdentity, cache: Cache): boolean {
  */
 async function createSessions(
 	config: WorkerConfig,
-	cache: Cache,
+	cache: CacheAt,
 	items: readonly SessionParams[],
 ): Promise<SessionResponse[] | Response> {
-	// Seed the ID → name cache so session-scoped requests skip the database lookup.
-	cacheIdToName.set(cache.id, cache.name);
+	// Seed the ID → cache map so session-scoped requests skip the database lookup.
+	cacheById.set(cache.id, cache);
 	// Straight into the bucket the cache is served from.
-	const isPrivate = await isPrivateCache(config, cache.name);
+	const isPrivate = await isPrivateCache(config, cache.path);
 	const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
 	const presigning = Boolean(config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint);
 
@@ -339,7 +346,7 @@ export async function handleCreateSession(
 	cacheName: string,
 	identity: AuthIdentity,
 ): Promise<Response> {
-	const cache = await findCacheByName(config.db, cacheName);
+	const cache = await findCache(config.db, orgOfPusher(identity), cacheName);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
 	}
@@ -370,7 +377,7 @@ export async function handleCreateSessions(
 	cacheName: string,
 	identity: AuthIdentity,
 ): Promise<Response> {
-	const cache = await findCacheByName(config.db, cacheName);
+	const cache = await findCache(config.db, orgOfPusher(identity), cacheName);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
 	}
@@ -611,12 +618,12 @@ export async function handleComplete(
  * rather than after the negative TTL. The Cache API is per data center: this
  * clears the one handling the publish, where the pusher's own lookups land.
  */
-async function forgetNarinfoMiss(origin: string, cacheName: string, storePathHash: string): Promise<void> {
+async function forgetNarinfoMiss(origin: string, cachePath: string, storePathHash: string): Promise<void> {
 	const cache = await caches.open("snowstead-narinfo");
 	// Both keys: cheaper than looking up whether the cache is private.
 	await Promise.all([
-		cache.delete(narinfoCacheKey(origin, cacheName, storePathHash, false)),
-		cache.delete(narinfoCacheKey(origin, cacheName, storePathHash, true)),
+		cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, false)),
+		cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, true)),
 	]);
 }
 
@@ -636,11 +643,11 @@ async function publishSessions(
 	sessions: readonly UploadSession[],
 	origin: string,
 ): Promise<PublishResult[]> {
-	const cacheName = await resolveCacheName(config.db, cacheId);
-	if (cacheName === undefined) {
+	const cache = await resolveCache(config.db, cacheId);
+	if (cache === undefined) {
 		return sessions.map((s) => ({ sessionId: s.id, error: "Internal error", status: 500 }));
 	}
-	const isPrivate = await isPrivateCache(config, cacheName);
+	const isPrivate = await isPrivateCache(config, cache.path);
 
 	const existing = new Map(
 		(await findPublishedPaths(config.db, cacheId, sessions.map((s) => s.storePathHash))).map((p) => [p.storePathHash, p]),
@@ -665,7 +672,7 @@ async function publishSessions(
 				// Publishing again rewrites the narinfo, so a publish that failed
 				// between storing it and recording the row heals on retry.
 				const blob = existingBlobs.find((b) => b.id === known.blobObjectId);
-				if (blob) await storeNarinfo(config, cacheName, known, blob, isPrivate);
+				if (blob) await storeNarinfo(config, cache, known, blob, isPrivate);
 				results.set(session.id, { sessionId: session.id, storePathHash: session.storePathHash, published: true, alreadyExisted: true });
 				return;
 			}
@@ -686,7 +693,7 @@ async function publishSessions(
 				system: session.system,
 				signaturesJson: "[]",
 			};
-			await storeNarinfo(config, cacheName, path, blob, isPrivate);
+			await storeNarinfo(config, cache, path, blob, isPrivate);
 			rows.push(path);
 		} catch (err) {
 			console.error("Failed to publish", { sessionId: session.id }, err);
@@ -695,7 +702,7 @@ async function publishSessions(
 	}));
 
 	const inserted = new Set(await createPublishedPaths(config.db, rows));
-	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cacheName, hash)));
+	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cache.path, hash)));
 	for (const session of sessions) {
 		if (results.has(session.id)) continue;
 		// A path that is not inserted was published by someone else meanwhile.
@@ -757,8 +764,8 @@ function parseParts(value: unknown): Map<string, Part[]> | string {
  */
 async function promoteStaged(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
-	const cacheName = await resolveCacheName(config.db, session.cacheId);
-	if (cacheName === undefined) return "Internal error";
+	const cache = await resolveCache(config.db, session.cacheId);
+	if (cache === undefined) return "Internal error";
 	if (session.r2UploadId) {
 		try {
 			await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
@@ -767,7 +774,7 @@ async function promoteStaged(config: WorkerConfig, session: UploadSession, parts
 		}
 	}
 	try {
-		const isPrivate = await isPrivateCache(config, cacheName);
+		const isPrivate = await isPrivateCache(config, cache.path);
 		const target = narKey(session.fileHash, session.compression, isPrivate);
 		const bucket = bucketFor(config, isPrivate);
 		if (session.fileSize > PRESIGNED_PUT_MAX_BYTES) {
@@ -903,7 +910,7 @@ export async function handleGetMissingPaths(
 		return errorResponse(`storePathHashes exceeds maximum of ${MAX_MISSING_PATHS_BATCH}`, 400);
 	}
 
-	const cache = await findCacheByName(config.db, body.cache);
+	const cache = await findCache(config.db, orgOfPusher(identity), body.cache);
 	if (!cache) {
 		return errorResponse("Cache not found", 404);
 	}

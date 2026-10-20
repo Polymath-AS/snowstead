@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCacheByName } from "../src/db/repository.js";
+import { createBlobObject, createPublishedPath, findCache } from "../src/db/repository.js";
 import { computeFingerprint } from "../src/signing.js";
 import { cacheKeyName } from "../src/cache-keys.js";
 
@@ -24,7 +24,7 @@ async function createdCache(): Promise<{ name: string; publicKey: string }> {
 
 /** Publishes a path straight to the database and backfills its narinfo; the backfill's answer. */
 async function backfill(cacheName: string, hash: string): Promise<{ written: number; skipped: string[] }> {
-	const cache = await findCacheByName(db, cacheName);
+	const cache = await findCache(db, "default", cacheName);
 	if (!cache) throw new Error(`no cache ${cacheName}`);
 	const blob = await createBlobObject(db, {
 		fileHash: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
@@ -87,7 +87,7 @@ describe("cache signing keys", () => {
 
 	it("keeps only the sealed secret, bound to the cache", async () => {
 		const { name } = await createdCache();
-		const cache = await findCacheByName(db, name);
+		const cache = await findCache(db, "default", name);
 
 		expect(cache?.signingKeySealed).toMatch(/^v1:/);
 		// Moved onto another cache, the sealed key doesn't open.

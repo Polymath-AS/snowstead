@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
 import {
 	createCache,
-	findCacheByName,
+	findCache,
 	createBlobObject,
 	findBlobObject,
 	createPublishedPath,
@@ -60,18 +60,18 @@ describe("caches", () => {
 		expect(row.createdAt).toBeInstanceOf(Date);
 	});
 
-	it("findCacheByName returns a matching cache", async () => {
+	it("findCache returns a matching cache", async () => {
 		const name = `cache-find-${crypto.randomUUID()}`;
 		const created = await createCache(getDb(), name);
-		const found = await findCacheByName(getDb(), name);
+		const found = await findCache(getDb(), "default", name);
 
 		expect(found).toBeDefined();
 		expect(found!.id).toBe(created.id);
 		expect(found!.name).toBe(name);
 	});
 
-	it("findCacheByName returns undefined for non-existent name", async () => {
-		const found = await findCacheByName(getDb(), `no-such-cache-${crypto.randomUUID()}`);
+	it("findCache returns undefined for non-existent name", async () => {
+		const found = await findCache(getDb(), "default", `no-such-cache-${crypto.randomUUID()}`);
 		expect(found).toBeUndefined();
 	});
 
