@@ -190,10 +190,21 @@ function parseSessionParams(input: unknown): SessionParams | string {
 }
 
 /**
- * Large NARs upload in parallel parts: one connection carries far less than
- * several. The parts go to a staging key of their own, never to the NAR's
- * shared key, until the assembled object has been checked against the file
- * hash.
+ * NARs are shared by every cache that has them, so a pusher may only add
+ * one to its cache by showing it has the bytes: knowing a NAR's hash and
+ * size, which its narinfo tells anyone who can read it, must not be enough
+ * to claim another org's private NAR, nor to overwrite a shared one.
+ *
+ * - A NAR stored already uploads to a staging key of the session's own, and
+ *   is checked against the file hash before the session completes.
+ * - So do large NARs in parts, whose assembled object R2 can't check.
+ * - Any other upload goes to the NAR's key, where R2 checks the hash on the
+ *   way in, tagged with its session: a session completes only on its own
+ *   upload, never on one another pusher made meanwhile.
+ *
+ * The exception is a NAR too large for one PUT (over 5 GiB) that isn't
+ * stored yet: R2 can't move it into place, so it assembles at its own key
+ * and is hashed in the Worker before it completes, and deleted if wrong.
  */
 const STAGING_PREFIX = "staging/";
 
@@ -245,7 +256,9 @@ async function createSessions(
 	const rows = await Promise.all(items.map(async (p) => {
 		const id = crypto.randomUUID();
 		const inParts = presigning && p.fileSize > PRESIGNED_PARTS_MIN_BYTES && p.fileSize <= PRESIGNED_PUT_MAX_BYTES;
-		const r2UploadKey = inParts ? `${STAGING_PREFIX}${id}` : narKey(p.fileHash, p.compression, isPrivate);
+		const target = narKey(p.fileHash, p.compression, isPrivate);
+		const stored = !inParts && (await bucketFor(config, isPrivate).head(target)) !== null;
+		const r2UploadKey = inParts || stored ? `${STAGING_PREFIX}${id}` : target;
 		const multipart = inParts ? await config.bucket.createMultipartUpload(r2UploadKey) : undefined;
 		return {
 			id,
@@ -306,6 +319,7 @@ async function createSessions(
 			row.r2UploadKey,
 			row.fileHash,
 			SESSION_TTL_SECONDS,
+			{ [SESSION_METADATA]: row.id },
 		);
 		return {
 			sessionId: row.id,
@@ -401,9 +415,14 @@ export async function handleMultipart(
 		return errorResponse("Internal error", 500);
 	}
 
-	const multipart = await bucketForKey(config, session.r2UploadKey).createMultipartUpload(session.r2UploadKey);
+	// Parts assemble at a staging key, unless the NAR is too large to move
+	// into place from one; then at its own key, hashed when it completes.
+	const key = isStaged(session) || session.fileSize <= PRESIGNED_PUT_MAX_BYTES ? `${STAGING_PREFIX}${session.id}` : session.r2UploadKey;
+	const multipart = await bucketForKey(config, key).createMultipartUpload(key, {
+		customMetadata: { [SESSION_METADATA]: session.id },
+	});
 
-	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId);
+	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId, key);
 	if (!transitioned) {
 		try { await multipart.abort(); } catch { /* best effort */ }
 		return errorResponse("Conflict", 409);
@@ -411,7 +430,7 @@ export async function handleMultipart(
 
 	return jsonResponse({
 		uploadId: multipart.uploadId,
-		r2Key: session.r2UploadKey,
+		r2Key: key,
 	});
 }
 
@@ -491,9 +510,22 @@ export async function handleUploadBlob(
 	await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
 		sha256: session.fileHash,
 		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
+		customMetadata: { [SESSION_METADATA]: session.id },
 	});
 
 	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
+}
+
+/** The object's metadata key naming the session that uploaded it. */
+const SESSION_METADATA = "session";
+
+/** Whether an object's bytes have this SHA-256, read through the Worker. */
+async function hashesTo(bucket: R2Bucket, key: string, sha256Hex: string): Promise<boolean> {
+	const object = await bucket.get(key);
+	if (!object) return false;
+	const digest = new DigestStream("SHA-256");
+	await object.body.pipeTo(digest);
+	return hex(await digest.digest) === sha256Hex;
 }
 
 /** Why the object a session uploaded is not the one it named, if it is not. */
@@ -501,17 +533,20 @@ async function uploadError(config: WorkerConfig, session: UploadSession): Promis
 	if (!session.r2UploadKey) {
 		return "Internal error";
 	}
-	const head = await bucketForKey(config, session.r2UploadKey).head(session.r2UploadKey);
-	if (!head) {
+	const bucket = bucketForKey(config, session.r2UploadKey);
+	const head = await bucket.head(session.r2UploadKey);
+	// Another pusher's upload of the same NAR proves nothing about this one.
+	if (!head || head.customMetadata?.[SESSION_METADATA] !== session.id) {
 		return "Upload incomplete";
 	}
 	if (head.size !== session.fileSize) {
 		return "File size mismatch";
 	}
-	// R2 checked a presigned upload against this hash already; check what it
-	// recorded, wherever it recorded one.
+	// R2 checked a single upload against this hash already; an assembled one
+	// it can't, so that's hashed here, and goes if it's wrong.
 	const stored = head.checksums.sha256;
-	if (stored && hex(stored) !== session.fileHash) {
+	if (stored ? hex(stored) !== session.fileHash : !(await hashesTo(bucket, session.r2UploadKey, session.fileHash))) {
+		if (!stored) await bucket.delete(session.r2UploadKey);
 		return "File hash mismatch";
 	}
 	return undefined;
@@ -530,7 +565,7 @@ export async function handleComplete(
 	// A presigned upload goes straight to R2, so its session is still pending.
 	// Staged parts are checked and moved into place only by a commit.
 	const presigned = session.status === "pending" && !session.r2UploadId;
-	if ((session.status !== "uploading" && !presigned) || isStaged(session)) {
+	if (session.status !== "uploading" && !presigned) {
 		return errorResponse("Conflict", 409);
 	}
 
@@ -547,13 +582,17 @@ export async function handleComplete(
 		await upsertUploadParts(config.db, sessionId, body.parts);
 	}
 
-	if (session.r2UploadId) {
-		const parts = await findUploadParts(config.db, sessionId);
+	const parts = (await findUploadParts(config.db, sessionId)).map((p) => ({ partNumber: p.partNumber, etag: p.etag }));
+	// Parts uploaded straight to R2 are named by the commit that completes them.
+	if (session.r2UploadId && isStaged(session) && parts.length === 0) {
+		return errorResponse("Conflict", 409);
+	}
+	if (session.r2UploadId && !isStaged(session)) {
 		const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
-		await multipart.complete(parts.map(p => ({ partNumber: p.partNumber, etag: p.etag })));
+		await multipart.complete(parts);
 	}
 
-	const invalid = await uploadError(config, session);
+	const invalid = isStaged(session) ? await promoteStaged(config, session, parts) : await uploadError(config, session);
 	if (invalid) {
 		return errorResponse(invalid, invalid === "Internal error" ? 500 : 400);
 	}
@@ -707,32 +746,38 @@ function parseParts(value: unknown): Map<string, Part[]> | string {
 }
 
 /**
- * Assembles a staged upload's parts, checks the object against the file
- * hash and moves it to the NAR's key: R2 refuses a put whose body does not
- * hash to it. The staging object goes either way.
+ * Checks a staged upload against the file hash and moves it to the NAR's
+ * key: assembling its parts first, if it came in parts. The move is a put
+ * R2 refuses unless the body hashes to the file hash, made even when the
+ * NAR is stored already, since that's how this pusher shows it has it;
+ * a refused put leaves the stored NAR as it was. NARs too large for one put
+ * are hashed in the Worker instead, and only staged when stored already.
+ * The staging object goes either way.
  */
 async function promoteStaged(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
 	const cacheName = await resolveCacheName(config.db, session.cacheId);
-	if (!session.r2UploadId || cacheName === undefined) return "Internal error";
-	try {
-		await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
-	} catch (err) {
-		return `Upload incomplete: ${err instanceof Error ? err.message : String(err)}`;
+	if (cacheName === undefined) return "Internal error";
+	if (session.r2UploadId) {
+		try {
+			await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
+		} catch (err) {
+			return `Upload incomplete: ${err instanceof Error ? err.message : String(err)}`;
+		}
 	}
 	try {
+		const isPrivate = await isPrivateCache(config, cacheName);
+		const target = narKey(session.fileHash, session.compression, isPrivate);
+		const bucket = bucketFor(config, isPrivate);
+		if (session.fileSize > PRESIGNED_PUT_MAX_BYTES) {
+			if (!(await hashesTo(config.bucket, key, session.fileHash))) return "File hash mismatch";
+			return (await bucket.head(target)) ? undefined : "Upload incomplete: the stored NAR is gone, push again";
+		}
 		const staged = await config.bucket.get(key);
 		if (!staged) return "Upload incomplete";
 		if (staged.size !== session.fileSize) {
 			await staged.body.cancel();
 			return "File size mismatch";
-		}
-		const isPrivate = await isPrivateCache(config, cacheName);
-		const target = narKey(session.fileHash, session.compression, isPrivate);
-		const bucket = bucketFor(config, isPrivate);
-		if (await bucket.head(target)) {
-			await staged.body.cancel();
-			return undefined;
 		}
 		try {
 			await bucket.put(target, staged.body, {

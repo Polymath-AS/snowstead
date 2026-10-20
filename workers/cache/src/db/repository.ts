@@ -394,11 +394,12 @@ export async function transitionToMultipart(
 	db: Db,
 	sessionId: string,
 	r2UploadId: string,
+	r2UploadKey: string,
 ): Promise<UploadSession | undefined> {
 	return first(
 		db
 			.update(uploadSessions)
-			.set({ status: "uploading", r2UploadId })
+			.set({ status: "uploading", r2UploadId, r2UploadKey })
 			.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, "pending")))
 			.returning(),
 	);
