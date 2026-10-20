@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
+import { cacheIdEntry, isCachePattern, signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
 import type { TokenClaims } from "./jwt.js";
 import type { TokenPermission } from "./db/types.js";
 import type { CacheStats, PathSelection } from "./db/repository.js";
@@ -36,6 +36,9 @@ import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
+
+/** A cache name pattern: cache name characters, and * for any run of them. */
+const CACHE_PATTERN_RE = /^[a-z0-9*-]{1,64}$/;
 
 const MAX_TOKEN_LIFETIME_DAYS = 365;
 const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
@@ -117,13 +120,24 @@ export async function handleCreateToken(
 	const dedupedCaches = [...new Set(body.caches)];
 	const dedupedPerms = [...new Set(validatedPerms)];
 
-	// A token is one org's, and names that org's caches; * is all of them,
-	// since it can reach no other org's.
+	// A token is one org's, and reaches only that org's caches: named ones
+	// by id, so a rename keeps the token working, and patterns by name, so
+	// ci-* takes in caches made later; * is all of them.
 	const tokenOrg = org ?? DEFAULT_ORG_ID;
-	for (const name of dedupedCaches) {
-		if (name !== "*" && !(await findCache(config.db, tokenOrg, name))) {
-			return errorResponse(`${name} is not a cache of ${tokenOrg}`, 400);
+	const entries: string[] = [];
+	for (const entry of dedupedCaches) {
+		if (isCachePattern(entry)) {
+			if (!CACHE_PATTERN_RE.test(entry)) {
+				return errorResponse(`${entry} must be cache name characters and *`, 400);
+			}
+			entries.push(entry);
+			continue;
 		}
+		const cache = await findCache(config.db, tokenOrg, entry);
+		if (!cache) {
+			return errorResponse(`${entry} is not a cache of ${tokenOrg}`, 400);
+		}
+		entries.push(cacheIdEntry(cache.id));
 	}
 
 	const now = Date.now() / 1000;
@@ -135,7 +149,7 @@ export async function handleCreateToken(
 		sub: body.subject,
 		iss: TOKEN_ISSUER,
 		aud: TOKEN_AUDIENCE,
-		caches: dedupedCaches,
+		caches: entries,
 		perms: dedupedPerms,
 		...(tokenOrg === undefined ? {} : { org: tokenOrg }),
 		iat: Math.floor(now),
@@ -149,7 +163,7 @@ export async function handleCreateToken(
 	await createApiToken(config.db, {
 		jti,
 		subject: body.subject,
-		cachesJson: JSON.stringify(dedupedCaches),
+		cachesJson: JSON.stringify(entries),
 		permsJson: JSON.stringify(dedupedPerms),
 		expiresAt,
 		createdBy: "admin",
@@ -175,11 +189,13 @@ export async function handleListTokens(
 ): Promise<Response> {
 	const filter = scope ?? orgFilter(url);
 	if (filter instanceof Response) return filter;
-	const tokens = await listApiTokens(config.db, filter);
+	const [tokens, caches] = await Promise.all([listApiTokens(config.db, filter), listCaches(config.db, filter)]);
+	// Shown by name: a token names caches by id, which nobody reads.
+	const names = new Map(caches.map((c) => [cacheIdEntry(c.id), c.name]));
 	const result = tokens.map((t) => ({
 		jti: t.jti,
 		subject: t.subject,
-		caches: JSON.parse(t.cachesJson),
+		caches: (JSON.parse(t.cachesJson) as string[]).map((entry) => names.get(entry) ?? entry),
 		perms: JSON.parse(t.permsJson),
 		org: t.orgId,
 		createdAt: t.createdAt,
@@ -276,12 +292,15 @@ export async function handleCreateCache(
 
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
-	if (body.private === true) {
-		await setPrivate(config, path, true, org);
+	if (body.private === true && existing) {
+		await setPrivate(config, path, true, { org, id: existing.id });
 		await setPublicCacheInfo(config, path, false);
 	}
 	const { cache, created } = await ensureCache(config.db, name, body.private !== true, org);
 	if (created) {
+		// A new cache's entry needs its id, so it follows the row, before the
+		// request returns and anything can be pushed to it.
+		if (!cache.isPublic) await setPrivate(config, path, true, { org, id: cache.id });
 		const key = await newCacheKey(config, cache);
 		if (key) await setCacheSigningKey(config.db, cache.id, key);
 	}
@@ -292,7 +311,7 @@ export async function handleCreateCache(
 		await setCachePublic(config.db, cache.id, isPublic);
 	}
 	if (isPublic) {
-		await setPrivate(config, path, false, org);
+		await setPrivate(config, path, false, { org, id: cache.id });
 		await setPublicCacheInfo(config, path, true);
 	}
 
@@ -484,7 +503,7 @@ export async function handleBackfillNarinfo(
 export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 	const caches = await listCaches(config.db);
 	for (const cache of caches) {
-		await setPrivate(config, cache.path, !cache.isPublic, cache.orgId);
+		await setPrivate(config, cache.path, !cache.isPublic, { org: cache.orgId, id: cache.id });
 	}
 	const revoked = await listRevokedTokens(config.db, new Date());
 	for (const token of revoked) {

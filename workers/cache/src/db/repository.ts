@@ -112,8 +112,9 @@ export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean)
 	await db.update(caches).set({ isPublic }).where(eq(caches.id, cacheId));
 }
 
-export async function listCaches(db: Db): Promise<CacheAt[]> {
-	return (await selectCachesAt(db).orderBy(caches.id)).map(located);
+/** Every cache, or one org's. */
+export async function listCaches(db: Db, orgId?: string): Promise<CacheAt[]> {
+	return (await selectCachesAt(db).where(orgId === undefined ? undefined : eq(caches.orgId, orgId)).orderBy(caches.id)).map(located);
 }
 
 export interface CacheStats {

@@ -268,7 +268,7 @@ describe("private org caches", () => {
 		await env.AUTH_KV.put(`private/${org}/${cache}`, "1");
 
 		expect((await admin("/auth/sync", "POST", {})).status).toBe(200);
-		expect(await env.AUTH_KV.get(`private/${org}/${cache}`)).toBe(JSON.stringify({ org }));
+		expect(JSON.parse((await env.AUTH_KV.get(`private/${org}/${cache}`)) ?? "{}")).toEqual({ org, id: expect.any(Number) });
 	});
 });
 
@@ -297,5 +297,56 @@ describe("public org caches", () => {
 		expect(narinfo).toContain(`URL: ../../nar/${fileHash}/zstd.nar`);
 		expect(narinfo).toMatch(new RegExp(`^Sig: ${cacheKeyName(env.SIGNING_KEY_NAME, `${org}/${cache}`)}:`, "m"));
 		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/nix-cache-info`)).not.toBeNull();
+	});
+});
+
+describe("token caches", () => {
+	function decode(jwt: string): { caches: string[] } {
+		const payload = jwt.split(".")[1].replaceAll("-", "+").replaceAll("_", "/");
+		return JSON.parse(atob(payload.padEnd(payload.length + ((4 - (payload.length % 4)) % 4), "=")));
+	}
+
+	async function token(org: string, caches: string[], perms: string[] = ["push"]): Promise<Response> {
+		return orgApi(`/${org}/tokens`, "POST", { subject: "test", perms, caches });
+	}
+
+	it("name caches by id, and list them by name", async () => {
+		const { org, cache } = await orgWithCache(null);
+		const res = await token(org, [cache]);
+		const { token: jwt } = await res.json<{ token: string }>();
+
+		expect(decode(jwt).caches).toEqual([expect.stringMatching(/^id:\d+$/)]);
+		const { tokens } = await (await orgApi(`/${org}/tokens`)).json<{ tokens: { caches: string[] }[] }>();
+		expect(tokens[0].caches).toEqual([cache]);
+	});
+
+	it("take in caches a pattern matches, made before or after", async () => {
+		const { org } = await orgWithCache(null);
+		await orgApi(`/${org}/caches`, "POST", { name: "ci-linux" });
+		const { token: jwt } = await (await token(org, ["ci-*"])).json<{ token: string }>();
+		await orgApi(`/${org}/caches`, "POST", { name: "ci-darwin" });
+		await orgApi(`/${org}/caches`, "POST", { name: "release" });
+
+		expect((await createSessions("ci-linux", [10], jwt)).status).toBe(201);
+		expect((await createSessions("ci-darwin", [10], jwt)).status).toBe(201);
+		expect((await createSessions("release", [10], jwt)).status).toBe(403);
+	});
+
+	it.each(["CI-*", "ci *", "ci/*", "x".repeat(65) + "*"])("refuse the pattern %s", async (pattern) => {
+		const { org } = await orgWithCache(null);
+		expect((await token(org, [pattern])).status).toBe(400);
+	});
+
+	it("from before ids, naming caches by name, still work", async () => {
+		const { org, cache } = await orgWithCache(null);
+		expect((await createSessions(cache, [10], await sign([cache], ["push"], org))).status).toBe(201);
+	});
+
+	it("pull from a private cache by id once its entry has it", async () => {
+		const { org, cache } = await orgWithCache(null, true);
+		const { token: jwt } = await (await token(org, [cache], ["pull"])).json<{ token: string }>();
+		const pull = () => SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`, { headers: { authorization: `Bearer ${jwt}` } });
+
+		expect((await pull()).status).toBe(200);
 	});
 });

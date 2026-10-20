@@ -108,12 +108,13 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 	if (result.kind !== "ok" || (await isRevoked(config, result.claims.jti))) {
 		return readAuthError("Unauthorized", 401);
 	}
-	if (!hasPermission(result.claims, "pull") || !hasCacheAccess(result.claims, cacheName)) {
+	// The cache's org and id are in its private entry; one from before them
+	// names none to check against until the entries are synced.
+	const cache = await privateCache(config, cachePath);
+	const id = cache.isPrivate ? cache.id : undefined;
+	if (!hasPermission(result.claims, "pull") || !hasCacheAccess(result.claims, { id, name: cacheName })) {
 		return readAuthError("Forbidden", 403);
 	}
-	// The cache's org is in its private entry; one from before orgs names
-	// none to check against until the entries are synced.
-	const cache = await privateCache(config, cachePath);
 	if (cache.isPrivate && cache.org !== undefined && !isOrgsToken(result.claims, cache.org)) {
 		return readAuthError("Forbidden", 403);
 	}

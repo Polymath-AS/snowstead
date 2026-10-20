@@ -8,7 +8,7 @@ import { bucketFor, narKey, narinfoKey } from "./layout.js";
 import { authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
 import { isPrivateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
-import { hasPermission, hasCacheAccess } from "./jwt.js";
+import { hasPermission } from "./jwt.js";
 import { errorResponse } from "./responses.js";
 import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@snowstead/cache-domain";
 import {
@@ -412,11 +412,7 @@ async function handleWriteApi(
 	const sessionCreate = sessionBatch ?? pathname.match(RE_SESSION_CREATE);
 	if (sessionCreate) {
 		const cacheName = sessionCreate[1];
-		if (identity.kind === "jwt" && !hasCacheAccess(identity.claims, cacheName)) {
-			const response = errorResponse("Forbidden", 403);
-			writeAuditLog(config, identity, "push", cacheName, 403, '{"reason":"cache access denied"}', ip);
-			return response;
-		}
+		// The handlers check the token reaches the cache: it may name it by id.
 		const response = sessionBatch
 			? await handleCreateSessions(request, config, cacheName, identity)
 			: await handleCreateSession(request, config, cacheName, identity);

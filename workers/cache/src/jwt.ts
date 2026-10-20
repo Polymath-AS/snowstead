@@ -261,6 +261,41 @@ export function isOrgsToken(claims: TokenClaims, cacheOrg: string | null): boole
 	return (claims.org ?? DEFAULT_ORG_ID) === (cacheOrg ?? DEFAULT_ORG_ID);
 }
 
-export function hasCacheAccess(claims: TokenClaims, cacheName: string): boolean {
-	return claims.caches.includes("*") || claims.caches.includes(cacheName);
+/**
+ * Whether a token's caches include this one. Each entry is `id:<cache id>`,
+ * one cache however it's renamed, or a pattern over its org's cache names
+ * where * matches any run of characters: `*` is every cache, `ci-*` every
+ * cache whose name starts with ci-, and a plain name, as tokens from before
+ * ids carry, is that cache.
+ */
+export function hasCacheAccess(claims: TokenClaims, cache: { readonly id?: number; readonly name: string }): boolean {
+	return claims.caches.some((entry) =>
+		entry.startsWith(CACHE_ID_PREFIX) ? cache.id !== undefined && entry === cacheIdEntry(cache.id) : matchesPattern(entry, cache.name),
+	);
+}
+
+export const CACHE_ID_PREFIX = "id:";
+
+export function cacheIdEntry(id: number): string {
+	return `${CACHE_ID_PREFIX}${id}`;
+}
+
+export function isCachePattern(entry: string): boolean {
+	return entry.includes("*");
+}
+
+function matchesPattern(pattern: string, name: string): boolean {
+	if (!isCachePattern(pattern)) return pattern === name;
+	const parts = pattern.split("*");
+	const last = parts.length - 1;
+	if (!name.startsWith(parts[0]) || !name.endsWith(parts[last]) || name.length < parts[0].length + parts[last].length) {
+		return false;
+	}
+	let at = parts[0].length;
+	for (const part of parts.slice(1, last)) {
+		const found = name.indexOf(part, at);
+		if (found === -1 || found + part.length > name.length - parts[last].length) return false;
+		at = found + part.length;
+	}
+	return true;
 }

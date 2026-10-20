@@ -190,9 +190,11 @@ without an org are its tokens.
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
   operator sets the storage limit and makes API keys.
 - **Tokens reach only their org's caches,** for pushing and for pulling
-  from a private cache, and name them by name; `*` is all of them. A
-  push names its cache the same way, so `snowstead push main` pushes to
-  the token's org's `main`.
+  from a private cache. A token is made naming caches, which it keeps by
+  id, so it outlives a rename, or patterns over names where `*` matches
+  anything: `ci-*` reaches every cache starting with `ci-`, including
+  ones made later, and `*` reaches them all. A push names its cache within
+  the token's org, so `snowstead push main` pushes to that org's `main`.
 - **Storage limits.** A push that would take an org's caches past its
   limit is refused with 507 before anything uploads.
 - **Signing keys.** With `SIGNING_MASTER_KEY` set, each new cache signs

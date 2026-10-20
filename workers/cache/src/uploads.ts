@@ -76,7 +76,7 @@ async function sessionAccessError(
 	}
 	if (identity.kind === "jwt") {
 		const cache = await resolveCache(config.db, session.cacheId);
-		if (cache === undefined || !hasCacheAccess(identity.claims, cache.name) || !isOrgsToken(identity.claims, cache.orgId)) {
+		if (cache === undefined || !hasCacheAccess(identity.claims, cache) || !isOrgsToken(identity.claims, cache.orgId)) {
 			return { error: "Forbidden", status: 403 };
 		}
 	}
@@ -241,8 +241,9 @@ function storageFullResponse(usage: OrgUsage & { readonly limit: number; readonl
 	);
 }
 
+/** Whether a pusher may push to this cache of its org. */
 function orgAllows(identity: AuthIdentity, cache: CacheAt): boolean {
-	return identity.kind !== "jwt" || isOrgsToken(identity.claims, cache.orgId);
+	return identity.kind !== "jwt" || (isOrgsToken(identity.claims, cache.orgId) && hasCacheAccess(identity.claims, cache));
 }
 
 /**
@@ -915,7 +916,7 @@ export async function handleGetMissingPaths(
 		return errorResponse("Cache not found", 404);
 	}
 
-	if (identity.kind === "jwt" && (!hasCacheAccess(identity.claims, body.cache) || !orgAllows(identity, cache))) {
+	if (identity.kind === "jwt" && (!hasCacheAccess(identity.claims, cache) || !orgAllows(identity, cache))) {
 		return errorResponse("Forbidden", 403);
 	}
 

@@ -19,8 +19,14 @@ import type { WorkerConfig } from "./config.js";
  */
 const KV_CACHE_TTL_SECONDS = 30;
 const MEMO_MAX_ENTRIES = 10_000;
-/** A private cache's org: an id, null for none, or undefined for an entry that predates orgs. */
-export type PrivateCache = { readonly isPrivate: false } | { readonly isPrivate: true; readonly org: string | null | undefined };
+/**
+ * A private cache's org: an id, null for none, or undefined for an entry
+ * that predates orgs; and its id, for tokens that name it by id, unless the
+ * entry predates that.
+ */
+export type PrivateCache =
+	| { readonly isPrivate: false }
+	| { readonly isPrivate: true; readonly org: string | null | undefined; readonly id?: number };
 
 const visibility = new Map<string, PrivateCache & { readonly until: number }>();
 
@@ -30,8 +36,12 @@ function parseEntry(value: string | null): PrivateCache {
 	if (value === null) return { isPrivate: false };
 	if (value === LEGACY_ENTRY) return { isPrivate: true, org: undefined };
 	try {
-		const { org } = JSON.parse(value) as { org?: unknown };
-		return { isPrivate: true, org: typeof org === "string" ? org : null };
+		const { org, id } = JSON.parse(value) as { org?: unknown; id?: unknown };
+		return {
+			isPrivate: true,
+			org: typeof org === "string" ? org : null,
+			...(typeof id === "number" ? { id } : {}),
+		};
 	} catch {
 		// Unreadable is still private: only the org check is lost.
 		return { isPrivate: true, org: undefined };
@@ -61,9 +71,14 @@ export async function isPrivateCache(config: WorkerConfig, cachePath: string): P
 }
 
 /** Writes or removes the entry; call before (private) or after (public) the database. */
-export async function setPrivate(config: WorkerConfig, cachePath: string, isPrivate: boolean, org: string | null): Promise<void> {
+export async function setPrivate(
+	config: WorkerConfig,
+	cachePath: string,
+	isPrivate: boolean,
+	cache: { readonly org: string | null; readonly id: number },
+): Promise<void> {
 	if (isPrivate) {
-		await config.authKv.put(privateKey(cachePath), JSON.stringify({ org }));
+		await config.authKv.put(privateKey(cachePath), JSON.stringify(cache));
 	} else {
 		await config.authKv.delete(privateKey(cachePath));
 	}
