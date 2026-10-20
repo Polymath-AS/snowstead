@@ -603,7 +603,7 @@ async function publishSessions(
 			await storeNarinfo(config, cacheName, path, blob, isPrivate);
 			rows.push(path);
 		} catch (err) {
-			console.error("Failed to publish", { sessionId: session.id, error: err instanceof Error ? err.message : String(err) });
+			console.error("Failed to publish", { sessionId: session.id }, err);
 			results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
 		}
 	}));

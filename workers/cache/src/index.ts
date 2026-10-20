@@ -20,7 +20,7 @@ export default {
 			}
 			return response;
 		} catch (err) {
-			console.error("Unhandled error", { error: err instanceof Error ? err.message : String(err) });
+			console.error("Unhandled error", err);
 			const response = new Response(JSON.stringify({ error: "Internal server error" }), {
 				status: 500,
 				headers: { "content-type": "application/json" },

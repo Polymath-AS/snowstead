@@ -141,7 +141,7 @@ function writeAuditLog(
 			ip,
 			status,
 		}).catch((err) => {
-			console.error("Failed to write audit log", { error: err instanceof Error ? err.message : String(err) });
+			console.error("Failed to write audit log", err);
 		}),
 	);
 }

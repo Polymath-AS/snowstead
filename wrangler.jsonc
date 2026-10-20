@@ -9,8 +9,26 @@
 	// Required by the pg driver, which reaches Postgres through Hyperdrive.
 	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		// Every request's logs: errors and the API's request lines are worth
+		// more than they cost, and public reads never reach the Worker.
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": true
+		},
+		// Traces of fetch, R2, KV, the Cache API and (as custom spans) Postgres.
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.4
+		},
+		// Groups uncaught exceptions, 5xx responses and logged errors. Wrangler
+		// turns it off on the next deploy if this is removed.
+		"issues": {
+			"enabled": true
+		}
 	},
+	// Source-mapped stack traces in logs and Issues.
 	"upload_source_maps": true,
 	"workers_dev": true,
 	"vars": {
