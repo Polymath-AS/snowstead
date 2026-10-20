@@ -14,6 +14,7 @@ import {
 	upstreamPaths,
 } from "./schema.js";
 import type {
+	AuditLog,
 	Org,
 	OrgApiKey,
 	Cache,
@@ -632,11 +633,20 @@ export async function createAuditLog(
 		readonly detail: string;
 		readonly ip: string | null;
 		readonly status: number;
+		readonly orgId: string | null;
 	},
 ): Promise<void> {
 	// No RETURNING: audit inserts are fire-and-forget on the hot write path,
 	// and skipping the row round trip keeps them as cheap as possible.
 	await db.insert(auditLogs).values(params);
+}
+
+/** An org's audit entries, newest first, before the entry `before` when given. */
+export async function listAuditLogs(db: Db, orgId: string, limit: number, before?: number): Promise<AuditLog[]> {
+	return db.select().from(auditLogs)
+		.where(and(eq(auditLogs.orgId, orgId), before === undefined ? undefined : lt(auditLogs.id, before)))
+		.orderBy(desc(auditLogs.id))
+		.limit(limit);
 }
 
 export async function deleteExpiredAuditLogs(

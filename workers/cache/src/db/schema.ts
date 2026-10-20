@@ -127,7 +127,10 @@ export const auditLogs = pgTable("audit_logs", {
 	detail: text("detail").notNull().default("{}"),
 	ip: text("ip"),
 	status: integer("status").notNull(),
+	/** The org it happened in, so each org can read its own; null for the operator's. */
+	orgId: text("org_id"),
 }, (table) => [
+	index("idx_audit_logs_org").on(table.orgId, table.id),
 	index("idx_audit_logs_actor").on(table.actor),
 	index("idx_audit_logs_cache").on(table.cacheName),
 	index("idx_audit_logs_time").on(table.timestamp),

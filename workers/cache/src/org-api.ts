@@ -1,7 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import { authenticateOrg, generateOrgApiKey } from "./auth.js";
 import { writeAuditLog } from "./audit.js";
-import { createOrgApiKey, findOrg, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
+import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
 import {
 	parseOrgId,
 	handleGetOrg,
@@ -34,6 +34,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
  *   POST /caches/:name/paths/delete
  *   GET  /tokens   POST /tokens
  *   POST /tokens/:jti/revoke
+ *   GET  /audit?before=&limit=       what happened in the org, newest first
  */
 export async function handleOrgApi(request: Request, config: WorkerConfig, url: URL): Promise<Response> {
 	const [rawOrg = "", ...rest] = url.pathname.slice("/_api/v1/orgs/".length).split("/");
@@ -50,7 +51,7 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	const isOperator = identity.kind === "admin";
 	const ip = request.headers.get("cf-connecting-ip");
 	const audit = (action: string, response: Response, cache: string | null = null, detail: object = {}) => {
-		writeAuditLog(config, identity, action, cache, response.status, JSON.stringify({ org, ...detail }), ip);
+		writeAuditLog(config, identity, action, cache, response.status, JSON.stringify(detail), ip, org);
 		return response;
 	};
 	const method = request.method;
@@ -92,7 +93,45 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		return audit("token.revoke", await handleRevokeToken(request, config, value(1), org), null, { jti: value(1) });
 	}
 
+	if (route === "audit" && method === "GET") return handleListAudit(config, org, url);
+
 	return errorResponse("Not Found", 404);
+}
+
+const DEFAULT_AUDIT_PAGE = 50;
+const MAX_AUDIT_PAGE = 200;
+
+/**
+ * A page of the org's audit log, newest first. `next` is the `before` for
+ * the page after, null at the end. Actors are API keys (key:<id>), token
+ * ids, or "admin" for the operator.
+ */
+async function handleListAudit(config: WorkerConfig, org: string, url: URL): Promise<Response> {
+	const limit = Number(url.searchParams.get("limit") ?? DEFAULT_AUDIT_PAGE);
+	const rawBefore = url.searchParams.get("before");
+	const before = rawBefore === null ? undefined : Number(rawBefore);
+	if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_PAGE) {
+		return errorResponse(`limit must be between 1 and ${MAX_AUDIT_PAGE}`, 400);
+	}
+	if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
+		return errorResponse("before must be an entry id", 400);
+	}
+
+	const rows = await listAuditLogs(config.db, org, limit, before);
+	const last = rows.at(-1);
+	return jsonResponse({
+		entries: rows.map((r) => ({
+			id: r.id,
+			at: r.timestamp,
+			actor: r.actor,
+			action: r.action,
+			cache: r.cacheName,
+			status: r.status,
+			detail: JSON.parse(r.detail) as unknown,
+			ip: r.ip,
+		})),
+		next: rows.length === limit && last ? last.id : null,
+	});
 }
 
 const MAX_KEY_NAME_LENGTH = 64;

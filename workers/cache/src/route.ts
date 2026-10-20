@@ -47,6 +47,7 @@ const API_ROUTES = new Set([
 	"orgs/:org/caches/:cache/paths/delete",
 	"orgs/:org/tokens",
 	"orgs/:org/tokens/:jti/revoke",
+	"orgs/:org/audit",
 ]);
 
 function apiTemplate(pathname: string): string | undefined {

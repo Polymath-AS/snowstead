@@ -125,3 +125,62 @@ describe("unknown orgs", () => {
 		expect((await orgApi(`/not%20an%20org`, OPERATOR)).status).toBe(404);
 	});
 });
+
+describe("org audit log", () => {
+	type Entry = { id: number; actor: string; action: string; cache: string | null; status: number; detail: Record<string, unknown> };
+
+	async function audit(org: string, credential: string, query = ""): Promise<{ entries: Entry[]; next: number | null }> {
+		const res = await orgApi(`/${org}/audit${query}`, credential);
+		expect(res.status).toBe(200);
+		return res.json();
+	}
+
+	/** Audit writes finish after their response: wait until the log has caught up. */
+	async function auditUntil(org: string, credential: string, done: (entries: Entry[]) => boolean): Promise<Entry[]> {
+		for (let i = 0; i < 50; i++) {
+			const { entries } = await audit(org, credential, "?limit=200");
+			if (done(entries)) return entries;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		throw new Error("audit log never caught up");
+	}
+
+	it("holds what happened in the org, by whom, and nothing of another org", async () => {
+		const a = await orgWithKey();
+		const b = await orgWithKey();
+		const made = await orgApi(`/${a.org}/tokens`, a.key, "POST", { subject: "ci", caches: [a.cache], perms: ["push"] });
+		const { token } = await made.json<{ token: string }>();
+		await SELF.fetch("http://example.com/_api/v1/get-missing-paths", {
+			method: "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+			body: JSON.stringify({ cache: a.cache, storePathHashes: ["0".repeat(32)] }),
+		});
+
+		const entries = await auditUntil(a.org, a.key, (e) => e.some((x) => x.action === "push"));
+		expect(entries.map((e) => e.action)).toEqual(expect.arrayContaining(["key.create", "cache.create", "token.create", "push"]));
+		expect(entries.find((e) => e.action === "token.create")?.actor).toBe(`key:${a.id}`);
+		expect(entries.find((e) => e.action === "key.create")?.actor).toBe("admin");
+
+		const theirs = await auditUntil(b.org, b.key, (e) => e.some((x) => x.action === "key.create"));
+		expect(theirs.every((e) => e.action !== "token.create" && e.action !== "push")).toBe(true);
+		expect((await orgApi(`/${b.org}/audit`, a.key)).status).toBe(403);
+	});
+
+	it("pages newest first", async () => {
+		const { org, key } = await orgWithKey();
+		for (let i = 0; i < 3; i++) {
+			await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache") });
+		}
+		const all = await auditUntil(org, key, (e) => e.filter((x) => x.action === "cache.create").length === 4);
+
+		const first = await audit(org, key, "?limit=2");
+		expect(first.entries.map((e) => e.id)).toEqual(all.slice(0, 2).map((e) => e.id));
+		const second = await audit(org, key, `?limit=2&before=${first.next}`);
+		expect(second.entries.map((e) => e.id)).toEqual(all.slice(2, 4).map((e) => e.id));
+	});
+
+	it.each(["?limit=0", "?limit=1000", "?before=x"])("refuses %s", async (query) => {
+		const { org, key } = await orgWithKey();
+		expect((await orgApi(`/${org}/audit${query}`, key)).status).toBe(400);
+	});
+});
