@@ -47,6 +47,10 @@ SIGNING_PRIVATE_KEY=$(nix key generate-secret --key-name local-1 | cut -d: -f2)
 EOF
   echo "Wrote .dev.vars with local secrets (ADMIN_SECRET=local-admin-secret)."
 fi
+# Seals each cache's own signing key; added to .dev.vars written before it.
+if ! grep -q '^SIGNING_MASTER_KEY=' "$ROOT/.dev.vars"; then
+  echo "SIGNING_MASTER_KEY=$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))')" >>"$ROOT/.dev.vars"
+fi
 
 echo "Postgres: $DATABASE_URL"
 CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" pnpm --filter @snowstead/cache-worker dev "$@"

@@ -2,6 +2,7 @@
 interface Secrets {
 	AUTH_TOKEN?: string;
 	SIGNING_PRIVATE_KEY?: string;
+	SIGNING_MASTER_KEY?: string;
 	R2_ACCESS_KEY_ID?: string;
 	R2_SECRET_ACCESS_KEY?: string;
 	R2_ENDPOINT?: string;

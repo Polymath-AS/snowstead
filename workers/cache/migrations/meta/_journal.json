@@ -29,6 +29,13 @@
       "when": 1792532659482,
       "tag": "0003_org_api_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792533004874,
+      "tag": "0004_cache_signing_keys",
+      "breakpoints": true
     }
   ]
 }

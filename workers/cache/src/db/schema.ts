@@ -24,6 +24,10 @@ export const caches = pgTable("caches", {
 	name: text("name").notNull().unique(),
 	isPublic: boolean("is_public").notNull().default(true),
 	orgId: text("org_id").references(() => orgs.id),
+	/** Its own signing key (see cache-keys.ts), or null to sign with the service's. */
+	signingKeyName: text("signing_key_name"),
+	signingPublicKey: text("signing_public_key"),
+	signingKeySealed: text("signing_key_sealed"),
 	createdAt: createdAt("created_at"),
 }, (table) => [
 	index("idx_caches_org").on(table.orgId),

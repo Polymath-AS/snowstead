@@ -57,6 +57,11 @@ wrangler secret put JWT_SECRET
 wrangler secret put ADMIN_SECRET
 wrangler secret put SIGNING_PRIVATE_KEY
 wrangler secret put SIGNING_KEY_NAME
+# Optional: 32 random bytes, base64 (openssl rand -base64 32). With it each
+# new cache gets a signing key of its own, sealed under this one; without
+# it every cache signs with SIGNING_PRIVATE_KEY. Losing it leaves caches
+# with their own keys unable to sign, so keep a copy.
+wrangler secret put SIGNING_MASTER_KEY
 # S3 keys of an R2 token limited to the two buckets (key id: the token id,
 # secret: the SHA-256 of its value). With them uploads go straight to R2
 # through presigned URLs and private NARs redirect to R2; without them both

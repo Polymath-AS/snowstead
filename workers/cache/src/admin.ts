@@ -4,6 +4,7 @@ import type { TokenClaims } from "./jwt.js";
 import type { TokenPermission } from "./db/types.js";
 import type { CacheStats } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
+import { newCacheKey } from "./cache-keys.js";
 import {
 	createApiToken,
 	listApiTokens,
@@ -280,7 +281,13 @@ export async function handleCreateCache(
 		await setPrivate(config, name, true, org);
 		await setPublicCacheInfo(config, name, false);
 	}
-	const { cache, created } = await ensureCache(config.db, name, body.private !== true, org);
+	const { cache, created } = await ensureCache(
+		config.db,
+		name,
+		body.private !== true,
+		org,
+		existing === undefined ? await newCacheKey(config, name) : null,
+	);
 	let isPublic = cache.isPublic;
 	const changed = !created && changing;
 	if (changed) {
@@ -349,7 +356,7 @@ export async function handleGetCache(
 	const recent = await listRecentPaths(config.db, stats.cache.id, RECENT_PATHS);
 	return jsonResponse({
 		...cacheSummary(stats),
-		publicKey: await signingPublicKey(config.signingKeyName, config.signingPrivateKey),
+		publicKey: stats.cache.signingPublicKey ?? (await signingPublicKey(config.signingKeyName, config.signingPrivateKey)),
 		recentPaths: recent.map((p) => ({ storePath: p.storePath, size: p.fileSize, addedAt: p.createdAt })),
 	});
 }

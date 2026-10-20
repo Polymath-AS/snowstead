@@ -67,8 +67,9 @@ export async function ensureCache(
 	name: string,
 	isPublic = true,
 	orgId: string | null = null,
+	signingKey: Pick<Cache, "signingKeyName" | "signingPublicKey" | "signingKeySealed"> | null = null,
 ): Promise<{ cache: Cache; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning());
+	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId, ...signingKey }).onConflictDoNothing().returning());
 	if (inserted) return { cache: inserted, created: true };
 	const existing = await findCacheByName(db, name);
 	if (!existing) throw new Error(`cache ${name} vanished`);

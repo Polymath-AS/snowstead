@@ -2,6 +2,8 @@ import { parseNarHash } from "@snowstead/cache-domain";
 import type { PublishedPath, BlobObject } from "./db/types.js";
 import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
+import { signingKeyFor } from "./cache-keys.js";
+import type { SigningKey } from "./cache-keys.js";
 import { IMMUTABLE, bucketFor, narinfoKey, narUrl, placeNar } from "./layout.js";
 
 export type NarinfoPath = Pick<
@@ -51,14 +53,14 @@ export function renderNarinfo(
 }
 
 /** The narinfo for a path, signed with the cache's key. */
-export async function signedNarinfo(config: WorkerConfig, path: NarinfoPath, blob: NarinfoBlob, isPrivate: boolean): Promise<string> {
+export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: NarinfoBlob, isPrivate: boolean): Promise<string> {
 	const refs: string[] = JSON.parse(path.referencesJson);
 	const storedSigs: string[] = JSON.parse(path.signaturesJson);
 	// Rows published before uploads canonicalised the hash may hold the SRI
 	// form, which Nix would not verify a signature over.
 	const narHash = parseNarHash(path.narHash);
 	const canonical = typeof narHash === "object" ? path : { ...path, narHash };
-	const sig = await signNarinfo(computeFingerprint(canonical, refs), config.signingKeyName, config.signingPrivateKey);
+	const sig = await signNarinfo(computeFingerprint(canonical, refs), key.name, key.secret);
 	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate), refs, storedSigs, sig ? [sig] : []);
 }
 
@@ -75,7 +77,7 @@ export async function storeNarinfo(
 	isPrivate: boolean,
 ): Promise<void> {
 	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
-	const body = await signedNarinfo(config, path, blob, isPrivate);
+	const body = await signedNarinfo(await signingKeyFor(config, cacheName), path, blob, isPrivate);
 	await bucketFor(config, isPrivate).put(narinfoKey(cacheName, path.storePathHash, isPrivate), body, {
 		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: IMMUTABLE },
 	});

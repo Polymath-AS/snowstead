@@ -15,6 +15,8 @@ export interface WorkerConfig {
 	readonly close: () => Promise<void>;
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
+	/** Seals each cache's own signing key; without it every cache signs with signingPrivateKey. */
+	readonly signingMasterKey: string;
 	readonly authToken: string;
 	readonly r2AccessKeyId: string;
 	readonly r2SecretAccessKey: string;
@@ -55,6 +57,7 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 		ctx,
 		signingKeyName: env.SIGNING_KEY_NAME || "snowstead-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
+		signingMasterKey: env.SIGNING_MASTER_KEY || "",
 		authToken: env.AUTH_TOKEN || "",
 		r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
 		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",
