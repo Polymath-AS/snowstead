@@ -5,6 +5,7 @@ import type { TokenPermission } from "./db/types.js";
 import type { CacheStats } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
+import { DEFAULT_ORG_ID } from "./db/schema.js";
 import {
 	createApiToken,
 	listApiTokens,
@@ -114,14 +115,14 @@ export async function handleCreateToken(
 	// orgs, since it reaches only caches of the org it carries.
 	let tokenOrg = org;
 	if (tokenOrg === undefined && !dedupedCaches.includes("*")) {
-		const orgs = new Set<string | null>();
+		const orgs = new Set<string>();
 		for (const name of dedupedCaches) {
-			orgs.add((await findCacheByName(config.db, name))?.orgId ?? null);
+			orgs.add((await findCacheByName(config.db, name))?.orgId ?? DEFAULT_ORG_ID);
 		}
 		if (orgs.size > 1) {
 			return errorResponse("a token's caches must all be of one org", 400);
 		}
-		tokenOrg = [...orgs][0] ?? undefined;
+		tokenOrg = [...orgs][0];
 	}
 
 	// An org's token names its caches: a wildcard would reach other orgs'.
@@ -244,11 +245,11 @@ export async function handleCreateCache(
 	const body = await parseJsonBody<{ name: string; private?: boolean; org?: string }>(request);
 	if (body instanceof Response) return body;
 
-	const org = scope ?? (body.org === undefined ? null : parseOrgId(body.org));
+	const org = scope ?? (body.org === undefined ? DEFAULT_ORG_ID : parseOrgId(body.org));
 	if (org === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
-	if (org !== null && !(await findOrg(config.db, org))) {
+	if (!(await findOrg(config.db, org))) {
 		return errorResponse(`no org ${org}`, 404);
 	}
 

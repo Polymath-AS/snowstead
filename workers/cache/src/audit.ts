@@ -2,18 +2,20 @@ import type { WorkerConfig } from "./config.js";
 import type { AuthIdentity } from "./auth.js";
 import { actorId } from "./auth.js";
 import { createAuditLog } from "./db/repository.js";
+import { DEFAULT_ORG_ID } from "./db/schema.js";
 
 /**
  * The org an entry belongs to: an API key's or a token's own, which is the
- * org of anything it can reach. The operator's acts on no one org unless
- * the caller says which.
+ * org of anything it can reach. The operator acts on no one org unless the
+ * caller says which.
  */
 function orgOf(identity: AuthIdentity): string | null {
 	switch (identity.kind) {
 		case "orgKey": return identity.org;
-		case "jwt": return identity.claims.org ?? null;
-		case "admin":
-		case "legacy": return null;
+		case "jwt": return identity.claims.org ?? DEFAULT_ORG_ID;
+		// The shared push secret is a self-hosted install's, which is all the default org.
+		case "legacy": return DEFAULT_ORG_ID;
+		case "admin": return null;
 	}
 }
 

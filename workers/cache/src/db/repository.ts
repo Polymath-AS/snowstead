@@ -12,6 +12,7 @@ import {
 	apiTokens,
 	auditLogs,
 	upstreamPaths,
+	DEFAULT_ORG_ID,
 } from "./schema.js";
 import type {
 	AuditLog,
@@ -67,7 +68,7 @@ export async function ensureCache(
 	db: Db,
 	name: string,
 	isPublic = true,
-	orgId: string | null = null,
+	orgId: string = DEFAULT_ORG_ID,
 	signingKey: Pick<Cache, "signingKeyName" | "signingPublicKey" | "signingKeySealed"> | null = null,
 ): Promise<{ cache: Cache; created: boolean }> {
 	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId, ...signingKey }).onConflictDoNothing().returning());
@@ -192,13 +193,19 @@ export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsa
  * Records upload sessions for an org's cache unless they would take it past
  * its storage limit; returns the usage that refused them, or undefined once
  * they are recorded. Locked per org, so concurrent pushes can't both fit
- * into the same space.
+ * into the same space. An org without a limit, such as a self-hosted
+ * install's default org, takes no lock.
  */
 export async function createUploadSessionsWithinLimit(
 	db: Db,
 	orgId: string,
 	rows: Parameters<typeof createUploadSessions>[1],
 ): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
+	if ((await findOrg(db, orgId))?.storageLimit == null) {
+		// A limit set meanwhile applies from the next push.
+		await createUploadSessions(db, rows);
+		return undefined;
+	}
 	return db.transaction(async (tx) => {
 		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + orgId}, 0))`);
 		const org = await findOrg(tx, orgId);

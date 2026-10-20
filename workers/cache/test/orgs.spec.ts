@@ -120,13 +120,43 @@ describe("storage limit", () => {
 		expect(results.map((r) => r.status).sort()).toEqual([201, 201, 507, 507]);
 	});
 
-	it("doesn't limit an org without one, or a cache without an org", async () => {
+	it("doesn't limit an org without one, such as the default org", async () => {
 		const { cache } = await orgWithCache(null);
 		expect((await createSessions(cache, [10 ** 12])).status).toBe(201);
 
 		const loose = unique("cache");
 		expect((await admin("/caches", "POST", { name: loose })).status).toBe(201);
 		expect((await createSessions(loose, [10 ** 12])).status).toBe(201);
+	});
+});
+
+describe("the default org", () => {
+	it("holds caches made without an org, as on a self-hosted install", async () => {
+		const name = unique("cache");
+		expect(await (await admin("/caches", "POST", { name })).json()).toMatchObject({ created: true });
+
+		const res = await orgApi(`/default/caches/${name}`);
+		expect(await res.json()).toMatchObject({ name, org: "default" });
+	});
+
+	it("is where a token without an org pushes, and nowhere else", async () => {
+		const name = unique("cache");
+		expect((await admin("/caches", "POST", { name })).status).toBe(201);
+		const other = await orgWithCache(null);
+		const now = Math.floor(Date.now() / 1000);
+		const orgless = await signJwt({
+			jti: crypto.randomUUID(),
+			sub: "test",
+			iss: TOKEN_ISSUER,
+			aud: TOKEN_AUDIENCE,
+			caches: ["*"],
+			perms: ["push"],
+			iat: now,
+			exp: now + 600,
+		}, env.JWT_SECRET);
+
+		expect((await createSessions(name, [100], orgless)).status).toBe(201);
+		expect((await createSessions(other.cache, [100], orgless)).status).toBe(403);
 	});
 });
 

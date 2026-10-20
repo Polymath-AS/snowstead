@@ -1,4 +1,5 @@
 import type { TokenPermission } from "./db/types.js";
+import { DEFAULT_ORG_ID } from "./db/schema.js";
 
 export type TokenClaims = {
 	readonly jti: string;
@@ -251,12 +252,13 @@ export function hasPermission(claims: TokenClaims, perm: TokenPermission): boole
 }
 
 /**
- * Whether a token may reach a cache of this org (null for none): only its
- * own org's, so an org's token is no use on another's cache, nor one made
- * without an org on an org's cache.
+ * Whether a token may reach a cache of this org: only its own org's, so an
+ * org's token is no use on another's cache. A token without an org is the
+ * default org's, as tokens from before orgs are, and so is a cache whose
+ * private entry names none.
  */
 export function isOrgsToken(claims: TokenClaims, cacheOrg: string | null): boolean {
-	return (claims.org ?? null) === cacheOrg;
+	return (claims.org ?? DEFAULT_ORG_ID) === (cacheOrg ?? DEFAULT_ORG_ID);
 }
 
 export function hasCacheAccess(claims: TokenClaims, cacheName: string): boolean {

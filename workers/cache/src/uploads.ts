@@ -4,7 +4,6 @@ import { hasCacheAccess, isOrgsToken } from "./jwt.js";
 import {
 	findCacheByName,
 	findCacheById,
-	createUploadSessions,
 	createUploadSessionsWithinLimit,
 	findUploadSession,
 	findUploadSessions,
@@ -229,7 +228,7 @@ function orgAllows(identity: AuthIdentity, cache: Cache): boolean {
 
 /**
  * Records sessions for paths of one cache in one statement, and says where
- * each NAR goes; a cache's org must have room for all of them.
+ * each NAR goes; the cache's org must have room for all of them.
  */
 async function createSessions(
 	config: WorkerConfig,
@@ -267,16 +266,12 @@ async function createSessions(
 			expiresAt,
 		};
 	}));
-	if (cache.orgId === null) {
-		await createUploadSessions(config.db, rows);
-	} else {
-		const refused = await createUploadSessionsWithinLimit(config.db, cache.orgId, rows);
-		if (refused) {
-			await Promise.allSettled(rows.flatMap((r) =>
-				r.r2UploadId ? [config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()] : [],
-			));
-			return storageFullResponse(refused);
-		}
+	const refused = await createUploadSessionsWithinLimit(config.db, cache.orgId, rows);
+	if (refused) {
+		await Promise.allSettled(rows.flatMap((r) =>
+			r.r2UploadId ? [config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()] : [],
+		));
+		return storageFullResponse(refused);
 	}
 
 	return Promise.all(rows.map(async (row): Promise<SessionResponse> => {

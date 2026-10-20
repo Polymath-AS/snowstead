@@ -166,3 +166,35 @@ The server remembers paths found upstream, so each is looked up there once.
 
 All write operations and admin actions are logged to Postgres with actor,
 action, cache name, IP, and status code. Logs are retained for 30 days.
+Each entry also records its org; an org reads its own with
+`GET /_api/v1/orgs/:org/audit`.
+
+## Orgs
+
+A hosted service runs Snowstead for many tenants. Each tenant is an org,
+which has caches, tokens, API keys, an audit log, and a storage limit.
+Who belongs to an org, and what it pays for, stay with the service that
+runs Snowstead.
+
+A self-hosted install doesn't need to know about any of this: everything
+belongs to the `default` org, which has no storage limit, and tokens made
+without an org are its tokens.
+
+- **Cache names are global.** Every cache is `<host>/<name>` whichever
+  org has it, so substituter URLs stay short. Creating a cache whose name
+  another org has answers 409.
+- **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
+  caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
+  org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
+  operator sets the storage limit and makes API keys.
+- **Tokens reach only their org's caches,** for pushing and for pulling
+  from a private cache.
+- **Storage limits.** A push that would take an org's caches past its
+  limit is refused with 507 before anything uploads.
+- **Signing keys.** With `SIGNING_MASTER_KEY` set, each new cache signs
+  with a key of its own, shown as the cache's `publicKey`. Caches from
+  before, and every cache without a master key, sign with
+  `SIGNING_PRIVATE_KEY`.
+
+After upgrading to orgs, run `POST /_api/v1/admin/auth/sync` once: it
+writes each private cache's org into KV, where pulls check it.

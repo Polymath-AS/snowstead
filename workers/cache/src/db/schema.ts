@@ -9,9 +9,12 @@ const id = () => bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAs
 
 /**
  * The tenants of a hosted service, each with its caches and a storage limit.
- * Their members and plans live with whatever runs the service; a cache
- * without an org, as on a self-hosted install, has no limit.
+ * Their members and plans live with whatever runs the service. Every cache
+ * has one: a self-hosted install's are all the default org's, which has no
+ * limit, and so are tokens made without an org.
  */
+export const DEFAULT_ORG_ID = "default";
+
 export const orgs = pgTable("orgs", {
 	id: text("id").primaryKey(),
 	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
@@ -23,7 +26,7 @@ export const caches = pgTable("caches", {
 	id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
 	name: text("name").notNull().unique(),
 	isPublic: boolean("is_public").notNull().default(true),
-	orgId: text("org_id").references(() => orgs.id),
+	orgId: text("org_id").notNull().default(DEFAULT_ORG_ID).references(() => orgs.id),
 	/** Its own signing key (see cache-keys.ts), or null to sign with the service's. */
 	signingKeyName: text("signing_key_name"),
 	signingPublicKey: text("signing_public_key"),
