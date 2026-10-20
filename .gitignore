@@ -8,3 +8,4 @@ dist/
 result
 .env
 .dev.vars
+.dev/

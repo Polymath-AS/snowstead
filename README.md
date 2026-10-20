@@ -27,13 +27,16 @@ pnpm check # type-check + tests across the workspace
 
 The worker's tests run against a throwaway Postgres that
 `scripts/with-postgres.sh` starts (or the server `SNOWSTEAD_TEST_DATABASE_URL`
-names). To run the worker locally against a database of your own:
+names). To run the worker locally on http://localhost:8787:
 
 ```bash
-export DATABASE_URL=postgres://USER:PASSWORD@localhost:5432/snowstead
-pnpm --filter @snowstead/cache-worker db:migrate
-CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" pnpm dev
+pnpm dev
 ```
+
+It starts a Postgres cluster in `.dev/postgres` that keeps its data
+between runs, migrates it, and on the first run writes `.dev.vars` with
+local secrets (`ADMIN_SECRET=local-admin-secret`, a fresh signing key).
+Delete `.dev/` to start over.
 
 After changing `workers/cache/src/db/schema.ts`, run
 `pnpm --filter @snowstead/cache-worker db:generate` and commit the migration.
