@@ -2,6 +2,7 @@ import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
 import { verifyJwt, hasPermission, hasCacheAccess } from "./jwt.js";
 import { isRevoked } from "./revocations.js";
+import { findOrgApiKey } from "./db/repository.js";
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
 function authError(message: string, status: number): Response {
@@ -115,7 +116,8 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 export type AuthIdentity =
 	| { readonly kind: "jwt"; readonly claims: TokenClaims }
 	| { readonly kind: "legacy" }
-	| { readonly kind: "admin" };
+	| { readonly kind: "admin" }
+	| { readonly kind: "orgKey"; readonly org: string; readonly keyId: string };
 
 export type AuthResult =
 	| { readonly kind: "ok"; readonly identity: AuthIdentity }
@@ -183,11 +185,71 @@ export async function authenticateAdmin(
 	return { kind: "ok", identity: { kind: "admin" } };
 }
 
+const ORG_KEY_PREFIX = "snowstead_key_";
+const ORG_KEY_ID = /^[a-z0-9]{16}$/;
+
+function hex(bytes: ArrayBuffer): string {
+	return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function hashSecret(secret: string): Promise<string> {
+	return hex(await crypto.subtle.digest("SHA-256", tsEncoder.encode(secret)));
+}
+
+/**
+ * A new org API key, `snowstead_key_<id>_<secret>`: the id finds its row
+ * and the secret proves it, and only the secret's hash is kept. Shown once.
+ */
+export async function generateOrgApiKey(): Promise<{ id: string; key: string; secretHash: string }> {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+	const id = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => alphabet[b % alphabet.length]).join("");
+	const secret = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+		.replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+	return { id, key: `${ORG_KEY_PREFIX}${id}_${secret}`, secretHash: await hashSecret(secret) };
+}
+
+/**
+ * Authenticates a request to one org's API: the operator's ADMIN_SECRET,
+ * which reaches every org, or an unrevoked API key of that org.
+ */
+export async function authenticateOrg(
+	request: Request,
+	config: WorkerConfig,
+	org: string,
+): Promise<AuthResult> {
+	const bearer = extractBearer(request);
+	if (typeof bearer !== "string") {
+		return { kind: "error", response: bearer };
+	}
+
+	if (config.adminSecret && (await timingSafeEqual(bearer, config.adminSecret))) {
+		return { kind: "ok", identity: { kind: "admin" } };
+	}
+
+	if (!bearer.startsWith(ORG_KEY_PREFIX)) {
+		return { kind: "error", response: authError("Forbidden", 403) };
+	}
+	const rest = bearer.slice(ORG_KEY_PREFIX.length);
+	const id = rest.slice(0, 16);
+	const secret = rest.slice(17);
+	if (!ORG_KEY_ID.test(id) || rest[16] !== "_" || secret.length === 0) {
+		return { kind: "error", response: authError("Forbidden", 403) };
+	}
+	const key = await findOrgApiKey(config.db, id);
+	// Hashed either way, so a missing key takes as long as a wrong one.
+	const valid = await timingSafeEqual(await hashSecret(secret), key?.secretHash ?? "");
+	if (!key || !valid || key.revokedAt !== null || key.orgId !== org) {
+		return { kind: "error", response: authError("Forbidden", 403) };
+	}
+	return { kind: "ok", identity: { kind: "orgKey", org, keyId: id } };
+}
+
 /** Extract the actor identifier for audit logging. */
 export function actorId(identity: AuthIdentity): string {
 	switch (identity.kind) {
 		case "jwt": return identity.claims.jti;
 		case "legacy": return "legacy";
 		case "admin": return "admin";
+		case "orgKey": return `key:${identity.keyId}`;
 	}
 }

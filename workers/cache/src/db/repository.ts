@@ -2,6 +2,7 @@ import { eq, and, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } fr
 import type { Db } from "./connection.js";
 import {
 	orgs,
+	orgApiKeys,
 	caches,
 	blobObjects,
 	publishedPaths,
@@ -14,6 +15,7 @@ import {
 } from "./schema.js";
 import type {
 	Org,
+	OrgApiKey,
 	Cache,
 	BlobObject,
 	PublishedPath,
@@ -126,6 +128,32 @@ export async function putOrg(db: Db, id: string, storageLimit: number | null): P
 			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit } })
 			.returning(),
 	);
+}
+
+export async function createOrgApiKey(
+	db: Db,
+	params: { readonly id: string; readonly orgId: string; readonly name: string; readonly secretHash: string },
+): Promise<OrgApiKey> {
+	return returned(db.insert(orgApiKeys).values(params).returning());
+}
+
+export async function findOrgApiKey(db: Db, id: string): Promise<OrgApiKey | undefined> {
+	return first(db.select().from(orgApiKeys).where(eq(orgApiKeys.id, id)).limit(1));
+}
+
+export async function listOrgApiKeys(db: Db, orgId: string): Promise<OrgApiKey[]> {
+	return db.select().from(orgApiKeys).where(eq(orgApiKeys.orgId, orgId)).orderBy(orgApiKeys.createdAt);
+}
+
+/** Revokes the org's key; false when it has no such key, revoked or not. */
+export async function revokeOrgApiKey(db: Db, orgId: string, id: string): Promise<boolean> {
+	const key = await first(
+		db.update(orgApiKeys)
+			.set({ revokedAt: sql`coalesce(${orgApiKeys.revokedAt}, now())` })
+			.where(and(eq(orgApiKeys.id, id), eq(orgApiKeys.orgId, orgId)))
+			.returning({ id: orgApiKeys.id }),
+	);
+	return key !== undefined;
 }
 
 export interface OrgUsage {

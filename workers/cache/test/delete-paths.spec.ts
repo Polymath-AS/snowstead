@@ -33,6 +33,15 @@ function admin(path: string, method = "GET", body?: unknown): Promise<Response> 
 	});
 }
 
+/** The org API, as the operator. */
+function orgApi(path: string, method = "GET", body?: unknown): Promise<Response> {
+	return SELF.fetch(`http://example.com/_api/v1/orgs${path}`, {
+		method,
+		headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+}
+
 function api(path: string, body: unknown): Promise<Response> {
 	return SELF.fetch(`http://example.com/_api/v1${path}`, {
 		method: "POST",
@@ -72,7 +81,7 @@ async function push(cache: string, hash: string, { body, fileHash }: { body: Uin
 }
 
 async function used(org: string): Promise<number> {
-	return (await (await admin(`/orgs/${org}`)).json<{ used: number }>()).used;
+	return (await (await orgApi(`/${org}`)).json<{ used: number }>()).used;
 }
 
 /** Ends the sessions that uploaded a NAR, as an hour passing would. */
@@ -84,7 +93,7 @@ describe("deleting published paths", () => {
 	it("frees its org's storage, so a push that was refused fits", async () => {
 		const org = unique("org");
 		const cache = unique("cache");
-		expect((await admin(`/orgs/${org}`, "PUT", { storageLimit: 100 })).status).toBe(200);
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: 100 })).status).toBe(200);
 		expect((await admin("/caches", "POST", { name: cache, org })).status).toBe(201);
 		const a = storePathHash();
 		expect(await push(cache, a, await nar(40))).toBe(201);

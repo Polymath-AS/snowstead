@@ -12,6 +12,15 @@ function admin(path: string, method = "GET", body?: unknown): Promise<Response> 
 	});
 }
 
+/** The org API, as the operator. */
+function orgApi(path: string, method = "GET", body?: unknown): Promise<Response> {
+	return SELF.fetch(`http://example.com/_api/v1/orgs${path}`, {
+		method,
+		headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+}
+
 function createSessions(cache: string, sizes: number[], token = "test-auth-token"): Promise<Response> {
 	const paths = sizes.map((fileSize) => {
 		const hash = crypto.randomUUID().replaceAll("-", "").slice(0, 32).replace(/[eotu]/g, "a");
@@ -35,7 +44,7 @@ function createSessions(cache: string, sizes: number[], token = "test-auth-token
 async function orgWithCache(storageLimit: number | null) {
 	const org = unique("org");
 	const cache = unique("cache");
-	expect((await admin(`/orgs/${org}`, "PUT", { storageLimit })).status).toBe(200);
+	expect((await orgApi(`/${org}`, "PUT", { storageLimit })).status).toBe(200);
 	expect((await admin("/caches", "POST", { name: cache, org })).status).toBe(201);
 	return { org, cache };
 }
@@ -43,17 +52,17 @@ async function orgWithCache(storageLimit: number | null) {
 describe("orgs", () => {
 	it("creates an org, changes its limit, and reports its usage", async () => {
 		const org = unique("org");
-		expect((await admin(`/orgs/${org}`)).status).toBe(404);
+		expect((await orgApi(`/${org}`)).status).toBe(404);
 
-		const created = await admin(`/orgs/${org}`, "PUT", { storageLimit: 1000 });
+		const created = await orgApi(`/${org}`, "PUT", { storageLimit: 1000 });
 		expect(await created.json()).toEqual({ id: org, storageLimit: 1000, used: 0, pending: 0 });
 
-		const raised = await admin(`/orgs/${org}`, "PUT", { storageLimit: null });
+		const raised = await orgApi(`/${org}`, "PUT", { storageLimit: null });
 		expect(await raised.json()).toMatchObject({ storageLimit: null });
 	});
 
 	it.each([-1, 1.5, "10GB"])("rejects a limit of %s", async (storageLimit) => {
-		expect((await admin(`/orgs/${unique("org")}`, "PUT", { storageLimit })).status).toBe(400);
+		expect((await orgApi(`/${unique("org")}`, "PUT", { storageLimit })).status).toBe(400);
 	});
 
 	it("lists only an org's caches", async () => {
@@ -93,7 +102,7 @@ describe("storage limit", () => {
 			error: "Not enough storage: this push needs 300 bytes, and 200 bytes of your 1.0 KB is left.",
 		});
 
-		expect(await (await admin(`/orgs/${org}`)).json()).toMatchObject({ used: 0, pending: 800 });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ used: 0, pending: 800 });
 		expect((await createSessions(cache, [200])).status).toBe(201);
 	});
 
@@ -101,7 +110,7 @@ describe("storage limit", () => {
 		const { org, cache } = await orgWithCache(1000);
 
 		expect((await createSessions(cache, [600, 600])).status).toBe(507);
-		expect(await (await admin(`/orgs/${org}`)).json()).toMatchObject({ pending: 0 });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 0 });
 	});
 
 	it("lets two pushes at once take no more than the limit", async () => {

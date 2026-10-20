@@ -1,8 +1,10 @@
 import type { WorkerConfig } from "./config.js";
-import { findCacheByName, createAuditLog } from "./db/repository.js";
+import { findCacheByName } from "./db/repository.js";
+import { writeAuditLog } from "./audit.js";
+import { handleOrgApi } from "./org-api.js";
 import { narinfoCacheKey } from "./narinfo.js";
 import { bucketFor, narKey, narinfoKey } from "./layout.js";
-import { authenticateWrite, authenticateAdmin, authorizeRead, actorId } from "./auth.js";
+import { authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
 import { isPrivateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission, hasCacheAccess } from "./jwt.js";
@@ -21,7 +23,7 @@ import {
 	handleCommit,
 } from "./uploads.js";
 import { createPresignedUrl } from "./presign.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleGetOrg, handlePutOrg, handleDeletePaths } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -34,7 +36,6 @@ const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 const RE_ADMIN_CACHE = /^\/_api\/v1\/admin\/caches\/([^/]+)$/;
 const RE_ADMIN_CACHE_PATHS_DELETE = /^\/_api\/v1\/admin\/caches\/([^/]+)\/paths\/delete$/;
-const RE_ADMIN_ORG = /^\/_api\/v1\/admin\/orgs\/([^/]+)$/;
 
 export async function handleRequest(
 	request: Request,
@@ -49,6 +50,10 @@ export async function handleRequest(
 
 	if (url.pathname === "/healthz") {
 		return handleHealthz(config);
+	}
+
+	if (url.pathname.startsWith("/_api/v1/orgs/")) {
+		return handleOrgApi(request, config, url);
 	}
 
 	if (url.pathname.startsWith("/_api/v1/admin/")) {
@@ -124,29 +129,6 @@ function json(body: Record<string, string | boolean | number>, status = 200): Re
 		status,
 		headers: { "content-type": "application/json; charset=utf-8" },
 	});
-}
-
-function writeAuditLog(
-	config: WorkerConfig,
-	identity: AuthIdentity,
-	action: string,
-	cacheName: string | null,
-	status: number,
-	detail: string,
-	ip: string | null,
-): void {
-	config.defer(
-		createAuditLog(config.db, {
-			actor: actorId(identity),
-			action,
-			cacheName,
-			detail,
-			ip,
-			status,
-		}).catch((err) => {
-			console.error("Failed to write audit log", err);
-		}),
-	);
 }
 
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
@@ -374,16 +356,6 @@ async function handleAdminApi(
 		const response = await handleDeletePaths(request, config, name, new URL(request.url).origin);
 		const detail = response.ok ? JSON.stringify({ deleted: (await response.clone().json<{ deleted: string[] }>()).deleted }) : "{}";
 		writeAuditLog(config, authResult.identity, "paths.delete", name, response.status, detail, ip);
-		return response;
-	}
-
-	const orgMatch = pathname.match(RE_ADMIN_ORG);
-	if (orgMatch && request.method === "GET") {
-		return handleGetOrg(config, decodeURIComponent(orgMatch[1]));
-	}
-	if (orgMatch && request.method === "PUT") {
-		const response = await handlePutOrg(request, config, decodeURIComponent(orgMatch[1]));
-		writeAuditLog(config, authResult.identity, "org.put", null, response.status, JSON.stringify({ org: decodeURIComponent(orgMatch[1]) }), ip);
 		return response;
 	}
 

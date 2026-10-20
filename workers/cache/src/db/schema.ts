@@ -139,3 +139,18 @@ export const upstreamPaths = pgTable("upstream_paths", {
 	upstream: text("upstream").notNull(),
 	foundAt: createdAt("found_at"),
 });
+
+/**
+ * Keys an org's own tooling calls the org API with. Only a hash of the key
+ * is kept; `id` is the public part of the key, which finds its row.
+ */
+export const orgApiKeys = pgTable("org_api_keys", {
+	id: text("id").primaryKey(),
+	orgId: text("org_id").notNull().references(() => orgs.id),
+	name: text("name").notNull(),
+	secretHash: text("secret_hash").notNull(),
+	createdAt: createdAt("created_at"),
+	revokedAt: timestamptz("revoked_at"),
+}, (table) => [
+	index("idx_org_api_keys_org").on(table.orgId),
+]);

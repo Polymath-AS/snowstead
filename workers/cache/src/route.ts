@@ -17,6 +17,8 @@ const VALUE_AFTER: Readonly<Record<string, string>> = {
 	caches: ":cache",
 	uploads: ":session",
 	tokens: ":jti",
+	orgs: ":org",
+	keys: ":key",
 	part: ":part",
 };
 
@@ -37,6 +39,14 @@ const API_ROUTES = new Set([
 	"admin/caches/:cache/paths/delete",
 	"admin/auth/sync",
 	"admin/narinfo/backfill",
+	"orgs/:org",
+	"orgs/:org/keys",
+	"orgs/:org/keys/:key/revoke",
+	"orgs/:org/caches",
+	"orgs/:org/caches/:cache",
+	"orgs/:org/caches/:cache/paths/delete",
+	"orgs/:org/tokens",
+	"orgs/:org/tokens/:jti/revoke",
 ]);
 
 function apiTemplate(pathname: string): string | undefined {

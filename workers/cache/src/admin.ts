@@ -35,14 +35,19 @@ const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
 const MAX_SUBJECT_LENGTH = 256;
 const MAX_REASON_LENGTH = 512;
 
+// Handlers that take `scope` serve both the operator's admin API, where it's
+// undefined and every org is in reach, and one org's API, where it's that
+// org: anything of another org then answers as missing.
+
 /** An org id as the service running Snowstead names it, such as a WorkOS organization id. */
-function parseOrgId(value: unknown): string | undefined {
+export function parseOrgId(value: unknown): string | undefined {
 	return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
 }
 
 export async function handleCreateToken(
 	request: Request,
 	config: WorkerConfig,
+	scope?: string,
 ): Promise<Response> {
 	if (!config.jwtSecret) {
 		return errorResponse("Service unavailable", 503);
@@ -57,8 +62,8 @@ export async function handleCreateToken(
 	}>(request);
 	if (body instanceof Response) return body;
 
-	const org = body.org === undefined ? undefined : parseOrgId(body.org);
-	if (body.org !== undefined && org === undefined) {
+	const org = scope ?? (body.org === undefined ? undefined : parseOrgId(body.org));
+	if (scope === undefined && body.org !== undefined && org === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
 
@@ -159,8 +164,9 @@ export async function handleCreateToken(
 export async function handleListTokens(
 	config: WorkerConfig,
 	url: URL,
+	scope?: string,
 ): Promise<Response> {
-	const filter = orgFilter(url);
+	const filter = scope ?? orgFilter(url);
 	if (filter instanceof Response) return filter;
 	const tokens = await listApiTokens(config.db, filter);
 	const result = tokens.map((t) => ({
@@ -183,6 +189,7 @@ export async function handleRevokeToken(
 	request: Request,
 	config: WorkerConfig,
 	jti: string,
+	scope?: string,
 ): Promise<Response> {
 	const body = await parseJsonBody<{
 		reason: string;
@@ -198,7 +205,7 @@ export async function handleRevokeToken(
 	}
 
 	const token = await findApiToken(config.db, jti);
-	if (!token || token.revokedAt) {
+	if (!token || token.revokedAt || (scope !== undefined && token.orgId !== scope)) {
 		return errorResponse("Token not found or already revoked", 404);
 	}
 	// KV first: requests check revocation there, and a failure after it still
@@ -217,11 +224,12 @@ export async function handleRevokeToken(
 export async function handleCreateCache(
 	request: Request,
 	config: WorkerConfig,
+	scope?: string,
 ): Promise<Response> {
 	const body = await parseJsonBody<{ name: string; private?: boolean; org?: string }>(request);
 	if (body instanceof Response) return body;
 
-	const org = body.org === undefined ? null : parseOrgId(body.org);
+	const org = scope ?? (body.org === undefined ? null : parseOrgId(body.org));
 	if (org === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
@@ -300,8 +308,9 @@ function orgFilter(url: URL): string | undefined | Response {
 export async function handleListCaches(
 	config: WorkerConfig,
 	url: URL,
+	scope?: string,
 ): Promise<Response> {
-	const filter = orgFilter(url);
+	const filter = scope ?? orgFilter(url);
 	if (filter instanceof Response) return filter;
 	const stats = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { orgId: filter });
 	return jsonResponse({ caches: stats.map(cacheSummary) });
@@ -311,6 +320,7 @@ export async function handleListCaches(
 export async function handleGetCache(
 	config: WorkerConfig,
 	rawName: string,
+	scope?: string,
 ): Promise<Response> {
 	const name = parseCacheName(rawName);
 	if (typeof name === "object") {
@@ -318,7 +328,7 @@ export async function handleGetCache(
 	}
 
 	const [stats] = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { name });
-	if (stats === undefined) {
+	if (stats === undefined || (scope !== undefined && stats.cache.orgId !== scope)) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
 
@@ -451,6 +461,7 @@ export async function handleDeletePaths(
 	config: WorkerConfig,
 	rawName: string,
 	origin: string,
+	scope?: string,
 ): Promise<Response> {
 	const name = parseCacheName(rawName);
 	if (typeof name === "object") {
@@ -487,7 +498,7 @@ export async function handleDeletePaths(
 	}
 
 	const cache = await findCacheByName(config.db, name);
-	if (!cache) {
+	if (!cache || (scope !== undefined && cache.orgId !== scope)) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
 	const isPrivate = await isPrivateCache(config, name);
