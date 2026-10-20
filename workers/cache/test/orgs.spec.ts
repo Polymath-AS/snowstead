@@ -175,3 +175,82 @@ describe("org tokens", () => {
 		expect((await createSessions(b.cache, [100], jwt)).status).toBe(403);
 	});
 });
+
+describe("tokens carry their caches' org", () => {
+	async function sign(caches: string[], perms: ("push" | "pull")[], org?: string): Promise<string> {
+		const now = Math.floor(Date.now() / 1000);
+		return signJwt({
+			jti: crypto.randomUUID(),
+			sub: "test",
+			iss: TOKEN_ISSUER,
+			aud: TOKEN_AUDIENCE,
+			caches,
+			perms,
+			...(org === undefined ? {} : { org }),
+			iat: now,
+			exp: now + 600,
+		}, env.JWT_SECRET);
+	}
+
+	function pull(cache: string, token: string): Promise<Response> {
+		return SELF.fetch(`http://example.com/${cache}/nix-cache-info`, { headers: { authorization: `Bearer ${token}` } });
+	}
+
+	async function privateOrgCache() {
+		const org = unique("org");
+		const cache = unique("cache");
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: null })).status).toBe(200);
+		expect((await admin("/caches", "POST", { name: cache, org, private: true })).status).toBe(201);
+		return { org, cache };
+	}
+
+	it("takes the org from its caches when the admin API isn't told one", async () => {
+		const { org, cache } = await orgWithCache(null);
+
+		const res = await admin("/tokens", "POST", { subject: "ci", caches: [cache], perms: ["push"] });
+		expect(await res.json()).toMatchObject({ org });
+	});
+
+	it("can't span two orgs", async () => {
+		const a = await orgWithCache(null);
+		const b = await orgWithCache(null);
+
+		expect((await admin("/tokens", "POST", { subject: "ci", caches: [a.cache, b.cache], perms: ["push"] })).status).toBe(400);
+	});
+
+	it("needs the org to push to an org's cache", async () => {
+		const { org, cache } = await orgWithCache(null);
+
+		expect((await createSessions(cache, [100], await sign([cache], ["push"]))).status).toBe(403);
+		expect((await createSessions(cache, [100], await sign([cache], ["push"], org))).status).toBe(201);
+	});
+
+	it("needs the org to look up missing paths", async () => {
+		const { cache } = await orgWithCache(null);
+		const res = await SELF.fetch("http://example.com/_api/v1/get-missing-paths", {
+			method: "POST",
+			headers: { authorization: `Bearer ${await sign([cache], ["push"], unique("org"))}`, "content-type": "application/json" },
+			body: JSON.stringify({ cache, storePathHashes: ["0".repeat(32)] }),
+		});
+		expect(res.status).toBe(403);
+	});
+
+	it("needs the org to pull from an org's private cache", async () => {
+		const { org, cache } = await privateOrgCache();
+
+		expect((await pull(cache, await sign([cache], ["pull"], org))).status).toBe(200);
+		expect((await pull(cache, await sign([cache], ["pull"], unique("org")))).status).toBe(403);
+		expect((await pull(cache, await sign([cache], ["pull"]))).status).toBe(403);
+	});
+
+	it("is checked against an entry from before orgs once auth is synced", async () => {
+		const { org, cache } = await privateOrgCache();
+		await env.AUTH_KV.put(`private/${cache}`, "1");
+		const stranger = await sign([cache], ["pull"], unique("org"));
+
+		// Unsynced, the entry names no org to check.
+		expect((await pull(cache, stranger)).status).toBe(200);
+		expect((await admin("/auth/sync", "POST", {})).status).toBe(200);
+		expect(await env.AUTH_KV.get(`private/${cache}`)).toBe(JSON.stringify({ org }));
+	});
+});

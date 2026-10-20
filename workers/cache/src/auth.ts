@@ -1,6 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import type { TokenClaims } from "./jwt.js";
-import { verifyJwt, hasPermission, hasCacheAccess } from "./jwt.js";
+import { verifyJwt, hasPermission, hasCacheAccess, isOrgsToken } from "./jwt.js";
+import { privateCache } from "./visibility.js";
 import { isRevoked } from "./revocations.js";
 import { findOrgApiKey } from "./db/repository.js";
 
@@ -107,6 +108,12 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 		return readAuthError("Unauthorized", 401);
 	}
 	if (!hasPermission(result.claims, "pull") || !hasCacheAccess(result.claims, cacheName)) {
+		return readAuthError("Forbidden", 403);
+	}
+	// The cache's org is in its private entry; one from before orgs names
+	// none to check against until the entries are synced.
+	const cache = await privateCache(config, cacheName);
+	if (cache.isPrivate && cache.org !== undefined && !isOrgsToken(result.claims, cache.org)) {
 		return readAuthError("Forbidden", 403);
 	}
 	return undefined;

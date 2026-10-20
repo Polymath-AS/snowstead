@@ -1,6 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import type { AuthIdentity } from "./auth.js";
-import { hasCacheAccess } from "./jwt.js";
+import { hasCacheAccess, isOrgsToken } from "./jwt.js";
 import {
 	findCacheByName,
 	findCacheById,
@@ -223,9 +223,8 @@ function storageFullResponse(usage: OrgUsage & { readonly limit: number; readonl
 	);
 }
 
-/** Whether a token tied to an org may push to this cache. */
 function orgAllows(identity: AuthIdentity, cache: Cache): boolean {
-	return identity.kind !== "jwt" || identity.claims.org === undefined || identity.claims.org === cache.orgId;
+	return identity.kind !== "jwt" || isOrgsToken(identity.claims, cache.orgId);
 }
 
 /**
@@ -868,7 +867,7 @@ export async function handleGetMissingPaths(
 		return errorResponse("Cache not found", 404);
 	}
 
-	if (identity.kind === "jwt" && !hasCacheAccess(identity.claims, body.cache)) {
+	if (identity.kind === "jwt" && (!hasCacheAccess(identity.claims, body.cache) || !orgAllows(identity, cache))) {
 		return errorResponse("Forbidden", 403);
 	}
 

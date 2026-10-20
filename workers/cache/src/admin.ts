@@ -109,6 +109,20 @@ export async function handleCreateToken(
 	const dedupedCaches = [...new Set(body.caches)];
 	const dedupedPerms = [...new Set(validatedPerms)];
 
+	// Without an org named, a token takes its caches' org; it can't span
+	// orgs, since it reaches only caches of the org it carries.
+	let tokenOrg = org;
+	if (tokenOrg === undefined && !dedupedCaches.includes("*")) {
+		const orgs = new Set<string | null>();
+		for (const name of dedupedCaches) {
+			orgs.add((await findCacheByName(config.db, name))?.orgId ?? null);
+		}
+		if (orgs.size > 1) {
+			return errorResponse("a token's caches must all be of one org", 400);
+		}
+		tokenOrg = [...orgs][0] ?? undefined;
+	}
+
 	// An org's token names its caches: a wildcard would reach other orgs'.
 	if (org !== undefined) {
 		for (const name of dedupedCaches) {
@@ -130,7 +144,7 @@ export async function handleCreateToken(
 		aud: TOKEN_AUDIENCE,
 		caches: dedupedCaches,
 		perms: dedupedPerms,
-		...(org === undefined ? {} : { org }),
+		...(tokenOrg === undefined ? {} : { org: tokenOrg }),
 		iat: Math.floor(now),
 		exp: Math.floor(exp),
 	};
@@ -146,7 +160,7 @@ export async function handleCreateToken(
 		permsJson: JSON.stringify(dedupedPerms),
 		expiresAt,
 		createdBy: "admin",
-		orgId: org ?? null,
+		orgId: tokenOrg ?? null,
 	});
 
 	return jsonResponse({
@@ -155,7 +169,7 @@ export async function handleCreateToken(
 		subject: body.subject,
 		caches: dedupedCaches,
 		perms: dedupedPerms,
-		org: org ?? null,
+		org: tokenOrg ?? null,
 		expiresAt,
 	}, 201);
 }
@@ -263,7 +277,7 @@ export async function handleCreateCache(
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
 	if (body.private === true) {
-		await setPrivate(config, name, true);
+		await setPrivate(config, name, true, org);
 		await setPublicCacheInfo(config, name, false);
 	}
 	const { cache, created } = await ensureCache(config.db, name, body.private !== true, org);
@@ -274,7 +288,7 @@ export async function handleCreateCache(
 		await setCachePublic(config.db, name, isPublic);
 	}
 	if (isPublic) {
-		await setPrivate(config, name, false);
+		await setPrivate(config, name, false, org);
 		await setPublicCacheInfo(config, name, true);
 	}
 
@@ -435,7 +449,7 @@ export async function handleBackfillNarinfo(
 export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 	const caches = await listCaches(config.db);
 	for (const cache of caches) {
-		await setPrivate(config, cache.name, !cache.isPublic);
+		await setPrivate(config, cache.name, !cache.isPublic, cache.orgId);
 	}
 	const revoked = await listRevokedTokens(config.db, new Date());
 	for (const token of revoked) {

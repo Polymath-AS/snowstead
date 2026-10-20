@@ -250,6 +250,15 @@ export function hasPermission(claims: TokenClaims, perm: TokenPermission): boole
 	return claims.perms.includes(perm);
 }
 
+/**
+ * Whether a token may reach a cache of this org (null for none): only its
+ * own org's, so an org's token is no use on another's cache, nor one made
+ * without an org on an org's cache.
+ */
+export function isOrgsToken(claims: TokenClaims, cacheOrg: string | null): boolean {
+	return (claims.org ?? null) === cacheOrg;
+}
+
 export function hasCacheAccess(claims: TokenClaims, cacheName: string): boolean {
 	return claims.caches.includes("*") || claims.caches.includes(cacheName);
 }
