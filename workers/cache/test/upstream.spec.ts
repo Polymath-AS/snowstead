@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, afterAll } from "vitest";
 import { resolveConfig } from "../src/config.js";
-import { servedUpstream } from "../src/upstream.js";
+import { checkUpstream, knownUpstream, servedUpstream } from "../src/upstream.js";
 
 const base = resolveConfig(env);
 afterAll(() => base.close());
@@ -49,6 +49,22 @@ describe("upstream caches", () => {
 	it("asks nothing without upstreams", async () => {
 		const { asked, fetcher } = upstream(new Set());
 		expect(await servedUpstream(base, [hash("e")], fetcher)).toEqual(new Set());
+		expect(asked).toEqual([]);
+	});
+});
+
+describe("checking upstreams apart from a push", () => {
+	it("records only what the server itself found", async () => {
+		const [f, g] = [hash("f"), hash("g")];
+		const { fetcher } = upstream(new Set([`https://up.example/${f}.narinfo`]));
+		expect(await checkUpstream(config, [f, g], fetcher)).toEqual([f]);
+		expect(await knownUpstream(config, [f, g])).toEqual(new Set([f]));
+	});
+
+	it("knows without asking", async () => {
+		const { asked, fetcher } = upstream(new Set());
+		await knownUpstream(config, [hash("h")]);
+		await checkUpstream({ ...config, upstreams: [] }, [hash("h")], fetcher);
 		expect(asked).toEqual([]);
 	});
 });

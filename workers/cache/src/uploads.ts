@@ -29,7 +29,7 @@ import { scheduleNarinfoPurge } from "./cdn.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { isPrivateCache, privateCache } from "./visibility.js";
-import { servedUpstream } from "./upstream.js";
+import { checkUpstream, knownUpstream } from "./upstream.js";
 import {
 	parseFileHash,
 	parseCompression,
@@ -934,11 +934,23 @@ export async function handleGetMissingPaths(
 	const existingSet = new Set(existingHashes);
 	const absent = body.storePathHashes.filter((h) => !existingSet.has(h));
 	// What an upstream serves is not missing: substituters have it already.
-	const served = await servedUpstream(config, absent);
+	// Answered from what the server has recorded, without asking an upstream:
+	// the client checks the paths it doesn't know about itself, free of a
+	// Worker's six connections at a time, and the server checks them after
+	// the response, recording what it finds for every later push.
+	const served = await knownUpstream(config, absent);
+	const unchecked = config.upstreams.length > 0 ? absent.filter((h) => !served.has(h)) : [];
+	if (unchecked.length > 0) {
+		config.defer(checkUpstream(config, unchecked).catch((err) => console.error("Upstream check failed", err)));
+	}
 
 	return jsonResponse({
+		// Still everything to push for clients that check nothing themselves.
 		missing: absent.filter((h) => !served.has(h)),
 		upstream: absent.filter((h) => served.has(h)),
+		// Which of missing a client may look up in upstreams, and skip if found.
+		unchecked,
+		upstreams: config.upstreams,
 	});
 }
 

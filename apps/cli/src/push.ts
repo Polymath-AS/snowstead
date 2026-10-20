@@ -17,6 +17,7 @@ import { batcher, limiter } from "./batch.js";
 import { getPathInfos, dumpAndCompress } from "./nix.js";
 import type { PathInfo } from "./nix.js";
 import { runPool } from "./pool.js";
+import { servedUpstream } from "./upstream.js";
 
 // Paths in flight at once. Most are small, so a push waits on round trips
 // far more than on bandwidth; compression has its own, CPU-sized limit.
@@ -137,15 +138,20 @@ export async function pushPaths(
     hashes.push(hash);
   }
 
-  // Check missing in sequential batches of the server's maximum size
-  const missingSet = new Set<string>();
-  let upstream = 0;
-  for (let i = 0; i < hashes.length; i += 500) {
-    const chunk = hashes.slice(i, i + 500);
-    const { missing, upstream: served } = await getMissingPaths(client, cache, chunk);
-    upstream += served.length;
-    for (const h of missing) {
-      missingSet.add(h);
+  // In batches of the server's maximum, all at once: each is one query.
+  const answers = await Promise.all(
+    Array.from({ length: Math.ceil(hashes.length / 500) }, (_, i) => getMissingPaths(client, cache, hashes.slice(i * 500, (i + 1) * 500))),
+  );
+  const missingSet = new Set(answers.flatMap((a) => a.missing));
+  let upstream = answers.reduce((n, a) => n + a.upstream.length, 0);
+  // Paths the server has never looked up upstream: looked up here, where a
+  // thousand take about a second, rather than holding up the server.
+  const unchecked = answers.flatMap((a) => a.unchecked);
+  const upstreams = answers[0]?.upstreams ?? [];
+  if (unchecked.length > 0 && upstreams.length > 0) {
+    for (const h of await servedUpstream(unchecked, upstreams)) {
+      missingSet.delete(h);
+      upstream++;
     }
   }
 

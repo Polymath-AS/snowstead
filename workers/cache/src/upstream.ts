@@ -16,23 +16,40 @@ export async function servedUpstream(
 	storePathHashes: readonly string[],
 	fetcher: typeof fetch = fetch,
 ): Promise<Set<string>> {
-	const { upstreams } = config;
-	const served = new Set(await findUpstreamHashes(config.db, storePathHashes, upstreams));
+	const served = await knownUpstream(config, storePathHashes);
 	const unknown = storePathHashes.filter((h) => !served.has(h));
-	if (unknown.length === 0 || upstreams.length === 0) return served;
+	for (const h of await checkUpstream(config, unknown, fetcher)) served.add(h);
+	return served;
+}
 
+/** The hashes among `storePathHashes` recorded as served upstream, without asking one. */
+export async function knownUpstream(config: WorkerConfig, storePathHashes: readonly string[]): Promise<Set<string>> {
+	return new Set(await findUpstreamHashes(config.db, storePathHashes, config.upstreams));
+}
+
+/**
+ * Asks the upstreams about `storePathHashes`, records those one serves, and
+ * returns them. Only the server's own answers are recorded: a client's
+ * claim that a path is upstream could make every other pusher skip it.
+ */
+export async function checkUpstream(
+	config: WorkerConfig,
+	storePathHashes: readonly string[],
+	fetcher: typeof fetch = fetch,
+): Promise<string[]> {
+	const { upstreams } = config;
+	if (storePathHashes.length === 0 || upstreams.length === 0) return [];
 	const found: { storePathHash: string; upstream: string }[] = [];
-	await Promise.all(unknown.map(async (storePathHash) => {
+	await Promise.all(storePathHashes.map(async (storePathHash) => {
 		for (const upstream of upstreams) {
 			if (await hasNarinfo(fetcher, upstream, storePathHash)) {
 				found.push({ storePathHash, upstream });
-				served.add(storePathHash);
 				return;
 			}
 		}
 	}));
 	await recordUpstreamPaths(config.db, found);
-	return served;
+	return found.map((f) => f.storePathHash);
 }
 
 async function hasNarinfo(fetcher: typeof fetch, upstream: string, storePathHash: string): Promise<boolean> {

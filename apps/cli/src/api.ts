@@ -44,11 +44,22 @@ async function jsonBody<T>(resp: Response): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+export interface MissingPaths {
+  /** Paths to push. */
+  readonly missing: string[];
+  /** Paths the server knows an upstream serves, left out of missing. */
+  readonly upstream: string[];
+  /** Of missing, those the server has not looked up in upstreams: a client may, and skip the ones found. */
+  readonly unchecked: string[];
+  /** The upstreams, as substituter URLs. */
+  readonly upstreams: string[];
+}
+
 export async function getMissingPaths(
   client: ApiClient,
   cache: string,
   storePathHashes: string[],
-): Promise<{ missing: string[]; upstream: string[] }> {
+): Promise<MissingPaths> {
   const resp = await request(client, "POST", "/_api/v1/get-missing-paths", {
     cache,
     storePathHashes,
@@ -57,9 +68,8 @@ export async function getMissingPaths(
     const text = await resp.text();
     throw new Error(`get-missing-paths failed (${resp.status}): ${text}`);
   }
-  // upstream: paths an upstream cache serves, which the server leaves out of missing.
-  const data = await jsonBody<{ missing: string[]; upstream?: string[] }>(resp);
-  return { missing: data.missing, upstream: data.upstream ?? [] };
+  const data = await jsonBody<Partial<MissingPaths> & { missing: string[] }>(resp);
+  return { missing: data.missing, upstream: data.upstream ?? [], unchecked: data.unchecked ?? [], upstreams: data.upstreams ?? [] };
 }
 
 interface SessionParams {
