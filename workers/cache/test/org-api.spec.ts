@@ -166,6 +166,22 @@ describe("org audit log", () => {
 		expect((await orgApi(`/${b.org}/audit`, a.key)).status).toBe(403);
 	});
 
+	it("names the caches, tokens, and keys it records, and never a secret", async () => {
+		const { org, cache, id, key } = await orgWithKey();
+		const made = await orgApi(`/${org}/tokens`, key, "POST", { subject: "ci", caches: [cache], perms: ["push"] });
+		const { jti, token } = await made.json<{ jti: string; token: string }>();
+		await orgApi(`/${org}/caches`, key, "POST", { name: cache, retentionDays: 14 });
+
+		const entries = await auditUntil(org, key, (e) => e.filter((x) => x.action === "cache.create").length === 2);
+		const [changed, created] = entries.filter((e) => e.action === "cache.create");
+		expect(created).toMatchObject({ cache, status: 201, detail: { private: false, retentionDays: null } });
+		expect(changed).toMatchObject({ cache, status: 200, detail: { private: false, retentionDays: 14 } });
+		expect(entries.find((e) => e.action === "token.create")?.detail).toEqual({ jti, subject: "ci" });
+		expect(entries.find((e) => e.action === "key.create")?.detail).toEqual({ key: id, name: "terraform" });
+		expect(JSON.stringify(entries)).not.toContain(token);
+		expect(JSON.stringify(entries)).not.toContain(key.split("_").at(-1));
+	});
+
 	it("pages newest first", async () => {
 		const { org, key } = await orgWithKey();
 		for (let i = 0; i < 3; i++) {

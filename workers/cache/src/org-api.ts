@@ -72,14 +72,22 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	if (route === "keys" && method === "GET") return handleListKeys(config, org);
 	if (route === "keys" && method === "POST") {
 		if (!isOperator) return errorResponse("Forbidden", 403);
-		return audit("key.create", await handleCreateKey(request, config, org));
+		const response = await handleCreateKey(request, config, org);
+		const made = await answered<{ id: string; name: string }>(response);
+		return audit("key.create", response, null, { key: made.id, name: made.name });
 	}
 	if (rest.length === 3 && rest[0] === "keys" && rest[2] === "revoke" && method === "POST") {
 		return audit("key.revoke", await handleRevokeKey(config, org, value(1)), null, { key: value(1) });
 	}
 
 	if (route === "caches" && method === "GET") return handleListCaches(config, url, org);
-	if (route === "caches" && method === "POST") return audit("cache.create", await handleCreateCache(request, config, org));
+	if (route === "caches" && method === "POST") {
+		// The same request creates a cache or sets an existing one's settings,
+		// so the entry keeps the settings it left, not only that it ran.
+		const response = await handleCreateCache(request, config, org);
+		const cache = await answered<{ name: string; private: boolean; retentionDays: number | null }>(response);
+		return audit("cache.create", response, cache.name ?? null, { private: cache.private, retentionDays: cache.retentionDays });
+	}
 	if (rest.length === 2 && rest[0] === "caches" && method === "GET") return handleGetCache(config, value(1), org);
 	if (rest.length === 4 && rest[0] === "caches" && rest[2] === "paths" && rest[3] === "delete" && method === "POST") {
 		const response = await handleDeletePaths(request, config, value(1), url.origin, org);
@@ -88,7 +96,11 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 
 	if (route === "tokens" && method === "GET") return handleListTokens(config, url, org);
-	if (route === "tokens" && method === "POST") return audit("token.create", await handleCreateToken(request, config, org));
+	if (route === "tokens" && method === "POST") {
+		const response = await handleCreateToken(request, config, org);
+		const token = await answered<{ jti: string; subject: string }>(response);
+		return audit("token.create", response, null, { jti: token.jti, subject: token.subject });
+	}
 	if (rest.length === 3 && rest[0] === "tokens" && rest[2] === "revoke" && method === "POST") {
 		return audit("token.revoke", await handleRevokeToken(request, config, value(1), org), null, { jti: value(1) });
 	}
@@ -96,6 +108,15 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	if (route === "audit" && method === "GET") return handleListAudit(config, org, url);
 
 	return errorResponse("Not Found", 404);
+}
+
+/**
+ * What a successful response said, for its audit entry, so the log can name
+ * what was made; a refusal names nothing. The token's secret is in its
+ * response too, so callers pick the fields to keep.
+ */
+async function answered<T>(response: Response): Promise<Partial<T>> {
+	return response.ok ? response.clone().json<T>() : {};
 }
 
 const DEFAULT_AUDIT_PAGE = 50;
