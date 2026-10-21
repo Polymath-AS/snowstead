@@ -165,7 +165,7 @@ export async function handleCreateToken(
 	await createApiToken(config.db, {
 		jti,
 		subject: body.subject,
-		cachesJson: JSON.stringify(entries),
+		caches: entries,
 		permsJson: JSON.stringify(dedupedPerms),
 		expiresAt,
 		createdBy: "admin",
@@ -197,7 +197,7 @@ export async function handleListTokens(
 	const result = tokens.map((t) => ({
 		jti: t.jti,
 		subject: t.subject,
-		caches: (JSON.parse(t.cachesJson) as string[]).map((entry) => names.get(entry) ?? entry),
+		caches: t.caches.map((entry) => names.get(entry) ?? entry),
 		perms: JSON.parse(t.permsJson),
 		org: t.orgId,
 		createdAt: t.createdAt,

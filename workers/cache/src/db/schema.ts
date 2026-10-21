@@ -1,4 +1,5 @@
-import { pgTable, text, integer, bigint, boolean, timestamp, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, integer, bigint, boolean, timestamp, uniqueIndex, index, check } from "drizzle-orm/pg-core";
 
 const timestamptz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 const createdAt = (name: string) => timestamptz(name).notNull().defaultNow();
@@ -121,7 +122,10 @@ export const gcMarks = pgTable("gc_marks", {
 export const apiTokens = pgTable("api_tokens", {
 	jti: text("jti").primaryKey(),
 	subject: text("subject").notNull(),
-	cachesJson: text("caches_json").notNull(),
+	// The caches claim's entries, as token_caches now records them. Kept, and
+	// still written, for one release, so a Worker from before token_caches
+	// still lists tokens; dropped once none runs.
+	cachesJson: text("caches_json").notNull().default("[]"),
 	permsJson: text("perms_json").notNull(),
 	createdAt: createdAt("created_at"),
 	expiresAt: timestamptz("expires_at").notNull(),
@@ -134,6 +138,26 @@ export const apiTokens = pgTable("api_tokens", {
 }, (table) => [
 	// Each org lists its own tokens.
 	index("idx_api_tokens_org").on(table.orgId),
+]);
+
+/**
+ * The caches a token reaches, one row per entry of its caches claim: a
+ * cache by id, held to it by a foreign key, or a name or pattern (`main`,
+ * `team-*`, `*`), matched against cache names. A pattern has no row to
+ * point at: it also reaches caches made after the token. The token carries
+ * the same entries; these are their record, for listing and for asking
+ * which tokens reach a cache.
+ */
+export const tokenCaches = pgTable("token_caches", {
+	id: id(),
+	tokenJti: text("token_jti").notNull().references(() => apiTokens.jti, { onDelete: "cascade" }),
+	cacheId: integer("cache_id").references(() => caches.id, { onDelete: "cascade" }),
+	pattern: text("pattern"),
+}, (table) => [
+	check("token_caches_cache_or_pattern", sql`(${table.cacheId} is null) <> (${table.pattern} is null)`),
+	uniqueIndex("token_caches_token_cache").on(table.tokenJti, table.cacheId),
+	uniqueIndex("token_caches_token_pattern").on(table.tokenJti, table.pattern),
+	index("idx_token_caches_cache").on(table.cacheId),
 ]);
 
 export const auditLogs = pgTable("audit_logs", {

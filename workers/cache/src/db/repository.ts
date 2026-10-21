@@ -11,10 +11,12 @@ import {
 	uploadParts,
 	gcMarks,
 	apiTokens,
+	tokenCaches,
 	auditLogs,
 	upstreamPaths,
 	DEFAULT_ORG_ID,
 } from "./schema.js";
+import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
 import type {
 	AuditLog,
 	Org,
@@ -690,19 +692,51 @@ export async function deleteGcMark(
 		.where(and(eq(gcMarks.targetType, targetType), eq(gcMarks.targetId, targetId)));
 }
 
+/** A token with the entries of its caches claim, as token_caches records them. */
+export type ApiTokenWithCaches = ApiToken & { readonly caches: string[] };
+
+/** Records a token and its cache entries together, or neither. */
 export async function createApiToken(
 	db: Db,
 	params: {
 		readonly jti: string;
 		readonly subject: string;
-		readonly cachesJson: string;
+		readonly caches: readonly string[];
 		readonly permsJson: string;
 		readonly expiresAt: Date;
 		readonly createdBy: string;
 		readonly orgId?: string | null;
 	},
-): Promise<ApiToken> {
-	return returned(db.insert(apiTokens).values(params).returning());
+): Promise<ApiTokenWithCaches> {
+	const { caches: entries, ...token } = params;
+	return db.transaction(async (tx) => {
+		const row = await returned(tx.insert(apiTokens).values({ ...token, cachesJson: JSON.stringify(entries) }).returning());
+		if (entries.length > 0) {
+			await tx.insert(tokenCaches).values(entries.map((entry) => tokenCacheRow(params.jti, entry)));
+		}
+		return { ...row, caches: [...entries] };
+	});
+}
+
+function tokenCacheRow(tokenJti: string, entry: string): typeof tokenCaches.$inferInsert {
+	return entry.startsWith(CACHE_ID_PREFIX)
+		? { tokenJti, cacheId: Number(entry.slice(CACHE_ID_PREFIX.length)) }
+		: { tokenJti, pattern: entry };
+}
+
+/** The cache entries of tokens, by jti, in the order they were given. */
+async function cacheEntriesOf(db: Db, jtis: readonly string[]): Promise<Map<string, string[]>> {
+	const entries = new Map(jtis.map((jti) => [jti, [] as string[]]));
+	if (jtis.length === 0) return entries;
+	const rows = await db
+		.select()
+		.from(tokenCaches)
+		.where(sql`${tokenCaches.tokenJti} = ANY(${sql.param([...jtis])}::text[])`)
+		.orderBy(tokenCaches.id);
+	for (const row of rows) {
+		entries.get(row.tokenJti)?.push(row.cacheId === null ? (row.pattern ?? "") : cacheIdEntry(row.cacheId));
+	}
+	return entries;
 }
 
 export async function findApiToken(
@@ -715,8 +749,10 @@ export async function findApiToken(
 export async function listApiTokens(
 	db: Db,
 	orgId?: string,
-): Promise<ApiToken[]> {
-	return db.select().from(apiTokens).where(orgId === undefined ? undefined : eq(apiTokens.orgId, orgId));
+): Promise<ApiTokenWithCaches[]> {
+	const tokens = await db.select().from(apiTokens).where(orgId === undefined ? undefined : eq(apiTokens.orgId, orgId));
+	const entries = await cacheEntriesOf(db, tokens.map((t) => t.jti));
+	return tokens.map((t) => ({ ...t, caches: entries.get(t.jti) ?? [] }));
 }
 
 export async function revokeApiToken(

@@ -18,7 +18,7 @@ import {
 	findGcMarks,
 	deleteGcMark,
 } from "../src/db/repository.js";
-import { createApiToken } from "../src/db/repository.js";
+import { createApiToken, listApiTokens, ensureCache } from "../src/db/repository.js";
 import { DEFAULT_ORG_ID } from "../src/db/schema.js";
 
 const db = testDb();
@@ -349,7 +349,7 @@ describe("api tokens", () => {
 	const token = (orgId: string | null) => createApiToken(db, {
 		jti: crypto.randomUUID(),
 		subject: "fk",
-		cachesJson: "[]",
+		caches: [],
 		permsJson: "[\"pull\"]",
 		expiresAt: new Date(Date.now() + 86400_000),
 		createdBy: "test",
@@ -363,3 +363,32 @@ describe("api tokens", () => {
 	});
 });
 
+describe("token caches", () => {
+	const create = (caches: string[]) => createApiToken(db, {
+		jti: crypto.randomUUID(),
+		subject: "entries",
+		caches,
+		permsJson: "[\"pull\"]",
+		expiresAt: new Date(Date.now() + 86400_000),
+		createdBy: "test",
+		orgId: null,
+	});
+
+	it("record each entry, by cache for ids, and list them back in order", async () => {
+		const { cache } = await ensureCache(db, "token-entries");
+		const token = await create([`id:${cache.id}`, "team-*", "main"]);
+		const listed = (await listApiTokens(db)).find((t) => t.jti === token.jti);
+		expect(listed?.caches).toEqual([`id:${cache.id}`, "team-*", "main"]);
+		// Still written, for a Worker from before token_caches.
+		expect(JSON.parse(listed?.cachesJson ?? "null")).toEqual([`id:${cache.id}`, "team-*", "main"]);
+	});
+
+	it("refuse an id entry for a cache that does not exist, and record nothing", async () => {
+		const jti = crypto.randomUUID();
+		await expect(createApiToken(db, {
+			jti, subject: "missing", caches: ["id:999999"], permsJson: "[]",
+			expiresAt: new Date(Date.now() + 86400_000), createdBy: "test", orgId: null,
+		})).rejects.toThrow();
+		expect((await listApiTokens(db)).some((t) => t.jti === jti)).toBe(false);
+	});
+});
