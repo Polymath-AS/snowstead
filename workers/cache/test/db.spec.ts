@@ -18,6 +18,8 @@ import {
 	findGcMarks,
 	deleteGcMark,
 } from "../src/db/repository.js";
+import { createApiToken } from "../src/db/repository.js";
+import { DEFAULT_ORG_ID } from "../src/db/schema.js";
 
 const db = testDb();
 
@@ -342,3 +344,22 @@ describe("gc_marks", () => {
 		).rejects.toThrow();
 	});
 });
+
+describe("api tokens", () => {
+	const token = (orgId: string | null) => createApiToken(db, {
+		jti: crypto.randomUUID(),
+		subject: "fk",
+		cachesJson: "[]",
+		permsJson: "[\"pull\"]",
+		expiresAt: new Date(Date.now() + 86400_000),
+		createdBy: "test",
+		orgId,
+	});
+
+	it("belong to an org that exists, or to none", async () => {
+		await expect(token(DEFAULT_ORG_ID)).resolves.toMatchObject({ orgId: DEFAULT_ORG_ID });
+		await expect(token(null)).resolves.toMatchObject({ orgId: null });
+		await expect(token("no-such-org")).rejects.toThrow();
+	});
+});
+

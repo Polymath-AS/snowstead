@@ -129,8 +129,12 @@ export const apiTokens = pgTable("api_tokens", {
 	revokedAt: timestamptz("revoked_at"),
 	revokedBy: text("revoked_by"),
 	revocationReason: text("revocation_reason"),
-	orgId: text("org_id"),
-});
+	// The org whose caches the token reaches; null for a token naming no org's.
+	orgId: text("org_id").references(() => orgs.id),
+}, (table) => [
+	// Each org lists its own tokens.
+	index("idx_api_tokens_org").on(table.orgId),
+]);
 
 export const auditLogs = pgTable("audit_logs", {
 	id: id(),
