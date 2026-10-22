@@ -178,11 +178,11 @@ export async function publishedHashes(db: Db, cacheId: number, hashes: readonly 
 	return new Set(rows.map((r) => r.hash));
 }
 
-/** Creates the org, or changes its storage limit and slug. */
-export async function putOrg(db: Db, id: string, storageLimit: number | null, slug: string): Promise<Org> {
+/** Creates the org, or changes its storage limit, slug, and whether it may have private caches. */
+export async function putOrg(db: Db, id: string, storageLimit: number | null, slug: string, privateCaches: boolean): Promise<Org> {
 	return returned(
-		db.insert(orgs).values({ id, storageLimit, slug })
-			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit, slug } })
+		db.insert(orgs).values({ id, storageLimit, slug, privateCaches })
+			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit, slug, privateCaches } })
 			.returning(),
 	);
 }

@@ -85,6 +85,13 @@
       "when": 1792657940972,
       "tag": "0011_org_slug_moves",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1792659146489,
+      "tag": "0012_org_private_caches",
+      "breakpoints": true
     }
   ]
 }

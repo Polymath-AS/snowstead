@@ -18,6 +18,7 @@ import {
 	findPublishedPaths,
 	findPublishedHashes,
 	touchPublishedPaths,
+	findOrg,
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
 import type { CacheAt, OrgUsage } from "./db/repository.js";
@@ -27,7 +28,7 @@ import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
 import { scheduleNarinfoPurge } from "./cdn.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
-import { isPrivateCache, privateCache } from "./visibility.js";
+import { PRIVATE_CACHES_REFUSED, isPrivateCache, privateCache } from "./visibility.js";
 import { checkUpstream, knownUpstream } from "./upstream.js";
 import {
 	parseFileHash,
@@ -261,6 +262,9 @@ async function createSessions(
 	cacheById.set(cache.id, cache);
 	// Straight into the bucket the cache is served from.
 	const isPrivate = await isPrivateCache(config, cache.path);
+	if (isPrivate && (await findOrg(config.db, cache.orgId))?.privateCaches === false) {
+		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
+	}
 	const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
 	const presigning = Boolean(config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint);
 

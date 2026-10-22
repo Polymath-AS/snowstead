@@ -28,6 +28,8 @@ export const orgs = pgTable("orgs", {
 	movingFrom: text("moving_from").unique(),
 	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
 	storageLimit: bytes("storage_limit"),
+	/** Whether its plan allows private caches. Without, its private caches stay private but take no pushes. */
+	privateCaches: boolean("private_caches").notNull().default(true),
 	createdAt: createdAt("created_at"),
 });
 

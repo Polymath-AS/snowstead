@@ -73,7 +73,7 @@ describe("orgs", () => {
 		expect((await orgApi(`/${org}`)).status).toBe(404);
 
 		const created = await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1000 });
-		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, used: 0, pending: 0 });
+		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, used: 0, pending: 0 });
 
 		const raised = await orgApi(`/${org}`, "PUT", { storageLimit: null });
 		expect(await raised.json()).toMatchObject({ slug: org, storageLimit: null });
@@ -415,5 +415,30 @@ describe("slug changes", () => {
 		// The old marker stays, so the old address stays private too.
 		expect((await pull(`${org}/${cache}`)).status).toBe(401);
 		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/${hash}.narinfo`)).toBeNull();
+	});
+});
+
+describe("orgs whose plan has no private caches", () => {
+	it("keep their private caches private and readable, but push to none and make no more", async () => {
+		const { org, cache, token } = await orgWithCache(null, true);
+		const reader = await sign([cache], ["pull"], org);
+		const pull = () => SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`, { headers: { authorization: `Bearer ${reader}` } });
+		const pushTo = (name: string) => createSessions(name, [16], token);
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: null, privateCaches: false })).status).toBe(200);
+
+		const refused = await pushTo(cache);
+		expect(refused.status).toBe(403);
+		expect(await refused.json()).toMatchObject({ error: expect.stringContaining("private caches") });
+		expect((await pull()).status).toBe(200);
+		expect((await SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`)).status).toBe(401);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: unique("cache"), private: true })).status).toBe(403);
+		// Its own settings still change, and public caches are as before.
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, private: true, retentionDays: 30 })).status).toBe(200);
+		const open = unique("cache");
+		expect((await orgApi(`/${org}/caches`, "POST", { name: open })).status).toBe(201);
+		expect((await pushTo(open)).status).toBe(201);
+
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: null, privateCaches: true })).status).toBe(200);
+		expect((await pushTo(cache)).status).toBe(201);
 	});
 });

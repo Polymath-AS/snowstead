@@ -230,7 +230,10 @@ without an org are its tokens.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
-  operator sets the storage limit and makes API keys.
+  operator sets the storage limit, whether the org may have private caches
+  (`privateCaches`), and makes API keys. An org that may not keeps its
+  private caches private and readable, but they take no pushes, and it
+  can't make new ones.
 - **Tokens reach only their org's caches,** for pushing and for pulling
   from a private cache. A token is made naming caches, which it keeps by
   id, so it outlives a rename, or patterns over names where `*` matches

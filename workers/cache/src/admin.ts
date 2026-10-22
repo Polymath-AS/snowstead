@@ -35,7 +35,7 @@ import {
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
 import { readyNewPath } from "./slug-move.js";
-import { setPrivate, isPrivateCache } from "./visibility.js";
+import { PRIVATE_CACHES_REFUSED, setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
@@ -288,6 +288,10 @@ export async function handleCreateCache(
 		return errorResponse(`no org ${org}`, 404);
 	}
 	const existing = await findCache(config.db, org, name);
+	// A plan without private caches keeps the ones it has private, but makes no more.
+	if (body.private === true && !orgRow.privateCaches && (existing === undefined || existing.isPublic)) {
+		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
+	}
 	const path = cachePath(orgRow.slug, name);
 	const changing = existing !== undefined && body.private !== undefined && existing.isPublic === body.private;
 	// A published path's objects live in its visibility's bucket; moving them
@@ -397,7 +401,15 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		return errorResponse(`no org ${id}`, 404);
 	}
 	const usage = await orgUsage(config.db, id, new Date());
-	return jsonResponse({ id: org.id, slug: org.slug, movingFrom: org.movingFrom, storageLimit: org.storageLimit, used: usage.used, pending: usage.pending }, status);
+	return jsonResponse({
+		id: org.id,
+		slug: org.slug,
+		movingFrom: org.movingFrom,
+		storageLimit: org.storageLimit,
+		privateCaches: org.privateCaches,
+		used: usage.used,
+		pending: usage.pending,
+	}, status);
 }
 
 /** An org's storage limit and what its caches hold. */
@@ -422,11 +434,14 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 	if (id === undefined) {
 		return errorResponse("org must be an org id", 400);
 	}
-	const body = await parseJsonBody<{ storageLimit?: unknown; slug?: unknown }>(request);
+	const body = await parseJsonBody<{ storageLimit?: unknown; slug?: unknown; privateCaches?: unknown }>(request);
 	if (body instanceof Response) return body;
 	const limit = body.storageLimit;
 	if (limit !== null && !(typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0)) {
 		return errorResponse("storageLimit must be a whole number of bytes, or null", 400);
+	}
+	if (body.privateCaches !== undefined && typeof body.privateCaches !== "boolean") {
+		return errorResponse("privateCaches must be a boolean", 400);
 	}
 
 	const existing = await findOrg(config.db, id);
@@ -456,7 +471,7 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 			await startSlugMove(config.db, id, slug, existing.slug);
 		}
 	}
-	await putOrg(config.db, id, limit, slug);
+	await putOrg(config.db, id, limit, slug, body.privateCaches ?? existing?.privateCaches ?? true);
 	return orgResponse(config, id);
 }
 
