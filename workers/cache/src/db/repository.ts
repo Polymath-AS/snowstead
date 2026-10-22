@@ -135,15 +135,14 @@ export async function listCacheStats(db: Db, since: Date, filter: { name?: strin
 		.select({
 			cache: caches,
 			slug: orgs.slug,
-			paths: sql`count(${publishedPaths.id})`.mapWith(Number),
-			size: sql`coalesce(sum(${blobObjects.fileSize}), 0)`.mapWith(Number),
+			paths: sql`${caches.pathCount}`.mapWith(Number),
+			size: sql`${caches.size}`.mapWith(Number),
 			addedSince: sql`count(${publishedPaths.id}) filter (where ${publishedPaths.createdAt} >= ${since.toISOString()}::timestamptz)`.mapWith(Number),
 			lastAddedAt: sql<Date | null>`max(${publishedPaths.createdAt})`.mapWith(publishedPaths.createdAt),
 		})
 		.from(caches)
 		.innerJoin(orgs, eq(caches.orgId, orgs.id))
 		.leftJoin(publishedPaths, eq(publishedPaths.cacheId, caches.id))
-		.leftJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
 		.where(and(
 			filter.name === undefined ? undefined : eq(caches.name, filter.name),
 			filter.orgId === undefined ? undefined : eq(caches.orgId, filter.orgId),
@@ -224,10 +223,8 @@ export interface OrgUsage {
 export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsage> {
 	const [used, pending] = await Promise.all([
 		first(
-			db.select({ bytes: sql`coalesce(sum(${blobObjects.fileSize}), 0)`.mapWith(Number) })
-				.from(publishedPaths)
-				.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
-				.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+			db.select({ bytes: sql`coalesce(sum(${caches.size}), 0)`.mapWith(Number) })
+				.from(caches)
 				.where(eq(caches.orgId, orgId)),
 		),
 		first(

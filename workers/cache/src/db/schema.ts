@@ -45,6 +45,14 @@ export const caches = pgTable("caches", {
 	signingKeySealed: text("signing_key_sealed"),
 	/** Days a path stays after its last push, or null to keep paths until deleted. */
 	retentionDays: integer("retention_days"),
+	/**
+	 * Its published paths, and the bytes of the NARs they point at (a NAR
+	 * shared with another cache counts in both). Kept by triggers on
+	 * published_paths (migration 0001), so usage is read rather than summed
+	 * over every path.
+	 */
+	pathCount: bigint("path_count", { mode: "number" }).notNull().default(0),
+	size: bytes("size").notNull().default(0),
 	createdAt: createdAt("created_at"),
 }, (table) => [
 	uniqueIndex("caches_org_name_unique").on(table.orgId, table.name),

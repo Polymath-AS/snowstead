@@ -17,6 +17,9 @@ import {
 	createGcMark,
 	findGcMarks,
 	deleteGcMark,
+	createPublishedPaths,
+	deletePublishedPaths,
+	listCacheStats,
 } from "../src/db/repository.js";
 import { createApiToken, listApiTokens, ensureCache } from "../src/db/repository.js";
 import { DEFAULT_ORG_ID } from "../src/db/schema.js";
@@ -121,6 +124,25 @@ describe("blob_objects", () => {
 });
 
 describe("published_paths", () => {
+	it("keep each cache's path count and size as the paths add up, through batched inserts and deletes", async () => {
+		const [a, b] = [await createCache(getDb(), `totals-a-${crypto.randomUUID()}`), await createCache(getDb(), `totals-b-${crypto.randomUUID()}`)];
+		const blob = (fileSize: number) => createBlobObject(getDb(), { fileHash: crypto.randomUUID(), fileSize, compression: "zstd", r2Key: `blobs/${crypto.randomUUID()}` });
+		const [small, big] = [await blob(100), await blob(7000)];
+		const path = (cacheId: number, blobObjectId: number) => {
+			const hash = crypto.randomUUID().replaceAll("-", "").slice(0, 32);
+			return { cacheId, storePathHash: hash, storePath: `/nix/store/${hash}-x`, narHash: "sha256:x", narSize: 1, blobObjectId, referencesJson: "[]", deriver: null, system: null, signaturesJson: "[]" };
+		};
+		// One statement over both caches; the big NAR shared between them counts in each.
+		const rows = [path(a.id, small.id), path(a.id, big.id), path(b.id, big.id), path(b.id, small.id), path(b.id, small.id)];
+		await createPublishedPaths(getDb(), rows);
+		await deletePublishedPaths(getDb(), b.id, { storePathHashes: [rows[3].storePathHash, rows[4].storePathHash] }, async () => {});
+
+		const stats = await listCacheStats(getDb(), new Date(0));
+		const of = (id: number) => stats.find((s) => s.cache.id === id);
+		expect([of(a.id)?.paths, of(a.id)?.size]).toEqual([2, 7100]);
+		expect([of(b.id)?.paths, of(b.id)?.size]).toEqual([1, 7000]);
+	});
+
 	it("creates a published path and reads it back", async () => {
 		const cache = await createCache(getDb(), `pp-create-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(getDb(), {
