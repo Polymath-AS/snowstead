@@ -4,6 +4,8 @@ import {
 	findExpiredSessions,
 	transitionSessionStatus,
 	deleteUploadSession,
+	deleteUploadSessions,
+	findExpiredCompletedSessions,
 	ensureBlobObjects,
 	deleteUnreferencedBlobObjects,
 	deleteExpiredApiTokens,
@@ -100,6 +102,25 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			expiredSessions++;
 		} catch (err) {
 			errors.push(`Failed to expire session ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	// Completed sessions served their purpose once published, but stayed
+	// forever: every query over upload_sessions read past them. Their
+	// canonical NARs are adopted first, as abandoned ones are above, so one
+	// completed but never published goes to the sweep instead of staying.
+	for (let batch = 0; batch < GC_BLOB_BATCHES; batch++) {
+		try {
+			const done = await findExpiredCompletedSessions(config.db, now, GC_BLOB_BATCH);
+			await ensureBlobObjects(config.db, done
+				.filter((s) => s.r2UploadKey && !s.r2UploadKey.startsWith("staging/"))
+				.map((s) => ({ fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression, r2Key: s.r2UploadKey ?? "" })));
+			await deleteUploadSessions(config.db, done.map((s) => s.id));
+			expiredSessions += done.length;
+			if (done.length < GC_BLOB_BATCH) break;
+		} catch (err) {
+			errors.push(`Failed to delete completed sessions: ${err instanceof Error ? err.message : String(err)}`);
+			break;
 		}
 	}
 

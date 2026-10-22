@@ -669,6 +669,22 @@ export async function deletePublishedPaths(
 	});
 }
 
+/** Up to `limit` completed sessions past their expiry, which nothing reads again. */
+export async function findExpiredCompletedSessions(db: Db, now: Date, limit: number): Promise<UploadSession[]> {
+	return db.select().from(uploadSessions)
+		.where(and(eq(uploadSessions.status, "completed"), lt(uploadSessions.expiresAt, now)))
+		.limit(limit);
+}
+
+/** Deletes sessions and their parts. */
+export async function deleteUploadSessions(db: Db, ids: readonly string[]): Promise<void> {
+	if (ids.length === 0) return;
+	await db.transaction(async (tx) => {
+		await tx.delete(uploadParts).where(sql`${uploadParts.sessionId} = ANY(${sql.param([...ids])}::text[])`);
+		await tx.delete(uploadSessions).where(sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`);
+	});
+}
+
 export async function deleteUploadSession(
 	db: Db,
 	sessionId: string,

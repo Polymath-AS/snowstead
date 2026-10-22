@@ -6,6 +6,8 @@ import {
 	createUploadSession,
 	findBlobObject,
 	findUploadSession,
+	transitionSessionStatus,
+	createPublishedPath,
 } from "../src/db/repository.js";
 import { runGarbageCollection } from "../src/gc.js";
 import { resolveConfig } from "../src/config.js";
@@ -64,6 +66,34 @@ describe("gc: expire abandoned sessions", () => {
 		expect((await findUploadSession(config.db, activeId))?.status).toBe("pending");
 		const active = await env.CACHE_BUCKET.get(activeKey);
 		expect(new Uint8Array(await active!.arrayBuffer())).toEqual(bytes);
+	});
+
+	it("deletes expired completed sessions, sweeping a NAR no path took and keeping a published one", async () => {
+		const cache = await createCache(config.db, `gc-completed-${crypto.randomUUID()}`);
+		const session = async (expiresAt: Date) => {
+			const id = crypto.randomUUID();
+			const fileHash = crypto.randomUUID().replaceAll("-", "").padEnd(64, "0");
+			const key = `nar/${fileHash}/zstd.nar`;
+			await env.PUBLIC_BUCKET.put(key, "nar");
+			await createUploadSession(config.db, { ...makeSessionParams({ id, cacheId: cache.id, expiresAt, r2UploadKey: key }), fileHash });
+			await transitionSessionStatus(config.db, id, "pending", "completed");
+			return { id, fileHash, key };
+		};
+		const unpublished = await session(new Date(0));
+		const published = await session(new Date(0));
+		const live = await session(new Date("2099-01-01T00:00:00.000Z"));
+		const blob = await createBlobObject(config.db, { fileHash: published.fileHash, fileSize: 512, compression: "zstd", r2Key: published.key });
+		await createPublishedPath(config.db, {
+			cacheId: cache.id, storePathHash: crypto.randomUUID(), storePath: "/nix/store/x", narHash: "sha256:x", narSize: 1,
+			blobObjectId: blob.id, referencesJson: "[]", deriver: null, system: null, signaturesJson: "[]",
+		});
+
+		expect((await runGarbageCollection(config)).errors).toEqual([]);
+		expect(await findUploadSession(config.db, unpublished.id)).toBeUndefined();
+		expect(await findUploadSession(config.db, published.id)).toBeUndefined();
+		expect((await findUploadSession(config.db, live.id))?.status).toBe("completed");
+		expect(await env.PUBLIC_BUCKET.head(unpublished.key)).toBeNull();
+		expect(await env.PUBLIC_BUCKET.head(published.key)).not.toBeNull();
 	});
 
 	it("retries a partially failed NAR deletion on the next GC run", async () => {
