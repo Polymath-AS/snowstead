@@ -125,7 +125,8 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 export type AuthIdentity =
 	| { readonly kind: "jwt"; readonly claims: TokenClaims }
 	| { readonly kind: "legacy" }
-	| { readonly kind: "admin" }
+	// The operator; through the dashboard, on behalf of a signed-in user.
+	| { readonly kind: "admin"; readonly onBehalfOf?: string }
 	| { readonly kind: "orgKey"; readonly org: string; readonly keyId: string };
 
 export type AuthResult =
@@ -173,6 +174,19 @@ export async function authenticateWrite(
 	return { kind: "error", response: authError("Forbidden", 403) };
 }
 
+// The header the dashboard names its signed-in user in, so the audit log
+// says who did what rather than "admin". Only believed next to ADMIN_SECRET.
+const ON_BEHALF_OF_HEADER = "x-snowstead-actor";
+const MAX_ON_BEHALF_OF_LENGTH = 254;
+
+function adminIdentity(request: Request): AuthIdentity {
+	const onBehalfOf = request.headers.get(ON_BEHALF_OF_HEADER)?.trim() ?? "";
+	if (onBehalfOf === "" || onBehalfOf.length > MAX_ON_BEHALF_OF_LENGTH || /[\s\p{Cc}]/u.test(onBehalfOf)) {
+		return { kind: "admin" };
+	}
+	return { kind: "admin", onBehalfOf };
+}
+
 /** Authenticate an admin request using ADMIN_SECRET. */
 export async function authenticateAdmin(
 	request: Request,
@@ -191,7 +205,7 @@ export async function authenticateAdmin(
 		return { kind: "error", response: authError("Forbidden", 403) };
 	}
 
-	return { kind: "ok", identity: { kind: "admin" } };
+	return { kind: "ok", identity: adminIdentity(request) };
 }
 
 const ORG_KEY_PREFIX = "snowstead_key_";
@@ -232,7 +246,7 @@ export async function authenticateOrg(
 	}
 
 	if (config.adminSecret && (await timingSafeEqual(bearer, config.adminSecret))) {
-		return { kind: "ok", identity: { kind: "admin" } };
+		return { kind: "ok", identity: adminIdentity(request) };
 	}
 
 	if (!bearer.startsWith(ORG_KEY_PREFIX)) {
@@ -258,7 +272,7 @@ export function actorId(identity: AuthIdentity): string {
 	switch (identity.kind) {
 		case "jwt": return identity.claims.jti;
 		case "legacy": return "legacy";
-		case "admin": return "admin";
+		case "admin": return identity.onBehalfOf === undefined ? "admin" : `user:${identity.onBehalfOf}`;
 		case "orgKey": return `key:${identity.keyId}`;
 	}
 }

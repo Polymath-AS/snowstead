@@ -140,7 +140,8 @@ const MAX_AUDIT_PAGE = 200;
 /**
  * A page of the org's audit log, newest first. `next` is the `before` for
  * the page after, null at the end. Actors are API keys (key:<id>), token
- * ids, or "admin" for the operator.
+ * ids, "admin" for the operator, or user:<email> for the operator acting
+ * for a dashboard user (x-snowstead-actor).
  */
 async function handleListAudit(config: WorkerConfig, org: string, url: URL): Promise<Response> {
 	const limit = Number(url.searchParams.get("limit") ?? DEFAULT_AUDIT_PAGE);

@@ -172,6 +172,24 @@ describe("org audit log", () => {
 		expect((await orgApi(`/${b.org}/audit`, a.key)).status).toBe(403);
 	});
 
+	it("names the dashboard user the operator acts for, and believes no one else", async () => {
+		const { org, key, id } = await orgWithKey();
+		const as = (credential: string, name: string) =>
+			SELF.fetch(`http://example.com/_api/v1/orgs/${org}/caches`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${credential}`, "content-type": "application/json", "x-snowstead-actor": "dev@example.com" },
+				body: JSON.stringify({ name }),
+			});
+		const byUser = unique("cache");
+		const byKey = unique("cache");
+		expect((await as(OPERATOR, byUser)).status).toBe(201);
+		expect((await as(key, byKey)).status).toBe(201);
+
+		const entries = await auditUntil(org, key, (e) => e.filter((x) => x.action === "cache.create").length === 3);
+		expect(entries.find((e) => e.cache === byUser)?.actor).toBe("user:dev@example.com");
+		expect(entries.find((e) => e.cache === byKey)?.actor).toBe(`key:${id}`);
+	});
+
 	it("names the caches, tokens, and keys it records, and never a secret", async () => {
 		const { org, cache, id, key } = await orgWithKey();
 		const made = await orgApi(`/${org}/tokens`, key, "POST", { subject: "ci", caches: [cache], perms: ["push"] });
