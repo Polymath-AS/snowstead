@@ -11,7 +11,6 @@ import {
 	transitionToMultipart,
 	completeUploadSessions,
 	upsertUploadPart,
-	upsertUploadParts,
 	findUploadParts,
 	ensureBlobObjects,
 	findBlobObjectsByIds,
@@ -572,42 +571,16 @@ export async function handleComplete(
 	if (result.error) return result.error;
 	const session = result.session;
 
-	// A presigned upload goes straight to R2, so its session is still pending.
-	// Staged parts are checked and moved into place only by a commit.
-	const presigned = session.status === "pending" && !session.r2UploadId;
-	if (session.status !== "uploading" && !presigned) {
-		return errorResponse("Conflict", 409);
-	}
-
-	if (!session.r2UploadKey) {
-		return errorResponse("Internal error", 500);
-	}
-
-	const body = await parseJsonBody<{
-		parts?: Array<{ partNumber: number; etag: string; size: number }>;
-	}>(request);
+	const body = await parseJsonBody<{ parts?: unknown } | null>(request);
 	if (body instanceof Response) return body;
+	if (!body || typeof body !== "object" || Array.isArray(body)) return errorResponse("Expected an object", 400);
+	const supplied = parsePartList(body.parts);
+	if (typeof supplied === "string") return errorResponse(supplied, 400);
+	const parts = supplied?.length ? supplied : await findUploadParts(config.db, sessionId);
+	const invalid = await completionError(config, session, parts);
+	if (invalid) return errorResponse(invalid.error, invalid.status);
 
-	if (body.parts && body.parts.length > 0) {
-		await upsertUploadParts(config.db, sessionId, body.parts);
-	}
-
-	const parts = (await findUploadParts(config.db, sessionId)).map((p) => ({ partNumber: p.partNumber, etag: p.etag }));
-	// Parts uploaded straight to R2 are named by the commit that completes them.
-	if (session.r2UploadId && isStaged(session) && parts.length === 0) {
-		return errorResponse("Conflict", 409);
-	}
-	if (session.r2UploadId && !isStaged(session)) {
-		const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
-		await multipart.complete(parts);
-	}
-
-	const invalid = isStaged(session) ? await promoteStaged(config, session, parts) : await uploadError(config, session);
-	if (invalid) {
-		return errorResponse(invalid, invalid === "Internal error" ? 500 : 400);
-	}
-
-	const transitioned = await transitionSessionStatus(config.db, sessionId, presigned ? "pending" : "uploading", "completed");
+	const transitioned = await transitionSessionStatus(config.db, sessionId, session.status === "pending" ? "pending" : "uploading", "completed");
 	if (!transitioned) {
 		return errorResponse("Conflict", 409);
 	}
@@ -743,21 +716,48 @@ export async function handlePublish(
 
 type Part = { readonly partNumber: number; readonly etag: string };
 
+function parsePartList(value: unknown): Part[] | string | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length > 10_000) return "parts must be an array of at most 10000 parts";
+	const parts: Part[] = [];
+	const seen = new Set<number>();
+	for (const p of value) {
+		if (!p || !Number.isInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || typeof p.etag !== "string") {
+			return "parts must contain {partNumber (1–10000), etag} objects";
+		}
+		const etag = p.etag.replace(/^"(.*)"$/, "$1");
+		if (!etag || seen.has(p.partNumber)) return "parts must have nonempty ETags and unique part numbers";
+		seen.add(p.partNumber);
+		parts.push({ partNumber: p.partNumber, etag });
+	}
+	return parts;
+}
+
 function parseParts(value: unknown): Map<string, Part[]> | string {
 	const parts = new Map<string, Part[]>();
 	if (value === undefined) return parts;
-	if (typeof value !== "object" || value === null) return "parts must map session ids to their parts";
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return "parts must map session ids to their parts";
 	for (const [sessionId, list] of Object.entries(value)) {
-		if (
-			!Array.isArray(list) ||
-			!list.every((p: { partNumber?: unknown; etag?: unknown }) => Number.isInteger(p?.partNumber) && typeof p?.etag === "string")
-		) {
-			return `parts of ${sessionId} must be {partNumber, etag} objects`;
-		}
-		// S3 quotes ETags; the binding takes them bare.
-		parts.set(sessionId, list.map((p: Part) => ({ partNumber: p.partNumber, etag: p.etag.replace(/^"(.*)"$/, "$1") })));
+		const parsed = parsePartList(list);
+		if (typeof parsed === "string" || !parsed) return `parts of ${sessionId}: ${parsed ?? "expected an array"}`;
+		parts.set(sessionId, parsed);
 	}
 	return parts;
+}
+
+/** Shared by single completion and batch commit; batch state writes stay batched. */
+async function completionError(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<{ error: string; status: number } | undefined> {
+	// Presigned PUTs leave the session pending until verification.
+	if (session.status !== "uploading" && !(session.status === "pending" && !session.r2UploadId)) {
+		return { error: "Conflict", status: 409 };
+	}
+	if (!session.r2UploadKey) return { error: "Internal error", status: 500 };
+	if (session.r2UploadId && parts.length === 0) return { error: "Conflict", status: 409 };
+	if (session.r2UploadId && !isStaged(session)) {
+		await bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId).complete([...parts]);
+	}
+	const error = isStaged(session) ? await promoteStaged(config, session, parts) : await uploadError(config, session);
+	return error ? { error, status: error === "Internal error" ? 500 : 400 } : undefined;
 }
 
 /**
@@ -823,6 +823,7 @@ export async function handleCommit(
 ): Promise<Response> {
 	const body = await parseJsonBody<{ sessionIds?: unknown; parts?: unknown }>(request);
 	if (body instanceof Response) return body;
+	if (!body || typeof body !== "object" || Array.isArray(body)) return errorResponse("Expected an object", 400);
 
 	const ids = body.sessionIds;
 	if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_BATCH || !ids.every((id) => typeof id === "string")) {
@@ -844,24 +845,19 @@ export async function handleCommit(
 		const denied = await sessionAccessError(config, session, identity);
 		if (denied || !session) {
 			fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
-		} else if (
-			session.status === "completed" ||
-			((session.status === "pending" || session.status === "uploading") && !session.r2UploadId) ||
-			(session.status === "uploading" && isStaged(session) && parts.has(sessionId))
-		) {
-			usable.push(session);
-		} else {
+		} else if (session.status !== "completed" && session.r2UploadId && !isStaged(session)) {
+			// Proxied canonical multipart uploads must use /complete first.
 			fail(sessionId, "Conflict", 409);
+		} else {
+			usable.push(session);
 		}
 	}
 
 	const uploaded = usable.filter((s) => s.status !== "completed");
-	const invalid = await Promise.all(uploaded.map((s) =>
-		isStaged(s) ? promoteStaged(config, s, parts.get(s.id) ?? []) : uploadError(config, s),
-	));
+	const invalid = await Promise.all(uploaded.map((s) => completionError(config, s, parts.get(s.id) ?? [])));
 	const verified = uploaded.filter((s, i) => {
 		const error = invalid[i];
-		if (error) fail(s.id, error, error === "Internal error" ? 500 : 400);
+		if (error) fail(s.id, error.error, error.status);
 		return !error;
 	});
 	const moved = new Set(await completeUploadSessions(config.db, verified.map((s) => s.id)));

@@ -535,26 +535,6 @@ export async function upsertUploadPart(
 	);
 }
 
-export async function upsertUploadParts(
-	db: Db,
-	sessionId: string,
-	parts: ReadonlyArray<{
-		readonly partNumber: number;
-		readonly etag: string;
-		readonly size: number;
-	}>,
-): Promise<void> {
-	if (parts.length === 0) return;
-	// One multi-row statement for all parts.
-	await db
-		.insert(uploadParts)
-		.values(parts.map((part) => ({ sessionId, partNumber: part.partNumber, etag: part.etag, size: part.size })))
-		.onConflictDoUpdate({
-			target: [uploadParts.sessionId, uploadParts.partNumber],
-			set: { etag: sql`excluded.etag`, size: sql`excluded.size` },
-		});
-}
-
 export async function findUploadParts(
 	db: Db,
 	sessionId: string,

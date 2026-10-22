@@ -383,11 +383,31 @@ describe("staged uploads", () => {
 		return (await res.json<{ results: Array<{ published?: boolean; error?: string; status?: number }> }>()).results[0];
 	}
 
-	it("assembles the parts, moves the NAR to its key and publishes it", async () => {
+	it.each(["complete", "commit"])("validates parts before %s, then assembles and publishes the NAR", async (endpoint) => {
 		const fileHash = await uniqueFileHash();
 		const staged = await stagedSession(fileHash, blob(fileHash));
 
-		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ published: true });
+		const finish = (parts: unknown) => endpoint === "complete"
+			? post(`/_api/v1/uploads/${staged.id}/complete`, { parts })
+			: post("/_api/v1/uploads/commit", { sessionIds: [staged.id], parts: { [staged.id]: parts } });
+		for (const parts of [
+			{}, [null], [{ partNumber: 0, etag: "x" }], [{ partNumber: 10_001, etag: "x" }],
+			[{ partNumber: 1.5, etag: "x" }], [{ partNumber: 1, etag: 123 }],
+			[{ partNumber: 1, etag: '""' }], [staged.parts[0], staged.parts[0]],
+		]) {
+			const rejected = await finish(parts);
+			expect(rejected.status).toBe(400);
+			expect((await rejected.json<{ error: string }>()).error).toContain("parts");
+		}
+		expect((await findUploadSession(getDb(), staged.id))?.status).toBe("uploading");
+		const finished = await finish(staged.parts.map((p) => ({ ...p, etag: `"${p.etag}"` })));
+		expect(finished.status).toBe(200);
+		if (endpoint === "complete") {
+			expect(await finished.json()).toMatchObject({ status: "completed" });
+			expect((await post(`/_api/v1/uploads/${staged.id}/publish`, {})).status).toBe(200);
+		} else {
+			expect(await finished.json()).toMatchObject({ results: [{ published: true }] });
+		}
 		const nar = await env.PUBLIC_BUCKET.get(`nar/${fileHash}/zstd.nar`);
 		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(blob(fileHash));
 		expect(await env.CACHE_BUCKET.head(staged.key)).toBeNull();
