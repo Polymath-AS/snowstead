@@ -2,7 +2,9 @@ import { env } from "cloudflare:test";
 import { describe, it, expect, afterAll } from "vitest";
 import {
 	createCache,
+	createBlobObject,
 	createUploadSession,
+	findBlobObject,
 	findUploadSession,
 } from "../src/db/repository.js";
 import { runGarbageCollection } from "../src/gc.js";
@@ -62,6 +64,24 @@ describe("gc: expire abandoned sessions", () => {
 		expect((await findUploadSession(config.db, activeId))?.status).toBe("pending");
 		const active = await env.CACHE_BUCKET.get(activeKey);
 		expect(new Uint8Array(await active!.arrayBuffer())).toEqual(bytes);
+	});
+
+	it("retries a partially failed NAR deletion on the next GC run", async () => {
+		const fileHash = crypto.randomUUID().replaceAll("-", "").padEnd(64, "0");
+		const key = `nar/${fileHash}/zstd.nar`;
+		await createBlobObject(config.db, { fileHash, fileSize: 3, compression: "zstd", r2Key: key });
+		await env.PUBLIC_BUCKET.put(key, "nar");
+		await env.CACHE_BUCKET.put(`nars/sha256/${fileHash}/zstd.nar`, "nar");
+		const unavailable: R2Bucket = Object.create(config.publicBucket);
+		unavailable.delete = async () => { throw new Error("R2 unavailable"); };
+		const failed = await runGarbageCollection({ ...config, publicBucket: unavailable });
+		expect(failed.errors).not.toEqual([]);
+		expect(await findBlobObject(config.db, fileHash, "zstd")).toBeDefined();
+
+		expect((await runGarbageCollection(config)).errors).toEqual([]);
+		expect(await env.PUBLIC_BUCKET.head(key)).toBeNull();
+		expect(await env.CACHE_BUCKET.head(`nars/sha256/${fileHash}/zstd.nar`)).toBeNull();
+		expect(await findBlobObject(config.db, fileHash, "zstd")).toBeUndefined();
 	});
 
 	it.each(["nar/", "nars/sha256/"])("collects an abandoned canonical upload under %s without a blob row", async (prefix) => {

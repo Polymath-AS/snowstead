@@ -131,27 +131,28 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	for (let batch = 0; batch < GC_BLOB_BATCHES; batch++) {
 		let blobs: BlobObject[];
 		try {
-			// Rows first, so nothing is published against a blob whose NAR is going.
-			blobs = await deleteUnreferencedBlobObjects(config.db, new Date(), GC_BLOB_BATCH);
+			blobs = await deleteUnreferencedBlobObjects(config.db, GC_BLOB_BATCH, async (pending) => {
+				// Both layouts: publishing may have copied a NAR to the other bucket.
+				const privateKeys = new Set<string>();
+				const publicKeys = new Set<string>();
+				for (const blob of pending) {
+					privateKeys.add(narKey(blob.fileHash, blob.compression, true));
+					publicKeys.add(narKey(blob.fileHash, blob.compression, false));
+					(bucketForKey(config, blob.r2Key) === config.bucket ? privateKeys : publicKeys).add(blob.r2Key);
+				}
+				// A rejected sibling must not release the transaction's fence while
+				// another delete is still running against a potentially re-used key.
+				const results = await Promise.allSettled([
+					...chunks([...privateKeys], R2_DELETE_MAX_KEYS).map((keys) => config.bucket.delete(keys)),
+					...chunks([...publicKeys], R2_DELETE_MAX_KEYS).map((keys) => config.publicBucket.delete(keys)),
+				]);
+				for (const result of results) {
+					if (result.status === "rejected") throw result.reason;
+				}
+			});
 		} catch (err) {
 			errors.push(`Failed to delete blobs: ${err instanceof Error ? err.message : String(err)}`);
 			break;
-		}
-		// Both layouts: publishing may have copied a NAR to the other bucket.
-		const privateKeys = new Set<string>();
-		const publicKeys = new Set<string>();
-		for (const blob of blobs) {
-			privateKeys.add(narKey(blob.fileHash, blob.compression, true));
-			publicKeys.add(narKey(blob.fileHash, blob.compression, false));
-			(bucketForKey(config, blob.r2Key) === config.bucket ? privateKeys : publicKeys).add(blob.r2Key);
-		}
-		try {
-			await Promise.all([
-				...chunks([...privateKeys], R2_DELETE_MAX_KEYS).map((keys) => config.bucket.delete(keys)),
-				...chunks([...publicKeys], R2_DELETE_MAX_KEYS).map((keys) => config.publicBucket.delete(keys)),
-			]);
-		} catch (err) {
-			errors.push(`Failed to delete the NARs of ${blobs.length} blobs: ${err instanceof Error ? err.message : String(err)}`);
 		}
 		deletedBlobs += blobs.length;
 		if (blobs.length < GC_BLOB_BATCH) break;

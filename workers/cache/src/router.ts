@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { cacheHasNar, findCacheByPath, findOrg } from "./db/repository.js";
+import { cacheHasNar, findCacheByPath, findOrg, withUploadSessionLock } from "./db/repository.js";
 import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { handleOrgApi } from "./org-api.js";
@@ -444,7 +444,8 @@ async function handleWriteApi(
 	}
 
 	if (pathname === "/_api/v1/uploads/commit") {
-		const response = await handleCommit(request, config, identity, new URL(request.url).origin);
+		const response = await withUploadSessionLock(config.db, (db) =>
+			handleCommit(request, { ...config, db }, identity, new URL(request.url).origin));
 		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"commit"}', ip);
 		return response;
 	}
@@ -453,39 +454,39 @@ async function handleWriteApi(
 	const uploadRoutes: ReadonlyArray<{
 		readonly pattern: RegExp;
 		readonly endpoint: string;
-		readonly handle: (match: RegExpMatchArray) => Promise<Response>;
+		readonly handle: (match: RegExpMatchArray, config: WorkerConfig) => Promise<Response>;
 	}> = [
 		{
 			pattern: RE_MULTIPART,
 			endpoint: "multipart",
-			handle: (m) => handleMultipart(config, m[1], identity),
+			handle: (m, c) => handleMultipart(c, m[1], identity),
 		},
 		{
 			pattern: RE_PART_UPLOAD,
 			endpoint: "upload-part",
-			handle: (m) => handleUploadPart(request, config, m[1], parseInt(m[2], 10), identity),
+			handle: (m, c) => handleUploadPart(request, c, m[1], parseInt(m[2], 10), identity),
 		},
 		{
 			pattern: RE_BLOB,
 			endpoint: "upload-blob",
-			handle: (m) => handleUploadBlob(request, config, m[1], identity),
+			handle: (m, c) => handleUploadBlob(request, c, m[1], identity),
 		},
 		{
 			pattern: RE_COMPLETE,
 			endpoint: "complete",
-			handle: (m) => handleComplete(request, config, m[1], identity),
+			handle: (m, c) => handleComplete(request, c, m[1], identity),
 		},
 		{
 			pattern: RE_PUBLISH,
 			endpoint: "publish",
-			handle: (m) => handlePublish(config, m[1], identity, new URL(request.url).origin),
+			handle: (m, c) => handlePublish(c, m[1], identity, new URL(request.url).origin),
 		},
 	];
 
 	for (const route of uploadRoutes) {
 		const match = pathname.match(route.pattern);
 		if (match) {
-			const response = await route.handle(match);
+			const response = await withUploadSessionLock(config.db, (db) => route.handle(match, { ...config, db }));
 			writeAuditLog(config, identity, "push", null, response.status, `{"endpoint":"${route.endpoint}"}`, ip);
 			return response;
 		}

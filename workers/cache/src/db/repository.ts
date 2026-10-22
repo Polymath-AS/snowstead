@@ -566,26 +566,39 @@ export async function findUploadParts(
 		.orderBy(uploadParts.partNumber);
 }
 
+/** Uploads may run together, but not across a canonical NAR deletion. */
+export async function withUploadSessionLock<T>(db: Db, run: (db: Db) => Promise<T>): Promise<T> {
+	return db.transaction(async (tx) => {
+		await tx.execute(sql`lock table upload_sessions in row exclusive mode`);
+		return run(tx);
+	});
+}
+
 /**
- * Deletes blobs no published path points at and no live upload session
- * names, up to `limit`, and returns them. A session's NAR may already sit at
- * its blob's key, about to be published: deleting the blob would take that
- * NAR from under the narinfo publishing writes.
+ * Withdraw unreferenced NARs before committing their row deletion. On any
+ * failure the rows remain as durable retry records. Fence session creation
+ * and upload finalization until all external deletes have settled.
  */
 export async function deleteUnreferencedBlobObjects(
 	db: Db,
-	now: Date,
 	limit: number,
+	withdraw: (blobs: readonly BlobObject[]) => Promise<void>,
 ): Promise<BlobObject[]> {
-	const unreferenced = db
-		.select({ id: blobObjects.id })
-		.from(blobObjects)
-		.where(and(
-			sql`not exists (select 1 from ${publishedPaths} where ${publishedPaths.blobObjectId} = ${blobObjects.id})`,
-			sql`not exists (select 1 from ${uploadSessions} where ${uploadSessions.fileHash} = ${blobObjects.fileHash} and ${uploadSessions.compression} = ${blobObjects.compression} and ${uploadSessions.expiresAt} > ${now.toISOString()}::timestamptz)`,
-		))
-		.limit(limit);
-	return db.delete(blobObjects).where(inArray(blobObjects.id, unreferenced)).returning();
+	return db.transaction(async (tx) => {
+		await tx.execute(sql`lock table upload_sessions in share mode`);
+		const now = new Date();
+		const unreferenced = tx
+			.select({ id: blobObjects.id })
+			.from(blobObjects)
+			.where(and(
+				sql`not exists (select 1 from ${publishedPaths} where ${publishedPaths.blobObjectId} = ${blobObjects.id})`,
+				sql`not exists (select 1 from ${uploadSessions} where ${uploadSessions.fileHash} = ${blobObjects.fileHash} and ${uploadSessions.compression} = ${blobObjects.compression} and ${uploadSessions.expiresAt} > ${now.toISOString()}::timestamptz)`,
+			))
+			.limit(limit);
+		const blobs = await tx.delete(blobObjects).where(inArray(blobObjects.id, unreferenced)).returning();
+		await withdraw(blobs);
+		return blobs;
+	});
 }
 
 /**
