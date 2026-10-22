@@ -20,6 +20,12 @@ export const orgs = pgTable("orgs", {
 	id: text("id").primaryKey(),
 	/** Its caches' path in URLs: /<slug>/<cache>. See cache-path.ts. */
 	slug: text("slug").notNull().unique(),
+	/**
+	 * The slug it had before its last change, while its caches' objects still
+	 * sit there and move to the new one (slug-move.ts). No other org can take
+	 * it until they're moved.
+	 */
+	movingFrom: text("moving_from").unique(),
 	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
 	storageLimit: bytes("storage_limit"),
 	createdAt: createdAt("created_at"),

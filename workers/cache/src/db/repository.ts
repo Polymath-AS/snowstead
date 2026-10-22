@@ -1,4 +1,4 @@
-import { eq, and, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
+import { eq, and, or, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import { cachePath } from "../cache-path.js";
 import {
@@ -156,8 +156,26 @@ export async function findOrg(db: Db, id: string): Promise<Org | undefined> {
 	return first(db.select().from(orgs).where(eq(orgs.id, id)).limit(1));
 }
 
-export async function findOrgBySlug(db: Db, slug: string): Promise<Org | undefined> {
-	return first(db.select().from(orgs).where(eq(orgs.slug, slug)).limit(1));
+/** The org that has this slug, or is still moving its caches away from it. */
+export async function findOrgHoldingSlug(db: Db, slug: string): Promise<Org | undefined> {
+	return first(db.select().from(orgs).where(or(eq(orgs.slug, slug), eq(orgs.movingFrom, slug))).limit(1));
+}
+
+/** Gives the org a new slug, keeping the old one while its objects move (slug-move.ts). */
+export async function startSlugMove(db: Db, id: string, slug: string, from: string): Promise<void> {
+	await db.update(orgs).set({ slug, movingFrom: from }).where(eq(orgs.id, id));
+}
+
+export async function finishSlugMove(db: Db, id: string): Promise<void> {
+	await db.update(orgs).set({ movingFrom: null }).where(eq(orgs.id, id));
+}
+
+/** Which of these store path hashes the cache still has published. */
+export async function publishedHashes(db: Db, cacheId: number, hashes: readonly string[]): Promise<Set<string>> {
+	if (hashes.length === 0) return new Set();
+	const rows = await db.select({ hash: publishedPaths.storePathHash }).from(publishedPaths)
+		.where(and(eq(publishedPaths.cacheId, cacheId), inArray(publishedPaths.storePathHash, [...hashes])));
+	return new Set(rows.map((r) => r.hash));
 }
 
 /** Creates the org, or changes its storage limit and slug. */
@@ -167,17 +185,6 @@ export async function putOrg(db: Db, id: string, storageLimit: number | null, sl
 			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit, slug } })
 			.returning(),
 	);
-}
-
-/** Whether any of an org's caches has a published path. */
-export async function orgHasPaths(db: Db, orgId: string): Promise<boolean> {
-	const row = await first(
-		db.select({ id: publishedPaths.id }).from(publishedPaths)
-			.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))
-			.where(eq(caches.orgId, orgId))
-			.limit(1),
-	);
-	return row !== undefined;
 }
 
 export async function createOrgApiKey(

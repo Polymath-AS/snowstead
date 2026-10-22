@@ -1,6 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import { actorId, authenticateOrg, generateOrgApiKey } from "./auth.js";
 import { writeAuditLog } from "./audit.js";
+import { moveSlugPage, parseMoveCursor } from "./slug-move.js";
 import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
 import {
 	parseOrgId,
@@ -28,7 +29,8 @@ import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
  * mint keys that outlive its revocation.
  *
  *   GET  /                           storage limit and usage
- *   PUT  /                           { storageLimit } (operator)
+ *   PUT  /                           { storageLimit, slug } (operator)
+ *   POST /move                       { cursor }: move a page of objects after a slug change
  *   GET  /keys                       the org's API keys, without secrets
  *   POST /keys                       { name }: a new key, shown once (operator)
  *   POST /keys/:id/revoke
@@ -74,6 +76,7 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		if (!isOperator) return errorResponse("Forbidden", 403);
 		return audit("org.put", await handlePutOrg(request, config, org));
 	}
+	if (route === "move" && method === "POST") return handleMoveSlug(request, config, org);
 
 	if (route === "keys" && method === "GET") return handleListKeys(config, org);
 	if (route === "keys" && method === "POST") {
@@ -200,4 +203,18 @@ async function handleRevokeKey(config: WorkerConfig, org: string, id: string): P
 		return errorResponse(`no key ${id}`, 404);
 	}
 	return jsonResponse({ revoked: true, id });
+}
+
+/**
+ * Moves a page of the org's objects to its new slug (slug-move.ts). Call
+ * with each answer's `next` until it says done.
+ */
+async function handleMoveSlug(request: Request, config: WorkerConfig, org: string): Promise<Response> {
+	const body = await parseJsonBody<{ cursor?: unknown }>(request);
+	if (body instanceof Response) return body;
+	const cursor = parseMoveCursor(body.cursor);
+	if (cursor === undefined) {
+		return errorResponse("cursor must be a previous answer's next", 400);
+	}
+	return jsonResponse(await moveSlugPage(config, org, cursor, new URL(request.url).origin));
 }

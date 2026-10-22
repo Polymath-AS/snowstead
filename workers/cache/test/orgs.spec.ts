@@ -73,7 +73,7 @@ describe("orgs", () => {
 		expect((await orgApi(`/${org}`)).status).toBe(404);
 
 		const created = await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1000 });
-		expect(await created.json()).toEqual({ id: org, slug: org, storageLimit: 1000, used: 0, pending: 0 });
+		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, used: 0, pending: 0 });
 
 		const raised = await orgApi(`/${org}`, "PUT", { storageLimit: null });
 		expect(await raised.json()).toMatchObject({ slug: org, storageLimit: null });
@@ -96,7 +96,7 @@ describe("orgs", () => {
 		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: a.org, storageLimit: null })).status).toBe(409);
 	});
 
-	it("renames an org and relocates its empty caches", async () => {
+	it("renames an org and relocates its caches", async () => {
 		const { org, cache } = await orgWithCache(null);
 		const renamed = unique("renamed");
 		expect(await (await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null })).json()).toMatchObject({ slug: renamed });
@@ -336,5 +336,84 @@ describe("token caches", () => {
 		const pull = () => SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`, { headers: { authorization: `Bearer ${jwt}` } });
 
 		expect((await pull()).status).toBe(200);
+	});
+});
+
+describe("slug changes", () => {
+	/** Publishes one path to the cache, as the client does. */
+	async function publish(cache: string, token: string, hash: string): Promise<void> {
+		const body = crypto.getRandomValues(new Uint8Array(16));
+		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))].map((b) => b.toString(16).padStart(2, "0")).join("");
+		const post = (path: string, payload: unknown) => SELF.fetch(`http://example.com/_api/v1${path}`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+			body: JSON.stringify(payload),
+		});
+		const created = await post(`/caches/${cache}/upload-sessions`, {
+			storePath: `/nix/store/${hash}-hello`, storePathHash: hash, narHash: `sha256:${"1".repeat(52)}`,
+			narSize: 32, fileHash, fileSize: 16, compression: "zstd",
+		});
+		const { sessionId } = await created.json<{ sessionId: string }>();
+		await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, { method: "PUT", headers: { authorization: `Bearer ${token}` }, body });
+		expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
+	}
+
+	/** Calls POST /move until it's done. */
+	async function move(org: string): Promise<void> {
+		let cursor: unknown = undefined;
+		for (let calls = 1; calls <= 20; calls++) {
+			const answer = await (await orgApi(`/${org}/move`, "POST", { cursor })).json<{ done: boolean; next?: unknown }>();
+			if (answer.done) return;
+			cursor = answer.next;
+		}
+		throw new Error("move never finished");
+	}
+
+	it("move a public cache's narinfo to the new slug, without paths deleted since", async () => {
+		const { org, cache, token } = await orgWithCache(null);
+		const [kept, deleted] = ["k".repeat(32), "d".repeat(32)];
+		await publish(cache, token, kept);
+		await publish(cache, token, deleted);
+		const renamed = unique("renamed");
+
+		const answer = await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null });
+		expect(await answer.json()).toMatchObject({ slug: renamed, movingFrom: org });
+		expect(await env.PUBLIC_BUCKET.head(`${renamed}/${cache}/nix-cache-info`)).not.toBeNull();
+		// Its old slug stays its own, and one change finishes before the next.
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org, storageLimit: null })).status).toBe(409);
+		expect((await orgApi(`/${org}`, "PUT", { slug: unique("again"), storageLimit: null })).status).toBe(409);
+		const del = await orgApi(`/${org}/caches/${cache}/paths/delete`, "POST", { storePathHashes: [deleted] });
+		expect(del.status).toBe(200);
+
+		await move(org);
+		const narinfo = await (await env.PUBLIC_BUCKET.get(`${renamed}/${cache}/${kept}.narinfo`))?.text();
+		expect(narinfo).toContain(`StorePath: /nix/store/${kept}-hello`);
+		expect(narinfo).toContain("URL: ../../nar/");
+		expect(await env.PUBLIC_BUCKET.head(`${renamed}/${cache}/${deleted}.narinfo`)).toBeNull();
+		expect((await env.PUBLIC_BUCKET.list({ prefix: `${org}/` })).objects).toEqual([]);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ slug: renamed, movingFrom: null });
+		// Done, the old slug is free again.
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
+	});
+
+	it("keep a private cache private at both slugs while it moves", async () => {
+		const { org, cache, token } = await orgWithCache(null, true);
+		const hash = "p".repeat(32);
+		await publish(cache, token, hash);
+		const renamed = unique("renamed");
+		const pull = (path: string) => SELF.fetch(`http://example.com/${path}/${hash}.narinfo`);
+
+		expect((await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null })).status).toBe(200);
+		expect((await pull(`${renamed}/${cache}`)).status).toBe(401);
+		expect((await pull(`${org}/${cache}`)).status).toBe(401);
+
+		await move(org);
+		const reader = await sign([cache], ["pull"], org);
+		const moved = await SELF.fetch(`http://example.com/${renamed}/${cache}/${hash}.narinfo`, { headers: { authorization: `Bearer ${reader}` } });
+		expect(moved.status).toBe(200);
+		expect(await env.CACHE_BUCKET.head(`narinfo/${org}/${cache}/${hash}.narinfo`)).toBeNull();
+		// The old marker stays, so the old address stays private too.
+		expect((await pull(`${org}/${cache}`)).status).toBe(401);
+		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/${hash}.narinfo`)).toBeNull();
 	});
 });

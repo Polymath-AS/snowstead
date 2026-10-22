@@ -40,8 +40,13 @@ export function bucketForKey(config: WorkerConfig, key: string): R2Bucket {
 	return bucketFor(config, !key.startsWith("nar/"));
 }
 
+/** Where the narinfo under a path lives: a cache's, or every cache of an org slug's. */
+export function narinfoPrefix(path: string, isPrivate: boolean): string {
+	return isPrivate ? `narinfo/${path}/` : `${path}/`;
+}
+
 export function narinfoKey(cachePath: string, storePathHash: string, isPrivate: boolean): string {
-	return isPrivate ? `narinfo/${cachePath}/${storePathHash}.narinfo` : `${cachePath}/${storePathHash}.narinfo`;
+	return `${narinfoPrefix(cachePath, isPrivate)}${storePathHash}.narinfo`;
 }
 
 /**

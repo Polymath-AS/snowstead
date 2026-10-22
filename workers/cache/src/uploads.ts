@@ -39,10 +39,12 @@ import {
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 import type { Db } from "./db/connection.js";
 
-// Module-scope cache: cache ID → cache, with its path. Neither changes once
-// the cache has paths (no rename or delete endpoints; an org's slug only
-// changes while it has none), so entries don't go stale where it matters.
-// Avoids a database round trip on every session-scoped upload request.
+// Module-scope cache: cache ID → cache, with its path. Its access and
+// visibility don't change once it has paths. Its path does when its org's
+// slug changes, so publishing looks the cache up afresh, and the old path
+// stays marked private for a private cache (slug-move.ts), which is all the
+// session-scoped requests use it for. Avoids a database round trip on each
+// of those.
 const cacheById = new Map<number, CacheAt>();
 
 async function resolveCache(
@@ -614,10 +616,13 @@ async function publishSessions(
 	sessions: readonly UploadSession[],
 	origin: string,
 ): Promise<PublishResult[]> {
-	const cache = await resolveCache(config.db, cacheId);
+	// Fresh, not resolveCache's copy: narinfo goes to the cache's path now,
+	// which an org's slug change moves (slug-move.ts).
+	const cache = await findCacheById(config.db, cacheId);
 	if (cache === undefined) {
 		return sessions.map((s) => ({ sessionId: s.id, error: "Internal error", status: 500 }));
 	}
+	cacheById.set(cache.id, cache);
 	const visibility = await privateCache(config, cache.path);
 	const isPrivate = visibility.isPrivate;
 	const privateGen = visibility.isPrivate ? visibility.gen : undefined;

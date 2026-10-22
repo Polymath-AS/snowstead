@@ -221,9 +221,12 @@ without an org are its tokens.
 
 - **Cache names are an org's own.** Each org has a slug, and its caches
   are served at `<host>/<slug>/<name>`, so every org can have a `main`.
-  The default org's caches stay at `<host>/<name>`. An org's slug can
-  change only while its caches have no paths, since public caches are
-  stored at their URL for the CDN to serve.
+  The default org's caches stay at `<host>/<name>`. Public caches are
+  stored at their URL for the CDN to serve, so changing an org's slug
+  moves objects: `PUT /orgs/:org` readies the new paths, then
+  `POST /orgs/:org/move` moves the narinfo a page at a time. Until it's
+  done the org keeps its old slug, and the old URLs answer for paths not
+  moved yet; after, they're gone.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the

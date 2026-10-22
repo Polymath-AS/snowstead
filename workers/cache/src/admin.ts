@@ -24,8 +24,8 @@ import {
 	setCachePublic,
 	setCacheRetention,
 	findCache,
-	findOrgBySlug,
-	orgHasPaths,
+	findOrgHoldingSlug,
+	startSlugMove,
 	setCacheSigningKey,
 	cacheHasPaths,
 	listPublishedPathsAfter,
@@ -34,6 +34,7 @@ import {
 	orgUsage,
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
+import { readyNewPath } from "./slug-move.js";
 import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "./layout.js";
@@ -396,7 +397,7 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		return errorResponse(`no org ${id}`, 404);
 	}
 	const usage = await orgUsage(config.db, id, new Date());
-	return jsonResponse({ id: org.id, slug: org.slug, storageLimit: org.storageLimit, used: usage.used, pending: usage.pending }, status);
+	return jsonResponse({ id: org.id, slug: org.slug, movingFrom: org.movingFrom, storageLimit: org.storageLimit, used: usage.used, pending: usage.pending }, status);
 }
 
 /** An org's storage limit and what its caches hold. */
@@ -412,8 +413,9 @@ export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise
  * Creates an org or sets its storage limit, in bytes or null for none, and
  * its slug, which its caches are served under (cache-path.ts). A lower limit
  * than its caches hold refuses new pushes until they fit again. Creating an
- * org needs a slug. Changing one moves every cache's URL, and public caches
- * are stored at theirs, so it's refused once the org has published paths.
+ * org needs a slug. Changing one moves every cache's URL, and caches are
+ * stored at theirs: the new paths are readied here, and POST /move then
+ * moves the objects (slug-move.ts). The old slug stays the org's until then.
  */
 export async function handlePutOrg(request: Request, config: WorkerConfig, rawId: string): Promise<Response> {
 	const id = parseOrgId(rawId);
@@ -434,17 +436,25 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 		if (typeof parsed === "object") {
 			return errorResponse(parsed.message, 400);
 		}
-		const holder = await findOrgBySlug(config.db, parsed);
+		const holder = await findOrgHoldingSlug(config.db, parsed);
 		if (holder && holder.id !== id) {
 			return errorResponse(`${parsed} is taken`, 409);
 		}
-		if (existing && (await orgHasPaths(config.db, id))) {
-			return errorResponse("an org's slug can't change once its caches have paths", 409);
+		if (existing?.movingFrom) {
+			return errorResponse("the last slug change is still moving the org's caches; finish it with POST /move first", 409);
 		}
 		slug = parsed;
 	}
 	if (slug === undefined) {
 		return errorResponse("slug is needed to create an org", 400);
+	}
+	if (existing && slug !== existing.slug) {
+		const orgCaches = await listCaches(config.db, id);
+		if (orgCaches.length > 0) {
+			const to = slug;
+			await Promise.all(orgCaches.map((c) => readyNewPath(config, c, cachePath(to, c.name))));
+			await startSlugMove(config.db, id, slug, existing.slug);
+		}
 	}
 	await putOrg(config.db, id, limit, slug);
 	return orgResponse(config, id);
