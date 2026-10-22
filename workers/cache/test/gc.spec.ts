@@ -54,12 +54,29 @@ describe("gc: expire abandoned sessions", () => {
 
 		const result = await runGarbageCollection(config);
 
-		expect(result.expiredSessions).toBe(1);
+		// The database is shared across files; other expired fixtures may exist.
+		expect(result.expiredSessions).toBeGreaterThanOrEqual(1);
 		expect(result.errors).toHaveLength(0);
 		expect(await findUploadSession(config.db, sessionId)).toBeUndefined();
 		expect(await env.CACHE_BUCKET.head(expiredKey)).toBeNull();
 		expect((await findUploadSession(config.db, activeId))?.status).toBe("pending");
 		const active = await env.CACHE_BUCKET.get(activeKey);
 		expect(new Uint8Array(await active!.arrayBuffer())).toEqual(bytes);
+	});
+
+	it.each(["nar/", "nars/sha256/"])("collects an abandoned canonical upload under %s without a blob row", async (prefix) => {
+		const cache = await createCache(config.db, `gc-orphan-${crypto.randomUUID()}`);
+		const fileHash = crypto.randomUUID().replaceAll("-", "").padEnd(64, "0");
+		const key = `${prefix}${fileHash}/zstd.nar`;
+		const bucket = prefix === "nar/" ? env.PUBLIC_BUCKET : env.CACHE_BUCKET;
+		const id = crypto.randomUUID();
+		await bucket.put(key, "abandoned bytes");
+		await createUploadSession(config.db, {
+			...makeSessionParams({ id, cacheId: cache.id, expiresAt: new Date(0), r2UploadKey: key }),
+			fileHash,
+		});
+		expect((await runGarbageCollection(config)).errors).toEqual([]);
+		expect(await findUploadSession(config.db, id)).toBeUndefined();
+		expect(await bucket.head(key)).toBeNull();
 	});
 });

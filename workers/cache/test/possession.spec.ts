@@ -3,6 +3,10 @@ import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
 import { createCache } from "../src/db/repository.js";
 import { narKey } from "../src/layout.js";
+import { eq } from "drizzle-orm";
+import { uploadSessions } from "../src/db/schema.js";
+import { runGarbageCollection } from "../src/gc.js";
+import { resolveConfig } from "../src/config.js";
 
 // NARs are shared by every cache that has them. These push one into one
 // cache, then try to get it into another without having its bytes.
@@ -149,5 +153,16 @@ describe("proof of possession", () => {
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await commit(b.sessionId)).toMatchObject({ status: 400, error: "Upload incomplete" });
 		expect(await narinfoStatus(second, b.hash)).toBe(404);
+
+		// The abandoned session names the same canonical key as the published
+		// path. Expiring it must not withdraw somebody else's bytes.
+		await db.update(uploadSessions).set({ expiresAt: new Date(0) }).where(eq(uploadSessions.id, b.sessionId));
+		const config = resolveConfig(env);
+		try {
+			expect((await runGarbageCollection(config)).errors).toEqual([]);
+			expect(await storedBytes(fileHash)).toEqual(bytes);
+		} finally {
+			await config.close();
+		}
 	});
 });

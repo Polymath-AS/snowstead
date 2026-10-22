@@ -4,6 +4,7 @@ import {
 	findExpiredSessions,
 	transitionSessionStatus,
 	deleteUploadSession,
+	ensureBlobObjects,
 	deleteUnreferencedBlobObjects,
 	deleteExpiredApiTokens,
 	deleteExpiredAuditLogs,
@@ -60,6 +61,16 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			// but validate to satisfy the type system without an assertion.
 			if (!isTransitionableStatus(session.status)) continue;
 
+			// Canonical keys can be shared with published paths or other uploads.
+			// Adopt abandoned uploads too, so the reference-aware sweep owns all
+			// canonical deletion, including objects never recorded by a publish.
+			if (session.r2UploadKey && !session.r2UploadKey.startsWith("staging/")) {
+				await ensureBlobObjects(config.db, [{
+					fileHash: session.fileHash, fileSize: session.fileSize,
+					compression: session.compression, r2Key: session.r2UploadKey,
+				}]);
+			}
+
 			const transitioned = await transitionSessionStatus(
 				config.db,
 				session.id,
@@ -77,7 +88,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 				}
 			}
 
-			if (session.r2UploadKey) {
+			if (session.r2UploadKey?.startsWith("staging/")) {
 				try {
 					await bucketForKey(config, session.r2UploadKey).delete(session.r2UploadKey);
 				} catch {
