@@ -12,13 +12,19 @@ const PKCS8_ED25519_PREFIX = new Uint8Array([
 	0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ]);
 
-let cachedKeyMaterial: string | undefined;
-let cachedKey: CryptoKey | undefined;
+const signingKeys = new Map<string, Promise<CryptoKey>>();
 
 async function getSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
-	if (cachedKey && cachedKeyMaterial === privateKeyBase64) {
-		return cachedKey;
-	}
+	const known = signingKeys.get(privateKeyBase64);
+	if (known) return known;
+	const pending = importSigningKey(privateKeyBase64);
+	if (signingKeys.size >= 256) signingKeys.delete(signingKeys.keys().next().value!);
+	signingKeys.set(privateKeyBase64, pending);
+	try { return await pending; }
+	catch (error) { signingKeys.delete(privateKeyBase64); throw error; }
+}
+
+async function importSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
 
 	const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
 	const seed = keyBytes.slice(0, 32);
@@ -36,8 +42,6 @@ async function getSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
 		["sign"],
 	);
 
-	cachedKeyMaterial = privateKeyBase64;
-	cachedKey = key;
 	return key;
 }
 

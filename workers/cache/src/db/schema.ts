@@ -50,6 +50,16 @@ export const caches = pgTable("caches", {
 	uniqueIndex("caches_org_name_unique").on(table.orgId, table.name),
 ]);
 
+export const cacheSigningKeys = pgTable("cache_signing_keys", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
+	signingKeyName: text("signing_key_name").notNull(),
+	signingPublicKey: text("signing_public_key").notNull(),
+	signingKeySealed: text("signing_key_sealed"),
+	state: text("state").notNull().default("staged"),
+	createdAt: createdAt("created_at"),
+}, (table) => [uniqueIndex("cache_signing_keys_name").on(table.cacheId, table.signingKeyName)]);
+
 export const blobObjects = pgTable("blob_objects", {
 	id: id(),
 	fileHash: text("file_hash").notNull(),

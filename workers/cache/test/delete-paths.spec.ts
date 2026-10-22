@@ -278,6 +278,8 @@ describe("deleting published paths", () => {
 		expect(await push(cache, b, shared, token)).toBe(201);
 		expect(await push(keep, c, shared, token)).toBe(201);
 		expect(await used(org)).toBe(70);
+		// A staged key goes with its cache.
+		expect((await orgApi(`/${org}/caches/${cache}/signing-keys`, "POST", {})).status).toBe(201);
 
 		const res = await orgApi(`/${org}/caches/${cache}/delete`, "POST");
 		expect(await res.json()).toEqual({ deleted: true, name: cache, paths: 2 });

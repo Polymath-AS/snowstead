@@ -27,6 +27,8 @@ export default defineConfig({
 					ADMIN_SECRET: "test-admin-secret",
 					JWT_SECRET: "test-jwt-secret-0123456789abcdef",
 					SIGNING_MASTER_KEY: "dGVzdC1zaWduaW5nLW1hc3Rlci1rZXktMzItYnl0ZXM=",
+					// Public, deterministic test-only seed; never depend on .dev.vars.
+					SIGNING_PRIVATE_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 					// No upstream: tests never reach the network. test/upstream.spec.ts
 					// checks one with a stand-in fetch.
 					UPSTREAM_CACHES: "",

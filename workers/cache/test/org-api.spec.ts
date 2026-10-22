@@ -32,6 +32,7 @@ describe("org API keys", () => {
 		const res = await orgApi(`/${org}/keys`, key);
 		const { keys } = await res.json<{ keys: Record<string, unknown>[] }>();
 		expect(keys).toEqual([{ id, name: "terraform", createdAt: expect.any(String), revokedAt: null }]);
+		expect(JSON.stringify(keys)).not.toContain(key.slice("snowstead_key_".length + 17));
 	});
 
 	it("reach their own org's caches and storage", async () => {

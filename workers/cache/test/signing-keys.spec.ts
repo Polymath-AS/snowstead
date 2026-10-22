@@ -22,6 +22,22 @@ async function createdCache(): Promise<{ name: string; publicKey: string }> {
 	return { name, publicKey };
 }
 
+function keysApi(name: string, method = "GET", body?: unknown, suffix = "", org = "default", token = "test-admin-secret"): Promise<Response> {
+	return SELF.fetch(`http://example.com/_api/v1/orgs/${org}/caches/${name}/signing-keys${suffix}`, {
+		method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+}
+
+async function nixSecret(): Promise<{ secret: string; publicKey: string }> {
+	const pair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]) as CryptoKeyPair;
+	const seed = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey)).slice(-32);
+	const pub = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+	const bytes = new Uint8Array(64); bytes.set(seed); bytes.set(pub, 32);
+	const name = `byok-${crypto.randomUUID()}`;
+	return { secret: `${name}:${btoa(String.fromCharCode(...bytes))}`, publicKey: `${name}:${btoa(String.fromCharCode(...pub))}` };
+}
+
 /** Publishes a path straight to the database and backfills its narinfo; the backfill's answer. */
 async function backfill(cacheName: string, hash: string): Promise<{ written: number; skipped: string[] }> {
 	const cache = await findCache(db, "default", cacheName);
@@ -66,6 +82,79 @@ async function verifies(narinfo: string, publicKey: string, storePath: string): 
 }
 
 describe("cache signing keys", () => {
+	it("authorizes signing management only within the API key's org and never audits imported secrets", async () => {
+		async function org() {
+			const name = `org-${crypto.randomUUID().slice(0, 8)}`;
+			const call = (path: string, method: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1/orgs/${name}${path}`, {
+				method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
+			});
+			expect((await call("", "PUT", { slug: name, storageLimit: null })).status).toBe(200);
+			expect((await call("/caches", "POST", { name: "main" })).status).toBe(201);
+			const { key } = await (await call("/keys", "POST", { name: "test" })).json<{ key: string }>();
+			return { name, key };
+		}
+		const a = await org(); const b = await org();
+		const imported = await nixSecret();
+		const staged = await keysApi("main", "POST", { secretKey: imported.secret }, "", a.name, a.key);
+		expect(staged.status).toBe(201);
+		const { id } = await staged.json<{ id: string }>();
+		for (const [method, body, suffix] of [["GET", undefined, ""], ["POST", {}, ""], ["POST", {}, `/${id}/activate`]] as const) {
+			expect((await keysApi("main", method, body, suffix, b.name, a.key)).status).toBe(403);
+		}
+		expect((await keysApi("main", "POST", {}, `/${id}/activate`, b.name, b.key)).status).toBe(404);
+		const text = await (await keysApi("main", "GET", undefined, "", a.name, a.key)).text();
+		expect(text).toContain(imported.publicKey);
+		expect(text).not.toContain(imported.secret.split(":")[1]);
+		const audit = await (await SELF.fetch(`http://example.com/_api/v1/orgs/${a.name}/audit`, { headers: { authorization: `Bearer ${a.key}` } })).text();
+		expect(audit).toContain("signing-key.stage");
+		expect(audit).not.toContain(imported.secret.split(":")[1]);
+	});
+
+	it("imports sealed BYOK, stages trust overlap, and rotates a previously cached signing key without rewriting old narinfo", async () => {
+		const a = await createdCache();
+		const b = await createdCache();
+		const oldHash = "7".repeat(32);
+		const old = await publish(a.name, oldHash);
+		const imported = await nixSecret();
+		const staged = await keysApi(a.name, "POST", { secretKey: imported.secret });
+		expect(staged.status).toBe(201);
+		const key = await staged.json<{ id: string; publicKey: string; state: string }>();
+		expect(key).toMatchObject({ publicKey: imported.publicKey, state: "staged" });
+		expect(JSON.stringify(key)).not.toContain(imported.secret);
+		expect((await keysApi(a.name, "POST", { secretKey: imported.secret })).status).toBe(409);
+		expect((await keysApi(b.name, "POST", { trustedPublicKeys: [a.publicKey, key.publicKey] }, `/${key.id}/activate`)).status).toBe(404);
+		expect((await keysApi(a.name, "POST", {}, `/${key.id}/activate`)).status).toBe(409);
+		expect(await verifies(await publish(a.name, "8".repeat(32)), a.publicKey, `/nix/store/${"8".repeat(32)}-signed`)).toBe(true);
+		expect((await keysApi(a.name, "POST", { trustedPublicKeys: [a.publicKey, key.publicKey] }, `/${key.id}/activate`)).status).toBe(200);
+		const hash = "9".repeat(32);
+		const fresh = await publish(a.name, hash);
+		expect(await verifies(fresh, key.publicKey, `/nix/store/${hash}-signed`)).toBe(true);
+		expect(await verifies(fresh, a.publicKey, `/nix/store/${hash}-signed`)).toBe(false);
+		expect(await (await SELF.fetch(`http://example.com/${a.name}/${oldHash}.narinfo`)).text()).toBe(old);
+		const status = await (await keysApi(a.name)).json<{ keys: { publicKey: string; state: string }[] }>();
+		expect(status.keys).toEqual(expect.arrayContaining([
+			expect.objectContaining({ publicKey: a.publicKey, state: "retired" }),
+			expect.objectContaining({ publicKey: key.publicKey, state: "active" }),
+		]));
+		const next = await (await keysApi(a.name, "POST", {})).json<{ id: string; publicKey: string }>();
+		expect((await keysApi(a.name, "POST", { trustedPublicKeys: [...status.keys.map(k => k.publicKey), next.publicKey] }, `/${next.id}/activate`)).status).toBe(200);
+		const nextHash = "a".repeat(32);
+		expect(await verifies(await publish(a.name, nextHash), next.publicKey, `/nix/store/${nextHash}-signed`)).toBe(true);
+		expect((await keysApi(a.name, "POST", { trustedPublicKeys: [] }, `/${key.id}/activate`)).status).toBe(409);
+	});
+
+	it("rejects malformed keys and mismatched seed/public halves without echoing secrets", async () => {
+		const a = await createdCache();
+		const one = await nixSecret();
+		const two = await nixSecret();
+		const bytes = atob(one.secret.split(":")[1]).slice(0, 32) + atob(two.secret.split(":")[1]).slice(32);
+		for (const secretKey of ["bad", "name:" + btoa("x".repeat(32)), "name:" + btoa(bytes), one.secret + "\n", 1]) {
+			const res = await keysApi(a.name, "POST", { secretKey });
+			expect(res.status).toBe(400);
+			expect(await res.text()).toContain("invalid Nix secret key");
+		}
+		expect((await keysApi(a.name, "POST", {}, "", "default", "wrong")).status).toBe(403);
+	});
 	it("gives each new cache a key of its own", async () => {
 		const a = await createdCache();
 		const b = await createdCache();

@@ -76,9 +76,31 @@ export async function newCacheKey(config: WorkerConfig, cache: { readonly id: nu
 	secret.set(seed);
 	secret.set(publicKey, 32);
 
+	return sealCacheKey(config, cache.id, cacheKeyName(config.signingKeyName, cache.path), secret);
+}
+
+export async function importCacheKey(config: WorkerConfig, cacheId: number, material: string): Promise<NewCacheKey> {
+	const match = /^([A-Za-z0-9][A-Za-z0-9._/+-]{0,199}):([A-Za-z0-9+/]{86}==)$/.exec(material);
+	if (!match) throw new Error("invalid Nix secret key");
+	const secret = unbase64(match[2]);
+	if (secret.length !== 64 || base64(secret) !== match[2]) throw new Error("invalid Nix secret key");
+	const prefix = new Uint8Array([48,46,2,1,0,48,5,6,3,43,101,112,4,34,4,32]);
+	const pkcs8 = new Uint8Array(48);
+	pkcs8.set(prefix); pkcs8.set(secret.slice(0, 32), 16);
+	const privateKey = await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
+	const publicKey = await crypto.subtle.importKey("raw", secret.slice(32), "Ed25519", false, ["verify"]);
+	const challenge = encoder.encode("Snowstead Nix key import validation");
+	if (!await crypto.subtle.verify("Ed25519", publicKey, await crypto.subtle.sign("Ed25519", privateKey, challenge), challenge)) {
+		throw new Error("invalid Nix secret key");
+	}
+	return sealCacheKey(config, cacheId, match[1], secret);
+}
+
+async function sealCacheKey(config: WorkerConfig, cacheId: number, name: string, secret: Uint8Array<ArrayBuffer>): Promise<NewCacheKey> {
+	if (!config.signingMasterKey) throw new Error("SIGNING_MASTER_KEY required");
 	const iv = crypto.getRandomValues(new Uint8Array(12));
 	const sealed = new Uint8Array(await crypto.subtle.encrypt(
-		{ name: "AES-GCM", iv, additionalData: boundTo(cache.id) },
+		{ name: "AES-GCM", iv, additionalData: boundTo(cacheId) },
 		await importMasterKey(config.signingMasterKey),
 		secret,
 	));
@@ -86,10 +108,9 @@ export async function newCacheKey(config: WorkerConfig, cache: { readonly id: nu
 	box.set(iv);
 	box.set(sealed, iv.length);
 
-	const name = cacheKeyName(config.signingKeyName, cache.path);
 	return {
 		signingKeyName: name,
-		signingPublicKey: `${name}:${base64(publicKey)}`,
+		signingPublicKey: `${name}:${base64(secret.slice(32))}`,
 		signingKeySealed: SEALED_VERSION + base64(box),
 	};
 }
@@ -110,21 +131,24 @@ async function unseal(config: WorkerConfig, cache: Cache): Promise<SigningKey | 
 	return { name: cache.signingKeyName, secret: base64(new Uint8Array(secret)) };
 }
 
-// Keys never change once a cache has one, so isolates keep them.
-const keys = new Map<number, SigningKey>();
-const MAX_KEYS = 10_000;
+// Re-read the active sealed version at every publish. No isolate can keep
+// selecting an obsolete key indefinitely after activation elsewhere.
+const keys = new Map<number, { version: string; key: SigningKey }>();
+const MAX_KEYS = 256;
 
 /** The key a cache's narinfo is signed with. */
 export async function signingKeyFor(config: WorkerConfig, cacheId: number): Promise<SigningKey> {
-	const known = keys.get(cacheId);
-	if (known) return known;
-
 	const cache = await findCacheById(config.db, cacheId);
-	const own = cache ? await unseal(config, cache) : undefined;
+	if (!cache) throw new Error("no cache for signing");
+	const version = JSON.stringify([cacheId, config.signingMasterKey, cache.signingKeyName, cache.signingKeySealed]);
+	const known = keys.get(cacheId);
+	if (known?.version === version) return known.key;
+	keys.delete(cacheId);
+	const own = await unseal(config, cache);
 	const key = own ?? { name: config.signingKeyName, secret: config.signingPrivateKey };
 	if (own) {
-		if (keys.size >= MAX_KEYS) keys.clear();
-		keys.set(cacheId, own);
+		if (keys.size >= MAX_KEYS) keys.delete(keys.keys().next().value!);
+		keys.set(cacheId, { version, key: own });
 	}
 	return key;
 }

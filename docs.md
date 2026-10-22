@@ -249,3 +249,59 @@ without an org are its tokens.
 
 After upgrading to orgs, run `POST /_api/v1/admin/auth/sync` once: it
 writes each private cache's org into KV, where pulls check it.
+
+### Cache signing key lifecycle
+
+Run database migrations before deploying. Signing management uses the org
+API's bearer authentication (`ADMIN_SECRET` or that org's API key), not a
+push token. No billing entitlement is enforced here. All responses are
+`Cache-Control: no-store`; private or sealed key material is never returned.
+
+Under `/_api/v1/orgs/:org/caches/:cache/signing-keys`:
+
+- `GET` returns `activePublicKey` and `keys`, each with `id`, `publicKey`,
+  and `state` (`staged`, `active`, or `retired`). The original cache/shared
+  key has `id: null` until the first rotation records its history.
+- `POST {}` generates a Snowstead-managed key, **staged**, not yet signing.
+- `POST {"secretKey":"name:base64"}` stages a BYOK Nix secret key. Import
+  requires canonical base64 of exactly 64 bytes (32-byte Ed25519 seed then
+  its matching public half). Names are 1–200 ASCII characters: alphanumeric
+  first, followed by alphanumeric or `._/+-`. Do not send a PEM, bare seed,
+  or trailing newline. The secret is sealed with AES-GCM under
+  `SIGNING_MASTER_KEY`, authenticated to the cache id. Both staging forms
+  return `201 {id, publicKey, state: "staged"}`. A key name cannot be reused
+  in the cache, including its historical keys or the service key name.
+- `POST /:id/activate {"trustedPublicKeys":["name:base64", ...]}` activates
+  a staged key and retires the previous active key atomically. First deploy
+  **all** keys returned by GET to clients' `trusted-public-keys`, retaining
+  old keys; then pass that full set as explicit confirmation. Missing trust
+  confirmation or a non-staged key returns 409; a missing cache/key is 404.
+  Activation does not prove clients were updated: the caller must ensure it.
+
+Staging and activation require `SIGNING_MASTER_KEY` (409 without it).
+Existing shared-key/self-hosted caches otherwise keep their behavior. The
+cache's existing `publicKey` field continues to show its current active key;
+use this lifecycle GET to discover the complete trust set after rotations.
+Retired public keys are retained permanently, and cannot be reactivated or
+deleted through this API. Their sealed secrets are removed from history.
+
+Rotation is **trust overlap**, not indefinite dual signing: new publications
+use only the new key. Existing R2/CDN narinfo is untouched and keeps its old
+signature and URL. Keep historical public keys trusted for as long as those
+objects or client caches exist. An explicit narinfo backfill may replace old
+signatures; don't use one as an automatic rotation step. This API is not an
+emergency compromise-revocation mechanism: removing old trust safely would
+require a separate re-sign/backfill and R2/CDN/client invalidation plan.
+No CDN purge is needed for this additive rotation. Any future rewrite must
+purge the rewritten narinfo URLs after R2 writes; purge implementation is
+outside signing management.
+
+Each publish re-reads the current sealed key version before selecting a
+bounded (256-entry) decrypted-key memo; Ed25519 imports also use a bounded
+256-entry, promise-coalescing memo rather than one tenant-thrashing slot.
+There is no signing on public reads. Keep Hyperdrive query caching disabled
+as required by setup above: stale database reads would delay key changes.
+A publish already in flight at activation may finish with the prior key,
+which is another reason to retain overlapping trust. Rotation does not
+rotate `SIGNING_MASTER_KEY`; retain that deployment secret to open active
+and staged keys.

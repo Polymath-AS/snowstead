@@ -21,6 +21,7 @@ const VALUE_AFTER: Readonly<Record<string, string>> = {
 	tokens: ":jti",
 	orgs: ":org",
 	keys: ":key",
+	"signing-keys": ":key",
 	part: ":part",
 };
 
@@ -51,6 +52,8 @@ const API_ROUTES = new Set([
 	"orgs/:org/caches/:cache/purge",
 	"orgs/:org/caches/:cache/paths",
 	"orgs/:org/caches/:cache/delete",
+	"orgs/:org/caches/:cache/signing-keys",
+	"orgs/:org/caches/:cache/signing-keys/:key/activate",
 	"orgs/:org/caches/:cache/paths/delete",
 	"orgs/:org/tokens",
 	"orgs/:org/tokens/:jti/revoke",

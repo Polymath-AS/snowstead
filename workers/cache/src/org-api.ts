@@ -1,5 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import { actorId, authenticateOrg, generateOrgApiKey } from "./auth.js";
+import { handleSigningApi } from "./signing-api.js";
 import { writeAuditLog } from "./audit.js";
 import { moveSlugPage, parseMoveCursor } from "./slug-move.js";
 import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
@@ -90,6 +91,13 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 
 	if (route === "caches" && method === "GET") return handleListCaches(config, url, org);
+	if (rest[0] === "caches" && rest[2] === "signing-keys" && (
+		(rest.length === 3 && (method === "GET" || method === "POST")) ||
+		(rest.length === 5 && rest[4] === "activate" && method === "POST")
+	)) {
+		const response = await handleSigningApi(request, config, org, value(1), rest.length === 5 ? value(3) : undefined);
+		return method === "GET" ? response : audit(rest.length === 5 ? "signing-key.activate" : "signing-key.stage", response, value(1));
+	}
 	if (route === "caches" && method === "POST") {
 		// The same request creates a cache or sets an existing one's settings,
 		// so the entry keeps the settings it left, not only that it ran.
