@@ -2,6 +2,8 @@ import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
 import { createCache, findPublishedPath, findCache, createUploadSessions, findUploadSession } from "../src/db/repository.js";
+import { uploadSessions } from "../src/db/schema.js";
+import { eq } from "drizzle-orm";
 
 const CACHE_NAME = "upload-test";
 const AUTH_TOKEN = "test-auth-token";
@@ -194,6 +196,23 @@ describe("publish", () => {
 		const narinfo = await res.text();
 		expect(narinfo).toContain("NarHash: sha256:02crsn39w9wxan1z3dz9g1zb76l09jb462qzb3q8r8zic4p2k6rg\n");
 		expect(narinfo).toContain(`References: ${ref}\n`);
+	});
+
+	it("refuses a session expiring by now whose NAR the blob sweep took, and takes one whose NAR is there", async () => {
+		const expire = (id: string) => getDb().update(uploadSessions).set({ expiresAt: new Date(Date.now() + 60_000) }).where(eq(uploadSessions.id, id));
+
+		const swept = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
+		await expire(swept.sessionId);
+		await env.PUBLIC_BUCKET.delete(swept.r2Key);
+		const refused = await post(`/_api/v1/uploads/${swept.sessionId}/publish`, {});
+		expect(refused.status).toBe(400);
+		expect(await refused.text()).toContain("the stored NAR is gone");
+		const cache = await findCache(getDb(), "default", CACHE_NAME);
+		expect(await findPublishedPath(getDb(), cache!.id, (await findUploadSession(getDb(), swept.sessionId))!.storePathHash)).toBeUndefined();
+
+		const kept = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
+		await expire(kept.sessionId);
+		expect((await post(`/_api/v1/uploads/${kept.sessionId}/publish`, {})).status).toBe(200);
 	});
 
 	it("returns 409 for uncompleted session", async () => {

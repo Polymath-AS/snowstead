@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { cacheHasNar, findCacheByPath, findOrg, recordBandwidth, withUploadSessionLock } from "./db/repository.js";
+import { cacheHasNar, findCacheByPath, findOrg, recordBandwidth } from "./db/repository.js";
 import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { overLimit } from "./rate-limit.js";
@@ -471,8 +471,7 @@ async function handleWriteApi(
 	}
 
 	if (pathname === "/_api/v1/uploads/commit") {
-		const response = await withUploadSessionLock(config.db, (db) =>
-			handleCommit(request, { ...config, db }, identity, new URL(request.url).origin));
+		const response = await handleCommit(request, config, identity, new URL(request.url).origin);
 		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"commit"}', ip);
 		return response;
 	}
@@ -513,7 +512,9 @@ async function handleWriteApi(
 	for (const route of uploadRoutes) {
 		const match = pathname.match(route.pattern);
 		if (match) {
-			const response = await withUploadSessionLock(config.db, (db) => route.handle(match, { ...config, db }));
+			// No transaction around the transfer: publishing fences itself
+			// against the blob sweep, briefly (uploads.ts).
+			const response = await route.handle(match, config);
 			writeAuditLog(config, identity, "push", null, response.status, `{"endpoint":"${route.endpoint}"}`, ip);
 			return response;
 		}

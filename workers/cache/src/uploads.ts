@@ -19,6 +19,7 @@ import {
 	findPublishedHashes,
 	touchPublishedPaths,
 	findOrg,
+	withUploadSessionLock,
 } from "./db/repository.js";
 import type { UploadSession } from "./db/types.js";
 import type { CacheAt, OrgUsage } from "./db/repository.js";
@@ -646,7 +647,7 @@ async function publishSessions(
 		blobs.find((b) => b.fileHash === fileHash && b.compression === compression);
 
 	const results = new Map<string, PublishResult>();
-	const rows: Parameters<typeof createPublishedPaths>[1][number][] = [];
+	const rows: (Parameters<typeof createPublishedPaths>[1][number] & { readonly session: UploadSession })[] = [];
 	await Promise.all(sessions.map(async (session) => {
 		const known = existing.get(session.storePathHash);
 		try {
@@ -676,14 +677,40 @@ async function publishSessions(
 				signaturesJson: "[]",
 			};
 			await storeNarinfo(config, cache, path, blob, isPrivate);
-			rows.push(path);
+			rows.push({ ...path, session });
 		} catch (err) {
 			console.error("Failed to publish", { sessionId: session.id }, err);
 			results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
 		}
 	}));
 
-	const inserted = new Set(await createPublishedPaths(config.db, rows));
+	const inserted = new Set(await withUploadSessionLock(config.db, async (tx) => {
+		// The blob sweep (gc.ts) deletes a NAR only once no live session names
+		// it, so a live session's NAR is still there, and its path row keeps it
+		// from now on. A session expiring by now may have lost its NAR, and its
+		// blob row, to a sweep since it was verified: those are checked again,
+		// here, where no sweep can run until the rows are in.
+		const soon = new Date(Date.now() + EXPIRY_MARGIN_MS);
+		const atRisk = rows.filter((r) => r.session.expiresAt <= soon);
+		const gone = new Set<string>();
+		await Promise.all(atRisk.map(async (r) => {
+			if (!(await bucketFor(config, isPrivate).head(narKey(r.session.fileHash, r.session.compression, isPrivate)))) gone.add(r.session.id);
+		}));
+		const kept = rows.filter((r) => !gone.has(r.session.id));
+		const current = await ensureBlobObjects(tx, kept.filter((r) => atRisk.includes(r)).map((r) => ({
+			fileHash: r.session.fileHash,
+			fileSize: r.session.fileSize,
+			compression: r.session.compression,
+			r2Key: narKey(r.session.fileHash, r.session.compression, isPrivate),
+		})));
+		for (const id of gone) {
+			results.set(id, { sessionId: id, error: "Upload incomplete: the stored NAR is gone, push again", status: 400 });
+		}
+		return createPublishedPaths(tx, kept.map(({ session, ...row }) => ({
+			...row,
+			blobObjectId: current.find((b) => b.fileHash === session.fileHash && b.compression === session.compression)?.id ?? row.blobObjectId,
+		})));
+	}));
 	// Re-publishes also rewrite narinfo (for example after a key change),
 	// and retries must invalidate even if a previous attempt inserted the row.
 	const published = sessions.filter((s) => {
@@ -897,6 +924,9 @@ const PRESIGNED_PUT_MAX_BYTES = 5 * 1024 ** 3 - (1 << 20);
 const PRESIGNED_PARTS_MIN_BYTES = 64 * 1024 ** 2;
 const PART_SIZE_BYTES = 32 * 1024 ** 2;
 const SESSION_TTL_SECONDS = 3600;
+// How close to expiry a session must be for publishing to check its NAR is
+// still there: clocks of the Worker and of the blob sweep can disagree a bit.
+const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 // Each path publishes with a handful of R2 and Cache API calls; 100 keeps a
 // batch well inside a request's subrequest and Cache API limits.
 const MAX_BATCH = 100;
