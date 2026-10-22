@@ -1,2 +1,0 @@
-ALTER TABLE "api_tokens" ADD CONSTRAINT "api_tokens_org_id_orgs_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."orgs"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-CREATE INDEX "idx_api_tokens_org" ON "api_tokens" USING btree ("org_id");

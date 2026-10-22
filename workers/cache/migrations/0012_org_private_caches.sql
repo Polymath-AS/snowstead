@@ -1,1 +1,0 @@
-ALTER TABLE "orgs" ADD COLUMN "private_caches" boolean DEFAULT true NOT NULL;
