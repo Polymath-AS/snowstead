@@ -259,7 +259,8 @@ push token. No billing entitlement is enforced here. All responses are
 
 Under `/_api/v1/orgs/:org/caches/:cache/signing-keys`:
 
-- `GET` returns `activePublicKey` and `keys`, each with `id`, `publicKey`,
+- `GET` returns `activePublicKey`, `shared` (true while the cache signs with
+  the service's key rather than one of its own), and `keys`, each with `id`, `publicKey`,
   and `state` (`staged`, `active`, or `retired`). The original cache/shared
   key has `id: null` until the first rotation records its history.
 - `POST {}` generates a Snowstead-managed key, **staged**, not yet signing.

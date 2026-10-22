@@ -16,7 +16,8 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 			const [locked] = await tx.select().from(caches).where(eq(caches.id, cache.id)).for("share");
 			const rows = await tx.select().from(cacheSigningKeys).where(scope);
 			const current = locked.signingPublicKey ?? await signingPublicKey(config.signingKeyName, config.signingPrivateKey);
-			return jsonResponse({ activePublicKey: current, keys: [
+			// shared: it signs with the service's key, which every cache without one of its own shares.
+			return jsonResponse({ activePublicKey: current, shared: locked.signingPublicKey === null, keys: [
 				...rows.map(k => ({ id: k.id, publicKey: k.signingPublicKey, state: k.state, createdAt: k.createdAt })),
 				...(!rows.some(k => k.signingPublicKey === current) && current ? [{ id: null, publicKey: current, state: "active" }] : []),
 			] });

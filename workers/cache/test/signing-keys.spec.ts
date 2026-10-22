@@ -195,4 +195,21 @@ describe("cache signing keys", () => {
 		const hash = "5".repeat(32);
 		expect(await verifies(await publish(name, hash), publicKey, `/nix/store/${hash}-signed`)).toBe(true);
 	});
+
+	it("moves a cache from before keys onto a key of its own", async () => {
+		const name = `old-${crypto.randomUUID().slice(0, 8)}`;
+		await db.execute(`insert into caches (name) values ('${name}')`);
+		const before = await (await keysApi(name)).json<{ shared: boolean; activePublicKey: string }>();
+		expect(before.shared).toBe(true);
+
+		const staged = await (await keysApi(name, "POST", {})).json<{ id: string; publicKey: string }>();
+		const trusted = [before.activePublicKey, staged.publicKey];
+		expect((await keysApi(name, "POST", { trustedPublicKeys: trusted }, `/${staged.id}/activate`)).status).toBe(200);
+
+		const after = await (await keysApi(name)).json<{ shared: boolean; activePublicKey: string; keys: { publicKey: string; state: string }[] }>();
+		expect(after).toMatchObject({ shared: false, activePublicKey: staged.publicKey });
+		expect(after.keys).toEqual(expect.arrayContaining([expect.objectContaining({ publicKey: before.activePublicKey, state: "retired" })]));
+		const hash = "6".repeat(32);
+		expect(await verifies(await publish(name, hash), staged.publicKey, `/nix/store/${hash}-signed`)).toBe(true);
+	});
 });
