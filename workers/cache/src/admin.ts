@@ -19,6 +19,7 @@ import {
 	listCaches,
 	listCacheStats,
 	listRecentPaths,
+	searchPublishedPaths,
 	setCachePublic,
 	setCacheRetention,
 	findCache,
@@ -641,4 +642,51 @@ export async function handlePurgeCache(
 	// Cloudflare acknowledged the purge, not a verified eviction in every
 	// location. Do not claim that the assets have already disappeared.
 	return jsonResponse({ accepted: true, paths: hashes ? [...new Set(hashes)] : "all" });
+}
+
+
+const DEFAULT_PATH_PAGE = 50;
+const MAX_PATH_PAGE = 200;
+
+/**
+ * A cache's paths, newest first, narrowed by `q` to the ones whose name
+ * contains it (a hash or package name; a full store path works too).
+ * `next` is the `before` for the page after, null at the end.
+ */
+export async function handleListPaths(config: WorkerConfig, rawName: string, url: URL, scope?: string): Promise<Response> {
+	const name = parseCacheName(rawName);
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+	const query = (url.searchParams.get("q") ?? "").trim().replace(/^\/nix\/store\//, "");
+	const limit = Number(url.searchParams.get("limit") ?? DEFAULT_PATH_PAGE);
+	const rawBefore = url.searchParams.get("before");
+	const before = rawBefore === null ? undefined : Number(rawBefore);
+	if (query.length > 200) {
+		return errorResponse("q must be at most 200 characters", 400);
+	}
+	if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PATH_PAGE) {
+		return errorResponse(`limit must be between 1 and ${MAX_PATH_PAGE}`, 400);
+	}
+	if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
+		return errorResponse("before must be a path id", 400);
+	}
+
+	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
+	if (!cache) {
+		return errorResponse(`no cache named ${name}`, 404);
+	}
+	const rows = await searchPublishedPaths(config.db, cache.id, query, limit, before);
+	const last = rows.at(-1);
+	return jsonResponse({
+		paths: rows.map((p) => ({
+			storePath: p.storePath,
+			storePathHash: p.storePathHash,
+			size: p.fileSize,
+			narSize: p.narSize,
+			addedAt: p.createdAt,
+			lastPushedAt: p.lastPushedAt,
+		})),
+		next: rows.length === limit && last ? last.id : null,
+	});
 }

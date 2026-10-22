@@ -282,6 +282,51 @@ export async function listRecentPaths(
 		.limit(limit);
 }
 
+export type PathMatch = {
+	id: number;
+	storePath: string;
+	storePathHash: string;
+	fileSize: number;
+	narSize: number;
+	createdAt: Date;
+	lastPushedAt: Date;
+};
+
+/**
+ * A cache's paths whose name, the store path after its directory, contains
+ * `query`, ignoring case: a hash prefix and a package name both match, and
+ * /nix/store itself matches nothing. Every path when `query` is empty.
+ * Newest first, `limit` at a time, below the id `before`.
+ */
+export async function searchPublishedPaths(
+	db: Db,
+	cacheId: number,
+	query: string,
+	limit: number,
+	before?: number,
+): Promise<PathMatch[]> {
+	const pattern = `%${query.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+	return db
+		.select({
+			id: publishedPaths.id,
+			storePath: publishedPaths.storePath,
+			storePathHash: publishedPaths.storePathHash,
+			fileSize: blobObjects.fileSize,
+			narSize: publishedPaths.narSize,
+			createdAt: publishedPaths.createdAt,
+			lastPushedAt: publishedPaths.lastPushedAt,
+		})
+		.from(publishedPaths)
+		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.where(and(
+			eq(publishedPaths.cacheId, cacheId),
+			query === "" ? undefined : sql`regexp_replace(${publishedPaths.storePath}, '^.*/', '') ILIKE ${pattern}`,
+			before === undefined ? undefined : lt(publishedPaths.id, before),
+		))
+		.orderBy(desc(publishedPaths.id))
+		.limit(limit);
+}
+
 export async function findBlobObject(
 	db: Db,
 	fileHash: string,

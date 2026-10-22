@@ -55,10 +55,10 @@ function deletePaths(cache: string, body: unknown, org?: string): Promise<Respon
 }
 
 /** Pushes one path as the client does, and returns the sessions' status. */
-async function push(cache: string, hash: string, { body, fileHash }: { body: Uint8Array; fileHash: string }, token = "test-auth-token"): Promise<number> {
+async function push(cache: string, hash: string, { body, fileHash }: { body: Uint8Array; fileHash: string }, token = "test-auth-token", name = "hello"): Promise<number> {
 	const res = await api(`/caches/${cache}/upload-sessions/batch`, {
 		paths: [{
-			storePath: `/nix/store/${hash}-hello`,
+			storePath: `/nix/store/${hash}-${name}`,
 			storePathHash: hash,
 			narHash: `sha256:${"1".repeat(52)}`,
 			narSize: body.byteLength,
@@ -226,6 +226,42 @@ describe("deleting published paths", () => {
 		{ label: "an invalid time", body: { before: "yesterday" } },
 	])("rejects $label", async ({ body }) => {
 		expect((await deletePaths("delete-test", body)).status).toBe(400);
+	});
+
+	it("lists an org's cache paths newest first, searched by name or hash", async () => {
+		const org = unique("org");
+		const cache = unique("cache");
+		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] })).json<{ token: string }>();
+		const [hello, world, openssl] = [storePathHash(), storePathHash(), storePathHash()];
+		expect(await push(cache, hello, await nar(10), token, "hello-2.12")).toBe(201);
+		expect(await push(cache, world, await nar(20), token, "Hello_World")).toBe(201);
+		expect(await push(cache, openssl, await nar(30), token, "openssl-3.0")).toBe(201);
+
+		const search = async (query: string) => {
+			const res = await orgApi(`/${org}/caches/${cache}/paths?${query}`);
+			expect(res.status, query).toBe(200);
+			return res.json<{ paths: { storePathHash: string; size: number; addedAt: string }[]; next: number | null }>();
+		};
+		const hashes = async (query: string) => (await search(query)).paths.map((p) => p.storePathHash);
+
+		expect(await hashes("")).toEqual([openssl, world, hello]);
+		expect(await hashes("q=HELLO")).toEqual([world, hello]);
+		// LIKE's wildcards are matched as themselves.
+		expect(await hashes("q=_")).toEqual([world]);
+		expect(await hashes(`q=${openssl.slice(0, 8)}`)).toEqual([openssl]);
+		expect(await hashes(`q=${encodeURIComponent(`/nix/store/${openssl}-openssl-3.0`)}`)).toEqual([openssl]);
+		// The store directory isn't part of a path's name.
+		expect(await hashes("q=store")).toEqual([]);
+
+		const first = await search("limit=2");
+		expect(first.paths.map((p) => [p.storePathHash, p.size])).toEqual([[openssl, 30], [world, 20]]);
+		const rest = await search(`limit=2&before=${first.next}`);
+		expect(rest).toMatchObject({ paths: [{ storePathHash: hello, size: 10, addedAt: expect.any(String) }], next: null });
+
+		expect((await orgApi(`/${org}/caches/${unique("cache")}/paths`)).status).toBe(404);
+		expect((await orgApi(`/${org}/caches/${cache}/paths?limit=0`)).status).toBe(400);
 	});
 
 	it("answers 404 for a cache that doesn't exist, and needs the admin secret", async () => {
