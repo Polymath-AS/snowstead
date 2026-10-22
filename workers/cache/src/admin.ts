@@ -20,6 +20,7 @@ import {
 	listCacheStats,
 	listRecentPaths,
 	searchPublishedPaths,
+	deleteEmptyCache,
 	setCachePublic,
 	setCacheRetention,
 	findCache,
@@ -35,7 +36,7 @@ import {
 import { storeNarinfo } from "./narinfo.js";
 import { setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
-import { RESERVED_CACHE_NAMES, setPublicCacheInfo } from "./layout.js";
+import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "./layout.js";
 import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
 import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
 
@@ -689,4 +690,51 @@ export async function handleListPaths(config: WorkerConfig, rawName: string, url
 		})),
 		next: rows.length === limit && last ? last.id : null,
 	});
+}
+
+// Paths published while a cache is being deleted send it round again.
+const DELETE_CACHE_ATTEMPTS = 3;
+
+/**
+ * Deletes a cache: its paths (as deleting paths does, a batch at a time),
+ * its nix-cache-info and private marker, what the CDN holds under it, and
+ * then the cache itself, so its name is free again. NARs stay for GC, which
+ * deletes each once no cache's path points at it. Tokens keep working for
+ * their other caches.
+ */
+export async function handleDeleteCache(config: WorkerConfig, rawName: string, origin: string, scope?: string): Promise<Response> {
+	const name = parseCacheName(rawName);
+	if (typeof name === "object") {
+		return errorResponse(name.message, 400);
+	}
+	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
+	if (!cache) {
+		return errorResponse(`no cache named ${name}`, 404);
+	}
+
+	let paths = 0;
+	for (let attempt = 1; ; attempt++) {
+		for (;;) {
+			const deleted = await deleteCachePaths(config, cache, { before: new Date(Date.now() + 60_000), limit: MAX_DELETE_BATCH }, origin);
+			paths += deleted.length;
+			if (deleted.length < MAX_DELETE_BATCH) break;
+		}
+		const { deleted, staged } = await deleteEmptyCache(config.db, cache.id);
+		if (deleted) {
+			await Promise.all(staged.map((key) => bucketForKey(config, key).delete(key).catch(() => undefined)));
+			break;
+		}
+		if (attempt === DELETE_CACHE_ATTEMPTS) {
+			return errorResponse("pushes kept publishing to this cache while it was deleted; try again", 409);
+		}
+	}
+
+	await setPublicCacheInfo(config, cache.path, false);
+	await setPrivate(config, cache.path, false, { org: cache.orgId, id: cache.id });
+	if (cache.isPublic) {
+		const purged = purgeCache(config, cache.path).catch((err: unknown) => console.error("CDN purge of a deleted cache failed", err));
+		if (config.ctx) config.ctx.waitUntil(purged);
+		else await purged;
+	}
+	return jsonResponse({ deleted: true, name, paths });
 }

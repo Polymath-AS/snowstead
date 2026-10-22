@@ -22,7 +22,7 @@ import {
 	handleCreateSessions,
 	handleCommit,
 } from "./uploads.js";
-import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths, handlePurgeCache } from "./admin.js";
+import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths, handlePurgeCache, handleDeleteCache } from "./admin.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
@@ -36,6 +36,7 @@ const RE_REVOKE = /^\/_api\/v1\/admin\/tokens\/([^/]+)\/revoke$/;
 const RE_ADMIN_CACHE = /^\/_api\/v1\/admin\/caches\/([^/]+)$/;
 const RE_ADMIN_CACHE_PATHS_DELETE = /^\/_api\/v1\/admin\/caches\/([^/]+)\/paths\/delete$/;
 const RE_ADMIN_CACHE_PURGE = /^\/_api\/v1\/admin\/caches\/([^/]+)\/purge$/;
+const RE_ADMIN_CACHE_DELETE = /^\/_api\/v1\/admin\/caches\/([^/]+)\/delete$/;
 
 export async function handleRequest(
 	request: Request,
@@ -371,6 +372,15 @@ async function handleAdminApi(
 		const name = decodeURIComponent(purgeMatch[1]);
 		const response = await handlePurgeCache(request, config, name);
 		writeAuditLog(config, authResult.identity, "cache.purge", name, response.status, "{}", ip);
+		return response;
+	}
+
+	const deleteCacheMatch = pathname.match(RE_ADMIN_CACHE_DELETE);
+	if (deleteCacheMatch && request.method === "POST") {
+		const name = decodeURIComponent(deleteCacheMatch[1]);
+		const response = await handleDeleteCache(config, name, new URL(request.url).origin);
+		const detail = response.ok ? JSON.stringify({ paths: (await response.clone().json<{ paths: number }>()).paths }) : "{}";
+		writeAuditLog(config, authResult.identity, "cache.delete", name, response.status, detail, ip);
 		return response;
 	}
 

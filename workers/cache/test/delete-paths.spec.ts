@@ -264,6 +264,41 @@ describe("deleting published paths", () => {
 		expect((await orgApi(`/${org}/caches/${cache}/paths?limit=0`)).status).toBe(400);
 	});
 
+	it("deletes a whole cache, freeing its storage and its name", async () => {
+		const org = unique("org");
+		const cache = unique("cache");
+		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		const keep = unique("cache");
+		expect((await orgApi(`/${org}/caches`, "POST", { name: keep })).status).toBe(201);
+		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache, keep], perms: ["push"] })).json<{ token: string }>();
+		const [a, b, c] = [storePathHash(), storePathHash(), storePathHash()];
+		const shared = await nar(30);
+		expect(await push(cache, a, await nar(10), token)).toBe(201);
+		expect(await push(cache, b, shared, token)).toBe(201);
+		expect(await push(keep, c, shared, token)).toBe(201);
+		expect(await used(org)).toBe(70);
+
+		const res = await orgApi(`/${org}/caches/${cache}/delete`, "POST");
+		expect(await res.json()).toEqual({ deleted: true, name: cache, paths: 2 });
+		expect(await used(org)).toBe(30);
+		expect((await orgApi(`/${org}/caches/${cache}`)).status).toBe(404);
+		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/nix-cache-info`)).toBeNull();
+		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/${a}.narinfo`)).toBeNull();
+		expect((await SELF.fetch(`http://example.com/${org}/${cache}/${a}.narinfo`)).status).toBe(404);
+		// The other cache and the NAR it shares are untouched, even after GC.
+		await expireSessions(shared.fileHash);
+		await runGarbageCollection(config);
+		expect((await SELF.fetch(`http://example.com/${org}/${keep}/${c}.narinfo`)).status).toBe(200);
+		expect(await findBlobObject(db, shared.fileHash, "zstd")).toBeDefined();
+
+		// The name is free, and a cache made under it starts empty.
+		const again = await orgApi(`/${org}/caches`, "POST", { name: cache });
+		expect(await again.json()).toMatchObject({ created: true });
+		expect(await (await orgApi(`/${org}/caches/${cache}`)).json()).toMatchObject({ paths: 0 });
+		expect((await orgApi(`/${org}/caches/${unique("cache")}/delete`, "POST")).status).toBe(404);
+	});
+
 	it("answers 404 for a cache that doesn't exist, and needs the admin secret", async () => {
 		expect((await deletePaths(unique("cache"), { storePathHashes: ["0".repeat(32)] })).status).toBe(404);
 		const res = await SELF.fetch(`http://example.com/_api/v1/admin/caches/${unique("cache")}/paths/delete`, {

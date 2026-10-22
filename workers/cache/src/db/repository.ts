@@ -946,3 +946,33 @@ export async function cacheHasNar(db: Db, cacheId: number, fileHash: string, com
 	);
 	return row !== undefined;
 }
+
+/**
+ * Removes an emptied cache's row and its upload sessions. A session's
+ * canonical upload is adopted as a blob object, as GC does for abandoned
+ * ones, so the sweep deletes it once nothing points at it; staged uploads
+ * are returned for the caller to delete. False when a path was published
+ * since the cache was emptied: the row is locked first, so none can be
+ * while this runs, and the caller empties it again.
+ */
+export async function deleteEmptyCache(db: Db, cacheId: number): Promise<{ deleted: boolean; staged: string[] }> {
+	return db.transaction(async (tx) => {
+		await tx.execute(sql`select id from ${caches} where ${caches.id} = ${cacheId} for update`);
+		const [published] = await tx.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1);
+		if (published) return { deleted: false, staged: [] };
+
+		const sessions = await tx.select().from(uploadSessions).where(eq(uploadSessions.cacheId, cacheId));
+		const canonical = sessions.filter((s) => s.r2UploadKey !== null && !s.r2UploadKey.startsWith("staging/"));
+		if (canonical.length > 0) {
+			await tx.insert(blobObjects).values(canonical.map((s) => ({
+				fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression, r2Key: s.r2UploadKey ?? "",
+			}))).onConflictDoNothing();
+		}
+		if (sessions.length > 0) {
+			await tx.delete(uploadParts).where(inArray(uploadParts.sessionId, sessions.map((s) => s.id)));
+			await tx.delete(uploadSessions).where(eq(uploadSessions.cacheId, cacheId));
+		}
+		await tx.delete(caches).where(eq(caches.id, cacheId));
+		return { deleted: true, staged: sessions.flatMap((s) => (s.r2UploadKey?.startsWith("staging/") ? [s.r2UploadKey] : [])) };
+	});
+}

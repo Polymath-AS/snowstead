@@ -12,6 +12,7 @@ import {
 	handleDeletePaths,
 	handlePurgeCache,
 	handleListPaths,
+	handleDeleteCache,
 	handleCreateToken,
 	handleListTokens,
 	handleRevokeToken,
@@ -35,6 +36,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
  *   GET  /caches/:name
  *   GET  /caches/:name/paths?q=&before=&limit=   its paths, searched by name
  *   POST /caches/:name/paths/delete
+ *   POST /caches/:name/delete        the cache, its paths, and its name
  *   POST /caches/:name/purge
  *   GET  /tokens   POST /tokens
  *   POST /tokens/:jti/revoke
@@ -97,6 +99,11 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		return audit("cache.purge", await handlePurgeCache(request, config, value(1), org), value(1));
 	}
 	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "paths" && method === "GET") return handleListPaths(config, value(1), url, org);
+	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "delete" && method === "POST") {
+		const response = await handleDeleteCache(config, value(1), url.origin, org);
+		const paths = response.ok ? (await response.clone().json<{ paths: number }>()).paths : undefined;
+		return audit("cache.delete", response, value(1), { paths });
+	}
 	if (rest.length === 4 && rest[0] === "caches" && rest[2] === "paths" && rest[3] === "delete" && method === "POST") {
 		const response = await handleDeletePaths(request, config, value(1), url.origin, org);
 		const deleted = response.ok ? (await response.clone().json<{ deleted: string[] }>()).deleted : [];
