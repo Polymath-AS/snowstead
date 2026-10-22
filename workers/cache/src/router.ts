@@ -5,7 +5,7 @@ import { writeAuditLog } from "./audit.js";
 import { handleOrgApi } from "./org-api.js";
 import { narinfoCacheKey, privateCacheBase } from "./narinfo.js";
 import { bucketFor, narKey, narinfoKey, NARINFO_CACHE_CONTROL } from "./layout.js";
-import { authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
+import { actorId, authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
 import { privateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission } from "./jwt.js";
@@ -341,7 +341,7 @@ async function handleAdminApi(
 	const ip = request.headers.get("cf-connecting-ip");
 
 	if (pathname === "/_api/v1/admin/tokens" && request.method === "POST") {
-		const response = await handleCreateToken(request, config);
+		const response = await handleCreateToken(request, config, actorId(authResult.identity));
 		writeAuditLog(config, authResult.identity, "token.create", null, response.status, "{}", ip);
 		return response;
 	}
@@ -407,7 +407,7 @@ async function handleAdminApi(
 
 	const revokeMatch = pathname.match(RE_REVOKE);
 	if (revokeMatch && request.method === "POST") {
-		const response = await handleRevokeToken(request, config, revokeMatch[1]);
+		const response = await handleRevokeToken(request, config, revokeMatch[1], actorId(authResult.identity));
 		writeAuditLog(config, authResult.identity, "token.revoke", null, response.status, JSON.stringify({ jti: revokeMatch[1] }), ip);
 		return response;
 	}

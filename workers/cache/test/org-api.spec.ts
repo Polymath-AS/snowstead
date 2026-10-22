@@ -190,6 +190,23 @@ describe("org audit log", () => {
 		expect(entries.find((e) => e.cache === byKey)?.actor).toBe(`key:${id}`);
 	});
 
+	it("keeps who made and revoked each token", async () => {
+		const { org, cache, key, id } = await orgWithKey();
+		const asUser = (path: string, body: unknown) =>
+			SELF.fetch(`http://example.com/_api/v1/orgs/${org}${path}`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${OPERATOR}`, "content-type": "application/json", "x-snowstead-actor": "dev@example.com" },
+				body: JSON.stringify(body),
+			});
+		const mine = await (await asUser("/tokens", { subject: "laptop", caches: [cache], perms: ["push"] })).json<{ jti: string }>();
+		const theirs = await (await orgApi(`/${org}/tokens`, key, "POST", { subject: "ci", caches: [cache], perms: ["push"] })).json<{ jti: string }>();
+		expect((await asUser(`/tokens/${theirs.jti}/revoke`, { reason: "left" })).status).toBe(200);
+
+		const { tokens } = await (await orgApi(`/${org}/tokens`, key)).json<{ tokens: { jti: string; createdBy: string; revokedBy: string | null }[] }>();
+		expect(tokens.find((t) => t.jti === mine.jti)).toMatchObject({ createdBy: "user:dev@example.com", revokedBy: null });
+		expect(tokens.find((t) => t.jti === theirs.jti)).toMatchObject({ createdBy: `key:${id}`, revokedBy: "user:dev@example.com" });
+	});
+
 	it("names the caches, tokens, and keys it records, and never a secret", async () => {
 		const { org, cache, id, key } = await orgWithKey();
 		const made = await orgApi(`/${org}/tokens`, key, "POST", { subject: "ci", caches: [cache], perms: ["push"] });

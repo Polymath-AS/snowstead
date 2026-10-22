@@ -61,6 +61,7 @@ export function parseOrgId(value: unknown): string | undefined {
 export async function handleCreateToken(
 	request: Request,
 	config: WorkerConfig,
+	actor: string,
 	scope?: string,
 ): Promise<Response> {
 	if (!config.jwtSecret) {
@@ -169,7 +170,7 @@ export async function handleCreateToken(
 		caches: entries,
 		permsJson: JSON.stringify(dedupedPerms),
 		expiresAt,
-		createdBy: "admin",
+		createdBy: actor,
 		orgId: tokenOrg ?? null,
 	});
 
@@ -215,6 +216,7 @@ export async function handleRevokeToken(
 	request: Request,
 	config: WorkerConfig,
 	jti: string,
+	actor: string,
 	scope?: string,
 ): Promise<Response> {
 	const body = await parseJsonBody<{
@@ -238,7 +240,7 @@ export async function handleRevokeToken(
 	// leaves the token refused, while the reverse would leave it working with
 	// the database saying otherwise.
 	await recordRevocation(config, jti, token.expiresAt);
-	await revokeApiToken(config.db, jti, "admin", body.reason);
+	await revokeApiToken(config.db, jti, actor, body.reason);
 
 	return jsonResponse({ revoked: true, jti });
 }

@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { authenticateOrg, generateOrgApiKey } from "./auth.js";
+import { actorId, authenticateOrg, generateOrgApiKey } from "./auth.js";
 import { writeAuditLog } from "./audit.js";
 import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
 import {
@@ -112,12 +112,12 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 
 	if (route === "tokens" && method === "GET") return handleListTokens(config, url, org);
 	if (route === "tokens" && method === "POST") {
-		const response = await handleCreateToken(request, config, org);
+		const response = await handleCreateToken(request, config, actorId(identity), org);
 		const token = await answered<{ jti: string; subject: string }>(response);
 		return audit("token.create", response, null, { jti: token.jti, subject: token.subject });
 	}
 	if (rest.length === 3 && rest[0] === "tokens" && rest[2] === "revoke" && method === "POST") {
-		return audit("token.revoke", await handleRevokeToken(request, config, value(1), org), null, { jti: value(1) });
+		return audit("token.revoke", await handleRevokeToken(request, config, value(1), actorId(identity), org), null, { jti: value(1) });
 	}
 
 	if (route === "audit" && method === "GET") return handleListAudit(config, org, url);
