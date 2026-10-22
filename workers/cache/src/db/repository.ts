@@ -300,13 +300,20 @@ export async function listRecentPaths(
 	cacheId: number,
 	limit: number,
 ): Promise<{ storePath: string; fileSize: number; createdAt: Date }[]> {
-	return db
-		.select({ storePath: publishedPaths.storePath, fileSize: blobObjects.fileSize, createdAt: publishedPaths.createdAt })
+	// The newest paths first, then their blobs: joining before the limit
+	// looked up the blob of every path in the cache to keep `limit` of them.
+	const recent = db
+		.select({ storePath: publishedPaths.storePath, blobObjectId: publishedPaths.blobObjectId, createdAt: publishedPaths.createdAt, id: publishedPaths.id })
 		.from(publishedPaths)
-		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
 		.where(eq(publishedPaths.cacheId, cacheId))
 		.orderBy(desc(publishedPaths.createdAt), desc(publishedPaths.id))
-		.limit(limit);
+		.limit(limit)
+		.as("recent");
+	return db
+		.select({ storePath: recent.storePath, fileSize: blobObjects.fileSize, createdAt: recent.createdAt })
+		.from(recent)
+		.innerJoin(blobObjects, eq(recent.blobObjectId, blobObjects.id))
+		.orderBy(desc(recent.createdAt), desc(recent.id));
 }
 
 export type PathMatch = {
