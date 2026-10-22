@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -42,10 +43,21 @@ before(async () => {
   await run("login", "selected", url, "selected-token");
   await run("login", "default", url, "default-token");
   await mkdir(join(home, "bin"));
-  // Closure resolution remains a subprocess; only Nix itself is a fixture.
-  await writeFile(join(home, "bin/nix"), `#!/bin/sh
-if [ "$1" != path-info ] || [ "$2" != -r ] || [ "$3" != /run/current-system ]; then exit 1; fi
-printf '%s\\n' '${storePath}'
+  // Exercise the real CLI and streaming pipeline without requiring a Nix store.
+  await writeFile(join(home, "bin/nix"), `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "path-info" && args[1] === "-r" && args[2] === "/run/current-system") {
+  console.log(${JSON.stringify(storePath)});
+} else if (args[0] === "path-info" && args[1] === "--json") {
+  console.log(JSON.stringify(Object.fromEntries(args.slice(2).map((path) => [path, {
+    narHash: "sha256:" + "1".repeat(52), narSize: 19, references: [],
+  }]))));
+} else if (args[0] === "store" && args[1] === "dump-path") {
+  process.stdout.write("identical NAR bytes");
+} else process.exit(1);
+`, { mode: 0o755 });
+  await writeFile(join(home, "bin/zstd"), `#!${process.execPath}
+process.stdin.pipe(process.stdout);
 `, { mode: 0o755 });
 });
 
@@ -110,3 +122,61 @@ test("malformed options fail before making an API request", async () => {
   }
   assert.equal(requests.length, count);
 });
+
+for (const method of ["direct", "presigned"]) {
+  test(`push proves possession for each ${method} session, including shared NAR keys`, async () => {
+    const paths = Array.from({ length: 4 }, (_, i) => `/nix/store/${String(i + 1).repeat(32)}-same-nar`);
+    const sessions = new Map();
+    const owner = new Map();
+    const published = new Set();
+    const uploaded = [];
+    const api = createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const bytes = Buffer.concat(chunks);
+      const send = (data) => res.end(JSON.stringify(data));
+      if (req.method === "PUT") {
+        const id = req.url.split("/").at(-2);
+        const session = sessions.get(id);
+        assert.ok(session, `unknown session ${id}`);
+        assert.equal(createHash("sha256").update(bytes).digest("hex"), session.fileHash);
+        assert.equal(bytes.length, session.fileSize);
+        uploaded.push(id);
+        owner.set(session.r2Key, id);
+        return send({ uploaded: true });
+      }
+      const data = JSON.parse(bytes);
+      if (req.url === "/_api/v1/get-missing-paths") return send({ missing: data.storePathHashes });
+      if (req.url.endsWith("/upload-sessions/batch")) {
+        return send({ sessions: data.paths.map((path) => {
+          const id = String(sessions.size + 1);
+          // Two sessions share a canonical key; the others are staged.
+          const r2Key = sessions.size < 2 ? `nar/${path.fileHash}/zstd.nar` : `staging/${id}`;
+          sessions.set(id, { ...path, r2Key });
+          return {
+            sessionId: id, r2Key, uploadMethod: method,
+            uploadUrl: `http://127.0.0.1:${api.address().port}/presigned/${id}/blob`, uploadHeaders: {},
+          };
+        }) });
+      }
+      assert.equal(req.url, "/_api/v1/uploads/commit");
+      return send({ results: data.sessionIds.map((id) => {
+        const session = sessions.get(id);
+        if (owner.get(session.r2Key) !== id) return { sessionId: id, error: "Upload incomplete", status: 400 };
+        published.add(session.storePath);
+        return { sessionId: id, published: true };
+      }) });
+    });
+    await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+    try {
+      await run("login", "upload", `http://127.0.0.1:${api.address().port}`, "push-token");
+      const { stdout } = await run("push", "--server", "upload", "main", "--jobs", "4", ...paths);
+      assert.match(stdout, /4 pushed, 0 skipped.*0 failed/);
+      assert.deepEqual([...published].sort(), paths.sort());
+      assert.equal(uploaded.length, 4);
+      assert.equal(new Set(uploaded).size, 4);
+    } finally {
+      await new Promise((resolve) => api.close(resolve));
+    }
+  });
+}
