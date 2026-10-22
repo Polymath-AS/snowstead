@@ -249,6 +249,7 @@ export async function uploadBlobMultipart(
   client: ApiClient,
   sessionId: string,
   filePath: string,
+  limit: <R>(fn: () => Promise<R>) => Promise<R>,
 ): Promise<void> {
   const fileInfo = await stat(filePath);
   const fileSize = Number(fileInfo.size);
@@ -259,9 +260,8 @@ export async function uploadBlobMultipart(
   const totalParts = Math.ceil(fileSize / partSize);
   const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
 
-  // Parts are independent byte ranges of the same file, so they can be
-  // read and uploaded concurrently.
-  await runPool(partNumbers, PART_UPLOAD_CONCURRENCY, async (partNumber) => {
+  // Acquire the push-wide slot before opening the part's file stream.
+  await runPool(partNumbers, PART_UPLOAD_CONCURRENCY, (partNumber) => limit(async () => {
     const start = (partNumber - 1) * partSize;
     const end = Math.min(start + partSize, fileSize);
     const length = end - start;
@@ -270,7 +270,7 @@ export async function uploadBlobMultipart(
     const webStream = ReadableStream.from(stream);
 
     await uploadPart(client, sessionId, partNumber, webStream, length);
-  });
+  }));
 }
 
 export interface TokenInfo {

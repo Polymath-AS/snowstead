@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
+import { uploadBlobMultipart, uploadPresignedParts } from "../dist/api.js";
+import { limiter } from "../dist/batch.js";
 
 const exec = promisify(execFile);
 const cli = new URL("../dist/main.js", import.meta.url);
@@ -180,3 +182,53 @@ for (const method of ["direct", "presigned"]) {
     }
   });
 }
+
+test("proxied and presigned parts share a concurrency budget, including after failure", async () => {
+  const bytes = Buffer.from("0123456789abc");
+  const file = join(home, "multipart.nar");
+  await writeFile(file, bytes);
+  const received = new Map();
+  let active = 0;
+  let peak = 0;
+  const api = createServer(async (req, res) => {
+    if (req.method === "POST") {
+      req.resume();
+      return res.end(JSON.stringify({ uploadId: "upload", r2Key: req.url }));
+    }
+    active++;
+    peak = Math.max(peak, active);
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      received.set(req.url, Buffer.concat(chunks));
+      // Hold the requests open so the test observes concurrent transfers.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (req.url.includes("/fail/")) res.statusCode = 400;
+      res.setHeader("etag", '"part-etag"');
+      res.end(JSON.stringify({ partNumber: 1, etag: "part-etag" }));
+    } finally {
+      active--;
+    }
+  });
+  await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${api.address().port}`;
+  const client = { server: url, token: "push-token" };
+  const slot = limiter(2);
+  try {
+    const sessions = ["first", "fail", "second", "third"];
+    const outcomes = await Promise.allSettled([
+      ...sessions.map((id) => uploadBlobMultipart(client, id, file, slot)),
+      uploadPresignedParts([1, 2, 3].map((partNumber) => ({ partNumber, url: `${url}/signed/${partNumber}` })), 5, file, slot),
+    ]);
+    assert.deepEqual(outcomes.map((r) => r.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    assert.match(outcomes[1].reason.message, /part upload failed \(400\)/);
+    assert.deepEqual(outcomes[4].value, [1, 2, 3].map((partNumber) => ({ partNumber, etag: '"part-etag"' })));
+    await uploadBlobMultipart(client, "after-failure", file, slot);
+    assert.equal(peak, 2);
+    assert.equal(received.size, 8);
+    for (const id of [...sessions, "after-failure"]) assert.deepEqual(received.get(`/_api/v1/uploads/${id}/part/1`), bytes);
+    for (const part of [1, 2, 3]) assert.deepEqual(received.get(`/signed/${part}`), bytes.subarray((part - 1) * 5, part * 5));
+  } finally {
+    await new Promise((resolve) => api.close(resolve));
+  }
+});

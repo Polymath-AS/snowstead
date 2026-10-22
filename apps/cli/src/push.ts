@@ -94,7 +94,7 @@ function pathPusher(client: ApiClient, cache: string) {
           // Straight to R2; the API never handles the NAR.
           await uploadPresigned(session.uploadUrl, session.uploadHeaders, narFile);
         } else if (shouldUseMultipart(fileSize)) {
-          await uploadBlobMultipart(client, session.sessionId, narFile);
+          await uploadBlobMultipart(client, session.sessionId, narFile, partSlot);
           // A commit takes multipart sessions only once completed.
           await completeUpload(client, session.sessionId);
         } else {
