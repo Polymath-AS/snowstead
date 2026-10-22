@@ -74,6 +74,15 @@
 			"id": "9c99efdbc9964220995416b4ea44e111"
 		}
 	],
+	// Requests a caller may make a minute, by who they are (rate-limit.ts):
+	// pushes by token, the org API by key or dashboard user, private reads by
+	// pull token. Generous: they stop runaway loops, not real work. Public
+	// reads never reach the Worker.
+	"ratelimits": [
+		{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+		{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+	],
 	// cache.snowstead.com itself is the public bucket; the Worker takes only the
 	// API and private caches there.
 	"routes": [

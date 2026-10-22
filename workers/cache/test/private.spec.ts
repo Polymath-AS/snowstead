@@ -1,5 +1,5 @@
 import { env, SELF } from "cloudflare:test";
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { testDb } from "./db.js";
 import { createBlobObject, createPublishedPath, findCache, revokeApiToken, setCachePublic } from "../src/db/repository.js";
 
@@ -209,5 +209,22 @@ describe("private NARs", () => {
 		expect((await admin(`/caches/${name}/paths/delete`, { storePathHashes: [hash] })).status).toBe(200);
 		expect((await read(`/${name}/${hash}.narinfo`, auth)).status).toBe(404);
 		expect((await read(`/${name}/nar/${file}/zstd.nar`, auth)).status).toBe(404);
+	});
+
+	it("count the bytes of every private NAR served, cached or not, toward the org", async () => {
+		const served = async () => {
+			const res = await SELF.fetch("http://example.com/_api/v1/orgs/default", { headers: { authorization: "Bearer test-admin-secret" } });
+			return (await res.json<{ servedThisMonth: number }>()).servedThisMonth;
+		};
+		// Earlier reads record after their responses.
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		const before = await served();
+
+		expect((await read(nar(PRIVATE), basic(pull))).status).toBe(200);
+		expect((await read(nar(PRIVATE), basic(pull))).status).toBe(200);
+		expect((await SELF.fetch(`http://example.com${nar(PRIVATE)}`, { method: "HEAD", headers: { authorization: basic(pull) } })).status).toBe(200);
+		expect((await read(nar(PUBLIC))).status).toBe(200);
+
+		await vi.waitFor(async () => expect(await served()).toBe(before + 2 * NAR.byteLength));
 	});
 });

@@ -1,7 +1,8 @@
 import type { WorkerConfig } from "./config.js";
-import { cacheHasNar, findCacheByPath, findOrg, withUploadSessionLock } from "./db/repository.js";
+import { cacheHasNar, findCacheByPath, findOrg, recordBandwidth, withUploadSessionLock } from "./db/repository.js";
 import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
+import { overLimit } from "./rate-limit.js";
 import { handleOrgApi } from "./org-api.js";
 import { narinfoCacheKey, privateCacheBase } from "./narinfo.js";
 import { bucketFor, narKey, narinfoKey, NARINFO_CACHE_CONTROL } from "./layout.js";
@@ -107,6 +108,9 @@ export async function handleRequest(
 	if (isPrivate) {
 		const denied = await authorizeRead(request, config, path, cacheName);
 		if (denied) return denied;
+		// By where the reads come from: the pull token itself stays in authorizeRead.
+		const limited = await overLimit(config, "read", `${path}:${request.headers.get("cf-connecting-ip") ?? "unknown"}`);
+		if (limited) return limited;
 	}
 
 	if (rest[0] === "nix-cache-info" && rest.length === 1) {
@@ -115,7 +119,7 @@ export async function handleRequest(
 		return response;
 	}
 
-	const scope = visibility.isPrivate ? { path, gen: visibility.gen, id: visibility.id, slug, name: cacheName } : undefined;
+	const scope = visibility.isPrivate ? { path, gen: visibility.gen, id: visibility.id, org: visibility.org, slug, name: cacheName } : undefined;
 	if (rest[0] === "nar" && rest.length === 3 && rest[2].endsWith(".nar")) {
 		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, scope);
 	}
@@ -231,6 +235,7 @@ interface PrivateScope {
 	readonly path: string;
 	readonly gen: number | string;
 	readonly id?: number;
+	readonly org: string | null | undefined;
 	readonly slug: string;
 	readonly name: string;
 }
@@ -272,6 +277,7 @@ async function handleNarDownload(
 	const cache = await caches.open("snowstead-nar");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
+		if (scope && method === "GET") meter(config, scope, Number(cached.headers.get("content-length") ?? 0));
 		return forClient(cached, isPrivate, method);
 	}
 
@@ -320,7 +326,16 @@ async function handleNarDownload(
 	if (config.ctx && object.size <= CACHED_NAR_MAX_BYTES) {
 		config.ctx.waitUntil(cache.put(cacheKey, response.clone()).catch(() => {}));
 	}
+	if (scope) meter(config, scope, object.size);
 	return forClient(response, isPrivate, method);
+}
+
+/** Counts a private NAR's bytes toward its org's bandwidth, after the response. */
+function meter(config: WorkerConfig, scope: PrivateScope, bytes: number): void {
+	config.defer((async () => {
+		const org = typeof scope.org === "string" ? scope.org : (await findCacheByPath(config.db, scope.slug, scope.name))?.orgId;
+		if (org !== undefined) await recordBandwidth(config.db, org, bytes, new Date());
+	})().catch((err) => console.error("Recording bandwidth failed", err)));
 }
 
 async function privateCacheHasNar(config: WorkerConfig, scope: PrivateScope, fileHash: string, compression: string): Promise<boolean> {
@@ -426,6 +441,8 @@ async function handleWriteApi(
 	}
 
 	const identity = authResult.identity;
+	const limited = await overLimit(config, "push", actorId(identity));
+	if (limited) return limited;
 	const ip = request.headers.get("cf-connecting-ip");
 
 	// Check push permission for JWT tokens

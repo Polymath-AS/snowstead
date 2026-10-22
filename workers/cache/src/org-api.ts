@@ -3,6 +3,7 @@ import { actorId, authenticateOrg, generateOrgApiKey } from "./auth.js";
 import { handleSigningApi } from "./signing-api.js";
 import { writeAuditLog } from "./audit.js";
 import { moveSlugPage, parseMoveCursor } from "./slug-move.js";
+import { overLimit } from "./rate-limit.js";
 import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
 import {
 	parseOrgId,
@@ -58,6 +59,11 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 	const identity = auth.identity;
 	const isOperator = identity.kind === "admin";
+	// The operator itself goes unlimited; acting for a dashboard user, it counts as them.
+	if (identity.kind !== "admin" || identity.onBehalfOf !== undefined) {
+		const limited = await overLimit(config, "api", actorId(identity));
+		if (limited) return limited;
+	}
 	const ip = request.headers.get("cf-connecting-ip");
 	const audit = (action: string, response: Response, cache: string | null = null, detail: object = {}) => {
 		writeAuditLog(config, identity, action, cache, response.status, JSON.stringify(detail), ip, org);

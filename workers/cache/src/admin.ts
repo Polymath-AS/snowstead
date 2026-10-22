@@ -32,6 +32,7 @@ import {
 	findOrg,
 	putOrg,
 	orgUsage,
+	bandwidthThisMonth,
 } from "./db/repository.js";
 import { storeNarinfo } from "./narinfo.js";
 import { readyNewPath } from "./slug-move.js";
@@ -400,7 +401,8 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 	if (!org) {
 		return errorResponse(`no org ${id}`, 404);
 	}
-	const usage = await orgUsage(config.db, id, new Date());
+	const now = new Date();
+	const [usage, served] = await Promise.all([orgUsage(config.db, id, now), bandwidthThisMonth(config.db, id, now)]);
 	return jsonResponse({
 		id: org.id,
 		slug: org.slug,
@@ -409,6 +411,7 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		privateCaches: org.privateCaches,
 		used: usage.used,
 		pending: usage.pending,
+		servedThisMonth: served,
 	}, status);
 }
 

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, integer, bigint, boolean, timestamp, uniqueIndex, index, check } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, boolean, timestamp, date, primaryKey, uniqueIndex, index, check } from "drizzle-orm/pg-core";
 
 const timestamptz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 const createdAt = (name: string) => timestamptz(name).notNull().defaultNow();
@@ -206,6 +206,16 @@ export const upstreamPaths = pgTable("upstream_paths", {
 	upstream: text("upstream").notNull(),
 	foundAt: createdAt("found_at"),
 });
+
+/**
+ * NAR bytes the Worker served for an org's private caches, by UTC day.
+ * Public caches are read from the bucket and CDN directly and aren't counted.
+ */
+export const bandwidthDaily = pgTable("bandwidth_daily", {
+	orgId: text("org_id").notNull().references(() => orgs.id),
+	day: date("day", { mode: "string" }).notNull(),
+	bytes: bytes("bytes").notNull().default(0),
+}, (table) => [primaryKey({ columns: [table.orgId, table.day] })]);
 
 /**
  * Keys an org's own tooling calls the org API with. Only a hash of the key

@@ -1,6 +1,7 @@
 import { connect } from "./db/connection.js";
 import type { Connection, Db } from "./db/connection.js";
 import type { CdnConfig } from "./cdn.js";
+import type { RateLimiters } from "./rate-limit.js";
 
 export interface WorkerConfig {
 	/** Private caches, and everything the Worker alone reads. */
@@ -14,6 +15,8 @@ export interface WorkerConfig {
 	readonly defer: (task: Promise<unknown>) => void;
 	/** Waits for deferred work, then releases the request's connection; nothing to wait for if it never opened one. */
 	readonly close: () => Promise<void> | undefined;
+	/** Per-caller request limits (rate-limit.ts); none configured is no limit. */
+	readonly rateLimiters: RateLimiters;
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
 	/** Seals each cache's own signing key; without it every cache signs with signingPrivateKey. */
@@ -92,5 +95,6 @@ function readSettings(env: Env): Settings {
 		cdn: env.CDN_ZONE_ID && env.CDN_PURGE_TOKEN && env.PUBLIC_CACHE_ORIGIN
 			? { zoneId: env.CDN_ZONE_ID, token: env.CDN_PURGE_TOKEN, origin: env.PUBLIC_CACHE_ORIGIN.replace(/\/$/, "") }
 			: undefined,
+		rateLimiters: { push: env.PUSH_LIMIT, api: env.API_LIMIT, read: env.READ_LIMIT },
 	};
 }

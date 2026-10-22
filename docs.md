@@ -242,6 +242,15 @@ without an org are its tokens.
   the token's org, so `snowstead push main` pushes to that org's `main`.
 - **Storage limits.** A push that would take an org's caches past its
   limit is refused with 507 before anything uploads.
+- **Rate limits.** Pushes (per token), org API calls (per key or dashboard
+  user), and private reads (per cache and address) each have a limit per
+  minute, set under `ratelimits` in `wrangler.jsonc`. Past it, requests get
+  429 with `retry-after`. The operator's own `ADMIN_SECRET` calls go
+  unlimited.
+- **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth`: the NAR bytes
+  the Worker served from the org's private caches this UTC month, counted
+  by day in `bandwidth_daily`. Public caches are served by the bucket and
+  CDN without the Worker, so they aren't counted here.
 - **Signing keys.** With `SIGNING_MASTER_KEY` set, each new cache signs
   with a key of its own, shown as the cache's `publicKey`. Caches from
   before, and every cache without a master key, sign with

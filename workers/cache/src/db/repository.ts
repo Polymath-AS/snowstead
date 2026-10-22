@@ -1,4 +1,4 @@
-import { eq, and, or, notInArray, inArray, lt, gt, isNull, isNotNull, sql, desc } from "drizzle-orm";
+import { eq, and, or, notInArray, inArray, lt, gt, gte, isNull, isNotNull, sql, desc } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import { cachePath } from "../cache-path.js";
 import {
@@ -14,6 +14,7 @@ import {
 	tokenCaches,
 	auditLogs,
 	upstreamPaths,
+	bandwidthDaily,
 	DEFAULT_ORG_ID,
 } from "./schema.js";
 import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
@@ -241,6 +242,26 @@ export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsa
 		),
 	]);
 	return { used: used?.bytes ?? 0, pending: pending?.bytes ?? 0 };
+}
+
+/** Adds bytes served for an org to its count for the UTC day of `now`. */
+export async function recordBandwidth(db: Db, orgId: string, bytes: number, now: Date): Promise<void> {
+	await db.insert(bandwidthDaily)
+		.values({ orgId, day: now.toISOString().slice(0, 10), bytes })
+		.onConflictDoUpdate({
+			target: [bandwidthDaily.orgId, bandwidthDaily.day],
+			set: { bytes: sql`${bandwidthDaily.bytes} + excluded.bytes` },
+		});
+}
+
+/** Bytes served for an org in the UTC month of `now`. */
+export async function bandwidthThisMonth(db: Db, orgId: string, now: Date): Promise<number> {
+	const row = await first(
+		db.select({ bytes: sql`coalesce(sum(${bandwidthDaily.bytes}), 0)`.mapWith(Number) })
+			.from(bandwidthDaily)
+			.where(and(eq(bandwidthDaily.orgId, orgId), gte(bandwidthDaily.day, `${now.toISOString().slice(0, 7)}-01`))),
+	);
+	return row?.bytes ?? 0;
 }
 
 /**

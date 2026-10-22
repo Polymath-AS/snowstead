@@ -73,7 +73,7 @@ describe("orgs", () => {
 		expect((await orgApi(`/${org}`)).status).toBe(404);
 
 		const created = await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1000 });
-		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, used: 0, pending: 0 });
+		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, used: 0, pending: 0, servedThisMonth: 0 });
 
 		const raised = await orgApi(`/${org}`, "PUT", { storageLimit: null });
 		expect(await raised.json()).toMatchObject({ slug: org, storageLimit: null });
