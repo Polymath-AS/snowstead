@@ -95,7 +95,8 @@ describe("narinfo", () => {
 		expect(res.status).toBe(200);
 		expect(res.headers.get("content-type")).toBe("text/x-nix-narinfo");
 		expect(res.headers.get("content-length")).toBeTruthy();
-		expect(res.headers.get("cache-control")).toContain("immutable");
+		expect(res.headers.get("cache-control")).toBe("public, max-age=300");
+		expect((await env.PUBLIC_BUCKET.head(`test-cache/${STORE_PATH_HASH}.narinfo`))?.httpMetadata?.cacheControl).toBe("public, max-age=300");
 		const body = await res.text();
 		expect(body).toBe("");
 	});

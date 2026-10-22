@@ -47,6 +47,7 @@ const API_ROUTES = new Set([
 	"orgs/:org/keys/:key/revoke",
 	"orgs/:org/caches",
 	"orgs/:org/caches/:cache",
+	"orgs/:org/caches/:cache/purge",
 	"orgs/:org/caches/:cache/paths/delete",
 	"orgs/:org/tokens",
 	"orgs/:org/tokens/:jti/revoke",

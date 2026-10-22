@@ -268,7 +268,7 @@ describe("private org caches", () => {
 		await env.AUTH_KV.put(`private/${org}/${cache}`, "1");
 
 		expect((await admin("/auth/sync", "POST", {})).status).toBe(200);
-		expect(JSON.parse((await env.AUTH_KV.get(`private/${org}/${cache}`)) ?? "{}")).toEqual({ org, id: expect.any(Number), gen: expect.any(Number) });
+		expect(JSON.parse((await env.AUTH_KV.get(`private/${org}/${cache}`)) ?? "{}")).toEqual({ org, id: expect.any(Number), gen: expect.any(String) });
 	});
 });
 

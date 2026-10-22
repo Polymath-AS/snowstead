@@ -6,7 +6,7 @@ import type { CacheStats, PathSelection } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
 import { deleteCachePaths } from "./path-deletion.js";
-import { purgeCache, purgeNarinfo } from "./cdn.js";
+import { purgeCache, purgeNarinfo, scheduleNarinfoPurge } from "./cdn.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
 import { cachePath, parseOrgSlug } from "./cache-path.js";
 import {
@@ -488,6 +488,11 @@ export async function handleBackfillNarinfo(
 		);
 	}
 	const skipped = rows.filter((_, i) => results[i].status === "rejected").map((r) => `${r.cache.path}/${r.path.storePathHash}`);
+	for (const cache of caches) {
+		if (visibility.get(cache)) continue;
+		const hashes = rows.filter((r, i) => r.cache.path === cache && results[i].status === "fulfilled").map((r) => r.path.storePathHash);
+		await scheduleNarinfoPurge(config, cache, hashes);
+	}
 	const last = rows.at(-1);
 	return jsonResponse({
 		written: rows.length - skipped.length,
@@ -600,6 +605,10 @@ export async function handlePurgeCache(
 	}
 	const body = await parseJsonBody<{ storePathHashes?: unknown }>(request);
 	if (body instanceof Response) return body;
+	if (body === null || typeof body !== "object" || Array.isArray(body)
+		|| Object.keys(body).some((key) => key !== "storePathHashes")) {
+		return errorResponse("expected {} or { storePathHashes }", 400);
+	}
 
 	let hashes: string[] | undefined;
 	if (body.storePathHashes !== undefined) {
@@ -608,7 +617,7 @@ export async function handlePurgeCache(
 		}
 		hashes = [];
 		for (const raw of body.storePathHashes) {
-			const hash = parseStorePathHash(String(raw));
+			const hash = parseStorePathHash(typeof raw === "string" ? raw : "");
 			if (typeof hash === "object") {
 				return errorResponse(`${String(raw)}: ${hash.message}`, 400);
 			}
@@ -620,7 +629,7 @@ export async function handlePurgeCache(
 	if (!cache) {
 		return errorResponse(`no cache named ${name}`, 404);
 	}
-	if (await isPrivateCache(config, cache.path)) {
+	if (!cache.isPublic) {
 		return errorResponse("private caches are not on the CDN", 400);
 	}
 	try {
@@ -629,5 +638,7 @@ export async function handlePurgeCache(
 		console.error("CDN purge failed", err);
 		return errorResponse("the CDN refused the purge; try again shortly", 502);
 	}
-	return jsonResponse({ purged: hashes ?? "all" });
+	// Cloudflare acknowledged the purge, not a verified eviction in every
+	// location. Do not claim that the assets have already disappeared.
+	return jsonResponse({ accepted: true, paths: hashes ? [...new Set(hashes)] : "all" });
 }

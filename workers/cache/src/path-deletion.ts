@@ -3,8 +3,8 @@ import type { CacheAt, PathSelection } from "./db/repository.js";
 import { deletePublishedPaths } from "./db/repository.js";
 import { bucketFor, narinfoKey } from "./layout.js";
 import { narinfoCacheKey } from "./narinfo.js";
-import { inBackground, purgeNarinfo } from "./cdn.js";
-import { isPrivateCache, nextGeneration } from "./visibility.js";
+import { scheduleNarinfoPurge } from "./cdn.js";
+import { nextGeneration } from "./visibility.js";
 
 /**
  * Deletes paths from a cache, which frees their bytes from its org's usage
@@ -19,11 +19,11 @@ import { isPrivateCache, nextGeneration } from "./visibility.js";
  */
 export async function deleteCachePaths(
 	config: WorkerConfig,
-	cache: Pick<CacheAt, "id" | "path">,
+	cache: Pick<CacheAt, "id" | "path" | "orgId" | "isPublic">,
 	which: PathSelection,
 	origin?: string,
 ): Promise<string[]> {
-	const isPrivate = await isPrivateCache(config, cache.path);
+	const isPrivate = !cache.isPublic;
 	const bucket = bucketFor(config, isPrivate);
 	const named = "storePathHashes" in which ? which.storePathHashes : [];
 
@@ -35,15 +35,13 @@ export async function deleteCachePaths(
 	if (isPrivate) {
 		// The Cache API can only be cleared where a request runs: moving the
 		// generation on retires the cache's copies everywhere instead.
-		if (deleted.length > 0 || named.length > 0) await nextGeneration(config, cache.path);
+		if (deleted.length > 0 || named.length > 0) await nextGeneration(config, cache);
 	} else if (origin !== undefined) {
 		// The Worker's own copies of public narinfo (served on workers.dev),
 		// in the one data center it can clear.
 		const narinfos = await caches.open("snowstead-narinfo");
-		await Promise.allSettled(deleted.map((h) => narinfos.delete(narinfoCacheKey(origin, cache.path, h))));
+		await Promise.all([...new Set([...named, ...deleted])].map((h) => narinfos.delete(narinfoCacheKey(origin, cache.path, h))));
 	}
-	// A public narinfo served before stays cached by the CDN for a year: the
-	// path would stay downloadable after its NAR is gone.
-	if (!isPrivate) await inBackground(config, purgeNarinfo(config, cache.path, [...new Set([...named, ...deleted])]));
+	if (!isPrivate) await scheduleNarinfoPurge(config, cache.path, [...named, ...deleted]);
 	return deleted;
 }

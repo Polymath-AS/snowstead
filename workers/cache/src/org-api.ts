@@ -10,6 +10,7 @@ import {
 	handleListCaches,
 	handleGetCache,
 	handleDeletePaths,
+	handlePurgeCache,
 	handleCreateToken,
 	handleListTokens,
 	handleRevokeToken,
@@ -32,6 +33,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
  *   GET  /caches   POST /caches      as the admin API, within the org
  *   GET  /caches/:name
  *   POST /caches/:name/paths/delete
+ *   POST /caches/:name/purge
  *   GET  /tokens   POST /tokens
  *   POST /tokens/:jti/revoke
  *   GET  /audit?before=&limit=       what happened in the org, newest first
@@ -89,6 +91,9 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		return audit("cache.create", response, cache.name ?? null, { private: cache.private, retentionDays: cache.retentionDays });
 	}
 	if (rest.length === 2 && rest[0] === "caches" && method === "GET") return handleGetCache(config, value(1), org);
+	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "purge" && method === "POST") {
+		return audit("cache.purge", await handlePurgeCache(request, config, value(1), org), value(1));
+	}
 	if (rest.length === 4 && rest[0] === "caches" && rest[2] === "paths" && rest[3] === "delete" && method === "POST") {
 		const response = await handleDeletePaths(request, config, value(1), url.origin, org);
 		const deleted = response.ok ? (await response.clone().json<{ deleted: string[] }>()).deleted : [];
@@ -185,4 +190,3 @@ async function handleRevokeKey(config: WorkerConfig, org: string, id: string): P
 	}
 	return jsonResponse({ revoked: true, id });
 }
-

@@ -21,6 +21,9 @@ export const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority:
 /** Content-addressed objects never change. */
 export const IMMUTABLE = "public, max-age=31536000, immutable";
 
+/** Narinfo can be deleted or re-signed; bound staleness if purging fails. */
+export const NARINFO_CACHE_CONTROL = "public, max-age=300";
+
 /** Names that would collide with the paths around public caches. */
 export const RESERVED_CACHE_NAMES: ReadonlySet<string> = new Set(["nar", "private", "nix-cache-info"]);
 

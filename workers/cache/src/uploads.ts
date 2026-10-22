@@ -25,7 +25,7 @@ import type { CacheAt, OrgUsage } from "./db/repository.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
 import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "./narinfo.js";
-import { inBackground, purgeNarinfo } from "./cdn.js";
+import { scheduleNarinfoPurge } from "./cdn.js";
 import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./layout.js";
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { isPrivateCache, privateCache } from "./visibility.js";
@@ -620,7 +620,7 @@ export async function handleComplete(
  * rather than after the negative TTL. The Cache API is per data center: this
  * clears the one handling the publish, where the pusher's own lookups land.
  */
-async function forgetNarinfoMiss(origin: string, cachePath: string, storePathHash: string, privateGen: number | undefined): Promise<void> {
+async function forgetNarinfoMiss(origin: string, cachePath: string, storePathHash: string, privateGen: number | string | undefined): Promise<void> {
 	const cache = await caches.open("snowstead-narinfo");
 	await cache.delete(narinfoCacheKey(origin, cachePath, storePathHash, privateGen));
 }
@@ -702,9 +702,14 @@ async function publishSessions(
 	}));
 
 	const inserted = new Set(await createPublishedPaths(config.db, rows));
-	await Promise.all([...inserted].map((hash) => forgetNarinfoMiss(origin, cache.path, hash, privateGen)));
-	// The CDN may hold a miss for a public path from before it was published.
-	if (!isPrivate) await inBackground(config, purgeNarinfo(config, cache.path, [...inserted]));
+	// Re-publishes also rewrite narinfo (for example after a key change),
+	// and retries must invalidate even if a previous attempt inserted the row.
+	const published = sessions.filter((s) => {
+		const result = results.get(s.id);
+		return result === undefined || "published" in result;
+	}).map((s) => s.storePathHash);
+	await Promise.all(published.map((hash) => forgetNarinfoMiss(origin, cache.path, hash, privateGen)));
+	if (!isPrivate) await scheduleNarinfoPurge(config, cache.path, published);
 	for (const session of sessions) {
 		if (results.has(session.id)) continue;
 		// A path that is not inserted was published by someone else meanwhile.

@@ -150,6 +150,17 @@ describe("deleting published paths", () => {
 		expect(await env.CACHE_BUCKET.head(`narinfo/${cache}/${hash}.narinfo`)).toBeNull();
 	});
 
+	it("also withdraws cached orphan narinfo when no database row exists", async () => {
+		const cache = unique("orphan");
+		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
+		const hash = storePathHash();
+		await env.PUBLIC_BUCKET.put(`${cache}/${hash}.narinfo`, "orphan narinfo");
+		const url = `http://example.com/${cache}/${hash}.narinfo`;
+		expect((await SELF.fetch(url)).status).toBe(200);
+		expect(await (await deletePaths(cache, { storePathHashes: [hash] })).json()).toMatchObject({ deleted: [], notFound: [hash] });
+		expect((await SELF.fetch(url)).status).toBe(404);
+	});
+
 	it("deletes every path published before a time", async () => {
 		const cache = unique("cache");
 		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);

@@ -64,8 +64,8 @@ wrangler secret put SIGNING_KEY_NAME
 wrangler secret put SIGNING_MASTER_KEY
 # S3 keys of an R2 token limited to the two buckets (key id: the token id,
 # secret: the SHA-256 of its value). With them uploads go straight to R2
-# through presigned URLs and private NARs redirect to R2; without them both
-# go through the Worker.
+# through presigned URLs; without them uploads go through the Worker.
+# Private downloads always go through the Worker for authorization.
 wrangler secret put R2_ACCESS_KEY_ID
 wrangler secret put R2_SECRET_ACCESS_KEY
 wrangler secret put R2_ENDPOINT        # https://<account id>.r2.cloudflarestorage.com

@@ -5,6 +5,7 @@ import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
 import { logRequest } from "./logging.js";
 import { routeOf } from "./route.js";
+import { retryCdnPurges } from "./cdn.js";
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -42,6 +43,14 @@ export default {
 	async scheduled(event, env, ctx): Promise<void> {
 		const config = resolveConfig(env);
 		try {
+			if (event.cron === "*/5 * * * *") {
+				try {
+					console.log("CDN purge retry completed", { completed: await retryCdnPurges(config) });
+				} catch (err) {
+					console.error("CDN purge backlog remains", err);
+				}
+				return;
+			}
 			const result = await runGarbageCollection(config);
 			const counts = {
 				expiredSessions: result.expiredSessions,

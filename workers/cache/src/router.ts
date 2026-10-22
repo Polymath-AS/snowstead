@@ -4,7 +4,7 @@ import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cach
 import { writeAuditLog } from "./audit.js";
 import { handleOrgApi } from "./org-api.js";
 import { narinfoCacheKey, privateCacheBase } from "./narinfo.js";
-import { bucketFor, narKey, narinfoKey } from "./layout.js";
+import { bucketFor, narKey, narinfoKey, NARINFO_CACHE_CONTROL } from "./layout.js";
 import { authenticateWrite, authenticateAdmin, authorizeRead } from "./auth.js";
 import { privateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
@@ -178,7 +178,7 @@ async function handleNarinfo(
 	hashStr: string,
 	method: string,
 	request: Request,
-	privateGen: number | undefined,
+	privateGen: number | string | undefined,
 ): Promise<Response> {
 	const isPrivate = privateGen !== undefined;
 	const storePathHash = parseStorePathHash(hashStr);
@@ -213,7 +213,7 @@ async function handleNarinfo(
 		headers: {
 			"content-type": "text/x-nix-narinfo",
 			"content-length": String(textEncoder.encode(body).byteLength),
-			"cache-control": "public, max-age=31536000, immutable",
+			"cache-control": NARINFO_CACHE_CONTROL,
 		},
 	});
 	if (config.ctx) {
@@ -225,7 +225,7 @@ async function handleNarinfo(
 /** The private cache a NAR is asked for through, past authorization. */
 interface PrivateScope {
 	readonly path: string;
-	readonly gen: number;
+	readonly gen: number | string;
 	readonly id?: number;
 	readonly slug: string;
 	readonly name: string;
@@ -308,7 +308,9 @@ async function handleNarDownload(
 		headers: {
 			"content-type": "application/x-nix-nar",
 			"content-length": String(object.size),
-			"cache-control": "public, max-age=31536000, immutable",
+			// Even if a generation write fails, a cached membership check must
+			// not let a deleted private NAR stay accessible for a year.
+			"cache-control": isPrivate ? NARINFO_CACHE_CONTROL : "public, max-age=31536000, immutable",
 		},
 	});
 	if (config.ctx && object.size <= CACHED_NAR_MAX_BYTES) {

@@ -18,6 +18,7 @@ describe("routes", () => {
 		["GET", "/private/acme/main/nar/abc/zstd.nar", "GET /private/:org/:cache/nar/:file"],
 		["POST", "/_api/v1/orgs/org_01ABC/keys/abcdefgh12345678/revoke", "POST /_api/v1/orgs/:org/keys/:key/revoke"],
 		["POST", "/_api/v1/orgs/org_01ABC/caches/team/paths/delete", "POST /_api/v1/orgs/:org/caches/:cache/paths/delete"],
+		["POST", "/_api/v1/orgs/org_01ABC/caches/team/purge", "POST /_api/v1/orgs/:org/caches/:cache/purge"],
 		["POST", "/_api/v1/orgs/org_01ABC/tokens/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/revoke", "POST /_api/v1/orgs/:org/tokens/:jti/revoke"],
 		["GET", "/uzaaft/nix-cache-info", "GET /:cache/nix-cache-info"],
 		["HEAD", `/private/team/${"a".repeat(32)}.narinfo`, "HEAD /private/:cache/:hash.narinfo"],

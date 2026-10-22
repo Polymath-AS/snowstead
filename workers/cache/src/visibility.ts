@@ -16,9 +16,9 @@ import type { WorkerConfig } from "./config.js";
  * can only be cleared in the data center a request runs in). Entries from before orgs say "1", which
  * names none; POST /_api/v1/admin/auth/sync rewrites them.
  *
- * KV reads are cached at the edge for KV_CACHE_TTL_SECONDS, misses too,
- * and isolates remember answers for as long: a change reaches every
- * location within that time.
+ * KV reads and isolate memos use a 30-second TTL, but KV is eventually
+ * consistent: propagation can take 60 seconds or more. This is not a
+ * bounded global invalidation or immediate revocation guarantee.
  */
 const KV_CACHE_TTL_SECONDS = 30;
 const MEMO_MAX_ENTRIES = 10_000;
@@ -29,7 +29,7 @@ const MEMO_MAX_ENTRIES = 10_000;
  */
 export type PrivateCache =
 	| { readonly isPrivate: false }
-	| { readonly isPrivate: true; readonly org: string | null | undefined; readonly id?: number; readonly gen: number };
+	| { readonly isPrivate: true; readonly org: string | null | undefined; readonly id?: number; readonly gen: number | string };
 
 const visibility = new Map<string, PrivateCache & { readonly until: number }>();
 
@@ -44,7 +44,7 @@ function parseEntry(value: string | null): PrivateCache {
 			isPrivate: true,
 			org: typeof org === "string" ? org : null,
 			...(typeof id === "number" ? { id } : {}),
-			gen: typeof gen === "number" ? gen : 0,
+			gen: typeof gen === "number" || typeof gen === "string" ? gen : 0,
 		};
 	} catch {
 		// Unreadable is still private: only the org check is lost.
@@ -84,11 +84,13 @@ export async function setPrivate(
 	if (isPrivate) {
 		// A generation of its own, so copies cached before it was last private
 		// (and its paths deleted while public) are never served again.
-		await config.authKv.put(privateKey(cachePath), JSON.stringify({ ...cache, gen: Date.now() }));
+		const entry = { ...cache, gen: crypto.randomUUID() };
+		await config.authKv.put(privateKey(cachePath), JSON.stringify(entry));
+		visibility.set(cachePath, { isPrivate: true, ...entry, until: Date.now() + KV_CACHE_TTL_SECONDS * 1000 });
 	} else {
 		await config.authKv.delete(privateKey(cachePath));
+		visibility.set(cachePath, { isPrivate: false, until: Date.now() + KV_CACHE_TTL_SECONDS * 1000 });
 	}
-	visibility.delete(cachePath);
 }
 
 // KV takes one write a second to a key; deletions in quick succession,
@@ -96,29 +98,21 @@ export async function setPrivate(
 const KV_WRITE_RETRIES = 5;
 
 /**
- * Moves a private cache's generation on, after its paths are deleted:
- * within KV_CACHE_TTL_SECONDS no location serves what it cached before.
+ * A fresh epoch after deletion, without reading/modifying a potentially
+ * stale KV value. Concurrent deletions must never reuse a generation.
+ * Remote readers pick it up eventually, not within a guaranteed deadline.
  */
-export async function nextGeneration(config: WorkerConfig, cachePath: string): Promise<void> {
-	const key = privateKey(cachePath);
-	const value = await config.authKv.get(key);
-	if (value === null) return;
-	const entry = parseEntry(value);
-	let fields: Record<string, unknown> = {};
-	try {
-		if (value !== LEGACY_ENTRY) fields = JSON.parse(value) as Record<string, unknown>;
-	} catch {
-		// Unreadable: rewritten with only the generation, still private.
-	}
-	const gen = Math.max(Date.now(), (entry.isPrivate ? entry.gen : 0) + 1);
+export async function nextGeneration(config: WorkerConfig, cache: { readonly path: string; readonly id: number; readonly orgId: string }): Promise<void> {
+	const key = privateKey(cache.path);
+	const entry = { org: cache.orgId, id: cache.id, gen: crypto.randomUUID() };
 	for (let attempt = 1; ; attempt++) {
 		try {
-			await config.authKv.put(key, JSON.stringify({ ...fields, gen }));
+			await config.authKv.put(key, JSON.stringify(entry));
 			break;
 		} catch (err) {
 			if (attempt === KV_WRITE_RETRIES) throw err;
 			await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
 		}
 	}
-	visibility.delete(cachePath);
+	visibility.set(cache.path, { isPrivate: true, ...entry, until: Date.now() + KV_CACHE_TTL_SECONDS * 1000 });
 }

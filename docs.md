@@ -54,18 +54,42 @@ Cache Rule, on the zone:
 - Cache eligibility: eligible; Edge TTL: use cache-control if present,
   bypass if not, and 60 seconds for status 404; Browser TTL: respect origin.
 
-Stored objects carry their own `Cache-Control` and are cached for a year.
-Misses are cached for a minute, so the many lookups Nix makes for paths a
-cache lacks are answered by the CDN. Publishing and deleting a path purge
-its narinfo from the CDN, so neither waits for a cached answer to expire.
+NARs are content-addressed and cached for a year. Narinfo can be deleted or
+re-signed, so it is cached for five minutes, without `immutable`. Misses are
+cached for a minute. Publishing, re-publishing, backfilling, and deleting
+paths (including retention) request CDN purges to accelerate visibility.
 Purging needs the vars `CDN_ZONE_ID` and `PUBLIC_CACHE_ORIGIN` and the
 secret `CDN_PURGE_TOKEN`, an API token with Cache Purge on the zone;
-without them nothing is purged. To purge by hand:
+without them nothing is purged. Automatic purges are saved under
+`cdn-purges/` in the **private** bucket before dispatch. Requests are batched
+and paced, with bounded retries for network errors, 429s, and 5xx responses.
+The five-minute cron retries unfinished jobs and respects `Retry-After`;
+GC still runs every six hours. Persistent failures appear in Worker error
+logs as `CDN purge backlog remains`. Fix the configuration or credentials
+and the backlog resumes. No new bucket or database table is needed.
+
+To purge by hand (an empty object purges the cache prefix, while
+`storePathHashes` targets up to 500 narinfo URLs):
 
 ```bash
 curl -X POST https://cache.example.com/_api/v1/admin/caches/main/purge \
   -H "authorization: Bearer $ADMIN_SECRET" -d '{}'   # or {"storePathHashes": [...]}
+
+# An org API key can purge only its own public caches.
+curl -X POST https://cache.example.com/_api/v1/orgs/ORG_ID/caches/main/purge \
+  -H "authorization: Bearer $ORG_API_KEY" -d '{}'
 ```
+
+The response `{ "accepted": true, "paths": "all" }` means Cloudflare
+acknowledged the request, not that eviction was verified everywhere.
+Purges don't remove clients' local copies, Nix's negative cache, or shared
+content-addressed NARs. This is cache invalidation, not erasure of public data.
+
+**Upgrading:** existing objects and CDN entries may still have the former
+one-year TTL. Run `POST /_api/v1/admin/narinfo/backfill` through all pages
+to rewrite their metadata and queue purges. The five-minute fallback
+applies after those old copies have been replaced; changing the Worker
+alone cannot shorten an already-cached response's TTL.
 
 ## Setup
 
@@ -108,7 +132,12 @@ nix.settings = {
 };
 ```
 
-Making a cache private or public takes effect within 30 seconds everywhere.
+Only empty caches can change visibility. Private-cache deletion changes a
+generation in KV, so old cached narinfo and NARs stop being served as the
+new value propagates. The KV and isolate cache TTLs are 30 seconds, but KV
+is eventually consistent and propagation can take 60 seconds or more;
+there is no strict global deadline. Private NAR downloads are authorized
+and streamed by the Worker, never redirected to a reusable presigned URL.
 
 ## Managing tokens
 

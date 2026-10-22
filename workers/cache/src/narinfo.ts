@@ -4,7 +4,7 @@ import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
 import { signingKeyFor } from "./cache-keys.js";
 import type { SigningKey } from "./cache-keys.js";
-import { IMMUTABLE, bucketFor, narinfoKey, narUrl, placeNar } from "./layout.js";
+import { NARINFO_CACHE_CONTROL, bucketFor, narinfoKey, narUrl, placeNar } from "./layout.js";
 
 export type NarinfoPath = Pick<
 	PublishedPath,
@@ -79,7 +79,7 @@ export async function storeNarinfo(
 	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
 	const body = await signedNarinfo(await signingKeyFor(config, cache.id), path, blob, isPrivate, cache.path);
 	await bucketFor(config, isPrivate).put(narinfoKey(cache.path, path.storePathHash, isPrivate), body, {
-		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: IMMUTABLE },
+		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: NARINFO_CACHE_CONTROL },
 	});
 }
 
@@ -89,7 +89,7 @@ export async function storeNarinfo(
  * Request: the Cache API takes either, and building a Request for every
  * lookup showed in profiles of cache reads.
  */
-export function narinfoCacheKey(origin: string, cachePath: string, storePathHash: string, privateGen?: number): string {
+export function narinfoCacheKey(origin: string, cachePath: string, storePathHash: string, privateGen?: number | string): string {
 	const base = privateGen === undefined ? `${origin}/${cachePath}` : privateCacheBase(cachePath, privateGen);
 	return `${base}/${storePathHash}.narinfo`;
 }
@@ -99,6 +99,6 @@ export function narinfoCacheKey(origin: string, cachePath: string, storePathHash
  * own, so they never answer a request for a public URL, and the cache's
  * generation (visibility.ts), so deleting paths retires every copy.
  */
-export function privateCacheBase(cachePath: string, gen: number): string {
+export function privateCacheBase(cachePath: string, gen: number | string): string {
 	return `https://private.snowstead.internal/${cachePath}/g${gen}`;
 }

@@ -58,10 +58,11 @@ describe("public caches live in the public bucket as Nix requests them", () => {
 
 		const { hash, fileHash, body } = await publish("open");
 		const narinfo = await env.PUBLIC_BUCKET.get(`open/${hash}.narinfo`);
-		expect(narinfo?.httpMetadata?.cacheControl).toContain("immutable");
+		expect(narinfo?.httpMetadata?.cacheControl).toBe("public, max-age=300");
 		expect(await narinfo?.text()).toContain(`URL: ../nar/${fileHash}/zstd.nar`);
 
 		const nar = await env.PUBLIC_BUCKET.get(`nar/${fileHash}/zstd.nar`);
+		expect(nar?.httpMetadata?.cacheControl).toBe("public, max-age=31536000, immutable");
 		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(body);
 
 		// The Worker serves the same layout where it fronts every cache.
