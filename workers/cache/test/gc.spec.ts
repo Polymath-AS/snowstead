@@ -3,21 +3,13 @@ import { describe, it, expect, afterAll } from "vitest";
 import {
 	createCache,
 	createUploadSession,
-	createBlobObject,
-	createPublishedPath,
 	findUploadSession,
-	findBlobObjectById,
 } from "../src/db/repository.js";
 import { runGarbageCollection } from "../src/gc.js";
 import { resolveConfig } from "../src/config.js";
-import type { WorkerConfig } from "../src/config.js";
 
 const config = resolveConfig(env);
 afterAll(() => config.close());
-
-function getConfig(): WorkerConfig {
-	return config;
-}
 
 function makeSessionParams(overrides: {
 	readonly id: string;
@@ -45,91 +37,29 @@ function makeSessionParams(overrides: {
 }
 
 describe("gc: expire abandoned sessions", () => {
-	it("expires and deletes sessions past their expiresAt", async () => {
-		const config = getConfig();
+	it("removes expired sessions and their staged bytes, but keeps active uploads", async () => {
 		const cache = await createCache(config.db, `gc-expire-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
+		const activeId = crypto.randomUUID();
+		const expiredKey = `staging/${sessionId}`;
+		const activeKey = `staging/${activeId}`;
 		await createUploadSession(
 			config.db,
-			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2020-01-01T00:00:00.000Z") }),
+			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2020-01-01T00:00:00.000Z"), r2UploadKey: expiredKey }),
 		);
+		await createUploadSession(config.db, makeSessionParams({ id: activeId, cacheId: cache.id, r2UploadKey: activeKey }));
+		const bytes = new Uint8Array([31, 7, 219]);
+		await env.CACHE_BUCKET.put(expiredKey, bytes);
+		await env.CACHE_BUCKET.put(activeKey, bytes);
 
 		const result = await runGarbageCollection(config);
 
-		expect(result.expiredSessions).toBeGreaterThanOrEqual(1);
+		expect(result.expiredSessions).toBe(1);
 		expect(result.errors).toHaveLength(0);
-
-		const found = await findUploadSession(config.db, sessionId);
-		expect(found).toBeUndefined();
-	});
-});
-
-describe("gc: delete unreferenced blobs", () => {
-	it("deletes blob objects not referenced by any published path", async () => {
-		const config = getConfig();
-		const blob = await createBlobObject(config.db, {
-			fileHash: `sha256:${crypto.randomUUID()}`,
-			fileSize: 2048,
-			compression: "zstd",
-			r2Key: `blobs/${crypto.randomUUID()}`,
-		});
-
-		const result = await runGarbageCollection(config);
-
-		expect(result.deletedBlobs).toBeGreaterThanOrEqual(1);
-		expect(result.errors).toHaveLength(0);
-
-		const found = await findBlobObjectById(config.db, blob.id);
-		expect(found).toBeUndefined();
-	});
-});
-
-describe("gc: keep referenced blobs", () => {
-	it("preserves blob objects that are referenced by a published path", async () => {
-		const config = getConfig();
-		const cache = await createCache(config.db, `gc-keep-${crypto.randomUUID()}`);
-		const blob = await createBlobObject(config.db, {
-			fileHash: `sha256:${crypto.randomUUID()}`,
-			fileSize: 2048,
-			compression: "zstd",
-			r2Key: `blobs/${crypto.randomUUID()}`,
-		});
-		const storePathHash = crypto.randomUUID();
-		await createPublishedPath(config.db, {
-			cacheId: cache.id,
-			storePathHash,
-			storePath: `/nix/store/${storePathHash}`,
-			narHash: `sha256:${crypto.randomUUID()}`,
-			narSize: 4096,
-			blobObjectId: blob.id,
-			referencesJson: "[]",
-			deriver: null,
-			system: null,
-			signaturesJson: "[]",
-		});
-
-		const result = await runGarbageCollection(config);
-
-		const found = await findBlobObjectById(config.db, blob.id);
-		expect(found).toBeDefined();
-	});
-});
-
-describe("gc: keep active sessions", () => {
-	it("does not expire sessions with future expiresAt", async () => {
-		const config = getConfig();
-		const cache = await createCache(config.db, `gc-active-${crypto.randomUUID()}`);
-		const sessionId = crypto.randomUUID();
-		await createUploadSession(
-			config.db,
-			makeSessionParams({ id: sessionId, cacheId: cache.id, expiresAt: new Date("2099-01-01T00:00:00.000Z") }),
-		);
-
-		const result = await runGarbageCollection(config);
-
-		expect(result.expiredSessions).toBe(0);
-
-		const found = await findUploadSession(config.db, sessionId);
-		expect(found).toBeDefined();
+		expect(await findUploadSession(config.db, sessionId)).toBeUndefined();
+		expect(await env.CACHE_BUCKET.head(expiredKey)).toBeNull();
+		expect((await findUploadSession(config.db, activeId))?.status).toBe("pending");
+		const active = await env.CACHE_BUCKET.get(activeKey);
+		expect(new Uint8Array(await active!.arrayBuffer())).toEqual(bytes);
 	});
 });

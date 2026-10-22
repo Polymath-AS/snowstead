@@ -51,23 +51,15 @@ function makeSessionParams(overrides: {
 }
 
 describe("caches", () => {
-	it("createCache creates a public cache with expected fields", async () => {
+	it("creates a public cache and reads it back", async () => {
 		const name = `cache-create-${crypto.randomUUID()}`;
 		const row = await createCache(getDb(), name);
 
 		expect(row.name).toBe(name);
+		expect(row.isPublic).toBe(true);
 		expect(typeof row.id).toBe("number");
 		expect(row.createdAt).toBeInstanceOf(Date);
-	});
-
-	it("findCache returns a matching cache", async () => {
-		const name = `cache-find-${crypto.randomUUID()}`;
-		const created = await createCache(getDb(), name);
-		const found = await findCache(getDb(), "default", name);
-
-		expect(found).toBeDefined();
-		expect(found!.id).toBe(created.id);
-		expect(found!.name).toBe(name);
+		expect(await findCache(getDb(), "default", name)).toEqual(row);
 	});
 
 	it("findCache returns undefined for non-existent name", async () => {
@@ -84,34 +76,21 @@ describe("caches", () => {
 });
 
 describe("blob_objects", () => {
-	it("createBlobObject creates a row with expected fields", async () => {
+	it("stores and finds blobs by hash and compression", async () => {
 		const fileHash = `sha256:${crypto.randomUUID()}`;
-		const row = await createBlobObject(getDb(), {
-			fileHash,
-			fileSize: 2048,
-			compression: "zstd",
-			r2Key: `blobs/${crypto.randomUUID()}`,
-		});
-
-		expect(row.fileHash).toBe(fileHash);
-		expect(row.fileSize).toBe(2048);
-		expect(row.compression).toBe("zstd");
-		expect(typeof row.id).toBe("number");
-		expect(row.createdAt).toBeInstanceOf(Date);
-	});
-
-	it("findBlobObject returns a matching blob", async () => {
-		const fileHash = `sha256:${crypto.randomUUID()}`;
-		const created = await createBlobObject(getDb(), {
-			fileHash,
-			fileSize: 100,
-			compression: "none",
-			r2Key: `blobs/${crypto.randomUUID()}`,
-		});
-		const found = await findBlobObject(getDb(), fileHash, "none");
-
-		expect(found).toBeDefined();
-		expect(found!.id).toBe(created.id);
+		const rows = [];
+		for (const [compression, fileSize] of [["zstd", 2048], ["none", 4096]] as const) {
+			const r2Key = `blobs/${crypto.randomUUID()}`;
+			const row = await createBlobObject(getDb(), { fileHash, fileSize, compression, r2Key });
+			expect(row).toMatchObject({ fileHash, fileSize, compression, r2Key });
+			expect(typeof row.id).toBe("number");
+			expect(row.createdAt).toBeInstanceOf(Date);
+			rows.push(row);
+		}
+		// Same hash, different compression: a hash-only lookup is wrong.
+		for (const row of rows) {
+			expect(await findBlobObject(getDb(), fileHash, row.compression)).toEqual(row);
+		}
 	});
 
 	it("findBlobObject returns undefined for non-existent", async () => {
@@ -140,7 +119,7 @@ describe("blob_objects", () => {
 });
 
 describe("published_paths", () => {
-	it("createPublishedPath creates a row with expected fields", async () => {
+	it("creates a published path and reads it back", async () => {
 		const cache = await createCache(getDb(), `pp-create-${crypto.randomUUID()}`);
 		const blob = await createBlobObject(getDb(), {
 			fileHash: `sha256:${crypto.randomUUID()}`,
@@ -169,6 +148,7 @@ describe("published_paths", () => {
 		expect(row.system).toBe("x86_64-linux");
 		expect(typeof row.id).toBe("number");
 		expect(row.createdAt).toBeInstanceOf(Date);
+		expect(await findPublishedPath(getDb(), cache.id, storePathHash)).toEqual(row);
 	});
 
 	it("keeps sizes past 2 GiB exact", async () => {
@@ -198,34 +178,6 @@ describe("published_paths", () => {
 		const found = await findPublishedPath(getDb(), cache.id, storePathHash);
 		expect(found?.narSize).toBe(narSize);
 		expect((await findBlobObject(getDb(), blob.fileHash, "zstd"))?.fileSize).toBe(fileSize);
-	});
-
-	it("findPublishedPath returns a matching path", async () => {
-		const cache = await createCache(getDb(), `pp-find-${crypto.randomUUID()}`);
-		const blob = await createBlobObject(getDb(), {
-			fileHash: `sha256:${crypto.randomUUID()}`,
-			fileSize: 500,
-			compression: "zstd",
-			r2Key: `blobs/${crypto.randomUUID()}`,
-		});
-		const storePathHash = crypto.randomUUID();
-
-		const created = await createPublishedPath(getDb(), {
-			cacheId: cache.id,
-			storePathHash,
-			storePath: `/nix/store/${storePathHash}`,
-			narHash: `sha256:${crypto.randomUUID()}`,
-			narSize: 4096,
-			blobObjectId: blob.id,
-			referencesJson: "[]",
-			deriver: null,
-			system: null,
-			signaturesJson: "[]",
-		});
-		const found = await findPublishedPath(getDb(), cache.id, storePathHash);
-
-		expect(found).toBeDefined();
-		expect(found!.id).toBe(created.id);
 	});
 
 	it("findPublishedPath returns undefined for non-existent", async () => {
@@ -261,7 +213,7 @@ describe("published_paths", () => {
 });
 
 describe("upload_sessions", () => {
-	it("createUploadSession creates a session with status pending", async () => {
+	it("creates, reads and conditionally transitions a session", async () => {
 		const cache = await createCache(getDb(), `us-create-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		const row = await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
@@ -270,28 +222,13 @@ describe("upload_sessions", () => {
 		expect(row.cacheId).toBe(cache.id);
 		expect(row.status).toBe("pending");
 		expect(row.createdAt).toBeInstanceOf(Date);
-	});
-
-	it("findUploadSession returns a matching session", async () => {
-		const cache = await createCache(getDb(), `us-find-${crypto.randomUUID()}`);
-		const sessionId = crypto.randomUUID();
-		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
-		const found = await findUploadSession(getDb(), sessionId);
-
-		expect(found).toBeDefined();
-		expect(found!.id).toBe(sessionId);
-	});
-
-	it("transitionSessionStatus updates and returns the session", async () => {
-		const cache = await createCache(getDb(), `us-update-${crypto.randomUUID()}`);
-		const sessionId = crypto.randomUUID();
-		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
+		expect(await findUploadSession(getDb(), sessionId)).toEqual(row);
 
 		const updated = await transitionSessionStatus(getDb(), sessionId, "pending", "uploading");
-
-		expect(updated).toBeDefined();
-		expect(updated!.status).toBe("uploading");
-		expect(updated!.id).toBe(sessionId);
+		expect(updated).toMatchObject({ id: sessionId, status: "uploading" });
+		expect(await findUploadSession(getDb(), sessionId)).toEqual(updated);
+		expect(await transitionSessionStatus(getDb(), sessionId, "pending", "completed")).toBeUndefined();
+		expect((await findUploadSession(getDb(), sessionId))?.status).toBe("uploading");
 	});
 
 	it("findExpiredSessions returns only expired non-completed sessions", async () => {
@@ -309,16 +246,6 @@ describe("upload_sessions", () => {
 			makeSessionParams({ id: freshId, cacheId: cache.id, expiresAt: new Date("2099-01-01T00:00:00.000Z") }),
 		);
 
-		const expired = await findExpiredSessions(getDb(), new Date());
-		const expiredIds = expired.map((s) => s.id);
-
-		expect(expiredIds).toContain(expiredId);
-		expect(expiredIds).not.toContain(freshId);
-	});
-
-	it("findExpiredSessions excludes completed sessions even if expired", async () => {
-		const cache = await createCache(getDb(), `us-exp-compl-${crypto.randomUUID()}`);
-
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(
 			getDb(),
@@ -329,45 +256,41 @@ describe("upload_sessions", () => {
 		const expired = await findExpiredSessions(getDb(), new Date());
 		const expiredIds = expired.map((s) => s.id);
 
+		expect(expiredIds).toContain(expiredId);
+		expect(expiredIds).not.toContain(freshId);
 		expect(expiredIds).not.toContain(sessionId);
 	});
 });
 
 describe("upload_parts", () => {
-	it("upsertUploadPart creates a part with expected fields", async () => {
+	it("stores parts and reads them back in part-number order", async () => {
 		const cache = await createCache(getDb(), `up-create-${crypto.randomUUID()}`);
 		const sessionId = crypto.randomUUID();
 		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
 
 		const row = await upsertUploadPart(getDb(), {
 			sessionId,
-			partNumber: 1,
+			partNumber: 3,
 			etag: "etag-abc",
 			size: 1024,
 		});
 
 		expect(row.sessionId).toBe(sessionId);
-		expect(row.partNumber).toBe(1);
+		expect(row.partNumber).toBe(3);
 		expect(row.etag).toBe("etag-abc");
 		expect(row.size).toBe(1024);
 		expect(typeof row.id).toBe("number");
-	});
 
-	it("findUploadParts returns parts ordered by partNumber", async () => {
-		const cache = await createCache(getDb(), `up-find-${crypto.randomUUID()}`);
-		const sessionId = crypto.randomUUID();
-		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
-
-		await upsertUploadPart(getDb(), { sessionId, partNumber: 3, etag: "e3", size: 300 });
 		await upsertUploadPart(getDb(), { sessionId, partNumber: 1, etag: "e1", size: 100 });
 		await upsertUploadPart(getDb(), { sessionId, partNumber: 2, etag: "e2", size: 200 });
 
 		const parts = await findUploadParts(getDb(), sessionId);
 
-		expect(parts).toHaveLength(3);
-		expect(parts[0].partNumber).toBe(1);
-		expect(parts[1].partNumber).toBe(2);
-		expect(parts[2].partNumber).toBe(3);
+		expect(parts).toEqual([
+			expect.objectContaining({ sessionId, partNumber: 1, etag: "e1", size: 100 }),
+			expect.objectContaining({ sessionId, partNumber: 2, etag: "e2", size: 200 }),
+			row,
+		]);
 	});
 });
 

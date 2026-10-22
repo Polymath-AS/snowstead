@@ -90,9 +90,10 @@ describe("read endpoints remain public", () => {
 		expect(body).toContain("StoreDir: /nix/store");
 	});
 
-	it("read endpoints via SELF work without auth (AUTH_TOKEN empty in test env)", async () => {
+	it("serves public cache info through SELF without credentials", async () => {
 		const res = await SELF.fetch(`http://example.com/${CACHE_NAME}/nix-cache-info`);
 
 		expect(res.status).toBe(200);
+		expect(await res.text()).toContain("StoreDir: /nix/store");
 	});
 });

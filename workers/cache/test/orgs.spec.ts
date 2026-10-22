@@ -96,7 +96,7 @@ describe("orgs", () => {
 		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: a.org, storageLimit: null })).status).toBe(409);
 	});
 
-	it("changes a slug only while its caches have no paths", async () => {
+	it("renames an org and relocates its empty caches", async () => {
 		const { org, cache } = await orgWithCache(null);
 		const renamed = unique("renamed");
 		expect(await (await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null })).json()).toMatchObject({ slug: renamed });
@@ -105,12 +105,11 @@ describe("orgs", () => {
 
 	it("lists only an org's caches", async () => {
 		const a = await orgWithCache(null);
-		const b = await orgWithCache(null);
+		await orgWithCache(null);
 
 		const res = await orgApi(`/${a.org}/caches`);
 		const { caches } = await res.json<{ caches: { name: string; org: string; path: string }[] }>();
 		expect(caches).toEqual([expect.objectContaining({ name: a.cache, org: a.org, path: `${a.org}/${a.cache}` })]);
-		expect(caches.map((c) => c.name)).not.toContain(b.cache);
 	});
 
 	it("lets every org have a cache of the same name, each at its own path", async () => {
@@ -196,19 +195,6 @@ describe("org tokens", () => {
 	async function token(org: string, body: Record<string, unknown>): Promise<Response> {
 		return orgApi(`/${org}/tokens`, "POST", { subject: "test", perms: ["push"], ...body });
 	}
-
-	it("push to their org's caches and list with them", async () => {
-		const { org, cache } = await orgWithCache(null);
-
-		const res = await token(org, { caches: [cache] });
-		expect(res.status).toBe(201);
-		const { token: jwt, jti } = await res.json<{ token: string; jti: string }>();
-		expect((await createSessions(cache, [100], jwt)).status).toBe(201);
-
-		const list = await orgApi(`/${org}/tokens`);
-		const { tokens } = await list.json<{ tokens: { jti: string; org: string }[] }>();
-		expect(tokens).toEqual([expect.objectContaining({ jti, org })]);
-	});
 
 	it("name only their org's caches; * is all of them", async () => {
 		const a = await orgWithCache(null);
@@ -310,14 +296,16 @@ describe("token caches", () => {
 		return orgApi(`/${org}/tokens`, "POST", { subject: "test", perms, caches });
 	}
 
-	it("name caches by id, and list them by name", async () => {
+	it("push to their org's caches by id and list them by name", async () => {
 		const { org, cache } = await orgWithCache(null);
 		const res = await token(org, [cache]);
-		const { token: jwt } = await res.json<{ token: string }>();
+		expect(res.status).toBe(201);
+		const { token: jwt, jti } = await res.json<{ token: string; jti: string }>();
 
 		expect(decode(jwt).caches).toEqual([expect.stringMatching(/^id:\d+$/)]);
-		const { tokens } = await (await orgApi(`/${org}/tokens`)).json<{ tokens: { caches: string[] }[] }>();
-		expect(tokens[0].caches).toEqual([cache]);
+		expect((await createSessions(cache, [100], jwt)).status).toBe(201);
+		const { tokens } = await (await orgApi(`/${org}/tokens`)).json<{ tokens: { jti: string; org: string; caches: string[] }[] }>();
+		expect(tokens).toEqual([expect.objectContaining({ jti, org, caches: [cache] })]);
 	});
 
 	it("take in caches a pattern matches, made before or after", async () => {

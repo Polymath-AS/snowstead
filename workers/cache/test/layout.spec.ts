@@ -72,7 +72,7 @@ describe("public caches live in the public bucket as Nix requests them", () => {
 });
 
 describe("private caches never reach the public bucket", () => {
-	it("keeps narinfo, NAR and cache info in the private bucket", async () => {
+	it("keeps objects private and serves narinfo under /private/ only with a pull token", async () => {
 		const { hash, fileHash } = await publish("closed");
 		expect(await env.PUBLIC_BUCKET.head(`closed/${hash}.narinfo`)).toBeNull();
 		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
@@ -81,16 +81,14 @@ describe("private caches never reach the public bucket", () => {
 		const narinfo = await env.CACHE_BUCKET.get(`narinfo/closed/${hash}.narinfo`);
 		expect(await narinfo?.text()).toContain(`URL: nar/${fileHash}/zstd.nar`);
 		expect(await env.CACHE_BUCKET.head(`nars/sha256/${fileHash}/zstd.nar`)).not.toBeNull();
-	});
 
-	it("are served under /private/ with a pull token", async () => {
-		const { hash } = await publish("closed");
 		const created = await api("/admin/tokens", { subject: "layout", caches: ["closed"], perms: ["pull"] }, "test-admin-secret");
 		const { token } = await created.json<{ token: string }>();
 		const res = await SELF.fetch(`http://example.com/private/closed/${hash}.narinfo`, {
 			headers: { authorization: `Bearer ${token}` },
 		});
 		expect(res.status).toBe(200);
+		expect(await res.text()).toContain(`URL: nar/${fileHash}/zstd.nar`);
 		expect((await SELF.fetch(`http://example.com/private/closed/${hash}.narinfo`)).status).toBe(401);
 	});
 });

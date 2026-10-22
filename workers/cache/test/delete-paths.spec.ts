@@ -3,7 +3,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
 import { testDb } from "./db.js";
 import { findBlobObject } from "../src/db/repository.js";
-import { uploadSessions } from "../src/db/schema.js";
+import { publishedPaths, uploadSessions } from "../src/db/schema.js";
 import { runGarbageCollection } from "../src/gc.js";
 import { resolveConfig } from "../src/config.js";
 
@@ -161,17 +161,20 @@ describe("deleting published paths", () => {
 		expect((await SELF.fetch(url)).status).toBe(404);
 	});
 
-	it("deletes every path published before a time", async () => {
+	it("deletes only paths published before the cutoff", async () => {
 		const cache = unique("cache");
 		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
 		const hashes = [storePathHash(), storePathHash()];
 		for (const hash of hashes) expect(await push(cache, hash, await nar(16))).toBe(201);
+		await db.update(publishedPaths).set({ createdAt: new Date("2000-01-01T00:00:00Z") }).where(eq(publishedPaths.storePathHash, hashes[0]));
 
-		const res = await deletePaths(cache, { before: new Date(Date.now() + 1000).toISOString() });
+		const res = await deletePaths(cache, { before: "2001-01-01T00:00:00Z" });
 		const { deleted, more } = await res.json<{ deleted: string[]; more: boolean }>();
-		expect(deleted.sort()).toEqual([...hashes].sort());
+		expect(deleted).toEqual([hashes[0]]);
 		expect(more).toBe(false);
-		expect(await (await admin(`/caches/${cache}`)).json()).toMatchObject({ paths: 0, size: 0 });
+		expect(await (await admin(`/caches/${cache}`)).json()).toMatchObject({ paths: 1, size: 16 });
+		expect((await SELF.fetch(`http://example.com/${cache}/${hashes[0]}.narinfo`)).status).toBe(404);
+		expect((await SELF.fetch(`http://example.com/${cache}/${hashes[1]}.narinfo`)).status).toBe(200);
 	});
 
 	it("leaves another cache's path to the same NAR, and GC deletes the NAR after the last", async () => {
@@ -186,13 +189,13 @@ describe("deleting published paths", () => {
 
 		expect((await deletePaths(first, { storePathHashes: [a] })).status).toBe(200);
 		await expireSessions(shared.fileHash);
-		await runGarbageCollection(config);
+		expect((await runGarbageCollection(config)).errors).toEqual([]);
 		expect((await SELF.fetch(`http://example.com/${second}/${b}.narinfo`)).status).toBe(200);
 		expect(await findBlobObject(db, shared.fileHash, "zstd")).toBeDefined();
 		expect(await env.PUBLIC_BUCKET.head(narKey)).not.toBeNull();
 
 		expect((await deletePaths(second, { storePathHashes: [b] })).status).toBe(200);
-		await runGarbageCollection(config);
+		expect((await runGarbageCollection(config)).errors).toEqual([]);
 		expect(await findBlobObject(db, shared.fileHash, "zstd")).toBeUndefined();
 		expect(await env.PUBLIC_BUCKET.head(narKey)).toBeNull();
 	});

@@ -65,7 +65,10 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 		sessionBody({ fileHash, storePathHash }),
 	);
 	expect(createRes.status).toBe(201);
-	const session = await createRes.json<{ sessionId: string; r2Key: string }>();
+	const session = await createRes.json<{ sessionId: string; r2Key: string; uploadMethod: string; expiresAt: string }>();
+	expect(session.r2Key).toBe(`nar/${fileHash}/zstd.nar`);
+	expect(session.uploadMethod).toBe("direct");
+	expect(Date.parse(session.expiresAt)).toBeGreaterThan(Date.now());
 
 	const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
 		method: "PUT",
@@ -76,6 +79,7 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 
 	const completeRes = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
 	expect(completeRes.status).toBe(200);
+	expect(await completeRes.json()).toMatchObject({ status: "completed" });
 
 	return session;
 }
@@ -86,20 +90,6 @@ beforeAll(async () => {
 });
 
 describe("create upload session", () => {
-	it("creates a session and returns 201 with expected fields", async () => {
-		const res = await post(
-			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			sessionBody({ fileHash: await uniqueFileHash(), storePathHash: uniqueStorePathHash() }),
-		);
-
-		expect(res.status).toBe(201);
-		const body = await res.json<Record<string, unknown>>();
-		expect(body).toHaveProperty("sessionId");
-		expect(body).toHaveProperty("r2Key");
-		expect(body).toHaveProperty("uploadMethod", "direct");
-		expect(body).toHaveProperty("expiresAt");
-	});
-
 	it("returns 404 for non-existent cache", async () => {
 		const res = await post(
 			"/_api/v1/caches/no-such-cache/upload-sessions",
@@ -131,30 +121,6 @@ describe("create upload session", () => {
 });
 
 describe("complete upload (direct)", () => {
-	it("completes a direct upload flow", async () => {
-		const fileHash = await uniqueFileHash();
-		const storePathHash = uniqueStorePathHash();
-
-		const createRes = await post(
-			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
-			sessionBody({ fileHash, storePathHash }),
-		);
-		expect(createRes.status).toBe(201);
-		const session = await createRes.json<{ sessionId: string; r2Key: string }>();
-
-		const blobRes = await SELF.fetch(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
-			method: "PUT",
-			headers: { authorization: `Bearer ${AUTH_TOKEN}` },
-			body: blob(fileHash),
-		});
-		expect(blobRes.status).toBe(200);
-
-		const completeRes = await post(`/_api/v1/uploads/${session.sessionId}/complete`, {});
-		expect(completeRes.status).toBe(200);
-		const completeBody = await completeRes.json<{ status: string }>();
-		expect(completeBody.status).toBe("completed");
-	});
-
 	it("returns 404 for non-existent session", async () => {
 		const res = await post("/_api/v1/uploads/00000000-0000-0000-0000-000000000000/complete", {});
 
@@ -191,9 +157,13 @@ describe("publish", () => {
 		expect((await SELF.fetch(url)).status).toBe(404);
 
 		const session = await createSessionAndUpload(await uniqueFileHash(), storePathHash);
-		expect((await post(`/_api/v1/uploads/${session.sessionId}/publish`, {})).status).toBe(200);
+		const published = await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
+		expect(published.status).toBe(200);
+		expect(await published.json()).toMatchObject({ published: true, storePathHash });
 
-		expect((await SELF.fetch(url)).status).toBe(200);
+		const narinfo = await SELF.fetch(url);
+		expect(narinfo.status).toBe(200);
+		expect(await narinfo.text()).toContain(`StorePath: /nix/store/${storePathHash}-hello\n`);
 	});
 
 	// What `nix path-info --json` prints: SRI hashes, full reference paths
@@ -226,24 +196,6 @@ describe("publish", () => {
 		expect(narinfo).toContain(`References: ${ref}\n`);
 	});
 
-	it("publishes a completed upload and path is readable", async () => {
-		const fileHash = await uniqueFileHash();
-		const storePathHash = uniqueStorePathHash();
-		const session = await createSessionAndUpload(fileHash, storePathHash);
-
-		const publishRes = await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
-		expect(publishRes.status).toBe(200);
-		const publishBody = await publishRes.json<{ published: boolean; storePathHash: string }>();
-		expect(publishBody.published).toBe(true);
-		expect(publishBody.storePathHash).toBe(storePathHash);
-
-		const db = getDb();
-		const cache = await findCache(db, "default", CACHE_NAME);
-		expect(cache).toBeDefined();
-		const published = await findPublishedPath(db, cache!.id, storePathHash);
-		expect(published).toBeDefined();
-	});
-
 	it("returns 409 for uncompleted session", async () => {
 		const createRes = await post(
 			`/_api/v1/caches/${CACHE_NAME}/upload-sessions`,
@@ -256,8 +208,13 @@ describe("publish", () => {
 		expect(res.status).toBe(409);
 	});
 
-	it("concurrent duplicate publish does not create duplicate paths", async () => {
-		const session = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
+	it("publishes once under concurrent requests and sequential retries", async () => {
+		const stats = () => SELF.fetch(`http://example.com/_api/v1/admin/caches/${CACHE_NAME}`, {
+			headers: { authorization: "Bearer test-admin-secret" },
+		}).then((r) => r.json<{ paths: number }>());
+		const before = await stats();
+		const storePathHash = uniqueStorePathHash();
+		const session = await createSessionAndUpload(await uniqueFileHash(), storePathHash);
 
 		const [r1, r2] = await Promise.all([
 			post(`/_api/v1/uploads/${session.sessionId}/publish`, {}),
@@ -270,18 +227,11 @@ describe("publish", () => {
 		const b2 = await r2.json<{ published: boolean; alreadyExisted?: boolean }>();
 		expect(b1.published).toBe(true);
 		expect(b2.published).toBe(true);
-	});
-
-	it("duplicate publish is idempotent", async () => {
-		const session = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
-
-		const first = await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
-		expect(first.status).toBe(200);
 
 		const second = await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
 		expect(second.status).toBe(200);
-		const body = await second.json<{ alreadyExisted: boolean }>();
-		expect(body.alreadyExisted).toBe(true);
+		expect(await second.json()).toMatchObject({ published: true, alreadyExisted: true, storePathHash });
+		expect((await stats()).paths).toBe(before.paths + 1);
 	});
 });
 
@@ -291,16 +241,15 @@ describe("get-missing-paths", () => {
 		const session = await createSessionAndUpload(await uniqueFileHash(), storePathHash);
 		await post(`/_api/v1/uploads/${session.sessionId}/publish`, {});
 
-		const randomHash = "x".repeat(32).replace(/x/g, () => "abcdfg0123456789"[Math.floor(Math.random() * 16)]);
+		const missingHash = "z".repeat(32);
 
 		const res = await post("/_api/v1/get-missing-paths", {
 			cache: CACHE_NAME,
-			storePathHashes: [storePathHash, randomHash],
+			storePathHashes: [storePathHash, missingHash],
 		});
 		expect(res.status).toBe(200);
 		const body = await res.json<{ missing: string[] }>();
-		expect(body.missing).not.toContain(storePathHash);
-		expect(body.missing).toContain(randomHash);
+		expect(body.missing).toEqual([missingHash]);
 	});
 
 	it("returns 404 for non-existent cache", async () => {
@@ -391,7 +340,7 @@ describe("batches", () => {
 		await Promise.all(sessions.map((s, i) => putBlob(s.sessionId, bodies[i].fileHash)));
 
 		const results = await commit(sessions.map((s) => s.sessionId));
-		expect(results.every((r) => r.published)).toBe(true);
+		expect(results).toEqual(sessions.map((s) => expect.objectContaining({ sessionId: s.sessionId, published: true })));
 		const cache = await findCache(getDb(), "default", CACHE_NAME);
 		expect(await findPublishedPath(getDb(), cache!.id, storePathHash)).toBeDefined();
 	});

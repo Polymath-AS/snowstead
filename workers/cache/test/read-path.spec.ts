@@ -54,51 +54,43 @@ beforeAll(async () => {
 });
 
 describe("nix-cache-info", () => {
-	it("returns cache info for an existing cache", async () => {
-		const res = await SELF.fetch("http://example.com/test-cache/nix-cache-info");
-
-		expect(res.status).toBe(200);
-		expect(res.headers.get("content-type")).toBe("text/x-nix-cache-info");
-		const body = await res.text();
-		expect(body).toContain("StoreDir: /nix/store");
-	});
-
-	it("returns 200 for any cache path", async () => {
-		const res = await SELF.fetch("http://example.com/nonexistent/nix-cache-info");
-
-		expect(res.status).toBe(200);
+	it("returns cache info even for a cache that has not been created", async () => {
+		for (const name of ["test-cache", "nonexistent"]) {
+			const res = await SELF.fetch(`http://example.com/${name}/nix-cache-info`);
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toBe("text/x-nix-cache-info");
+			expect(await res.text()).toContain("StoreDir: /nix/store\n");
+		}
 	});
 });
 
 describe("narinfo", () => {
-	it("returns narinfo for a published path", async () => {
+	it("serves published metadata, with identical headers and no body for HEAD", async () => {
 		const res = await SELF.fetch(`http://example.com/test-cache/${STORE_PATH_HASH}.narinfo`);
 
 		expect(res.status).toBe(200);
 		expect(res.headers.get("content-type")).toBe("text/x-nix-narinfo");
 		const body = await res.text();
-		expect(body).toContain("StorePath:");
-		expect(body).toContain("NarHash:");
-		expect(body).toContain("FileHash:");
+		expect(body).toContain(`StorePath: /nix/store/${STORE_PATH_HASH}-hello\n`);
+		expect(body).toContain(`NarHash: ${NAR_HASH}\n`);
+		expect(body).toContain(`FileHash: sha256:${FILE_HASH}\n`);
 		expect(body).toContain("Compression: zstd");
 		// A public cache shares its NARs: the narinfo points one level up.
-		expect(body).toContain("URL: ../nar/");
-	});
-
-	it("HEAD returns 200 with headers but no body", async () => {
-		const request = new Request(`http://example.com/test-cache/${STORE_PATH_HASH}.narinfo`, {
-			method: "HEAD",
-		});
-		const config = resolveConfig(env);
-		const res = await handleRequest(request, config);
-
-		expect(res.status).toBe(200);
-		expect(res.headers.get("content-type")).toBe("text/x-nix-narinfo");
-		expect(res.headers.get("content-length")).toBeTruthy();
+		expect(body).toContain(`URL: ../nar/${FILE_HASH}/zstd.nar\n`);
 		expect(res.headers.get("cache-control")).toBe("public, max-age=300");
 		expect((await env.PUBLIC_BUCKET.head(`test-cache/${STORE_PATH_HASH}.narinfo`))?.httpMetadata?.cacheControl).toBe("public, max-age=300");
-		const body = await res.text();
-		expect(body).toBe("");
+
+		// Inspect the handler's response: HTTP transport can strip a HEAD body
+		// even when the handler incorrectly returns one.
+		const config = resolveConfig(env);
+		const head = await handleRequest(new Request(`http://example.com/test-cache/${STORE_PATH_HASH}.narinfo`, { method: "HEAD" }), config);
+		await config.close();
+		expect(head.status).toBe(200);
+		for (const header of ["content-type", "cache-control"]) {
+			expect(head.headers.get(header)).toBe(res.headers.get(header));
+		}
+		expect(head.headers.get("content-length")).toBe(String(new TextEncoder().encode(body).byteLength));
+		expect(await head.text()).toBe("");
 	});
 
 	it("returns 404 for a valid hash that is not published", async () => {

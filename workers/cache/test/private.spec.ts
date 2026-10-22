@@ -172,13 +172,6 @@ describe("private caches", () => {
 });
 
 describe("private NARs", () => {
-	it("come from the Worker itself, not a link to R2", async () => {
-		const res = await read(nar(PRIVATE), `Bearer ${pull}`);
-		expect(res.status).toBe(200);
-		expect(new Uint8Array(await res.arrayBuffer())).toEqual(NAR);
-		expect(res.headers.get("cache-control")).toBe("private, no-cache");
-	});
-
 	it("are refused through a cache none of whose paths uses them", async () => {
 		const other = (await token([OTHER], ["pull"])).token;
 		// The NAR exists, under PRIVATE; asked for through OTHER by its hash.

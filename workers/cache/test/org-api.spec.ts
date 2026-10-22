@@ -32,7 +32,6 @@ describe("org API keys", () => {
 		const res = await orgApi(`/${org}/keys`, key);
 		const { keys } = await res.json<{ keys: Record<string, unknown>[] }>();
 		expect(keys).toEqual([{ id, name: "terraform", createdAt: expect.any(String), revokedAt: null }]);
-		expect(JSON.stringify(keys)).not.toContain(key.split("_").at(-1));
 	});
 
 	it("reach their own org's caches and storage", async () => {
@@ -106,13 +105,20 @@ describe("org tokens through the org API", () => {
 		const b = await orgWithKey();
 
 		const made = await orgApi(`/${a.org}/tokens`, a.key, "POST", { subject: "ci", caches: [a.cache], perms: ["push"] });
-		expect(await made.json()).toMatchObject({ org: a.org });
+		const issued = await made.json<{ jti: string; org: string }>();
+		expect(issued.org).toBe(a.org);
 		const other = await orgApi(`/${b.org}/tokens`, b.key, "POST", { subject: "ci", caches: [b.cache], perms: ["push"] });
 		const { jti } = await other.json<{ jti: string }>();
 
 		const list = await orgApi(`/${a.org}/tokens`, a.key);
-		expect((await list.json<{ tokens: { org: string }[] }>()).tokens.every((t) => t.org === a.org)).toBe(true);
+		expect((await list.json<{ tokens: { jti: string; org: string }[] }>()).tokens).toEqual([
+			expect.objectContaining({ jti: issued.jti, org: a.org }),
+		]);
 		expect((await orgApi(`/${a.org}/tokens/${jti}/revoke`, a.key, "POST", { reason: "test" })).status).toBe(404);
+		const theirs = await orgApi(`/${b.org}/tokens`, b.key);
+		expect((await theirs.json<{ tokens: { jti: string; revokedAt: string | null }[] }>()).tokens).toEqual([
+			expect.objectContaining({ jti, revokedAt: null }),
+		]);
 		// Nor can its tokens name another org's caches.
 		const cross = await orgApi(`/${a.org}/tokens`, a.key, "POST", { subject: "ci", caches: [b.cache], perms: ["push"] });
 		expect(cross.status).toBe(400);
@@ -120,7 +126,7 @@ describe("org tokens through the org API", () => {
 });
 
 describe("unknown orgs", () => {
-	it("answer 404 to the operator and refuse keys", async () => {
+	it("answer 404 to the operator for missing or invalid orgs", async () => {
 		expect((await orgApi(`/${unique("org")}/caches`, OPERATOR)).status).toBe(404);
 		expect((await orgApi(`/not%20an%20org`, OPERATOR)).status).toBe(404);
 	});
@@ -179,7 +185,7 @@ describe("org audit log", () => {
 		expect(entries.find((e) => e.action === "token.create")?.detail).toEqual({ jti, subject: "ci" });
 		expect(entries.find((e) => e.action === "key.create")?.detail).toEqual({ key: id, name: "terraform" });
 		expect(JSON.stringify(entries)).not.toContain(token);
-		expect(JSON.stringify(entries)).not.toContain(key.split("_").at(-1));
+		expect(JSON.stringify(entries)).not.toContain(key.slice(`snowstead_key_${id}_`.length));
 	});
 
 	it("pages newest first", async () => {
@@ -188,11 +194,18 @@ describe("org audit log", () => {
 			await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache") });
 		}
 		const all = await auditUntil(org, key, (e) => e.filter((x) => x.action === "cache.create").length === 4);
+		const ids = all.map((e) => e.id);
+		expect(ids).toEqual([...ids].sort((a, b) => b - a));
 
 		const first = await audit(org, key, "?limit=2");
 		expect(first.entries.map((e) => e.id)).toEqual(all.slice(0, 2).map((e) => e.id));
+		expect(first.next).toBe(first.entries[1].id);
 		const second = await audit(org, key, `?limit=2&before=${first.next}`);
 		expect(second.entries.map((e) => e.id)).toEqual(all.slice(2, 4).map((e) => e.id));
+		expect(second.next).toBe(second.entries[1].id);
+		const last = await audit(org, key, `?limit=200&before=${second.next}`);
+		expect(last.entries.map((e) => e.id)).toEqual(ids.slice(4));
+		expect(last.next).toBeNull();
 	});
 
 	it.each(["?limit=0", "?limit=1000", "?before=x"])("refuses %s", async (query) => {
