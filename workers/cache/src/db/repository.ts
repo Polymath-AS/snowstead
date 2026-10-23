@@ -1,4 +1,5 @@
 import { eq, and, or, notInArray, inArray, lt, gt, gte, isNull, isNotNull, sql, desc } from "drizzle-orm";
+import type { AnyColumn, SQL } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import { cachePath } from "../cache-path.js";
 import {
@@ -35,6 +36,15 @@ import type {
 /** The first row a query returns, if any. */
 async function first<T>(rows: Promise<T[]>): Promise<T | undefined> {
 	return (await rows)[0];
+}
+
+/**
+ * `column = ANY($1)`, with the values as one array parameter: an IN list
+ * with a placeholder per value costs Drizzle a type check per element to
+ * build, which profiling showed dominating requests.
+ */
+function anyOf(column: AnyColumn, values: readonly (string | number)[], type: "text" | "bigint" = "text"): SQL {
+	return sql`${column} = ANY(${sql.param([...values])}::${sql.raw(type)}[])`;
 }
 
 /** The first row of a write with RETURNING, which must produce one. */
@@ -456,16 +466,13 @@ export async function findPublishedHashes(
 ): Promise<string[]> {
 	if (storePathHashes.length === 0) return [];
 
-	// The hashes go as one array parameter: an IN list with a placeholder per
-	// hash costs Drizzle a type check per element to build, which profiling
-	// showed dominating the request. sql.param keeps the array whole.
 	const rows = await db
 		.select({ storePathHash: publishedPaths.storePathHash })
 		.from(publishedPaths)
 		.where(
 			and(
 				eq(publishedPaths.cacheId, cacheId),
-				sql`${publishedPaths.storePathHash} = ANY(${sql.param(storePathHashes)}::text[])`,
+				anyOf(publishedPaths.storePathHash, storePathHashes),
 			),
 		);
 	return rows.map((r) => r.storePathHash);
@@ -634,7 +641,7 @@ export async function touchPublishedPaths(db: Db, cacheId: number, storePathHash
 		.set({ lastPushedAt: now })
 		.where(and(
 			eq(publishedPaths.cacheId, cacheId),
-			sql`${publishedPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
+			anyOf(publishedPaths.storePathHash, storePathHashes),
 			lt(publishedPaths.lastPushedAt, new Date(now.getTime() - 24 * 60 * 60 * 1000)),
 		));
 }
@@ -657,7 +664,7 @@ export async function deletePublishedPaths(
 		const column = "lastPushedBefore" in which ? publishedPaths.lastPushedAt : publishedPaths.createdAt;
 		const before = "lastPushedBefore" in which ? which.lastPushedBefore : "before" in which ? which.before : undefined;
 		const match = "storePathHashes" in which
-			? sql`${publishedPaths.storePathHash} = ANY(${sql.param([...which.storePathHashes])}::text[])`
+			? anyOf(publishedPaths.storePathHash, which.storePathHashes)
 			: inArray(
 				publishedPaths.id,
 				tx.select({ id: publishedPaths.id })
@@ -687,8 +694,8 @@ export async function findExpiredCompletedSessions(db: Db, now: Date, limit: num
 export async function deleteUploadSessions(db: Db, ids: readonly string[]): Promise<void> {
 	if (ids.length === 0) return;
 	await db.transaction(async (tx) => {
-		await tx.delete(uploadParts).where(sql`${uploadParts.sessionId} = ANY(${sql.param([...ids])}::text[])`);
-		await tx.delete(uploadSessions).where(sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`);
+		await tx.delete(uploadParts).where(anyOf(uploadParts.sessionId, ids));
+		await tx.delete(uploadSessions).where(anyOf(uploadSessions.id, ids));
 	});
 }
 
@@ -772,7 +779,7 @@ async function cacheEntriesOf(db: Db, jtis: readonly string[]): Promise<Map<stri
 	const rows = await db
 		.select()
 		.from(tokenCaches)
-		.where(sql`${tokenCaches.tokenJti} = ANY(${sql.param([...jtis])}::text[])`)
+		.where(anyOf(tokenCaches.tokenJti, jtis))
 		.orderBy(tokenCaches.id);
 	for (const row of rows) {
 		entries.get(row.tokenJti)?.push(row.cacheId === null ? (row.pattern ?? "") : cacheIdEntry(row.cacheId));
@@ -880,7 +887,7 @@ export async function findUploadSessions(db: Db, ids: readonly string[]): Promis
 	return db
 		.select()
 		.from(uploadSessions)
-		.where(sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`);
+		.where(anyOf(uploadSessions.id, ids));
 }
 
 /**
@@ -894,7 +901,7 @@ export async function completeUploadSessions(db: Db, ids: readonly string[]): Pr
 		.set({ status: "completed" })
 		.where(
 			and(
-				sql`${uploadSessions.id} = ANY(${sql.param([...ids])}::text[])`,
+				anyOf(uploadSessions.id, ids),
 				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
 			),
 		)
@@ -914,7 +921,7 @@ export async function findPublishedPaths(
 		.where(
 			and(
 				eq(publishedPaths.cacheId, cacheId),
-				sql`${publishedPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
+				anyOf(publishedPaths.storePathHash, storePathHashes),
 			),
 		);
 }
@@ -924,7 +931,7 @@ export async function findBlobObjectsByIds(db: Db, ids: readonly number[]): Prom
 	return db
 		.select()
 		.from(blobObjects)
-		.where(sql`${blobObjects.id} = ANY(${sql.param([...ids])}::bigint[])`);
+		.where(anyOf(blobObjects.id, ids, "bigint"));
 }
 
 /** Records blobs not yet recorded, and returns every one of them. */
@@ -937,7 +944,7 @@ export async function ensureBlobObjects(
 	const found = await db
 		.select()
 		.from(blobObjects)
-		.where(sql`${blobObjects.fileHash} = ANY(${sql.param(rows.map((r) => r.fileHash))}::text[])`);
+		.where(anyOf(blobObjects.fileHash, rows.map((r) => r.fileHash)));
 	return found.filter((b) => rows.some((r) => r.fileHash === b.fileHash && r.compression === b.compression));
 }
 
@@ -967,8 +974,8 @@ export async function findUpstreamHashes(
 		.from(upstreamPaths)
 		.where(
 			and(
-				sql`${upstreamPaths.storePathHash} = ANY(${sql.param([...storePathHashes])}::text[])`,
-				sql`${upstreamPaths.upstream} = ANY(${sql.param([...upstreams])}::text[])`,
+				anyOf(upstreamPaths.storePathHash, storePathHashes),
+				anyOf(upstreamPaths.upstream, upstreams),
 			),
 		);
 	return rows.map((r) => r.storePathHash);
