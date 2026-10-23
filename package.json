@@ -1,5 +1,5 @@
 {
-  "packageManager": "pnpm@12.14.0",
+  "packageManager": "pnpm@12.15.0",
   "type": "module",
   "name": "snowstead",
   "private": true,
@@ -23,6 +23,6 @@
     }
   },
   "devDependencies": {
-    "wrangler": "^4.151.1"
+    "wrangler": "^4.152.0"
   }
 }
