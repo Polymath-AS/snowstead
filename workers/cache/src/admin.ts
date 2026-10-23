@@ -2,7 +2,7 @@ import type { WorkerConfig } from "./config.js";
 import { cacheIdEntry, isCachePattern, signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
 import type { TokenClaims } from "./jwt.js";
 import type { TokenPermission } from "./db/types.js";
-import type { CacheStats, PathSelection } from "./db/repository.js";
+import type { CacheAt, CacheStats, PathSelection } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
 import { deleteCachePaths } from "./path-deletion.js";
@@ -360,6 +360,11 @@ function orgFilter(url: URL): string | undefined | Response {
 	return parseOrgId(raw) ?? errorResponse("org must be an org id", 400);
 }
 
+/** A cache of the org in `scope` (the default org's without one), or a 404 naming it. */
+async function cacheNamed(config: WorkerConfig, name: string, scope: string | undefined): Promise<CacheAt | Response> {
+	return (await findCache(config.db, scope ?? DEFAULT_ORG_ID, name)) ?? errorResponse(`no cache named ${name}`, 404);
+}
+
 /** All caches, or one org's with `?org=`. */
 export async function handleListCaches(
 	config: WorkerConfig,
@@ -603,10 +608,8 @@ export async function handleDeletePaths(
 		which = { before, limit: MAX_DELETE_BATCH };
 	}
 
-	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
-	if (!cache) {
-		return errorResponse(`no cache named ${name}`, 404);
-	}
+	const cache = await cacheNamed(config, name, scope);
+	if (cache instanceof Response) return cache;
 	const deleted = await deleteCachePaths(config, cache, which, origin);
 
 	const gone = new Set(deleted);
@@ -657,10 +660,8 @@ export async function handlePurgeCache(
 		}
 	}
 
-	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
-	if (!cache) {
-		return errorResponse(`no cache named ${name}`, 404);
-	}
+	const cache = await cacheNamed(config, name, scope);
+	if (cache instanceof Response) return cache;
 	if (!cache.isPublic) {
 		return errorResponse("private caches are not on the CDN", 400);
 	}
@@ -703,10 +704,8 @@ export async function handleListPaths(config: WorkerConfig, rawName: string, url
 		return errorResponse("before must be a path id", 400);
 	}
 
-	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
-	if (!cache) {
-		return errorResponse(`no cache named ${name}`, 404);
-	}
+	const cache = await cacheNamed(config, name, scope);
+	if (cache instanceof Response) return cache;
 	const rows = await searchPublishedPaths(config.db, cache.id, query, limit, before);
 	const last = rows.at(-1);
 	return jsonResponse({
@@ -737,10 +736,8 @@ export async function handleDeleteCache(config: WorkerConfig, rawName: string, o
 	if (typeof name === "object") {
 		return errorResponse(name.message, 400);
 	}
-	const cache = await findCache(config.db, scope ?? DEFAULT_ORG_ID, name);
-	if (!cache) {
-		return errorResponse(`no cache named ${name}`, 404);
-	}
+	const cache = await cacheNamed(config, name, scope);
+	if (cache instanceof Response) return cache;
 
 	let paths = 0;
 	for (let attempt = 1; ; attempt++) {
