@@ -1,14 +1,13 @@
 import type { WorkerConfig } from "./config.js";
-import { cacheIdEntry, isCachePattern, signJwt, isTokenPermission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
+import { cacheIdEntry, isCachePattern, signJwt, Permission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "./jwt.js";
 import type { TokenClaims } from "./jwt.js";
-import type { TokenPermission } from "./db/types.js";
 import type { CacheAt, CacheStats, PathSelection } from "./db/repository.js";
 import { signingPublicKey } from "./signing.js";
 import { newCacheKey } from "./cache-keys.js";
 import { deleteCachePaths } from "./path-deletion.js";
 import { purgeCache, purgeNarinfo, scheduleNarinfoPurge } from "./cdn.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
-import { cachePath, parseOrgSlug } from "./cache-path.js";
+import { OrgSlug, cachePath } from "./cache-path.js";
 import {
 	createApiToken,
 	listApiTokens,
@@ -39,8 +38,9 @@ import { readyNewPath } from "./slug-move.js";
 import { PRIVATE_CACHES_REFUSED, setPrivate, isPrivateCache } from "./visibility.js";
 import { recordRevocation } from "./revocations.js";
 import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "./layout.js";
-import { parseCacheName, parseStorePathHash } from "@snowstead/cache-domain";
-import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
+import * as v from "valibot";
+import { CacheName, OrgId, StorePathHash, parseBody, parsed } from "./schemas.js";
+import { jsonResponse, errorResponse } from "./responses.js";
 
 /** A cache name pattern: cache name characters, and * for any run of them. */
 const CACHE_PATTERN_RE = /^[a-z0-9*-]{1,64}$/;
@@ -55,10 +55,28 @@ const MAX_REASON_LENGTH = 512;
 // API, where it's that org. Cache names are an org's own, so a cache of
 // another org is never in reach.
 
-/** An org id as the service running Snowstead names it, such as a WorkOS organization id. */
-export function parseOrgId(value: unknown): string | undefined {
-	return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
-}
+const SUBJECT = "subject must be a non-empty string";
+const CACHE_ENTRY = "each cache entry must be a non-empty string";
+const EXPIRES = `expiresInDays must be between 1 and ${MAX_TOKEN_LIFETIME_DAYS}`;
+
+const NewToken = v.object({
+	org: v.optional(OrgId),
+	subject: v.pipe(v.string(SUBJECT), v.nonEmpty(SUBJECT), v.maxLength(MAX_SUBJECT_LENGTH, "subject exceeds maximum length")),
+	caches: v.pipe(
+		v.array(v.pipe(v.string(CACHE_ENTRY), v.nonEmpty(CACHE_ENTRY)), "caches must be a non-empty array of cache names"),
+		v.nonEmpty("caches must be a non-empty array of cache names"),
+		v.maxLength(MAX_CACHES_PER_TOKEN, `caches exceeds maximum of ${MAX_CACHES_PER_TOKEN}`),
+	),
+	perms: v.pipe(
+		v.array(Permission, "perms must be a non-empty array"),
+		v.nonEmpty("perms must be a non-empty array"),
+		v.maxLength(MAX_PERMS_PER_TOKEN, `perms exceeds maximum of ${MAX_PERMS_PER_TOKEN}`),
+	),
+	expiresInDays: v.optional(
+		v.pipe(v.number(EXPIRES), v.integer(EXPIRES), v.minValue(1, EXPIRES), v.maxValue(MAX_TOKEN_LIFETIME_DAYS, EXPIRES)),
+		DEFAULT_TOKEN_LIFETIME_DAYS,
+	),
+});
 
 export async function handleCreateToken(
 	request: Request,
@@ -70,61 +88,13 @@ export async function handleCreateToken(
 		return errorResponse("Service unavailable", 503);
 	}
 
-	const body = await parseJsonBody<{
-		subject: string;
-		caches: string[];
-		perms: string[];
-		expiresInDays?: number;
-		org?: string;
-	}>(request);
+	const body = await parseBody(request, NewToken);
 	if (body instanceof Response) return body;
 
-	const org = scope ?? (body.org === undefined ? undefined : parseOrgId(body.org));
-	if (scope === undefined && body.org !== undefined && org === undefined) {
-		return errorResponse("org must be an org id", 400);
-	}
-
-	if (!body.subject || typeof body.subject !== "string") {
-		return errorResponse("subject must be a non-empty string", 400);
-	}
-
-	if (body.subject.length > MAX_SUBJECT_LENGTH) {
-		return errorResponse("subject exceeds maximum length", 400);
-	}
-
-	if (!Array.isArray(body.caches) || body.caches.length === 0) {
-		return errorResponse("caches must be a non-empty array of cache names", 400);
-	}
-	if (body.caches.length > MAX_CACHES_PER_TOKEN) {
-		return errorResponse(`caches exceeds maximum of ${MAX_CACHES_PER_TOKEN}`, 400);
-	}
-	for (const c of body.caches) {
-		if (typeof c !== "string" || c.length === 0) {
-			return errorResponse("each cache entry must be a non-empty string", 400);
-		}
-	}
-
-	if (!Array.isArray(body.perms) || body.perms.length === 0) {
-		return errorResponse("perms must be a non-empty array", 400);
-	}
-	if (body.perms.length > MAX_PERMS_PER_TOKEN) {
-		return errorResponse(`perms exceeds maximum of ${MAX_PERMS_PER_TOKEN}`, 400);
-	}
-	const validatedPerms: TokenPermission[] = [];
-	for (const p of body.perms) {
-		if (typeof p !== "string" || !isTokenPermission(p)) {
-			return errorResponse(`invalid permission: ${String(p)}, expected "pull" or "push"`, 400);
-		}
-		validatedPerms.push(p);
-	}
-
-	const expiresInDays = body.expiresInDays ?? DEFAULT_TOKEN_LIFETIME_DAYS;
-	if (!Number.isFinite(expiresInDays) || !Number.isInteger(expiresInDays) || expiresInDays < 1 || expiresInDays > MAX_TOKEN_LIFETIME_DAYS) {
-		return errorResponse(`expiresInDays must be between 1 and ${MAX_TOKEN_LIFETIME_DAYS}`, 400);
-	}
-
+	const org = scope ?? body.org;
+	const expiresInDays = body.expiresInDays;
 	const dedupedCaches = [...new Set(body.caches)];
-	const dedupedPerms = [...new Set(validatedPerms)];
+	const dedupedPerms = [...new Set(body.perms)];
 
 	// A token is one org's, and reaches only that org's caches: named ones
 	// by id, so a rename keeps the token working, and patterns by name, so
@@ -214,6 +184,12 @@ export async function handleListTokens(
 	return jsonResponse({ tokens: result });
 }
 
+const REASON = "reason must be a non-empty string";
+
+const Revocation = v.object({
+	reason: v.pipe(v.string(REASON), v.nonEmpty(REASON), v.maxLength(MAX_REASON_LENGTH, "reason exceeds maximum length")),
+});
+
 export async function handleRevokeToken(
 	request: Request,
 	config: WorkerConfig,
@@ -221,18 +197,8 @@ export async function handleRevokeToken(
 	actor: string,
 	scope?: string,
 ): Promise<Response> {
-	const body = await parseJsonBody<{
-		reason: string;
-	}>(request);
+	const body = await parseBody(request, Revocation);
 	if (body instanceof Response) return body;
-
-	if (!body.reason || typeof body.reason !== "string") {
-		return errorResponse("reason must be a non-empty string", 400);
-	}
-
-	if (body.reason.length > MAX_REASON_LENGTH) {
-		return errorResponse("reason exceeds maximum length", 400);
-	}
 
 	const token = await findApiToken(config.db, jti);
 	if (!token || token.revokedAt || (scope !== undefined && token.orgId !== scope)) {
@@ -249,6 +215,20 @@ export async function handleRevokeToken(
 
 const MAX_RETENTION_DAYS = 3650;
 
+const RETENTION = `retentionDays must be a whole number of days from 1 to ${MAX_RETENTION_DAYS}, or null`;
+
+const CacheSettings = v.object({
+	retentionDays: v.optional(
+		v.nullable(v.pipe(v.number(RETENTION), v.integer(RETENTION), v.minValue(1, RETENTION), v.maxValue(MAX_RETENTION_DAYS, RETENTION))),
+	),
+	org: v.optional(OrgId, DEFAULT_ORG_ID),
+	name: v.pipe(
+		CacheName,
+		v.check((name) => !RESERVED_CACHE_NAMES.has(name), (issue) => `${String(issue.input)} is reserved`),
+	),
+	private: v.optional(v.boolean("private must be a boolean")),
+});
+
 /**
  * Creates a cache, or sets an existing one's visibility when `private` is
  * given and its retention when `retentionDays` is: days a path stays after
@@ -260,29 +240,12 @@ export async function handleCreateCache(
 	config: WorkerConfig,
 	scope?: string,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ name: string; private?: boolean; org?: string; retentionDays?: unknown }>(request);
+	const body = await parseBody(request, CacheSettings);
 	if (body instanceof Response) return body;
 
 	const retention = body.retentionDays;
-	if (retention !== undefined && retention !== null
-		&& !(typeof retention === "number" && Number.isInteger(retention) && retention >= 1 && retention <= MAX_RETENTION_DAYS)) {
-		return errorResponse(`retentionDays must be a whole number of days from 1 to ${MAX_RETENTION_DAYS}, or null`, 400);
-	}
-
-	const org = scope ?? (body.org === undefined ? DEFAULT_ORG_ID : parseOrgId(body.org));
-	if (org === undefined) {
-		return errorResponse("org must be an org id", 400);
-	}
-	const name = parseCacheName(String(body.name ?? ""));
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
-	if (RESERVED_CACHE_NAMES.has(name)) {
-		return errorResponse(`${name} is reserved`, 400);
-	}
-	if (body.private !== undefined && typeof body.private !== "boolean") {
-		return errorResponse("private must be a boolean", 400);
-	}
+	const org = scope ?? body.org;
+	const name = body.name;
 
 	const orgRow = await findOrg(config.db, org);
 	if (!orgRow) {
@@ -357,7 +320,7 @@ function cacheSummary(stats: CacheStats) {
 function orgFilter(url: URL): string | undefined | Response {
 	const raw = url.searchParams.get("org");
 	if (raw === null) return undefined;
-	return parseOrgId(raw) ?? errorResponse("org must be an org id", 400);
+	return parsed(OrgId, raw);
 }
 
 /** A cache of the org in `scope` (the default org's without one), or a 404 naming it. */
@@ -383,10 +346,8 @@ export async function handleGetCache(
 	rawName: string,
 	scope?: string,
 ): Promise<Response> {
-	const name = parseCacheName(rawName);
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
+	const name = parsed(CacheName, rawName);
+	if (name instanceof Response) return name;
 
 	const [stats] = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { name, orgId: scope ?? DEFAULT_ORG_ID });
 	if (stats === undefined) {
@@ -422,12 +383,19 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 
 /** An org's storage limit and what its caches hold. */
 export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise<Response> {
-	const id = parseOrgId(rawId);
-	if (id === undefined) {
-		return errorResponse("org must be an org id", 400);
-	}
+	const id = parsed(OrgId, rawId);
+	if (id instanceof Response) return id;
 	return orgResponse(config, id);
 }
+
+const STORAGE_LIMIT = "storageLimit must be a whole number of bytes, or null";
+
+const OrgTerms = v.object({
+	storageLimit: v.nullable(v.pipe(v.number(STORAGE_LIMIT), v.safeInteger(STORAGE_LIMIT), v.minValue(0, STORAGE_LIMIT))),
+	// Parsed only when it changes, below.
+	slug: v.optional(v.unknown()),
+	privateCaches: v.optional(v.boolean("privateCaches must be a boolean")),
+});
 
 /**
  * Creates an org or sets its storage limit, in bytes or null for none, and
@@ -438,35 +406,28 @@ export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise
  * moves the objects (slug-move.ts). The old slug stays the org's until then.
  */
 export async function handlePutOrg(request: Request, config: WorkerConfig, rawId: string): Promise<Response> {
-	const id = parseOrgId(rawId);
-	if (id === undefined) {
-		return errorResponse("org must be an org id", 400);
-	}
-	const body = await parseJsonBody<{ storageLimit?: unknown; slug?: unknown; privateCaches?: unknown }>(request);
+	const id = parsed(OrgId, rawId);
+	if (id instanceof Response) return id;
+	const body = await parseBody(request, OrgTerms);
 	if (body instanceof Response) return body;
 	const limit = body.storageLimit;
-	if (limit !== null && !(typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0)) {
-		return errorResponse("storageLimit must be a whole number of bytes, or null", 400);
-	}
-	if (body.privateCaches !== undefined && typeof body.privateCaches !== "boolean") {
-		return errorResponse("privateCaches must be a boolean", 400);
-	}
 
 	const existing = await findOrg(config.db, id);
 	let slug = existing?.slug;
 	if (body.slug !== undefined && body.slug !== slug) {
-		const parsed = id === DEFAULT_ORG_ID ? { message: "the default org's slug can't change" } : parseOrgSlug(body.slug);
-		if (typeof parsed === "object") {
-			return errorResponse(parsed.message, 400);
+		if (id === DEFAULT_ORG_ID) {
+			return errorResponse("the default org's slug can't change", 400);
 		}
-		const holder = await findOrgHoldingSlug(config.db, parsed);
+		const wanted = parsed(OrgSlug, body.slug);
+		if (wanted instanceof Response) return wanted;
+		const holder = await findOrgHoldingSlug(config.db, wanted);
 		if (holder && holder.id !== id) {
-			return errorResponse(`${parsed} is taken`, 409);
+			return errorResponse(`${wanted} is taken`, 409);
 		}
 		if (existing?.movingFrom) {
 			return errorResponse("the last slug change is still moving the org's caches; finish it with POST /move first", 409);
 		}
-		slug = parsed;
+		slug = wanted;
 	}
 	if (slug === undefined) {
 		return errorResponse("slug is needed to create an org", 400);
@@ -486,6 +447,14 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 const MAX_BACKFILL_BATCH = 1000;
 const BACKFILL_CONCURRENCY = 4;
 
+const AFTER = "after must be a non-negative integer";
+const BACKFILL_LIMIT = `limit must be between 1 and ${MAX_BACKFILL_BATCH}`;
+
+const BackfillPage = v.object({
+	after: v.optional(v.pipe(v.number(AFTER), v.integer(AFTER), v.minValue(0, AFTER)), 0),
+	limit: v.optional(v.pipe(v.number(BACKFILL_LIMIT), v.integer(BACKFILL_LIMIT), v.minValue(1, BACKFILL_LIMIT), v.maxValue(MAX_BACKFILL_BATCH, BACKFILL_LIMIT)), 500),
+});
+
 /**
  * Renders and stores the narinfo of published paths after `after` (an id),
  * for paths published before narinfo was stored at publish, or after the
@@ -495,17 +464,9 @@ export async function handleBackfillNarinfo(
 	request: Request,
 	config: WorkerConfig,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ after?: number; limit?: number }>(request);
+	const body = await parseBody(request, BackfillPage);
 	if (body instanceof Response) return body;
-
-	const after = body.after ?? 0;
-	const limit = body.limit ?? 500;
-	if (!Number.isInteger(after) || after < 0) {
-		return errorResponse("after must be a non-negative integer", 400);
-	}
-	if (!Number.isInteger(limit) || limit < 1 || limit > MAX_BACKFILL_BATCH) {
-		return errorResponse(`limit must be between 1 and ${MAX_BACKFILL_BATCH}`, 400);
-	}
+	const { after, limit } = body;
 
 	const rows = await listPublishedPathsAfter(config.db, after, limit);
 	const caches = [...new Set(rows.map((r) => r.cache.path))];
@@ -557,6 +518,20 @@ export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 
 const MAX_DELETE_BATCH = 500;
 
+const HASHES = `storePathHashes must be an array of 1 to ${MAX_DELETE_BATCH} hashes`;
+
+const Hashes = v.pipe(v.array(StorePathHash, HASHES), v.minLength(1, HASHES), v.maxLength(MAX_DELETE_BATCH, HASHES));
+
+const ISO_TIME = "before must be an ISO 8601 time";
+
+const PathsToDelete = v.pipe(
+	v.object({
+		storePathHashes: v.optional(Hashes),
+		before: v.optional(v.pipe(v.string(ISO_TIME), v.transform((at) => new Date(at)), v.check((at) => !Number.isNaN(at.getTime()), ISO_TIME))),
+	}),
+	v.check((body) => (body.storePathHashes === undefined) !== (body.before === undefined), "give one of storePathHashes or before"),
+);
+
 /**
  * Deletes published paths from a cache, which frees their bytes from its
  * org's usage at once. The body names the paths, `{ storePathHashes }` with
@@ -574,39 +549,13 @@ export async function handleDeletePaths(
 	origin: string,
 	scope?: string,
 ): Promise<Response> {
-	const name = parseCacheName(rawName);
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
-	const body = await parseJsonBody<{ storePathHashes?: unknown; before?: unknown }>(request);
+	const name = parsed(CacheName, rawName);
+	if (name instanceof Response) return name;
+	const body = await parseBody(request, PathsToDelete);
 	if (body instanceof Response) return body;
 
-	if ((body.storePathHashes === undefined) === (body.before === undefined)) {
-		return errorResponse("give one of storePathHashes or before", 400);
-	}
-	let which: PathSelection;
-	let named: string[] = [];
-	if (body.storePathHashes !== undefined) {
-		const hashes = body.storePathHashes;
-		if (!Array.isArray(hashes) || hashes.length === 0 || hashes.length > MAX_DELETE_BATCH) {
-			return errorResponse(`storePathHashes must be an array of 1 to ${MAX_DELETE_BATCH} hashes`, 400);
-		}
-		for (const raw of hashes) {
-			const hash = parseStorePathHash(String(raw));
-			if (typeof hash === "object") {
-				return errorResponse(`${String(raw)}: ${hash.message}`, 400);
-			}
-			named.push(hash);
-		}
-		named = [...new Set(named)];
-		which = { storePathHashes: named };
-	} else {
-		const before = typeof body.before === "string" ? new Date(body.before) : undefined;
-		if (before === undefined || Number.isNaN(before.getTime())) {
-			return errorResponse("before must be an ISO 8601 time", 400);
-		}
-		which = { before, limit: MAX_DELETE_BATCH };
-	}
+	const named = [...new Set(body.storePathHashes)];
+	const which: PathSelection = body.before ? { before: body.before, limit: MAX_DELETE_BATCH } : { storePathHashes: named };
 
 	const cache = await cacheNamed(config, name, scope);
 	if (cache instanceof Response) return cache;
@@ -620,6 +569,8 @@ export async function handleDeletePaths(
 	});
 }
 
+const PathsToPurge = v.strictObject({ storePathHashes: v.optional(Hashes) }, "expected {} or { storePathHashes }");
+
 /**
  * Purges what the CDN holds for a public cache: the narinfo of the paths
  * named, or everything under the cache. Publishing and deleting purge on
@@ -631,34 +582,14 @@ export async function handlePurgeCache(
 	rawName: string,
 	scope?: string,
 ): Promise<Response> {
-	const name = parseCacheName(rawName);
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
+	const name = parsed(CacheName, rawName);
+	if (name instanceof Response) return name;
 	if (!config.cdn) {
 		return errorResponse("no CDN is configured to purge", 400);
 	}
-	const body = await parseJsonBody<{ storePathHashes?: unknown }>(request);
+	const body = await parseBody(request, PathsToPurge);
 	if (body instanceof Response) return body;
-	if (body === null || typeof body !== "object" || Array.isArray(body)
-		|| Object.keys(body).some((key) => key !== "storePathHashes")) {
-		return errorResponse("expected {} or { storePathHashes }", 400);
-	}
-
-	let hashes: string[] | undefined;
-	if (body.storePathHashes !== undefined) {
-		if (!Array.isArray(body.storePathHashes) || body.storePathHashes.length === 0 || body.storePathHashes.length > MAX_DELETE_BATCH) {
-			return errorResponse(`storePathHashes must be an array of 1 to ${MAX_DELETE_BATCH} hashes`, 400);
-		}
-		hashes = [];
-		for (const raw of body.storePathHashes) {
-			const hash = parseStorePathHash(typeof raw === "string" ? raw : "");
-			if (typeof hash === "object") {
-				return errorResponse(`${String(raw)}: ${hash.message}`, 400);
-			}
-			hashes.push(hash);
-		}
-	}
+	const hashes = body.storePathHashes;
 
 	const cache = await cacheNamed(config, name, scope);
 	if (cache instanceof Response) return cache;
@@ -686,10 +617,8 @@ const MAX_PATH_PAGE = 200;
  * `next` is the `before` for the page after, null at the end.
  */
 export async function handleListPaths(config: WorkerConfig, rawName: string, url: URL, scope?: string): Promise<Response> {
-	const name = parseCacheName(rawName);
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
+	const name = parsed(CacheName, rawName);
+	if (name instanceof Response) return name;
 	const query = (url.searchParams.get("q") ?? "").trim().replace(/^\/nix\/store\//, "");
 	const limit = Number(url.searchParams.get("limit") ?? DEFAULT_PATH_PAGE);
 	const rawBefore = url.searchParams.get("before");
@@ -732,10 +661,8 @@ const DELETE_CACHE_ATTEMPTS = 3;
  * their other caches.
  */
 export async function handleDeleteCache(config: WorkerConfig, rawName: string, origin: string, scope?: string): Promise<Response> {
-	const name = parseCacheName(rawName);
-	if (typeof name === "object") {
-		return errorResponse(name.message, 400);
-	}
+	const name = parsed(CacheName, rawName);
+	if (name instanceof Response) return name;
 	const cache = await cacheNamed(config, name, scope);
 	if (cache instanceof Response) return cache;
 

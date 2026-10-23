@@ -136,7 +136,7 @@ export async function authenticateWrite(
 	}
 
 	const bearer = extractBearer(request);
-	if (typeof bearer !== "string") {
+	if (bearer instanceof Response) {
 		return { kind: "error", response: bearer };
 	}
 
@@ -184,7 +184,7 @@ export async function authenticateAdmin(
 	}
 
 	const bearer = extractBearer(request);
-	if (typeof bearer !== "string") {
+	if (bearer instanceof Response) {
 		return { kind: "error", response: bearer };
 	}
 
@@ -228,7 +228,7 @@ export async function authenticateOrg(
 	org: string,
 ): Promise<AuthResult> {
 	const bearer = extractBearer(request);
-	if (typeof bearer !== "string") {
+	if (bearer instanceof Response) {
 		return { kind: "error", response: bearer };
 	}
 

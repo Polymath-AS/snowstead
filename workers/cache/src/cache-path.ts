@@ -1,3 +1,5 @@
+import * as v from "valibot";
+
 /**
  * Where a cache is, in URLs and in storage. The default org's caches (all
  * of a self-hosted install's) are at /<cache>, as caches were before orgs;
@@ -18,16 +20,14 @@ const RESERVED_SLUGS: ReadonlySet<string> = new Set([DEFAULT_ORG_SLUG, "nar", "p
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/;
 
-/** An org's slug, or why it can't be one. */
-export function parseOrgSlug(value: unknown): string | { readonly message: string } {
-	if (typeof value !== "string" || !SLUG_RE.test(value)) {
-		return { message: "slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash" };
-	}
-	if (RESERVED_SLUGS.has(value)) {
-		return { message: `${value} is reserved` };
-	}
-	return value;
-}
+const SLUG = "slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash";
+
+/** An org's slug. */
+export const OrgSlug = v.pipe(
+	v.string(SLUG),
+	v.regex(SLUG_RE, SLUG),
+	v.check((slug) => !RESERVED_SLUGS.has(slug), (issue) => `${String(issue.input)} is reserved`),
+);
 
 export function cachePath(orgSlug: string, cacheName: string): string {
 	return orgSlug === DEFAULT_ORG_SLUG ? cacheName : `${orgSlug}/${cacheName}`;

@@ -1,10 +1,18 @@
+import * as v from "valibot";
 import { and, eq } from "drizzle-orm";
 import type { WorkerConfig } from "./config.js";
 import { findCache } from "./db/repository.js";
 import { caches, cacheSigningKeys } from "./db/schema.js";
 import { importCacheKey, newCacheKey } from "./cache-keys.js";
 import { signingPublicKey } from "./signing.js";
-import { errorResponse, jsonResponse, parseJsonBody } from "./responses.js";
+import { errorResponse, jsonResponse } from "./responses.js";
+import { parseBody } from "./schemas.js";
+
+const SigningRequest = v.object({
+	secretKey: v.optional(v.string("invalid Nix secret key")),
+	// Anything else is no confirmation, which activation refuses below.
+	trustedPublicKeys: v.fallback(v.optional(v.array(v.string())), undefined),
+}, "expected JSON object");
 
 /** Authenticated by org-api; never serialize a row containing a sealed secret. */
 export async function handleSigningApi(request: Request, config: WorkerConfig, org: string, name: string, id?: string): Promise<Response> {
@@ -25,13 +33,11 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 	}
 	if (request.method !== "POST") return errorResponse("Not Found", 404);
 	if (!config.signingMasterKey) return errorResponse("managed signing requires SIGNING_MASTER_KEY", 409);
-	const body = await parseJsonBody<{ secretKey?: unknown; trustedPublicKeys?: unknown }>(request);
+	const body = await parseBody(request, SigningRequest);
 	if (body instanceof Response) return body;
-	if (!body || typeof body !== "object" || Array.isArray(body)) return errorResponse("expected JSON object", 400);
 	if (!id) {
 		let key;
 		if (body.secretKey !== undefined) {
-			if (typeof body.secretKey !== "string") return errorResponse("invalid Nix secret key", 400);
 			try { key = await importCacheKey(config, cache.id, body.secretKey); }
 			catch { return errorResponse("invalid Nix secret key", 400); }
 		} else {
@@ -56,7 +62,8 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 		if (target.state !== "staged" || !target.signingKeySealed) return errorResponse("key is not staged", 409);
 		const oldPublic = current.signingPublicKey ?? await signingPublicKey(config.signingKeyName, config.signingPrivateKey);
 		const required = [...rows.map(k => k.signingPublicKey), ...(oldPublic ? [oldPublic] : [])];
-		if (!Array.isArray(body.trustedPublicKeys) || !required.every(k => body.trustedPublicKeys instanceof Array && body.trustedPublicKeys.includes(k))) {
+		const trusted = body.trustedPublicKeys;
+		if (!trusted || !required.every(k => trusted.includes(k))) {
 			return errorResponse("confirm trustedPublicKeys includes all existing and staged public keys before activation", 409);
 		}
 		if (oldPublic && !rows.some(k => k.signingPublicKey === oldPublic)) {

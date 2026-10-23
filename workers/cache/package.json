@@ -24,6 +24,7 @@
     "@snowstead/cache-domain": "workspace:*",
     "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.4",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "valibot": "^1.5.0"
   }
 }

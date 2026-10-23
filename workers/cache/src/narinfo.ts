@@ -1,4 +1,4 @@
-import { parseNarHash } from "@snowstead/cache-domain";
+import { NarHash, valueOf } from "./schemas.js";
 import type { PublishedPath, BlobObject } from "./db/types.js";
 import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
@@ -58,8 +58,8 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
 	const storedSigs: string[] = JSON.parse(path.signaturesJson);
 	// Rows published before uploads canonicalised the hash may hold the SRI
 	// form, which Nix would not verify a signature over.
-	const narHash = parseNarHash(path.narHash);
-	const canonical = typeof narHash === "object" ? path : { ...path, narHash };
+	const narHash = valueOf(NarHash, path.narHash);
+	const canonical = narHash === undefined ? path : { ...path, narHash };
 	const sig = await signNarinfo(computeFingerprint(canonical, refs), key.name, key.secret);
 	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate, cachePath), refs, storedSigs, sig ? [sig] : []);
 }

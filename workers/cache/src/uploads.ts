@@ -1,3 +1,4 @@
+import * as v from "valibot";
 import type { WorkerConfig } from "./config.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasCacheAccess, isOrgsToken } from "./jwt.js";
@@ -31,14 +32,8 @@ import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "./
 import { createPresignedPartPut, createPresignedPut } from "./presign.js";
 import { PRIVATE_CACHES_REFUSED, isPrivateCache, privateCache } from "./visibility.js";
 import { checkUpstream, knownUpstream } from "./upstream.js";
-import {
-	parseFileHash,
-	parseCompression,
-	parseNarHash,
-	parseStorePathBasename,
-	parseStorePathHash,
-} from "@snowstead/cache-domain";
-import { jsonResponse, errorResponse, parseJsonBody, messageOf } from "./responses.js";
+import { jsonResponse, errorResponse, messageOf } from "./responses.js";
+import { Compression, FileHash, NarHash, StorePathBasename, StorePathHash, parseBody } from "./schemas.js";
 import type { Db } from "./db/connection.js";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
@@ -105,101 +100,36 @@ async function loadSessionWithAuthCheck(
 	return { session };
 }
 
-interface SessionParams {
-	readonly storePath: string;
-	readonly storePathHash: string;
-	readonly narHash: string;
-	readonly narSize: number;
-	readonly fileHash: string;
-	readonly fileSize: number;
-	readonly compression: string;
-	readonly references: readonly string[];
-	readonly deriver: string | null;
-	readonly system: string | null;
-}
+const MISSING = "Missing required fields";
 
-/** The session a client asks for, or why it cannot have it. */
-function parseSessionParams(input: unknown): SessionParams | string {
-	if (typeof input !== "object" || input === null) {
-		return "Missing required fields";
-	}
-	const body = input as Record<string, unknown>;
-	if (!body.storePath || !body.storePathHash || !body.narHash || !body.fileHash || !body.compression) {
-		return "Missing required fields";
-	}
+/** A narinfo line's value: printable ASCII without spaces, or nothing. */
+const NarinfoWord = (field: string) =>
+	v.optional(v.nullable(v.pipe(v.string(`${field} must be printable ASCII without spaces`), v.regex(/^[!-~]+$/, `${field} must be printable ASCII without spaces`))), null);
 
-	if (typeof body.narSize !== "number" || typeof body.fileSize !== "number") {
-		return "narSize and fileSize must be numbers";
-	}
+const Size = (field: string) =>
+	v.pipe(v.number("narSize and fileSize must be numbers"), v.finite(`${field} must be a positive number`), v.gtValue(0, `${field} must be a positive number`));
 
-	const storePathHash = parseStorePathHash(String(body.storePathHash));
-	if (typeof storePathHash === "object") {
-		return storePathHash.message;
-	}
+/** The session a client asks for. Each field becomes a narinfo line. */
+const SessionParams = v.pipe(
+	v.object({
+		storePath: v.pipe(v.string(MISSING), v.nonEmpty(MISSING)),
+		storePathHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), StorePathHash),
+		narHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), NarHash),
+		narSize: Size("narSize"),
+		fileHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), FileHash),
+		fileSize: Size("fileSize"),
+		compression: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), Compression),
+		references: v.nullish(v.array(StorePathBasename, "references must be an array"), []),
+		deriver: NarinfoWord("deriver"),
+		system: NarinfoWord("system"),
+	}, MISSING),
+	v.check(
+		({ storePath, storePathHash }) => storePath.startsWith(`/nix/store/${storePathHash}-`) && v.is(StorePathBasename, storePath.slice(11)),
+		"storePath must be /nix/store/<storePathHash>-<name>",
+	),
+);
 
-	if (!Number.isFinite(body.narSize) || body.narSize <= 0) {
-		return "narSize must be a positive number";
-	}
-	if (!Number.isFinite(body.fileSize) || body.fileSize <= 0) {
-		return "fileSize must be a positive number";
-	}
-
-	const fileHash = parseFileHash(String(body.fileHash));
-	if (typeof fileHash === "object") {
-		return fileHash.message;
-	}
-
-	const compression = parseCompression(String(body.compression));
-	if (typeof compression === "object") {
-		return compression.message;
-	}
-
-	// Stored canonical: the narinfo signature covers the nix32 form.
-	const narHash = parseNarHash(String(body.narHash));
-	if (typeof narHash === "object") {
-		return narHash.message;
-	}
-
-	// Each of these becomes a narinfo line.
-	const storePath = String(body.storePath);
-	const storeBasename = storePath.startsWith("/nix/store/") ? storePath.slice(11) : "";
-	if (
-		typeof parseStorePathBasename(storeBasename) === "object" ||
-		!storeBasename.startsWith(`${storePathHash}-`)
-	) {
-		return "storePath must be /nix/store/<storePathHash>-<name>";
-	}
-	for (const field of ["deriver", "system"] as const) {
-		const value = body[field];
-		if (value != null && (typeof value !== "string" || !/^[!-~]+$/.test(value))) {
-			return `${field} must be printable ASCII without spaces`;
-		}
-	}
-
-	const references = body.references ?? [];
-	if (!Array.isArray(references)) {
-		return "references must be an array";
-	}
-	for (const r of references) {
-		const parsed = parseStorePathBasename(String(r));
-		if (typeof parsed === "object") {
-			return parsed.message;
-		}
-	}
-
-	return {
-		storePath,
-		storePathHash,
-		narHash,
-		narSize: body.narSize,
-		fileHash,
-		fileSize: body.fileSize,
-		compression,
-		references: references.map(String),
-		deriver: (body.deriver as string | undefined) ?? null,
-		system: (body.system as string | undefined) ?? null,
-	};
-}
+type SessionParams = v.InferOutput<typeof SessionParams>;
 
 /**
  * NARs are shared by every cache that has them, so a pusher may only add
@@ -362,13 +292,8 @@ export async function handleCreateSession(
 		return errorResponse("Forbidden", 403);
 	}
 
-	const body = await parseJsonBody<unknown>(request);
-	if (body instanceof Response) return body;
-
-	const params = parseSessionParams(body);
-	if (typeof params === "string") {
-		return errorResponse(params, 400);
-	}
+	const params = await parseBody(request, SessionParams);
+	if (params instanceof Response) return params;
 
 	const sessions = await createSessions(config, cache, [params]);
 	if (sessions instanceof Response) return sessions;
@@ -393,23 +318,10 @@ export async function handleCreateSessions(
 		return errorResponse("Forbidden", 403);
 	}
 
-	const body = await parseJsonBody<{ paths?: unknown }>(request);
+	const body = await parseBody(request, SessionBatch);
 	if (body instanceof Response) return body;
 
-	if (!Array.isArray(body.paths) || body.paths.length === 0 || body.paths.length > MAX_BATCH) {
-		return errorResponse(`paths must be an array of 1 to ${MAX_BATCH} sessions`, 400);
-	}
-
-	const items: SessionParams[] = [];
-	for (const [i, item] of body.paths.entries()) {
-		const params = parseSessionParams(item);
-		if (typeof params === "string") {
-			return errorResponse(`paths[${i}]: ${params}`, 400);
-		}
-		items.push(params);
-	}
-
-	const sessions = await createSessions(config, cache, items);
+	const sessions = await createSessions(config, cache, body.paths);
 	if (sessions instanceof Response) return sessions;
 	return jsonResponse({ sessions }, 201);
 }
@@ -578,12 +490,9 @@ export async function handleComplete(
 	if (result.error) return result.error;
 	const session = result.session;
 
-	const body = await parseJsonBody<{ parts?: unknown } | null>(request);
+	const body = await parseBody(request, v.object({ parts: v.optional(PartList) }, OBJECT));
 	if (body instanceof Response) return body;
-	if (!body || typeof body !== "object" || Array.isArray(body)) return errorResponse("Expected an object", 400);
-	const supplied = parsePartList(body.parts);
-	if (typeof supplied === "string") return errorResponse(supplied, 400);
-	const parts = supplied?.length ? supplied : await findUploadParts(config.db, sessionId);
+	const parts = body.parts?.length ? body.parts : await findUploadParts(config.db, sessionId);
 	const invalid = await completionError(config, session, parts);
 	if (invalid) return errorResponse(invalid.error, invalid.status);
 
@@ -750,36 +659,24 @@ export async function handlePublish(
 	return jsonResponse({ published: true, storePathHash: published.storePathHash, alreadyExisted: published.alreadyExisted });
 }
 
-type Part = { readonly partNumber: number; readonly etag: string };
+const OBJECT = "Expected an object";
+const PARTS = "parts must contain {partNumber (1–10000), etag} objects";
+const UNIQUE_PARTS = "parts must have nonempty ETags and unique part numbers";
 
-function parsePartList(value: unknown): Part[] | string | undefined {
-	if (value === undefined) return undefined;
-	if (!Array.isArray(value) || value.length > 10_000) return "parts must be an array of at most 10000 parts";
-	const parts: Part[] = [];
-	const seen = new Set<number>();
-	for (const p of value) {
-		if (!p || !Number.isInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || typeof p.etag !== "string") {
-			return "parts must contain {partNumber (1–10000), etag} objects";
-		}
-		const etag = p.etag.replace(/^"(.*)"$/, "$1");
-		if (!etag || seen.has(p.partNumber)) return "parts must have nonempty ETags and unique part numbers";
-		seen.add(p.partNumber);
-		parts.push({ partNumber: p.partNumber, etag });
-	}
-	return parts;
-}
+/** A multipart upload's parts, with ETags unquoted. */
+const PartList = v.pipe(
+	v.array(
+		v.object({
+			partNumber: v.pipe(v.number(PARTS), v.integer(PARTS), v.minValue(1, PARTS), v.maxValue(10_000, PARTS)),
+			etag: v.pipe(v.string(PARTS), v.transform((etag) => etag.replace(/^"(.*)"$/, "$1"))),
+		}, PARTS),
+		"parts must be an array of at most 10000 parts",
+	),
+	v.maxLength(10_000, "parts must be an array of at most 10000 parts"),
+	v.check((parts) => parts.every((p) => p.etag !== "") && new Set(parts.map((p) => p.partNumber)).size === parts.length, UNIQUE_PARTS),
+);
 
-function parseParts(value: unknown): Map<string, Part[]> | string {
-	const parts = new Map<string, Part[]>();
-	if (value === undefined) return parts;
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return "parts must map session ids to their parts";
-	for (const [sessionId, list] of Object.entries(value)) {
-		const parsed = parsePartList(list);
-		if (typeof parsed === "string" || !parsed) return `parts of ${sessionId}: ${parsed ?? "expected an array"}`;
-		parts.set(sessionId, parsed);
-	}
-	return parts;
-}
+type Part = v.InferOutput<typeof PartList>[number];
 
 /** Shared by single completion and batch commit; batch state writes stay batched. */
 async function completionError(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<{ error: string; status: number } | undefined> {
@@ -857,19 +754,10 @@ export async function handleCommit(
 	identity: AuthIdentity,
 	origin: string,
 ): Promise<Response> {
-	const body = await parseJsonBody<{ sessionIds?: unknown; parts?: unknown }>(request);
+	const body = await parseBody(request, Commit);
 	if (body instanceof Response) return body;
-	if (!body || typeof body !== "object" || Array.isArray(body)) return errorResponse("Expected an object", 400);
-
-	const ids = body.sessionIds;
-	if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_BATCH || !ids.every((id) => typeof id === "string")) {
-		return errorResponse(`sessionIds must be an array of 1 to ${MAX_BATCH} session ids`, 400);
-	}
-	const sessionIds = [...new Set(ids as string[])];
-	const parts = parseParts(body.parts);
-	if (typeof parts === "string") {
-		return errorResponse(parts, 400);
-	}
+	const sessionIds = [...new Set(body.sessionIds)];
+	const parts = new Map(Object.entries(body.parts));
 
 	const results = new Map<string, PublishResult>();
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, error, status });
@@ -931,26 +819,38 @@ const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 // batch well inside a request's subrequest and Cache API limits.
 const MAX_BATCH = 100;
 
+const PATHS = `paths must be an array of 1 to ${MAX_BATCH} sessions`;
+
+const SessionBatch = v.object({
+	paths: v.pipe(v.array(SessionParams, PATHS), v.minLength(1, PATHS), v.maxLength(MAX_BATCH, PATHS)),
+});
+
+const SESSION_IDS = `sessionIds must be an array of 1 to ${MAX_BATCH} session ids`;
+
+const Commit = v.object({
+	sessionIds: v.pipe(v.array(v.string(SESSION_IDS), SESSION_IDS), v.minLength(1, SESSION_IDS), v.maxLength(MAX_BATCH, SESSION_IDS)),
+	parts: v.optional(v.record(v.string(), PartList, "parts must map session ids to their parts"), {}),
+}, OBJECT);
+
 const MAX_MISSING_PATHS_BATCH = 1000;
+
+const MISSING_PATHS = "Missing required fields: cache, storePathHashes";
+
+const MissingPathsQuery = v.object({
+	cache: v.pipe(v.string(MISSING_PATHS), v.nonEmpty(MISSING_PATHS)),
+	storePathHashes: v.pipe(
+		v.array(v.string(), MISSING_PATHS),
+		v.maxLength(MAX_MISSING_PATHS_BATCH, `storePathHashes exceeds maximum of ${MAX_MISSING_PATHS_BATCH}`),
+	),
+});
 
 export async function handleGetMissingPaths(
 	request: Request,
 	config: WorkerConfig,
 	identity: AuthIdentity,
 ): Promise<Response> {
-	const body = await parseJsonBody<{
-		cache: string;
-		storePathHashes: string[];
-	}>(request);
+	const body = await parseBody(request, MissingPathsQuery);
 	if (body instanceof Response) return body;
-
-	if (!body.cache || !Array.isArray(body.storePathHashes)) {
-		return errorResponse("Missing required fields: cache, storePathHashes", 400);
-	}
-
-	if (body.storePathHashes.length > MAX_MISSING_PATHS_BATCH) {
-		return errorResponse(`storePathHashes exceeds maximum of ${MAX_MISSING_PATHS_BATCH}`, 400);
-	}
 
 	const cache = await findCache(config.db, orgOfPusher(identity), body.cache);
 	if (!cache) {

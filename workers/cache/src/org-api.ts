@@ -1,12 +1,12 @@
+import * as v from "valibot";
 import type { WorkerConfig } from "./config.js";
 import { actorId, authenticateOrg, generateOrgApiKey } from "./auth.js";
 import { handleSigningApi } from "./signing-api.js";
 import { writeAuditLog } from "./audit.js";
-import { moveSlugPage, parseMoveCursor } from "./slug-move.js";
+import { MoveCursor, moveSlugPage } from "./slug-move.js";
 import { overLimit } from "./rate-limit.js";
 import { createOrgApiKey, findOrg, listAuditLogs, listOrgApiKeys, revokeOrgApiKey } from "./db/repository.js";
 import {
-	parseOrgId,
 	handleGetOrg,
 	handlePutOrg,
 	handleCreateCache,
@@ -20,7 +20,8 @@ import {
 	handleListTokens,
 	handleRevokeToken,
 } from "./admin.js";
-import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
+import { jsonResponse, errorResponse } from "./responses.js";
+import { OrgId, parseBody, valueOf } from "./schemas.js";
 
 /**
  * One org's API, under /_api/v1/orgs/:org: its storage, caches, tokens, and
@@ -48,7 +49,7 @@ import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
  */
 export async function handleOrgApi(request: Request, config: WorkerConfig, url: URL): Promise<Response> {
 	const [rawOrg = "", ...rest] = url.pathname.slice("/_api/v1/orgs/".length).split("/");
-	const org = parseOrgId(decodeURIComponent(rawOrg));
+	const org = valueOf(OrgId, decodeURIComponent(rawOrg));
 	if (org === undefined) {
 		return errorResponse("Not Found", 404);
 	}
@@ -190,14 +191,16 @@ async function handleListAudit(config: WorkerConfig, org: string, url: URL): Pro
 
 const MAX_KEY_NAME_LENGTH = 64;
 
-async function handleCreateKey(request: Request, config: WorkerConfig, org: string): Promise<Response> {
-	const body = await parseJsonBody<{ name?: unknown }>(request);
-	if (body instanceof Response) return body;
+const KEY_NAME = `name must be 1 to ${MAX_KEY_NAME_LENGTH} characters`;
 
-	const name = typeof body.name === "string" ? body.name.trim() : "";
-	if (name.length === 0 || name.length > MAX_KEY_NAME_LENGTH) {
-		return errorResponse(`name must be 1 to ${MAX_KEY_NAME_LENGTH} characters`, 400);
-	}
+const NewKey = v.object({
+	name: v.pipe(v.string(KEY_NAME), v.trim(), v.nonEmpty(KEY_NAME), v.maxLength(MAX_KEY_NAME_LENGTH, KEY_NAME)),
+});
+
+async function handleCreateKey(request: Request, config: WorkerConfig, org: string): Promise<Response> {
+	const body = await parseBody(request, NewKey);
+	if (body instanceof Response) return body;
+	const name = body.name;
 
 	const { id, key, secretHash } = await generateOrgApiKey();
 	const row = await createOrgApiKey(config.db, { id, orgId: org, name, secretHash });
@@ -224,11 +227,7 @@ async function handleRevokeKey(config: WorkerConfig, org: string, id: string): P
  * with each answer's `next` until it says done.
  */
 async function handleMoveSlug(request: Request, config: WorkerConfig, org: string): Promise<Response> {
-	const body = await parseJsonBody<{ cursor?: unknown }>(request);
+	const body = await parseBody(request, v.object({ cursor: MoveCursor }));
 	if (body instanceof Response) return body;
-	const cursor = parseMoveCursor(body.cursor);
-	if (cursor === undefined) {
-		return errorResponse("cursor must be a previous answer's next", 400);
-	}
-	return jsonResponse(await moveSlugPage(config, org, cursor, new URL(request.url).origin));
+	return jsonResponse(await moveSlugPage(config, org, body.cursor, new URL(request.url).origin));
 }

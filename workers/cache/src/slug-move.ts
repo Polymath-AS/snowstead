@@ -1,3 +1,4 @@
+import * as v from "valibot";
 import type { WorkerConfig } from "./config.js";
 import { cachePath } from "./cache-path.js";
 import { scheduleNarinfoPurge } from "./cdn.js";
@@ -23,23 +24,17 @@ import { setPrivate } from "./visibility.js";
 
 const MOVE_PAGE = 200;
 
-type Phase = "public" | "private";
+const CURSOR = "cursor must be a previous answer's next";
 
-export interface MoveCursor {
-	readonly phase: Phase;
-	readonly cursor?: string;
-}
+/** Where a move left off: a previous answer's `next`, or nothing to start. */
+export const MoveCursor = v.nullish(
+	v.object({ phase: v.picklist(["public", "private"], CURSOR), cursor: v.optional(v.string(CURSOR)) }, CURSOR),
+	{ phase: "public" },
+);
+
+export type MoveCursor = v.InferOutput<typeof MoveCursor>;
 
 export type MoveResult = { readonly done: true } | { readonly done: false; readonly next: MoveCursor; readonly moved: number };
-
-export function parseMoveCursor(value: unknown): MoveCursor | undefined {
-	if (value === undefined || value === null) return { phase: "public" };
-	if (typeof value !== "object") return undefined;
-	const { phase, cursor } = value as { phase?: unknown; cursor?: unknown };
-	if (phase !== "public" && phase !== "private") return undefined;
-	if (cursor !== undefined && typeof cursor !== "string") return undefined;
-	return cursor === undefined ? { phase } : { phase, cursor };
-}
 
 /** Copies the cache's still-published narinfo from the old slug to its path; the hashes it copied. */
 async function moveNarinfo(config: WorkerConfig, cache: CacheAt, from: string, hashes: readonly string[], isPrivate: boolean): Promise<string[]> {

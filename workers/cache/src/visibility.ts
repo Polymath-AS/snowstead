@@ -1,3 +1,4 @@
+import * as v from "valibot";
 import type { WorkerConfig } from "./config.js";
 
 /**
@@ -35,17 +36,18 @@ const visibility = new Map<string, PrivateCache & { readonly until: number }>();
 
 const LEGACY_ENTRY = "1";
 
+/** A private cache's entry; a field it lacks or garbles falls back on its own. */
+const Entry = v.object({
+	org: v.fallback(v.nullable(v.string()), null),
+	id: v.fallback(v.optional(v.number()), undefined),
+	gen: v.fallback(v.union([v.number(), v.string()]), 0),
+});
+
 function parseEntry(value: string | null): PrivateCache {
 	if (value === null) return { isPrivate: false };
 	if (value === LEGACY_ENTRY) return { isPrivate: true, org: undefined, gen: 0 };
 	try {
-		const { org, id, gen } = JSON.parse(value) as { org?: unknown; id?: unknown; gen?: unknown };
-		return {
-			isPrivate: true,
-			org: typeof org === "string" ? org : null,
-			...(typeof id === "number" ? { id } : {}),
-			gen: typeof gen === "number" || typeof gen === "string" ? gen : 0,
-		};
+		return { isPrivate: true, ...v.parse(Entry, JSON.parse(value)) };
 	} catch {
 		// Unreadable is still private: only the org check is lost.
 		return { isPrivate: true, org: undefined, gen: 0 };

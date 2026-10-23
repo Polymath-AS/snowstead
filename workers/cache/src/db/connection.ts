@@ -1,3 +1,4 @@
+import * as v from "valibot";
 import { tracing } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/node-postgres";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -16,10 +17,14 @@ export interface Connection {
 // Statements are parameterized, so their text carries no values.
 const MAX_TRACED_QUERY_CHARS = 2000;
 
+/** What pg.query is given: the statement, or a config holding it. */
+const QueryText = v.fallback(
+	v.union([v.string(), v.pipe(v.object({ text: v.string() }), v.transform(({ text }) => text))]),
+	"",
+);
+
 function queryText(config: unknown): string {
-	if (typeof config === "string") return config;
-	const text = (config as { text?: unknown } | null)?.text;
-	return typeof text === "string" ? text : "";
+	return v.parse(QueryText, config);
 }
 
 /**

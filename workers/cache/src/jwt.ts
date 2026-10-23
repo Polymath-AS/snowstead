@@ -1,5 +1,7 @@
+import * as v from "valibot";
 import type { TokenPermission } from "./db/types.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
+import { valueOf } from "./schemas.js";
 
 export type TokenClaims = {
 	readonly jti: string;
@@ -73,98 +75,32 @@ const MAX_CLOCK_SKEW_SECONDS = 60;
 export const MAX_CACHES_PER_TOKEN = 50;
 export const MAX_PERMS_PER_TOKEN = 10;
 
-export const VALID_PERMISSIONS: ReadonlySet<string> = new Set<string>(["pull", "push"]);
+/** What a token lets its holder do with its caches. */
+export const Permission = v.picklist(["pull", "push"] satisfies TokenPermission[], (issue) => `invalid permission: ${String(issue.input)}, expected "pull" or "push"`);
 
-export function isTokenPermission(value: string): value is TokenPermission {
-	return VALID_PERMISSIONS.has(value);
-}
+const NonEmpty = v.pipe(v.string(), v.nonEmpty());
 
-function validateClaims(obj: Record<string, unknown>): JwtVerifyResult {
-	const jti = obj["jti"];
-	if (typeof jti !== "string" || jti.length === 0) {
-		return { kind: "error", reason: "invalid token" };
-	}
+/** A token's claims, as signing writes them; a token without all of them is invalid. */
+const Claims = v.pipe(
+	v.object({
+		jti: NonEmpty,
+		sub: NonEmpty,
+		iss: v.literal(TOKEN_ISSUER),
+		aud: v.literal(TOKEN_AUDIENCE),
+		caches: v.pipe(v.array(NonEmpty), v.nonEmpty(), v.maxLength(MAX_CACHES_PER_TOKEN)),
+		perms: v.pipe(v.array(Permission), v.nonEmpty(), v.maxLength(MAX_PERMS_PER_TOKEN)),
+		org: v.optional(NonEmpty),
+		exp: v.pipe(v.number(), v.safeInteger()),
+		iat: v.pipe(v.number(), v.safeInteger()),
+	}),
+	// Not issued in the future, allowing a small clock skew between nodes.
+	v.check(({ iat }) => iat <= Date.now() / 1000 + MAX_CLOCK_SKEW_SECONDS),
+	v.check(({ exp, iat }) => exp > iat),
+);
 
-	const sub = obj["sub"];
-	if (typeof sub !== "string" || sub.length === 0) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const exp = obj["exp"];
-	if (typeof exp !== "number") {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const iat = obj["iat"];
-	if (typeof iat !== "number") {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const iss = obj["iss"];
-	if (typeof iss !== "string" || iss !== TOKEN_ISSUER) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const aud = obj["aud"];
-	if (typeof aud !== "string" || aud !== TOKEN_AUDIENCE) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(iat)) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	// Reject tokens issued in the future, allowing a small clock skew between nodes.
-	const now = Date.now() / 1000;
-	if (iat > now + MAX_CLOCK_SKEW_SECONDS) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	if (exp <= iat) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const rawCaches = obj["caches"];
-	if (!Array.isArray(rawCaches) || rawCaches.length === 0) {
-		return { kind: "error", reason: "invalid token" };
-	}
-	if (rawCaches.length > MAX_CACHES_PER_TOKEN) {
-		return { kind: "error", reason: "invalid token" };
-	}
-	const validatedCaches: string[] = [];
-	for (let i = 0; i < rawCaches.length; i++) {
-		const entry: unknown = rawCaches[i];
-		if (typeof entry !== "string" || entry.length === 0) {
-			return { kind: "error", reason: "invalid token" };
-		}
-		validatedCaches.push(entry);
-	}
-
-	const rawPerms = obj["perms"];
-	if (!Array.isArray(rawPerms) || rawPerms.length === 0) {
-		return { kind: "error", reason: "invalid token" };
-	}
-	if (rawPerms.length > MAX_PERMS_PER_TOKEN) {
-		return { kind: "error", reason: "invalid token" };
-	}
-	const validatedPerms: TokenPermission[] = [];
-	for (let i = 0; i < rawPerms.length; i++) {
-		const perm: unknown = rawPerms[i];
-		if (typeof perm !== "string" || !isTokenPermission(perm)) {
-			return { kind: "error", reason: "invalid token" };
-		}
-		validatedPerms.push(perm);
-	}
-
-	const org = obj["org"];
-	if (org !== undefined && (typeof org !== "string" || org.length === 0)) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	return {
-		kind: "ok",
-		claims: { jti, sub, iss, aud, caches: validatedCaches, perms: validatedPerms, ...(org === undefined ? {} : { org }), exp, iat },
-	};
+function validateClaims(payload: unknown): JwtVerifyResult {
+	const claims = valueOf(Claims, payload);
+	return claims ? { kind: "ok", claims } : { kind: "error", reason: "invalid token" };
 }
 
 // Tokens verified recently, so a client sending one with every request pays
@@ -229,14 +165,8 @@ async function verifyToken(token: string, secret: string): Promise<JwtVerifyResu
 		return { kind: "error", reason: "invalid token" };
 	}
 
-	if (typeof rawParsed !== "object" || rawParsed === null) {
-		return { kind: "error", reason: "invalid token" };
-	}
-
-	const claims: Record<string, unknown> = Object.fromEntries(Object.entries(rawParsed));
-
-	const earlyExp = claims["exp"];
-	if (typeof earlyExp === "number" && earlyExp <= Date.now() / 1000 - MAX_CLOCK_SKEW_SECONDS) {
+	const early = valueOf(v.object({ exp: v.number() }), rawParsed);
+	if (early && early.exp <= Date.now() / 1000 - MAX_CLOCK_SKEW_SECONDS) {
 		return { kind: "error", reason: "invalid token" };
 	}
 
@@ -258,7 +188,7 @@ async function verifyToken(token: string, secret: string): Promise<JwtVerifyResu
 		return { kind: "error", reason: "invalid token" };
 	}
 
-	return validateClaims(claims);
+	return validateClaims(rawParsed);
 }
 
 export async function signJwt(claims: TokenClaims, secret: string): Promise<string> {

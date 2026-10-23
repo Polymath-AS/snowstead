@@ -1,6 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import { cacheHasNar, findCacheByPath, findOrg, recordBandwidth } from "./db/repository.js";
-import { cachePath, parseOrgSlug, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
+import { OrgSlug, cachePath, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { overLimit } from "./rate-limit.js";
 import { handleOrgApi } from "./org-api.js";
@@ -11,7 +11,7 @@ import { privateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission } from "./jwt.js";
 import { errorResponse, jsonResponse } from "./responses.js";
-import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@snowstead/cache-domain";
+import { CacheName, Compression, FileHash, StorePathHash, valueOf } from "./schemas.js";
 import {
 	handleCreateSession,
 	handleMultipart,
@@ -93,9 +93,9 @@ export async function handleRequest(
 
 	// /<cache>/... is a default-org cache, /<slug>/<cache>/... another org's.
 	const at = splitReadPath(segments);
-	const cacheName = at === undefined ? undefined : parseCacheName(at.cache);
-	const slug = at === undefined || at.slug === DEFAULT_ORG_SLUG ? at?.slug : parseOrgSlug(at.slug);
-	if (at === undefined || typeof cacheName !== "string" || typeof slug !== "string") {
+	const cacheName = valueOf(CacheName, at?.cache);
+	const slug = at?.slug === DEFAULT_ORG_SLUG ? at.slug : valueOf(OrgSlug, at?.slug);
+	if (at === undefined || cacheName === undefined || slug === undefined) {
 		return new Response("Not Found", { status: 404 });
 	}
 	const path = cachePath(slug, cacheName);
@@ -182,8 +182,8 @@ async function handleNarinfo(
 	privateGen: number | string | undefined,
 ): Promise<Response> {
 	const isPrivate = privateGen !== undefined;
-	const storePathHash = parseStorePathHash(hashStr);
-	if (typeof storePathHash === "object") {
+	const storePathHash = valueOf(StorePathHash, hashStr);
+	if (storePathHash === undefined) {
 		return new Response("Not Found", { status: 404 });
 	}
 
@@ -246,13 +246,9 @@ async function handleNarDownload(
 	method: string,
 	scope?: PrivateScope,
 ): Promise<Response> {
-	const fileHash = parseFileHash(rawFileHash);
-	if (typeof fileHash === "object") {
-		return new Response("Not Found", { status: 404 });
-	}
-
-	const compression = parseCompression(rawCompression);
-	if (typeof compression === "object") {
+	const fileHash = valueOf(FileHash, rawFileHash);
+	const compression = valueOf(Compression, rawCompression);
+	if (fileHash === undefined || compression === undefined) {
 		return new Response("Not Found", { status: 404 });
 	}
 
@@ -326,7 +322,7 @@ async function handleNarDownload(
 /** Counts a private NAR's bytes toward its org's bandwidth, after the response. */
 function meter(config: WorkerConfig, scope: PrivateScope, bytes: number): void {
 	config.defer((async () => {
-		const org = typeof scope.org === "string" ? scope.org : (await findCacheByPath(config.db, scope.slug, scope.name))?.orgId;
+		const org = scope.org ?? (await findCacheByPath(config.db, scope.slug, scope.name))?.orgId;
 		if (org !== undefined) await recordBandwidth(config.db, org, bytes, new Date());
 	})().catch((err) => console.error("Recording bandwidth failed", err)));
 }
