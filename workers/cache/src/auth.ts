@@ -4,17 +4,11 @@ import { verifyJwt, hasPermission, hasCacheAccess, isOrgsToken } from "./jwt.js"
 import { privateCache } from "./visibility.js";
 import { isRevoked } from "./revocations.js";
 import { findOrgApiKey } from "./db/repository.js";
+import { errorResponse } from "./responses.js";
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
 function authError(message: string, status: number): Response {
-	const headers: Record<string, string> = {
-		"content-type": "application/json; charset=utf-8",
-		"cache-control": "no-store",
-	};
-	if (status === 401) {
-		headers["www-authenticate"] = "Bearer";
-	}
-	return new Response(JSON.stringify({ error: message }), { status, headers });
+	return errorResponse(message, status, status === 401 ? { "www-authenticate": "Bearer" } : {});
 }
 
 /** Extract bearer token from Authorization header, or return an error response. */
@@ -78,15 +72,8 @@ function extractCredential(request: Request): string | undefined {
 }
 
 function readAuthError(message: string, status: number): Response {
-	const headers: Record<string, string> = {
-		"content-type": "application/json; charset=utf-8",
-		"cache-control": "no-store",
-	};
-	if (status === 401) {
-		// Basic, so Nix and curl answer with their netrc credentials.
-		headers["www-authenticate"] = 'Basic realm="snowstead"';
-	}
-	return new Response(JSON.stringify({ error: message }), { status, headers });
+	// Basic, so Nix and curl answer with their netrc credentials.
+	return errorResponse(message, status, status === 401 ? { "www-authenticate": 'Basic realm="snowstead"' } : {});
 }
 
 /**

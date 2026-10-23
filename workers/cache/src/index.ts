@@ -6,6 +6,7 @@ import { runGarbageCollection } from "./gc.js";
 import { logRequest } from "./logging.js";
 import { routeOf } from "./route.js";
 import { retryCdnPurges } from "./cdn.js";
+import { errorResponse } from "./responses.js";
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -30,10 +31,7 @@ export default {
 			return response;
 		} catch (err) {
 			console.error("Unhandled error", err);
-			const response = new Response(JSON.stringify({ error: "Internal server error" }), {
-				status: 500,
-				headers: { "content-type": "application/json" },
-			});
+			const response = errorResponse("Internal server error", 500);
 			logRequest(request, response, start, route());
 			return response;
 		} finally {

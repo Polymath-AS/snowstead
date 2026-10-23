@@ -1,4 +1,5 @@
 import type { WorkerConfig } from "./config.js";
+import { errorResponse } from "./responses.js";
 
 /**
  * Per-caller request limits, through Workers rate limiting (wrangler.jsonc):
@@ -28,8 +29,5 @@ export async function overLimit(config: WorkerConfig, kind: LimitKind, caller: s
 	if (!limiter) return undefined;
 	const { success } = await limiter.limit({ key: caller });
 	if (success) return undefined;
-	return new Response(JSON.stringify({ error: `Too many requests: slow down, and retry in ${RETRY_AFTER_SECONDS} seconds` }), {
-		status: 429,
-		headers: { "content-type": "application/json", "retry-after": String(RETRY_AFTER_SECONDS) },
-	});
+	return errorResponse(`Too many requests: slow down, and retry in ${RETRY_AFTER_SECONDS} seconds`, 429, { "retry-after": String(RETRY_AFTER_SECONDS) });
 }

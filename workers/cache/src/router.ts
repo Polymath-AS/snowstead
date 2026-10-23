@@ -10,7 +10,7 @@ import { actorId, authenticateWrite, authenticateAdmin, authorizeRead } from "./
 import { privateCache } from "./visibility.js";
 import type { AuthIdentity } from "./auth.js";
 import { hasPermission } from "./jwt.js";
-import { errorResponse } from "./responses.js";
+import { errorResponse, jsonResponse } from "./responses.js";
 import { parseCacheName, parseStorePathHash, parseFileHash, parseCompression } from "@snowstead/cache-domain";
 import {
 	handleCreateSession,
@@ -47,7 +47,7 @@ export async function handleRequest(
 	const method = request.method;
 
 	if (url.pathname === "/") {
-		return json({ service: "snowstead", status: "ok" });
+		return jsonResponse({ service: "snowstead", status: "ok" });
 	}
 
 	if (url.pathname === "/healthz") {
@@ -132,19 +132,12 @@ export async function handleRequest(
 	return new Response("Not Found", { status: 404 });
 }
 
-function json(body: Record<string, string | boolean | number>, status = 200): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json; charset=utf-8" },
-	});
-}
-
 async function handleHealthz(config: WorkerConfig): Promise<Response> {
 	try {
 		await findOrg(config.db, "__healthz_probe__");
-		return json({ ok: true, service: "snowstead" });
+		return jsonResponse({ ok: true, service: "snowstead" });
 	} catch {
-		return json({ ok: false, service: "snowstead" }, 503);
+		return jsonResponse({ ok: false, service: "snowstead" }, 503);
 	}
 }
 
