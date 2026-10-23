@@ -38,7 +38,7 @@ import {
 	parseStorePathBasename,
 	parseStorePathHash,
 } from "@snowstead/cache-domain";
-import { jsonResponse, errorResponse, parseJsonBody } from "./responses.js";
+import { jsonResponse, errorResponse, parseJsonBody, messageOf } from "./responses.js";
 import type { Db } from "./db/connection.js";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
@@ -813,7 +813,7 @@ async function promoteStaged(config: WorkerConfig, session: UploadSession, parts
 		try {
 			await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
 		} catch (err) {
-			return `Upload incomplete: ${err instanceof Error ? err.message : String(err)}`;
+			return `Upload incomplete: ${messageOf(err)}`;
 		}
 	}
 	try {

@@ -13,6 +13,7 @@ import {
 	listCachesWithRetention,
 } from "./db/repository.js";
 import { deleteCachePaths } from "./path-deletion.js";
+import { messageOf } from "./responses.js";
 import type { BlobObject, UploadSessionStatus } from "./db/types.js";
 
 const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading"]);
@@ -101,7 +102,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			await deleteUploadSession(config.db, session.id);
 			expiredSessions++;
 		} catch (err) {
-			errors.push(`Failed to expire session ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+			errors.push(`Failed to expire session ${session.id}: ${messageOf(err)}`);
 		}
 	}
 
@@ -119,7 +120,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 			expiredSessions += done.length;
 			if (done.length < GC_BLOB_BATCH) break;
 		} catch (err) {
-			errors.push(`Failed to delete completed sessions: ${err instanceof Error ? err.message : String(err)}`);
+			errors.push(`Failed to delete completed sessions: ${messageOf(err)}`);
 			break;
 		}
 	}
@@ -129,7 +130,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	try {
 		caches = await listCachesWithRetention(config.db);
 	} catch (err) {
-		errors.push(`Failed to list caches with retention: ${err instanceof Error ? err.message : String(err)}`);
+		errors.push(`Failed to list caches with retention: ${messageOf(err)}`);
 	}
 	let retentionBudget = RETENTION_BATCHES_PER_RUN;
 	for (const cache of caches) {
@@ -141,7 +142,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 				expiredPaths += deleted.length;
 				if (deleted.length < RETENTION_BATCH) break;
 			} catch (err) {
-				errors.push(`Failed to expire paths of ${cache.name}: ${err instanceof Error ? err.message : String(err)}`);
+				errors.push(`Failed to expire paths of ${cache.name}: ${messageOf(err)}`);
 				break;
 			}
 		}
@@ -172,7 +173,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 				}
 			});
 		} catch (err) {
-			errors.push(`Failed to delete blobs: ${err instanceof Error ? err.message : String(err)}`);
+			errors.push(`Failed to delete blobs: ${messageOf(err)}`);
 			break;
 		}
 		deletedBlobs += blobs.length;
@@ -182,14 +183,14 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	try {
 		expiredTokens = await deleteExpiredApiTokens(config.db, now);
 	} catch (err) {
-		errors.push(`Failed to delete expired tokens: ${err instanceof Error ? err.message : String(err)}`);
+		errors.push(`Failed to delete expired tokens: ${messageOf(err)}`);
 	}
 
 	try {
 		const cutoff = new Date(Date.now() - AUDIT_LOG_RETENTION_DAYS * 86400_000);
 		expiredAuditLogs = await deleteExpiredAuditLogs(config.db, cutoff);
 	} catch (err) {
-		errors.push(`Failed to delete expired audit logs: ${err instanceof Error ? err.message : String(err)}`);
+		errors.push(`Failed to delete expired audit logs: ${messageOf(err)}`);
 	}
 
 	return { expiredSessions, expiredPaths, deletedBlobs, expiredTokens, expiredAuditLogs, errors };

@@ -21,3 +21,8 @@ export async function parseJsonBody<T>(request: Request): Promise<T | Response> 
 		return errorResponse("Invalid JSON in request body", 400);
 	}
 }
+
+/** What went wrong, for a log line or an error list. */
+export function messageOf(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
