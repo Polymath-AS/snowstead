@@ -1,4 +1,5 @@
 import { cloudflareTest } from '@cloudflare/vitest-plugin';
+import { builtinModules } from 'node:module';
 import { defineConfig } from 'vitest/config';
 
 // One fresh database per run on the server SNOWSTEAD_TEST_DATABASE_URL names
@@ -38,6 +39,16 @@ export default defineConfig({
 	],
 	test: {
 		globalSetup: ['./test/global-setup.ts'],
+		// Bundle pg's CommonJS dependency graph for the Workers module loader.
+		deps: {
+			optimizer: {
+				ssr: {
+					enabled: true,
+					include: ['pg'],
+					rolldownOptions: { external: [...builtinModules, /^node:/] },
+				},
+			},
+		},
 		// Files share the database, and GC sweeps all of it.
 		fileParallelism: false,
 	},
