@@ -35,6 +35,7 @@ const API_ROUTES = new Set([
 	"uploads/:session/blob",
 	"uploads/:session/complete",
 	"uploads/:session/publish",
+	"admin/overview",
 	"admin/tokens",
 	"admin/tokens/:jti/revoke",
 	"admin/caches",

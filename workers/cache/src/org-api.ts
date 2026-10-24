@@ -32,7 +32,7 @@ import { OrgId, parseBody, valueOf } from "./schemas.js";
  * mint keys that outlive its revocation.
  *
  *   GET  /                           storage limit and usage
- *   PUT  /                           { storageLimit, slug } (operator)
+ *   PUT  /                           { slug?, storageLimit?, privateCaches?, customSigningKeys? } (operator)
  *   POST /move                       { cursor }: move a page of objects after a slug change
  *   GET  /keys                       the org's API keys, without secrets
  *   POST /keys                       { name }: a new key, shown once (operator)
@@ -82,7 +82,13 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	if (route === "" && method === "GET") return handleGetOrg(config, org);
 	if (route === "" && method === "PUT") {
 		if (!isOperator) return errorResponse("Forbidden", 403);
-		return audit("org.put", await handlePutOrg(request, config, org));
+		const old = await findOrg(config.db, org);
+		const response = await handlePutOrg(request, config, org);
+		const current = response.ok ? await findOrg(config.db, org) : undefined;
+		return audit("org.put", response, null, {
+			old: old ? { slug: old.slug, storageLimit: old.storageLimit, privateCaches: old.privateCaches, customSigningKeys: old.customSigningKeys } : null,
+			new: current ? { slug: current.slug, storageLimit: current.storageLimit, privateCaches: current.privateCaches, customSigningKeys: current.customSigningKeys } : null,
+		});
 	}
 	if (route === "move" && method === "POST") return handleMoveSlug(request, config, org);
 
@@ -103,7 +109,9 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		(rest.length === 5 && rest[4] === "activate" && method === "POST")
 	)) {
 		const response = await handleSigningApi(request, config, org, value(1), rest.length === 5 ? value(3) : undefined);
-		return method === "GET" ? response : audit(rest.length === 5 ? "signing-key.activate" : "signing-key.stage", response, value(1));
+		if (method === "GET") return response;
+		const key = await answered<{ id: string; publicKey: string }>(response);
+		return audit(rest.length === 5 ? "signing-key.activate" : "signing-key.stage", response, value(1), { key: key.id, publicKey: key.publicKey });
 	}
 	if (route === "caches" && method === "POST") {
 		// The same request creates a cache or sets an existing one's settings,

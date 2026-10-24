@@ -36,6 +36,8 @@
 	"workers_dev": true,
 	"vars": {
 		"SIGNING_KEY_NAME": "snowstead-1",
+		// Hosted caches must never fall back to the service's shared key.
+		"REQUIRE_CACHE_SIGNING_KEYS": "true",
 		// Space-separated binary caches whose paths pushes skip; empty pushes everything.
 		"UPSTREAM_CACHES": "https://cache.nixos.org",
 		// The CDN in front of the public bucket, purged when paths are published
@@ -91,5 +93,66 @@
 	],
 	"triggers": {
 		"crons": ["0 */6 * * *", "*/5 * * * *"]
+	},
+	"env": {
+		// Bindings are intentionally explicit: Wrangler does not inherit them.
+		"production": {
+			"name": "snowstead",
+			"vars": {
+				"SIGNING_KEY_NAME": "snowstead-1",
+				"REQUIRE_CACHE_SIGNING_KEYS": "true",
+				"UPSTREAM_CACHES": "https://cache.nixos.org",
+				"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
+				"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "5600f9fcae284ef6b92a0d809068d44d" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "9c99efdbc9964220995416b4ea44e111" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+			],
+			"secrets_store_secrets": [{
+				"binding": "SIGNING_MASTER_KEY_STORE",
+				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",
+				"secret_name": "snowstead-production-signing-master-key"
+			}]
+		},
+		"staging": {
+			"name": "snowstead-staging",
+			"workers_dev": false,
+			"preview_urls": false,
+			// Staging serves reads through the Worker, not production's public CDN.
+			"routes": [{ "pattern": "cache-staging.snowstead.com", "custom_domain": true }],
+			"vars": {
+				"SIGNING_KEY_NAME": "snowstead-staging-1",
+				"REQUIRE_CACHE_SIGNING_KEYS": "true",
+				"UPSTREAM_CACHES": "https://cache.nixos.org",
+				"CDN_ZONE_ID": "",
+				"PUBLIC_CACHE_ORIGIN": "",
+				"R2_BUCKET_NAME": "snowstead-staging-private",
+				"R2_PUBLIC_BUCKET_NAME": "snowstead-staging-public"
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-staging-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-staging-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "896fb71e5f8f44dda6c6331227eb5a04" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "78a7b1b04a314a79ba614e11c5b0ede5" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "2001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "API_LIMIT", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "2003", "simple": { "limit": 12000, "period": 60 } }
+			],
+			"secrets_store_secrets": [{
+				"binding": "SIGNING_MASTER_KEY_STORE",
+				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",
+				"secret_name": "snowstead-staging-signing-master-key"
+			}]
+		}
 	}
 }

@@ -15,6 +15,20 @@
       "when": 1792687625932,
       "tag": "0001_cache_totals",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1792843702666,
+      "tag": "0002_bouncy_sersi",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1792844210513,
+      "tag": "0003_org_signing_permissions",
+      "breakpoints": true
     }
   ]
 }

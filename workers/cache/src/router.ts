@@ -1,5 +1,5 @@
 import type { WorkerConfig } from "./config.js";
-import { cacheHasNar, findCacheByPath, findOrg, recordBandwidth } from "./db/repository.js";
+import { cacheHasNar, findCacheByPath, findOrg, globalOverview, recordBandwidth, listOrgs } from "./db/repository.js";
 import { OrgSlug, cachePath, splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 import { writeAuditLog } from "./audit.js";
 import { overLimit } from "./rate-limit.js";
@@ -340,6 +340,14 @@ async function handleAdminApi(
 	const authResult = await authenticateAdmin(request, config);
 	if (authResult.kind === "error") {
 		return authResult.response;
+	}
+
+	if (pathname === "/_api/v1/admin/orgs" && request.method === "GET") {
+		return jsonResponse({ orgs: await listOrgs(config.db) });
+	}
+
+	if (pathname === "/_api/v1/admin/overview" && request.method === "GET") {
+		return jsonResponse(await globalOverview(config.db, new Date()));
 	}
 
 	const ip = request.headers.get("cf-connecting-ip");

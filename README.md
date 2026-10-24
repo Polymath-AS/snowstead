@@ -55,12 +55,9 @@ wrangler hyperdrive create snowstead --caching-disabled \
 # set the Hyperdrive id in wrangler.jsonc
 wrangler secret put JWT_SECRET
 wrangler secret put ADMIN_SECRET
-wrangler secret put SIGNING_PRIVATE_KEY
-wrangler secret put SIGNING_KEY_NAME
-# Optional: 32 random bytes, base64 (openssl rand -base64 32). With it each
-# new cache gets a signing key of its own, sealed under this one; without
-# it every cache signs with SIGNING_PRIVATE_KEY. Losing it leaves caches
-# with their own keys unable to sign, so keep a copy.
+# Required: 32 random bytes, base64 (openssl rand -base64 32). Each new
+# cache gets its own signing key, encrypted under this master key.
+# Back it up separately from the database; losing it prevents signing.
 wrangler secret put SIGNING_MASTER_KEY
 # S3 keys of an R2 token limited to the two buckets (key id: the token id,
 # secret: the SHA-256 of its value). With them uploads go straight to R2
@@ -72,6 +69,14 @@ wrangler secret put R2_ENDPOINT        # https://<account id>.r2.cloudflarestora
 # migrates the database directly (not through Hyperdrive), then deploys
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
+
+The default configuration requires per-cache keys and fails closed without
+the master key. Existing caches without their own key need a staged key
+and explicit trust-overlap activation before they can publish. Self-hosters
+who deliberately want the legacy shared key can set
+`REQUIRE_CACHE_SIGNING_KEYS` to `"false"` and configure
+`SIGNING_PRIVATE_KEY` and `SIGNING_KEY_NAME`. See the signing-key lifecycle
+and recovery guidance in [docs.md](docs.md).
 
 ## Push store paths
 

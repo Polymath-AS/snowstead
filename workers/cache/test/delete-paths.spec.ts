@@ -90,6 +90,27 @@ async function expireSessions(fileHash: string): Promise<void> {
 }
 
 describe("deleting published paths", () => {
+	it("keeps published data on an over-quota downgrade and immediately blocks new pushes", async () => {
+		const org = unique("org");
+		const cache = unique("cache");
+		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 100 })).status).toBe(200);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] })).json<{ token: string }>();
+		const hash = storePathHash();
+		expect(await push(cache, hash, await nar(40), token)).toBe(201);
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: 10 })).status).toBe(200);
+		expect(await used(org)).toBe(40);
+		expect(await push(cache, storePathHash(), await nar(1), token)).toBe(507);
+		expect((await SELF.fetch(`http://example.com/${org}/${cache}/${hash}.narinfo`)).status).toBe(200);
+		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/${hash}.narinfo`)).not.toBeNull();
+		// An unrelated registration cannot reset the lowered limit or erase data.
+		expect((await orgApi(`/${org}`, "PUT", { slug: org })).status).toBe(200);
+		expect(await used(org)).toBe(40);
+		expect(await push(cache, storePathHash(), await nar(1), token)).toBe(507);
+		expect((await orgApi(`/${org}`, "PUT", { storageLimit: 100 })).status).toBe(200);
+		expect(await push(cache, storePathHash(), await nar(1), token)).toBe(201);
+	});
+
 	it("frees its org's storage, so a push that was refused fits", async () => {
 		const org = unique("org");
 		const cache = unique("cache");

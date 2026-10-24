@@ -6,6 +6,7 @@ import {
 	orgs,
 	orgApiKeys,
 	caches,
+	cacheSigningKeys,
 	blobObjects,
 	publishedPaths,
 	uploadSessions,
@@ -19,6 +20,7 @@ import {
 	DEFAULT_ORG_ID,
 } from "./schema.js";
 import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
+import type { NewCacheKey } from "../cache-keys.js";
 import type {
 	AuditLog,
 	Org,
@@ -112,9 +114,16 @@ export async function ensureCache(
 export async function setCacheSigningKey(
 	db: Db,
 	cacheId: number,
-	key: Pick<Cache, "signingKeyName" | "signingPublicKey" | "signingKeySealed">,
+	key: NewCacheKey,
 ): Promise<void> {
-	await db.update(caches).set(key).where(and(eq(caches.id, cacheId), isNull(caches.signingKeySealed)));
+	await db.transaction(async tx => {
+		const updated = await tx.update(caches).set({
+			signingKeyName: key.signingKeyName,
+			signingPublicKey: key.signingPublicKey,
+			signingKeySealed: key.signingKeySealed,
+		}).where(and(eq(caches.id, cacheId), isNull(caches.signingKeySealed))).returning({ id: caches.id });
+		if (updated.length) await tx.insert(cacheSigningKeys).values({ ...key, cacheId, state: "active" });
+	});
 }
 
 export async function cacheHasPaths(db: Db, cacheId: number): Promise<boolean> {
@@ -168,7 +177,8 @@ export async function findOrg(db: Db, id: string): Promise<Org | undefined> {
 
 /** The org that has this slug, or is still moving its caches away from it. */
 export async function findOrgHoldingSlug(db: Db, slug: string): Promise<Org | undefined> {
-	return first(db.select().from(orgs).where(or(eq(orgs.slug, slug), eq(orgs.movingFrom, slug))).limit(1));
+	const row = await first(db.select({ id: orgs.id }).from(orgs).where(or(eq(orgs.slug, slug), eq(orgs.movingFrom, slug))).limit(1));
+	return row && findOrg(db, row.id);
 }
 
 /** Gives the org a new slug, keeping the old one while its objects move (slug-move.ts). */
@@ -188,13 +198,20 @@ export async function publishedHashes(db: Db, cacheId: number, hashes: readonly 
 	return new Set(rows.map((r) => r.hash));
 }
 
-/** Creates the org, or changes its storage limit, slug, and whether it may have private caches. */
-export async function putOrg(db: Db, id: string, storageLimit: number | null, slug: string, privateCaches: boolean): Promise<Org> {
-	return returned(
-		db.insert(orgs).values({ id, storageLimit, slug, privateCaches })
-			.onConflictDoUpdate({ target: orgs.id, set: { storageLimit, slug, privateCaches } })
-			.returning(),
-	);
+/** Creates an org or updates only the supplied limits. */
+export async function putOrg(db: Db, id: string, slug: string, limits: Partial<Pick<Org, "storageLimit" | "privateCaches" | "customSigningKeys">>): Promise<boolean> {
+	// Arbitrate every unique constraint: simultaneous inserts of the same id
+	// and slug can conflict on the slug index before the id index. A separate
+	// UPDATE sees the winning row once ON CONFLICT has waited for it to commit.
+	const inserted = await first(db.insert(orgs).values({ id, slug, ...limits }).onConflictDoNothing().returning({ id: orgs.id }));
+	if (inserted) return true;
+	// Undefined is omitted from SET: a stale registration must not replace a
+	// concurrent limits update with creation defaults (or old limits).
+	return (await db.update(orgs).set({ slug, ...limits }).where(eq(orgs.id, id)).returning({ id: orgs.id })).length > 0;
+}
+
+export async function listOrgs(db: Db): Promise<Pick<Org, "id" | "slug" | "storageLimit" | "privateCaches" | "customSigningKeys">[]> {
+	return db.select({ id: orgs.id, slug: orgs.slug, storageLimit: orgs.storageLimit, privateCaches: orgs.privateCaches, customSigningKeys: orgs.customSigningKeys }).from(orgs).orderBy(orgs.id);
 }
 
 export async function createOrgApiKey(
@@ -228,6 +245,23 @@ export interface OrgUsage {
 	readonly used: number;
 	/** Bytes of uploads under way that would add to it. */
 	readonly pending: number;
+}
+
+/** Operator-only totals. No customer names, paths, credentials, or identities. */
+export async function globalOverview(db: Db, now: Date) {
+	const [row] = await db.select({
+		orgs: sql`(select count(*) from ${orgs})`.mapWith(Number),
+		caches: sql`(select count(*) from ${caches})`.mapWith(Number),
+		paths: sql`(select coalesce(sum(${caches.pathCount}), 0) from ${caches})`.mapWith(Number),
+		storedBytes: sql`(select coalesce(sum(${caches.size}), 0) from ${caches})`.mapWith(Number),
+		physicalStoredBytes: sql`(select coalesce(sum(${blobObjects.fileSize}), 0) from ${blobObjects})`.mapWith(Number),
+		pendingBytes: sql`(select coalesce(sum(${uploadSessions.fileSize}), 0) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
+		uploadsPending: sql`(select count(*) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
+		privateServedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.bytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
+		activeTokens: sql`(select count(*) from ${apiTokens} where ${apiTokens.revokedAt} is null and ${apiTokens.expiresAt} > ${now})`.mapWith(Number),
+		apiKeys: sql`(select count(*) from ${orgApiKeys} where ${orgApiKeys.revokedAt} is null)`.mapWith(Number),
+	}).from(sql`(select 1) as singleton`);
+	return row;
 }
 
 export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsage> {

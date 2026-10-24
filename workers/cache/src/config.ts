@@ -19,8 +19,10 @@ export interface WorkerConfig {
 	readonly rateLimiters: RateLimiters;
 	readonly signingKeyName: string;
 	readonly signingPrivateKey: string;
-	/** Seals each cache's own signing key; without it every cache signs with signingPrivateKey. */
-	readonly signingMasterKey: string;
+	/** Seals each cache's own signing key; required for hosted creation and signing. */
+	readonly signingMasterKey: () => Promise<string>;
+	/** Refuse shared-key and unsigned publication on the hosted service. */
+	readonly requireCacheSigningKeys: boolean;
 	readonly authToken: string;
 	readonly r2AccessKeyId: string;
 	readonly r2SecretAccessKey: string;
@@ -76,13 +78,21 @@ function readSettings(env: Env): Settings {
 	if (!env.HYPERDRIVE) {
 		throw new Error("Missing required binding: HYPERDRIVE");
 	}
+	// Resolve only for signing, never on public reads. Cache successful store
+	// reads in this isolate, but let a transient store failure be retried.
+	let master: Promise<string> | undefined;
+	const signingMasterKey = () => master ??= (env.SIGNING_MASTER_KEY_STORE
+		? env.SIGNING_MASTER_KEY_STORE.get()
+		: Promise.resolve(env.SIGNING_MASTER_KEY || ""))
+		.catch(error => { master = undefined; throw error; });
 	return {
 		bucket: env.CACHE_BUCKET,
 		publicBucket: env.PUBLIC_BUCKET,
 		authKv: env.AUTH_KV,
 		signingKeyName: env.SIGNING_KEY_NAME || "snowstead-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
-		signingMasterKey: env.SIGNING_MASTER_KEY || "",
+		signingMasterKey,
+		requireCacheSigningKeys: env.REQUIRE_CACHE_SIGNING_KEYS === "true",
 		authToken: env.AUTH_TOKEN || "",
 		r2AccessKeyId: env.R2_ACCESS_KEY_ID || "",
 		r2SecretAccessKey: env.R2_SECRET_ACCESS_KEY || "",

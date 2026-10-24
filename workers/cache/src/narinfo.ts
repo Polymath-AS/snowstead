@@ -60,7 +60,7 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
 	// form, which Nix would not verify a signature over.
 	const narHash = valueOf(NarHash, path.narHash);
 	const canonical = narHash === undefined ? path : { ...path, narHash };
-	const sig = await signNarinfo(computeFingerprint(canonical, refs), key.name, key.secret);
+	const sig = await signNarinfo(computeFingerprint(canonical, refs), key.name, key.key);
 	return renderNarinfo(canonical, blob, narUrl(blob.fileHash, blob.compression, isPrivate, cachePath), refs, storedSigs, sig ? [sig] : []);
 }
 

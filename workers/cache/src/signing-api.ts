@@ -1,7 +1,7 @@
 import * as v from "valibot";
 import { and, eq } from "drizzle-orm";
 import type { WorkerConfig } from "./config.js";
-import { findCache } from "./db/repository.js";
+import { findCache, findOrg } from "./db/repository.js";
 import { caches, cacheSigningKeys } from "./db/schema.js";
 import { importCacheKey, newCacheKey } from "./cache-keys.js";
 import { signingPublicKey } from "./signing.js";
@@ -32,27 +32,28 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 		});
 	}
 	if (request.method !== "POST") return errorResponse("Not Found", 404);
-	if (!config.signingMasterKey) return errorResponse("managed signing requires SIGNING_MASTER_KEY", 409);
+	if (!await config.signingMasterKey()) return errorResponse("managed signing requires SIGNING_MASTER_KEY", 409);
 	const body = await parseBody(request, SigningRequest);
 	if (body instanceof Response) return body;
+	const permission = await findOrg(config.db, org);
 	if (!id) {
 		let key;
 		if (body.secretKey !== undefined) {
+			if (!permission?.customSigningKeys) return errorResponse("custom signing keys are not allowed for this organization", 403);
 			try { key = await importCacheKey(config, cache.id, body.secretKey); }
 			catch { return errorResponse("invalid Nix secret key", 400); }
 		} else {
-			key = await newCacheKey(config, { id: cache.id, path: `${cache.path}-${crypto.randomUUID()}` });
+			key = await newCacheKey(config, cache);
 		}
 		if (!key) return errorResponse("managed signing unavailable", 409);
-		const keyId = crypto.randomUUID();
 		// Serialize with activation and other staging requests for this cache.
 		const made = await config.db.transaction(async tx => {
 			const [current] = await tx.select().from(caches).where(eq(caches.id, cache.id)).for("update");
 			if (key.signingKeyName === current.signingKeyName || key.signingKeyName === config.signingKeyName) return false;
-			const rows = await tx.insert(cacheSigningKeys).values({ id: keyId, cacheId: cache.id, ...key }).onConflictDoNothing().returning();
+			const rows = await tx.insert(cacheSigningKeys).values({ cacheId: cache.id, ...key }).onConflictDoNothing().returning();
 			return rows.length > 0;
 		});
-		return made ? jsonResponse({ id: keyId, publicKey: key.signingPublicKey, state: "staged" }, 201) : errorResponse("key name already used", 409);
+		return made ? jsonResponse({ id: key.id, publicKey: key.signingPublicKey, state: "staged" }, 201) : errorResponse("key name or managed public key already used", 409);
 	}
 	const result = await config.db.transaction(async tx => {
 		const [current] = await tx.select().from(caches).where(eq(caches.id, cache.id)).for("update");
@@ -60,6 +61,7 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 		const target = rows.find(k => k.id === id);
 		if (!target) return errorResponse("no signing key", 404);
 		if (target.state !== "staged" || !target.signingKeySealed) return errorResponse("key is not staged", 409);
+		if (!target.managedPublicKey && !permission?.customSigningKeys) return errorResponse("custom signing keys are not allowed for this organization", 403);
 		const oldPublic = current.signingPublicKey ?? await signingPublicKey(config.signingKeyName, config.signingPrivateKey);
 		const required = [...rows.map(k => k.signingPublicKey), ...(oldPublic ? [oldPublic] : [])];
 		const trusted = body.trustedPublicKeys;
