@@ -7,7 +7,7 @@
   "description": "Cloudflare-native Nix binary cache",
   "scripts": {
     "build": "echo 'wrangler bundles at deploy time'",
-    "deploy": "pnpm --filter @snowstead/cache-worker db:migrate && pnpm exec wrangler deploy",
+    "deploy": "pnpm --filter @snowstead/cache-worker db:migrate && pnpm exec wrangler deploy --env production",
     "dev": "scripts/dev.sh",
     "dev:profile": "scripts/dev-profile.sh",
     "check": "pnpm -r check"

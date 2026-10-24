@@ -11,18 +11,21 @@ wrangler r2 bucket local-uploads enable snowstead-private
 # pg_write_all_data. Query caching off: uploads must read their own writes.
 wrangler hyperdrive create snowstead --caching-disabled \
   --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
-# set the Hyperdrive id in wrangler.jsonc
-wrangler secret put JWT_SECRET
-wrangler secret put ADMIN_SECRET
-wrangler secret put SIGNING_PRIVATE_KEY
-wrangler secret put SIGNING_KEY_NAME
+# set the production Hyperdrive id in wrangler.jsonc
+wrangler secret put JWT_SECRET --env production
+wrangler secret put ADMIN_SECRET --env production
+# Generate 32 cryptographically random bytes, base64; keep a private backup
+# separately from Postgres. Paste through the hidden prompt, not shell arguments.
+# The account store container is owned by the infrastructure Terraform stack.
+wrangler secrets-store secret create <STORE_ID> \
+  --name snowstead-production-signing-master-key --scopes workers --remote
 # S3 keys of an R2 token limited to the two buckets (key id: the token id,
 # secret: the SHA-256 of its value). With them uploads go straight to R2
 # through presigned URLs; without them they go through the Worker. Private
 # NARs are always served by the Worker, which checks the reader.
-wrangler secret put R2_ACCESS_KEY_ID
-wrangler secret put R2_SECRET_ACCESS_KEY
-wrangler secret put R2_ENDPOINT        # https://<account id>.r2.cloudflarestorage.com
+wrangler secret put R2_ACCESS_KEY_ID --env production
+wrangler secret put R2_SECRET_ACCESS_KEY --env production
+wrangler secret put R2_ENDPOINT --env production # https://<account id>.r2.cloudflarestorage.com
 # migrates the database directly (not through Hyperdrive), then deploys
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
@@ -31,8 +34,46 @@ DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm 
 |--------|---------|
 | `JWT_SECRET` | HMAC-SHA256 key for JWT token signing |
 | `ADMIN_SECRET` | Bearer token for the admin API |
-| `SIGNING_PRIVATE_KEY` | Ed25519 key for narinfo signing |
-| `SIGNING_KEY_NAME` | Key name prefix for signatures |
+| `SIGNING_MASTER_KEY_STORE` | Secrets Store binding to the 32-byte base64 AES-GCM key sealing per-cache signing keys |
+| `SIGNING_PRIVATE_KEY` | Legacy shared Ed25519 key; only for explicit self-hosted shared-key mode |
+
+`SIGNING_KEY_NAME` is a non-secret key-name prefix in `wrangler.jsonc`.
+Hosted deployment explicitly selects `--env production`, whose bindings are
+not inherited from the local configuration. Staging must use its own R2, KV,
+database, Hyperdrive and environment-prefixed secret source. Cloudflare permits
+one Secrets Store per account: source names isolate deployment configuration,
+not account-level IAM. Terraform owns the store, never secret values.
+
+The master key is loaded lazily through `SIGNING_MASTER_KEY_STORE.get()` only
+when signing or creating keys. Successful reads are reused by the isolate;
+failed reads can be retried and never fall back to a different key. A plain
+`SIGNING_MASTER_KEY` secret is supported for local/self-hosted installations
+only when the store binding is absent. Never replace an existing master key
+without a re-encryption migration; a database backup alone cannot recover
+sealed signing keys.
+
+Staging uses `cache-staging.snowstead.com`, serving reads through its Worker
+instead of production's public CDN. Its database starts empty with the same
+migrations; the populated benchmark `dev` branch is not staging. After setting
+the non-secret bindings from Terraform's staging handoff:
+
+```bash
+# A private JSON file containing distinct staging ADMIN_SECRET and JWT_SECRET.
+# Do not copy production values or commit this file.
+pnpm exec wrangler deploy --env staging --secrets-file /private/staging-worker.json
+```
+
+Staging uses authenticated proxied uploads until its own bucket-scoped R2
+credentials are configured. Its S3 bucket names are explicit, so adding them
+cannot silently target production's default bucket names. Staging disables
+workers.dev and preview aliases.
+
+The default `REQUIRE_CACHE_SIGNING_KEYS: "true"` refuses cache creation
+without a master key and refuses publication without a per-cache key.
+Self-hosters may explicitly set it to `"false"` to use
+`SIGNING_PRIVATE_KEY` for caches without their own key. Existing shared-key
+caches need trust-overlap activation before publishing under hosted policy;
+do not silently replace a key clients already trust.
 
 ### Public caches on a custom domain
 
@@ -211,9 +252,9 @@ Each entry also records its org; an org reads its own with
 ## Orgs
 
 A hosted service runs Snowstead for many tenants. Each tenant is an org,
-which has caches, tokens, API keys, an audit log, and a storage limit.
-Who belongs to an org, and what it pays for, stay with the service that
-runs Snowstead.
+which has caches, tokens, API keys, an audit log, and operator-set limits
+in Postgres. Membership and commercial policy stay with the service that
+runs Snowstead, outside the cache service.
 
 A self-hosted install doesn't need to know about any of this: everything
 belongs to the `default` org, which has no storage limit, and tokens made
@@ -230,8 +271,8 @@ without an org are its tokens.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
-  operator sets the storage limit, whether the org may have private caches
-  (`privateCaches`), and makes API keys. An org that may not keeps its
+  operator sets org limits and permissions, and makes API keys.
+  An org without private-cache permission keeps its
   private caches private and readable, but they take no pushes, and it
   can't make new ones.
 - **Tokens reach only their org's caches,** for pushing and for pulling
@@ -251,34 +292,70 @@ without an org are its tokens.
   the Worker served from the org's private caches this UTC month, counted
   by day in `bandwidth_daily`. Public caches are served by the bucket and
   CDN without the Worker, so they aren't counted here.
-- **Signing keys.** With `SIGNING_MASTER_KEY` set, each new cache signs
-  with a key of its own, shown as the cache's `publicKey`. Caches from
-  before, and every cache without a master key, sign with
-  `SIGNING_PRIVATE_KEY`.
+- **Signing keys.** Each new cache gets its own cryptographically generated
+  Ed25519 key, shown as its `publicKey`. Managed key names use the immutable
+  cache ID and a random UUID; managed public bytes are unique in Postgres.
+  Creation and initial key registration are atomic. `customSigningKeys`
+  is an operator-set org permission for BYOK; org API keys cannot
+  change it. Removing permission does not disable an active imported key.
+
+### Org limits API
+
+All responses are `Cache-Control: no-store`. `storageLimit` is a nonnegative
+safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
+
+- `GET /_api/v1/admin/orgs` returns
+  `{orgs: [{id, slug, storageLimit, privateCaches, customSigningKeys}]}`.
+- `PUT /_api/v1/orgs/:org` takes
+  `{slug?, storageLimit?, privateCaches?, customSigningKeys?}`. Creation
+  requires a slug and defaults to unlimited storage, private caches allowed,
+  and custom signing keys disallowed. Omitted limits preserve existing
+  values, including concurrent updates. Unknown fields are rejected with 400.
+- Org GET and PUT responses contain `id`, `slug`, `movingFrom`,
+  `storageLimit`, `privateCaches`, `customSigningKeys`, `used`, `pending`, and
+  `servedThisMonth`.
+- `GET /_api/v1/admin/overview` retains the global operator overview.
+
+All admin endpoints and org PUTs require operator `ADMIN_SECRET`
+authentication; org API keys cannot change their own limits or list all orgs.
+`org.put` records old/new slug and limits in the affected org's audit log,
+with the operator or forwarded dashboard actor identity.
+
+Limits are read from Postgres on every enforcement lookup, not held in KV.
+Updates apply immediately on subsequent requests. Lowering a limit never
+deletes published data or makes a private cache public: it refuses disallowed
+new pushes and new private caches, and blocks BYOK import/activation while
+leaving already-active keys working.
 
 After upgrading to orgs, run `POST /_api/v1/admin/auth/sync` once: it
-writes each private cache's org into KV, where pulls check it.
+writes each private cache's org into KV, where pulls check it. This existing
+visibility index is unrelated to org limits; changing limits requires
+no KV synchronization.
 
 ### Cache signing key lifecycle
 
 Run database migrations before deploying. Signing management uses the org
 API's bearer authentication (`ADMIN_SECRET` or that org's API key), not a
-push token. No billing entitlement is enforced here. All responses are
+push token. BYOK staging and activation require `customSigningKeys`; managed
+key rotation does not. In the dashboard, mutations require the org owner.
+All responses are
 `Cache-Control: no-store`; private or sealed key material is never returned.
 
 Under `/_api/v1/orgs/:org/caches/:cache/signing-keys`:
 
 - `GET` returns `activePublicKey`, `shared` (true while the cache signs with
   the service's key rather than one of its own), and `keys`, each with `id`, `publicKey`,
-  and `state` (`staged`, `active`, or `retired`). The original cache/shared
-  key has `id: null` until the first rotation records its history.
+  and `state` (`staged`, `active`, or `retired`). New initial managed keys
+  have history IDs. A legacy shared key has `id: null` until its first
+  rotation records its history.
 - `POST {}` generates a Snowstead-managed key, **staged**, not yet signing.
 - `POST {"secretKey":"name:base64"}` stages a BYOK Nix secret key. Import
   requires canonical base64 of exactly 64 bytes (32-byte Ed25519 seed then
   its matching public half). Names are 1–200 ASCII characters: alphanumeric
   first, followed by alphanumeric or `._/+-`. Do not send a PEM, bare seed,
   or trailing newline. The secret is sealed with AES-GCM under
-  `SIGNING_MASTER_KEY`, authenticated to the cache id. Both staging forms
+  `SIGNING_MASTER_KEY`, authenticated to the version, cache ID, key UUID,
+  name, and public key. Both staging forms
   return `201 {id, publicKey, state: "staged"}`. A key name cannot be reused
   in the cache, including its historical keys or the service key name.
 - `POST /:id/activate {"trustedPublicKeys":["name:base64", ...]}` activates
@@ -289,7 +366,8 @@ Under `/_api/v1/orgs/:org/caches/:cache/signing-keys`:
   Activation does not prove clients were updated: the caller must ensure it.
 
 Staging and activation require `SIGNING_MASTER_KEY` (409 without it).
-Existing shared-key/self-hosted caches otherwise keep their behavior. The
+Legacy shared signing is available only with explicit self-hosted opt-out
+from the required-per-cache-key policy. The
 cache's existing `publicKey` field continues to show its current active key;
 use this lifecycle GET to discover the complete trust set after rotations.
 Retired public keys are retained permanently, and cannot be reactivated or
@@ -307,11 +385,31 @@ purge the rewritten narinfo URLs after R2 writes; purge implementation is
 outside signing management.
 
 Each publish re-reads the current sealed key version before selecting a
-bounded (256-entry) decrypted-key memo; Ed25519 imports also use a bounded
-256-entry, promise-coalescing memo rather than one tenant-thrashing slot.
+bounded (256-entry), promise-coalescing memo of non-extractable, signing-only
+CryptoKeys. Decrypted tenant secret bytes are not memoized; transient byte
+buffers are cleared after use where practical. This is not a guarantee of
+complete memory erasure in a JavaScript runtime.
 There is no signing on public reads. Keep Hyperdrive query caching disabled
 as required by setup above: stale database reads would delay key changes.
 A publish already in flight at activation may finish with the prior key,
 which is another reason to retain overlapping trust. Rotation does not
 rotate `SIGNING_MASTER_KEY`; retain that deployment secret to open active
 and staged keys.
+
+### Signing-key backup and recovery
+
+Back up Postgres (including caches and key history) and keep a separate,
+access-controlled backup of `SIGNING_MASTER_KEY` in a password manager or
+secrets vault. Restrict production secret access to operators; never put
+keys in logs, source control, public R2, or support tickets. A database
+backup alone cannot restore signing. The master key can decrypt every
+tenant key, so it remains a shared security boundary, not HSM isolation.
+
+Before inviting testers, restore a database backup into an isolated
+environment using the matching master key, publish a test narinfo, and
+verify its signature against the unchanged advertised public key. A wrong
+or missing master key must fail rather than fall back to a shared key.
+Existing v1 sealed keys remain readable; newly sealed keys use v2 identity
+authentication. Do not replace the master secret to rotate cache keys:
+that makes existing ciphertext unreadable. Master-key rotation and
+emergency compromise recovery need a separate, tested migration plan.

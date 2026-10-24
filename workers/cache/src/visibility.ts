@@ -119,6 +119,6 @@ export async function nextGeneration(config: WorkerConfig, cache: { readonly pat
 	visibility.set(cache.path, { isPrivate: true, ...entry, until: Date.now() + KV_CACHE_TTL_SECONDS * 1000 });
 }
 
-/** Why a push to, or a new, private cache is refused when its org's plan has none. */
+/** Why a push to, or a new, private cache is refused without org permission. */
 export const PRIVATE_CACHES_REFUSED =
-	"this org's plan doesn't include private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made";
+	"this org does not allow private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made";

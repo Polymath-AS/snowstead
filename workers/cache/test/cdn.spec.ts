@@ -144,7 +144,7 @@ describe("org-scoped manual purges", () => {
 			headers: { authorization: "Bearer test-admin-secret" }, body: JSON.stringify(body),
 		});
 		for (const id of [org, other]) {
-			expect((await setup(id, { slug: id, storageLimit: null })).status).toBe(200);
+			expect((await setup(id, { slug: id })).status).toBe(200);
 			expect((await setup(`${id}/caches`, { name: "main" })).status).toBe(201);
 		}
 		const key = await (await setup(`${org}/keys`, { name: "purger" })).json<{ key: string }>();

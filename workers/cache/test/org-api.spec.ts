@@ -16,7 +16,7 @@ function orgApi(path: string, credential: string, method = "GET", body?: unknown
 async function orgWithKey() {
 	const org = unique("org");
 	const cache = unique("cache");
-	expect((await orgApi(`/${org}`, OPERATOR, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
+	expect((await orgApi(`/${org}`, OPERATOR, "PUT", { slug: org })).status).toBe(200);
 	expect((await orgApi(`/${org}/caches`, OPERATOR, "POST", { name: cache })).status).toBe(201);
 	const res = await orgApi(`/${org}/keys`, OPERATOR, "POST", { name: "terraform" });
 	expect(res.status).toBe(201);

@@ -12,37 +12,16 @@ const PKCS8_ED25519_PREFIX = new Uint8Array([
 	0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ]);
 
-const signingKeys = new Map<string, Promise<CryptoKey>>();
-
-async function getSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
-	const known = signingKeys.get(privateKeyBase64);
-	if (known) return known;
-	const pending = importSigningKey(privateKeyBase64);
-	if (signingKeys.size >= 256) signingKeys.delete(signingKeys.keys().next().value!);
-	signingKeys.set(privateKeyBase64, pending);
-	try { return await pending; }
-	catch (error) { signingKeys.delete(privateKeyBase64); throw error; }
-}
-
-async function importSigningKey(privateKeyBase64: string): Promise<CryptoKey> {
-
-	const keyBytes = Uint8Array.from(atob(privateKeyBase64), c => c.charCodeAt(0));
-	const seed = keyBytes.slice(0, 32);
+/** Import transient Nix key material as a non-extractable signing-only key. */
+export async function importSigningKey(keyBytes: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
 	const pkcs8 = new Uint8Array(PKCS8_ED25519_PREFIX.length + 32);
 	pkcs8.set(PKCS8_ED25519_PREFIX);
-	pkcs8.set(seed, PKCS8_ED25519_PREFIX.length);
-	const pkcs8Buffer = new ArrayBuffer(pkcs8.byteLength);
-	new Uint8Array(pkcs8Buffer).set(pkcs8);
-
-	const key = await crypto.subtle.importKey(
-		"pkcs8",
-		pkcs8Buffer,
-		{ name: "Ed25519" },
-		false,
-		["sign"],
-	);
-
-	return key;
+	pkcs8.set(keyBytes.subarray(0, 32), PKCS8_ED25519_PREFIX.length);
+	try {
+		return await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
+	} finally {
+		pkcs8.fill(0);
+	}
 }
 
 /**
@@ -76,13 +55,12 @@ export async function signingPublicKey(keyName: string, privateKeyBase64: string
 export async function signNarinfo(
 	fingerprint: string,
 	keyName: string,
-	privateKeyBase64: string,
+	key: CryptoKey | undefined,
 ): Promise<string> {
-	if (!privateKeyBase64) {
+	if (!key) {
 		return "";
 	}
 
-	const key = await getSigningKey(privateKeyBase64);
 	const data = textEncoder.encode(fingerprint);
 	const signature = await crypto.subtle.sign("Ed25519", key, data);
 	const sigBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)));

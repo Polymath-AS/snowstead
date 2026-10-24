@@ -252,7 +252,10 @@ export async function handleCreateCache(
 		return errorResponse(`no org ${org}`, 404);
 	}
 	const existing = await findCache(config.db, org, name);
-	// A plan without private caches keeps the ones it has private, but makes no more.
+	if (!existing && config.requireCacheSigningKeys && !await config.signingMasterKey()) {
+		return errorResponse("cache signing requires SIGNING_MASTER_KEY", 503);
+	}
+	// An org without private-cache permission keeps existing ones private, but makes no more.
 	if (body.private === true && !orgRow.privateCaches && (existing === undefined || existing.isPublic)) {
 		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 	}
@@ -270,13 +273,16 @@ export async function handleCreateCache(
 		await setPrivate(config, path, true, { org, id: existing.id });
 		await setPublicCacheInfo(config, path, false);
 	}
-	const { cache, created } = await ensureCache(config.db, name, body.private !== true, org);
+	const { cache, created } = await config.db.transaction(async tx => {
+		const result = await ensureCache(tx, name, body.private !== true, org);
+		if (result.created) {
+			const key = await newCacheKey(config, result.cache);
+			if (key) await setCacheSigningKey(tx, result.cache.id, key);
+		}
+		return result;
+	});
 	if (created) {
-		// A new cache's entry needs its id, so it follows the row, before the
-		// request returns and anything can be pushed to it.
 		if (!cache.isPublic) await setPrivate(config, path, true, { org, id: cache.id });
-		const key = await newCacheKey(config, cache);
-		if (key) await setCacheSigningKey(config.db, cache.id, key);
 	}
 	let isPublic = cache.isPublic;
 	const changed = !created && changing;
@@ -375,6 +381,7 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		movingFrom: org.movingFrom,
 		storageLimit: org.storageLimit,
 		privateCaches: org.privateCaches,
+		customSigningKeys: org.customSigningKeys,
 		used: usage.used,
 		pending: usage.pending,
 		servedThisMonth: served,
@@ -388,18 +395,18 @@ export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise
 	return orgResponse(config, id);
 }
 
-const STORAGE_LIMIT = "storageLimit must be a whole number of bytes, or null";
-
-const OrgTerms = v.object({
-	storageLimit: v.nullable(v.pipe(v.number(STORAGE_LIMIT), v.safeInteger(STORAGE_LIMIT), v.minValue(0, STORAGE_LIMIT))),
+const OrgTerms = v.strictObject({
 	// Parsed only when it changes, below.
 	slug: v.optional(v.unknown()),
-	privateCaches: v.optional(v.boolean("privateCaches must be a boolean")),
+	storageLimit: v.optional(v.nullable(v.pipe(v.number(), v.safeInteger(), v.minValue(0)))),
+	privateCaches: v.optional(v.boolean()),
+	customSigningKeys: v.optional(v.boolean()),
 });
 
+const OrgSlugConflict = v.object({ cause: v.object({ code: v.literal("23505"), constraint: v.literal("orgs_slug_unique") }) });
+
 /**
- * Creates an org or sets its storage limit, in bytes or null for none, and
- * its slug, which its caches are served under (cache-path.ts). A lower limit
+ * Creates an org or updates its limits and slug (cache-path.ts). A lower limit
  * than its caches hold refuses new pushes until they fit again. Creating an
  * org needs a slug. Changing one moves every cache's URL, and caches are
  * stored at theirs: the new paths are readied here, and POST /move then
@@ -410,7 +417,6 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 	if (id instanceof Response) return id;
 	const body = await parseBody(request, OrgTerms);
 	if (body instanceof Response) return body;
-	const limit = body.storageLimit;
 
 	const existing = await findOrg(config.db, id);
 	let slug = existing?.slug;
@@ -432,15 +438,22 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 	if (slug === undefined) {
 		return errorResponse("slug is needed to create an org", 400);
 	}
-	if (existing && slug !== existing.slug) {
-		const orgCaches = await listCaches(config.db, id);
-		if (orgCaches.length > 0) {
-			const to = slug;
-			await Promise.all(orgCaches.map((c) => readyNewPath(config, c, cachePath(to, c.name))));
-			await startSlugMove(config.db, id, slug, existing.slug);
+	try {
+		if (existing && slug !== existing.slug) {
+			const orgCaches = await listCaches(config.db, id);
+			if (orgCaches.length > 0) {
+				const to = slug;
+				await Promise.all(orgCaches.map((c) => readyNewPath(config, c, cachePath(to, c.name))));
+				await startSlugMove(config.db, id, slug, existing.slug);
+			}
 		}
+		const { storageLimit, privateCaches, customSigningKeys } = body;
+		if (!(await putOrg(config.db, id, slug, { storageLimit, privateCaches, customSigningKeys }))) return errorResponse(`${slug} is taken`, 409);
+	} catch (err) {
+		// The preflight slug lookup is advisory; Postgres decides concurrent claims.
+		if (v.is(OrgSlugConflict, err)) return errorResponse(`${slug} is taken`, 409);
+		throw err;
 	}
-	await putOrg(config.db, id, limit, slug, body.privateCaches ?? existing?.privateCaches ?? true);
 	return orgResponse(config, id);
 }
 

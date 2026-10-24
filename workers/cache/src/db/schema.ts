@@ -9,8 +9,8 @@ const bytes = (name: string) => bigint(name, { mode: "number" });
 const id = () => bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity();
 
 /**
- * The tenants of a hosted service, each with its caches and a storage limit.
- * Their members and plans live with whatever runs the service. Every cache
+ * The tenants of a hosted service, each with its caches and operator-set limits.
+ * Their members live with whatever runs the service. Every cache
  * has one: a self-hosted install's are all the default org's, which has no
  * limit, and so are tokens made without an org.
  */
@@ -26,10 +26,9 @@ export const orgs = pgTable("orgs", {
 	 * it until they're moved.
 	 */
 	movingFrom: text("moving_from").unique(),
-	/** Bytes its caches may hold, counted like a cache's size; null for no limit. */
 	storageLimit: bytes("storage_limit"),
-	/** Whether its plan allows private caches. Without, its private caches stay private but take no pushes. */
 	privateCaches: boolean("private_caches").notNull().default(true),
+	customSigningKeys: boolean("custom_signing_keys").notNull().default(false),
 	createdAt: createdAt("created_at"),
 });
 
@@ -63,6 +62,8 @@ export const cacheSigningKeys = pgTable("cache_signing_keys", {
 	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
 	signingKeyName: text("signing_key_name").notNull(),
 	signingPublicKey: text("signing_public_key").notNull(),
+	/** Public bytes only; imports may intentionally reuse customer key material. */
+	managedPublicKey: text("managed_public_key").unique(),
 	signingKeySealed: text("signing_key_sealed"),
 	state: text("state").notNull().default("staged"),
 	createdAt: createdAt("created_at"),

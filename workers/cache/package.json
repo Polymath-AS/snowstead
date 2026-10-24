@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy --config ../../wrangler.jsonc",
+    "deploy": "wrangler deploy --config ../../wrangler.jsonc --env production",
     "dev": "CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false wrangler dev --config ../../wrangler.jsonc",
     "test": "../../scripts/with-postgres.sh vitest run",
     "cf-typegen": "CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false wrangler types --config ../../wrangler.jsonc",

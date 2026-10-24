@@ -1,7 +1,8 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createCache, createBlobObject, createPublishedPath } from "../src/db/repository.js";
+import { createCache, createBlobObject, createPublishedPath, ensureCache } from "../src/db/repository.js";
+import { orgs, uploadSessions, apiTokens, orgApiKeys, bandwidthDaily } from "../src/db/schema.js";
 import { signingPublicKey } from "../src/signing.js";
 
 const db = testDb();
@@ -50,6 +51,42 @@ describe("admin caches", () => {
 });
 
 describe("admin cache stats", () => {
+	it("reports only aggregate global usage to the operator, distinguishing shared bytes and live uploads", async () => {
+		expect((await admin("/overview", {}, "test-auth-token")).status).toBe(403);
+		const before = await (await admin("/overview")).json<Record<string, number>>();
+		const org = `overview-${crypto.randomUUID()}`;
+		await db.insert(orgs).values({ id: org, slug: org });
+		const a = await createCache(db, `overview-${crypto.randomUUID().slice(0, 8)}`);
+		const { cache: b } = await ensureCache(db, a.name, true, org);
+		const blob = await createBlobObject(db, { fileHash: crypto.randomUUID(), fileSize: 400, compression: "zstd", r2Key: crypto.randomUUID() });
+		for (const cache of [a, b]) await createPublishedPath(db, {
+			cacheId: cache.id, storePathHash: "2".repeat(32), storePath: `/nix/store/${"2".repeat(32)}-private-name`,
+			narHash: `sha256:${"1".repeat(52)}`, narSize: 900, blobObjectId: blob.id,
+			referencesJson: "[]", deriver: null, system: null, signaturesJson: "[]",
+		});
+		const now = new Date();
+		const future = new Date(now.getTime() + 3_600_000);
+		const past = new Date(now.getTime() - 3_600_000);
+		for (const [status, size, expiresAt] of [["pending", 111, future], ["uploading", 222, future], ["pending", 444, past], ["completed", 888, future]] as const) {
+			await db.insert(uploadSessions).values({ id: crypto.randomUUID(), cacheId: a.id, storePathHash: crypto.randomUUID(), storePath: "private-path",
+				narHash: "hash", narSize: size, fileHash: crypto.randomUUID(), fileSize: size, compression: "zstd", status, expiresAt });
+		}
+		for (const [expiresAt, revokedAt] of [[future, null], [past, null], [future, now]]) {
+			await db.insert(apiTokens).values({ jti: crypto.randomUUID(), subject: "hidden-person", caches: ["*"], permsJson: '["push"]', expiresAt, revokedAt, createdBy: "admin" });
+		}
+		for (const revokedAt of [null, now]) await db.insert(orgApiKeys).values({ id: crypto.randomUUID(), orgId: org, name: "hidden-key", secretHash: "hidden-secret", revokedAt });
+		await db.insert(bandwidthDaily).values({ orgId: org, day: now.toISOString().slice(0, 10), bytes: 1234 });
+		await db.insert(bandwidthDaily).values({ orgId: org, day: "2000-01-01", bytes: 9999 });
+		const response = await admin("/overview");
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(await response.json()).toEqual({
+			orgs: before.orgs + 1, caches: before.caches + 2, paths: before.paths + 2,
+			storedBytes: before.storedBytes + 800, physicalStoredBytes: before.physicalStoredBytes + 400,
+			pendingBytes: before.pendingBytes + 333, uploadsPending: before.uploadsPending + 2,
+			privateServedThisMonth: before.privateServedThisMonth + 1234, activeTokens: before.activeTokens + 1, apiKeys: before.apiKeys + 1,
+		});
+	});
+
 	it("counts a cache's paths and lists the newest", async () => {
 		const cache = await createCache(db, `stats-${crypto.randomUUID().slice(0, 8)}`);
 		const blob = await createBlobObject(db, {

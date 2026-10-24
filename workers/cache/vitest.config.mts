@@ -28,8 +28,11 @@ export default defineConfig({
 					ADMIN_SECRET: "test-admin-secret",
 					JWT_SECRET: "test-jwt-secret-0123456789abcdef",
 					SIGNING_MASTER_KEY: "dGVzdC1zaWduaW5nLW1hc3Rlci1rZXktMzItYnl0ZXM=",
+					// Legacy self-hosted fixtures opt in to shared keys explicitly.
+					REQUIRE_CACHE_SIGNING_KEYS: "false",
 					// Public, deterministic test-only seed; never depend on .dev.vars.
 					SIGNING_PRIVATE_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+					SIGNING_KEY_NAME: "snowstead-1",
 					// No upstream: tests never reach the network. test/upstream.spec.ts
 					// checks one with a stand-in fetch.
 					UPSTREAM_CACHES: "",

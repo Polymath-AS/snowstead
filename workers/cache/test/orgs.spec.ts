@@ -1,7 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { signJwt, TOKEN_ISSUER, TOKEN_AUDIENCE } from "../src/jwt.js";
-import { cacheKeyName } from "../src/cache-keys.js";
 
 const unique = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -68,38 +67,80 @@ async function orgWithCache(storageLimit: number | null, isPrivate = false) {
 }
 
 describe("orgs", () => {
-	it("creates an org, changes its limit, and reports its usage", async () => {
+	it("registers concurrently without losing quota updates and returns conflicts for competing slug claims", async () => {
+		for (let round = 0; round < 8; round++) {
+			const org = unique("org");
+			const responses = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+				orgApi(`/${org}`, "PUT", { slug: org, ...(i === 0 ? { storageLimit: 1234, privateCaches: false, customSigningKeys: true } : {}) })));
+			expect(responses.map(r => r.status)).toEqual(Array(8).fill(200));
+			expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ id: org, slug: org, storageLimit: 1234, privateCaches: false, customSigningKeys: true });
+		}
+		const slug = unique("claimed");
+		const claimants = Array.from({ length: 8 }, () => unique("org"));
+		const responses = await Promise.all(claimants.map(org => orgApi(`/${org}`, "PUT", { slug })));
+		expect(responses.map(r => r.status).sort()).toEqual([200, 409, 409, 409, 409, 409, 409, 409]);
+		const winner = claimants[responses.findIndex(r => r.status === 200)];
+		expect(await (await orgApi(`/${winner}`)).json()).toMatchObject({ id: winner, slug, storageLimit: null, privateCaches: true, customSigningKeys: false });
+		// Existing orgs racing to rename hit UPDATE's unique constraint instead.
+		const movers = [unique("org"), unique("org")];
+		for (const org of movers) expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1234 })).status).toBe(200);
+		const destination = unique("renamed");
+		const renamed = await Promise.all(movers.map(org => orgApi(`/${org}`, "PUT", { slug: destination })));
+		expect(renamed.map(r => r.status).sort()).toEqual([200, 409]);
+		for (const org of movers) expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ storageLimit: 1234 });
+	});
+
+	it("exposes generic operator-only limits, validates updates, and preserves omitted values", async () => {
 		const org = unique("org");
 		expect((await orgApi(`/${org}`)).status).toBe(404);
 
 		const created = await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1000 });
-		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, used: 0, pending: 0, servedThisMonth: 0 });
+		expect(created.headers.get("cache-control")).toBe("no-store");
+		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, customSigningKeys: false, used: 0, pending: 0, servedThisMonth: 0 });
+		const limits = { storageLimit: 0, privateCaches: false, customSigningKeys: true };
+		expect(await (await orgApi(`/${org}`, "PUT", limits)).json()).toMatchObject(limits);
+		for (const body of [{}, { slug: org }]) {
+			expect(await (await orgApi(`/${org}`, "PUT", body)).json()).toMatchObject(limits);
+		}
+		for (const body of [
+			{ tierId: "commercial" }, { tier: {} },
+			...[-1, 1.5, "10GB", Number.MAX_SAFE_INTEGER + 1, true].map(storageLimit => ({ storageLimit })),
+			{ privateCaches: null }, { privateCaches: "true" }, { customSigningKeys: null }, { customSigningKeys: 1 },
+		]) expect((await orgApi(`/${org}`, "PUT", body)).status).toBe(400);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject(limits);
+		const { key } = await (await orgApi(`/${org}/keys`, "POST", { name: "test" })).json<{ key: string }>();
+		for (const body of [{ storageLimit: null }, { privateCaches: true }, { customSigningKeys: false }]) {
+			expect((await SELF.fetch(`http://example.com/_api/v1/orgs/${org}`, {
+				method: "PUT", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(body),
+			})).status).toBe(403);
+		}
+		const inventory = await admin("/orgs");
+		expect(inventory.headers.get("cache-control")).toBe("no-store");
+		expect((await inventory.json<{ orgs: unknown[] }>()).orgs).toContainEqual({ id: org, slug: org, ...limits });
+		expect((await SELF.fetch("http://example.com/_api/v1/admin/orgs")).status).toBe(401);
+		expect((await SELF.fetch("http://example.com/_api/v1/admin/orgs", { headers: { authorization: `Bearer ${key}` } })).status).toBe(403);
 
 		const raised = await orgApi(`/${org}`, "PUT", { storageLimit: null });
-		expect(await raised.json()).toMatchObject({ slug: org, storageLimit: null });
-	});
-
-	it.each([-1, 1.5, "10GB"])("rejects a limit of %s", async (storageLimit) => {
-		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: unique("slug"), storageLimit })).status).toBe(400);
+		expect(await raised.json()).toMatchObject({ slug: org, storageLimit: null, privateCaches: false, customSigningKeys: true });
 	});
 
 	it("needs a slug to be created", async () => {
-		expect((await orgApi(`/${unique("org")}`, "PUT", { storageLimit: null })).status).toBe(400);
+		expect((await orgApi(`/${unique("org")}`, "PUT", {})).status).toBe(400);
 	});
 
 	it.each(["Acme", "-acme", "acme-", "a".repeat(40), "default", "nar", "private"])("refuses the slug %s", async (slug) => {
-		expect((await orgApi(`/${unique("org")}`, "PUT", { slug, storageLimit: null })).status).toBe(400);
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug })).status).toBe(400);
 	});
 
 	it("gives each slug to one org", async () => {
 		const a = await orgWithCache(null);
-		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: a.org, storageLimit: null })).status).toBe(409);
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: a.org })).status).toBe(409);
 	});
 
 	it("renames an org and relocates its caches", async () => {
 		const { org, cache } = await orgWithCache(null);
 		const renamed = unique("renamed");
-		expect(await (await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null })).json()).toMatchObject({ slug: renamed });
+		expect(await (await orgApi(`/${org}`, "PUT", { slug: renamed })).json()).toMatchObject({ slug: renamed });
 		expect(await (await orgApi(`/${org}/caches/${cache}`)).json()).toMatchObject({ path: `${renamed}/${cache}` });
 	});
 
@@ -281,7 +322,8 @@ describe("public org caches", () => {
 		const stored = await env.PUBLIC_BUCKET.get(`${org}/${cache}/${hash}.narinfo`);
 		const narinfo = (await stored?.text()) ?? "";
 		expect(narinfo).toContain(`URL: ../../nar/${fileHash}/zstd.nar`);
-		expect(narinfo).toMatch(new RegExp(`^Sig: ${cacheKeyName(env.SIGNING_KEY_NAME, `${org}/${cache}`)}:`, "m"));
+		const detail = await (await orgApi(`/${org}/caches/${cache}`)).json<{ publicKey: string }>();
+		expect(narinfo.split("\n").some(line => line.startsWith(`Sig: ${detail.publicKey.split(":")[0]}:`))).toBe(true);
 		expect(await env.PUBLIC_BUCKET.head(`${org}/${cache}/nix-cache-info`)).not.toBeNull();
 	});
 });
@@ -376,12 +418,12 @@ describe("slug changes", () => {
 		await publish(cache, token, deleted);
 		const renamed = unique("renamed");
 
-		const answer = await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null });
+		const answer = await orgApi(`/${org}`, "PUT", { slug: renamed });
 		expect(await answer.json()).toMatchObject({ slug: renamed, movingFrom: org });
 		expect(await env.PUBLIC_BUCKET.head(`${renamed}/${cache}/nix-cache-info`)).not.toBeNull();
 		// Its old slug stays its own, and one change finishes before the next.
-		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org, storageLimit: null })).status).toBe(409);
-		expect((await orgApi(`/${org}`, "PUT", { slug: unique("again"), storageLimit: null })).status).toBe(409);
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org })).status).toBe(409);
+		expect((await orgApi(`/${org}`, "PUT", { slug: unique("again") })).status).toBe(409);
 		const del = await orgApi(`/${org}/caches/${cache}/paths/delete`, "POST", { storePathHashes: [deleted] });
 		expect(del.status).toBe(200);
 
@@ -393,7 +435,7 @@ describe("slug changes", () => {
 		expect((await env.PUBLIC_BUCKET.list({ prefix: `${org}/` })).objects).toEqual([]);
 		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ slug: renamed, movingFrom: null });
 		// Done, the old slug is free again.
-		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
+		expect((await orgApi(`/${unique("org")}`, "PUT", { slug: org })).status).toBe(200);
 	});
 
 	it("keep a private cache private at both slugs while it moves", async () => {
@@ -403,7 +445,7 @@ describe("slug changes", () => {
 		const renamed = unique("renamed");
 		const pull = (path: string) => SELF.fetch(`http://example.com/${path}/${hash}.narinfo`);
 
-		expect((await orgApi(`/${org}`, "PUT", { slug: renamed, storageLimit: null })).status).toBe(200);
+		expect((await orgApi(`/${org}`, "PUT", { slug: renamed })).status).toBe(200);
 		expect((await pull(`${renamed}/${cache}`)).status).toBe(401);
 		expect((await pull(`${org}/${cache}`)).status).toBe(401);
 
@@ -418,13 +460,13 @@ describe("slug changes", () => {
 	});
 });
 
-describe("orgs whose plan has no private caches", () => {
+describe("orgs without private-cache permission", () => {
 	it("keep their private caches private and readable, but push to none and make no more", async () => {
 		const { org, cache, token } = await orgWithCache(null, true);
 		const reader = await sign([cache], ["pull"], org);
 		const pull = () => SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`, { headers: { authorization: `Bearer ${reader}` } });
 		const pushTo = (name: string) => createSessions(name, [16], token);
-		expect((await orgApi(`/${org}`, "PUT", { storageLimit: null, privateCaches: false })).status).toBe(200);
+		expect((await orgApi(`/${org}`, "PUT", { privateCaches: false })).status).toBe(200);
 
 		const refused = await pushTo(cache);
 		expect(refused.status).toBe(403);
@@ -438,7 +480,7 @@ describe("orgs whose plan has no private caches", () => {
 		expect((await orgApi(`/${org}/caches`, "POST", { name: open })).status).toBe(201);
 		expect((await pushTo(open)).status).toBe(201);
 
-		expect((await orgApi(`/${org}`, "PUT", { storageLimit: null, privateCaches: true })).status).toBe(200);
+		expect((await orgApi(`/${org}`, "PUT", { privateCaches: true })).status).toBe(200);
 		expect((await pushTo(cache)).status).toBe(201);
 	});
 });
