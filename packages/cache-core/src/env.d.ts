@@ -16,6 +16,11 @@ interface Secrets {
 
 interface Env extends Secrets {}
 
+// Workers' streaming hash extension (not present in TypeScript's webworker lib).
+interface Crypto {
+	DigestStream: typeof DigestStream;
+}
+
 declare namespace Cloudflare {
 	interface Env extends Secrets {}
 }

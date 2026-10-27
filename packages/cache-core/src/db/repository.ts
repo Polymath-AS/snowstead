@@ -17,6 +17,7 @@ import {
 	auditLogs,
 	upstreamPaths,
 	bandwidthDaily,
+	goEntries,
 	DEFAULT_ORG_ID,
 } from "./schema.js";
 import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
@@ -130,8 +131,22 @@ export async function cacheHasPaths(db: Db, cacheId: number): Promise<boolean> {
 	return (await first(db.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1))) !== undefined;
 }
 
-export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean): Promise<void> {
-	await db.update(caches).set({ isPublic }).where(eq(caches.id, cacheId));
+/** Live Go entries and reservations both prevent changing shared visibility. */
+export async function cacheHasGoEntries(db: Db, cacheId: number): Promise<boolean> {
+	return (await first(db.select({ id: goEntries.id }).from(goEntries)
+		.innerJoin(caches, eq(goEntries.cacheId, caches.id)).where(and(eq(caches.id, cacheId),
+			eq(goEntries.generation, caches.goGeneration), gt(goEntries.expiresAt, new Date()),
+		)).limit(1))) !== undefined;
+}
+
+export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean): Promise<boolean> {
+	return db.transaction(async tx => {
+		// Go reservation and publication take this row's lock as well.
+		const [cache] = await tx.select().from(caches).where(eq(caches.id, cacheId)).for("update");
+		if (!cache || (cache.isPublic !== isPublic && await cacheHasGoEntries(tx, cacheId))) return false;
+		await tx.update(caches).set({ isPublic }).where(eq(caches.id, cacheId));
+		return true;
+	});
 }
 
 /** Every cache, or one org's. */
@@ -265,7 +280,7 @@ export async function globalOverview(db: Db, now: Date) {
 }
 
 export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsage> {
-	const [used, pending] = await Promise.all([
+	const [used, pending, go] = await Promise.all([
 		first(
 			db.select({ bytes: sql`coalesce(sum(${caches.size}), 0)`.mapWith(Number) })
 				.from(caches)
@@ -281,8 +296,14 @@ export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsa
 					gt(uploadSessions.expiresAt, now),
 				)),
 		),
+		first(db.select({
+			used: sql`coalesce(sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is not null), 0)`.mapWith(Number),
+			pending: sql`coalesce(sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is null), 0)`.mapWith(Number),
+		}).from(goEntries).innerJoin(caches, eq(goEntries.cacheId, caches.id)).where(and(
+			eq(caches.orgId, orgId), eq(goEntries.generation, caches.goGeneration), gt(goEntries.expiresAt, now),
+		))),
 	]);
-	return { used: used?.bytes ?? 0, pending: pending?.bytes ?? 0 };
+	return { used: (used?.bytes ?? 0) + (go?.used ?? 0), pending: (pending?.bytes ?? 0) + (go?.pending ?? 0) };
 }
 
 /** Adds bytes served for an org to its count for the UTC day of `now`. */

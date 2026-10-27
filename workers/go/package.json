@@ -1,0 +1,12 @@
+{
+  "name": "@snowstead/go-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "tsc --noEmit" },
+  "dependencies": {
+    "@snowstead/cache-core": "workspace:*",
+    "drizzle-orm": "^0.45.4"
+  },
+  "devDependencies": { "typescript": "^7.0.2" }
+}

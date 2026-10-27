@@ -44,6 +44,8 @@ export const caches = pgTable("caches", {
 	signingKeySealed: text("signing_key_sealed"),
 	/** Days a path stays after its last push, or null to keep paths until deleted. */
 	retentionDays: integer("retention_days"),
+	/** Go resets change this namespace without touching Nix paths. */
+	goGeneration: text("go_generation").notNull().default("0"),
 	/**
 	 * Its published paths, and the bytes of the NARs they point at (a NAR
 	 * shared with another cache counts in both). Kept by triggers on
@@ -239,4 +241,20 @@ export const orgApiKeys = pgTable("org_api_keys", {
 	revokedAt: timestamptz("revoked_at"),
 }, (table) => [
 	index("idx_org_api_keys_org").on(table.orgId),
+]);
+
+/** Reservations survive failed uploads so the bounded sweep owns every R2 key. */
+export const goEntries = pgTable("go_entries", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").references(() => caches.id, { onDelete: "set null" }),
+	generation: text("generation").notNull(),
+	action: text("action").notNull(),
+	r2Key: text("r2_key").notNull().unique(),
+	size: bytes("size").notNull(),
+	output: text("output").notNull(),
+	uploadedAt: timestamptz("uploaded_at"),
+	expiresAt: timestamptz("expires_at").notNull(),
+}, (table) => [
+	uniqueIndex("go_entries_action").on(table.cacheId, table.generation, table.action),
+	index("go_entries_expiry").on(table.expiresAt),
 ]);
