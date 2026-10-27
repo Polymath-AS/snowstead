@@ -103,6 +103,13 @@ export async function handleRequest(
 
 	const scope = visibility.isPrivate ? { path, gen: visibility.gen, id: visibility.id, org: visibility.org, slug, name: cacheName } : undefined;
 	if (rest[0] === "nar" && rest.length === 3 && rest[2].endsWith(".nar")) {
+		// Authorize scoped public URLs before looking up a shared cached blob.
+		if (!isPrivate) {
+			const cache = await findCacheByPath(config.db, slug, cacheName);
+			if (!cache?.isPublic || !(await cacheHasNar(config.db, cache.id, rest[1], rest[2].slice(0, -".nar".length)))) {
+				return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+			}
+		}
 		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, scope);
 	}
 
