@@ -61,6 +61,10 @@
             pkgs.nodejs_22
             pkgs.pnpm
             pkgs.wrangler
+            # The GOCACHEPROG helper and real Terraform build gate.
+            pkgs.go
+            pkgs.stdenv.cc
+            pkgs.time
             # Tests run against a throwaway cluster (scripts/with-postgres.sh).
             pkgs.postgresql
             # scripts/load-test.sh
