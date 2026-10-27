@@ -1,0 +1,7 @@
+{
+  "name": "@snowstead/go-cache",
+  "private": true,
+  "scripts": {
+    "check": "go test -race ./... && go vet ./..."
+  }
+}
