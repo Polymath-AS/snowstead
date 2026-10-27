@@ -76,7 +76,7 @@ export const MAX_CACHES_PER_TOKEN = 50;
 export const MAX_PERMS_PER_TOKEN = 10;
 
 /** What a token lets its holder do with its caches. */
-export const Permission = v.picklist(["pull", "push"] satisfies TokenPermission[], (issue) => `invalid permission: ${String(issue.input)}, expected "pull" or "push"`);
+export const Permission = v.picklist(["pull", "push", "go:read", "go:write"] satisfies TokenPermission[], (issue) => `invalid permission: ${String(issue.input)}, expected "pull", "push", "go:read", or "go:write"`);
 
 const NonEmpty = v.pipe(v.string(), v.nonEmpty());
 

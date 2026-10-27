@@ -3,16 +3,21 @@
 ## Deployment
 
 The root `wrangler.jsonc` is the public **gateway** (`snowstead`). It routes
-management APIs to `snowstead-control` and Nix reads/uploads to `snowstead-nix`
+management APIs to `snowstead-control`, Nix reads/uploads to `snowstead-nix`,
+and `/_api/v1/go/` artifact requests to `snowstead-go`
 over HTTP service bindings, forwarding the original URL, headers, and body.
 It has no database, storage, signing, or authorization logic. The service
-configs are `workers/control/wrangler.jsonc` and `workers/nix/wrangler.jsonc`.
+configs are under `workers/control`, `workers/nix`, and `workers/go`.
 Only control runs garbage collection and CDN-purge retries. Public Nix objects
 still bypass all Workers through the existing R2 custom domain and CDN.
 
-Both services share the environment's existing R2 buckets, AUTH_KV, Hyperdrive,
-database, and signing-master-key source. Shared code and unchanged migrations
-live in `packages/cache-core`; this split needs no schema or data migration.
+The services share the environment's existing R2 buckets, AUTH_KV, Hyperdrive,
+database, and signing-master-key source. Shared code and migrations live in
+`packages/cache-core`. The Worker split itself leaves existing data unchanged;
+Go support additionally requires migrations `0004` and `0005` before rollout.
+Give Go the same `JWT_SECRET` as control so it can verify scoped Go tokens;
+Go permissions are independent of Nix push/pull permissions. Go management and
+cleanup remain in control, not the protocol Worker.
 
 ```bash
 wrangler r2 bucket create snowstead-private
@@ -26,6 +31,7 @@ wrangler hyperdrive create snowstead --caching-disabled \
 # Set the production Hyperdrive id in both service configs.
 # Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
 wrangler secret put JWT_SECRET --config workers/nix/wrangler.jsonc --env production
+wrangler secret put JWT_SECRET --config workers/go/wrangler.jsonc --env production
 wrangler secret put JWT_SECRET --config workers/control/wrangler.jsonc --env production
 wrangler secret put ADMIN_SECRET --config workers/control/wrangler.jsonc --env production
 # Generate 32 cryptographically random bytes, base64; keep a private backup
@@ -60,7 +66,7 @@ not account-level IAM. Terraform owns the store, never secret values.
 
 ### Existing-installation cutover
 
-Deploy Nix and control **before** replacing the existing `snowstead` Worker
+Deploy Nix, Go, and control **before** replacing the existing `snowstead` Worker
 with the gateway. Keep the original JWT secret, signing-master-key source,
 bucket names, KV namespace, and database; generating replacement secrets would
 invalidate tokens or make existing sealed keys unreadable. Give both services
@@ -72,7 +78,7 @@ For first deployment, private per-service JSON secret files can be supplied
 with Wrangler's `--secrets-file` option. Do not commit them. Test the private
 services through a local gateway before switching public traffic. Keep the
 old deployment available for rollback. `pnpm deploy` migrates the existing
-schema, deploys Nix, deploys control, then updates the gateway last. The old
+schema, deploys Nix and Go, deploys control, then updates the gateway last. The old
 Worker and control may briefly both run maintenance during this sequence;
 schedule the cutover between cron invocations rather than running concurrent GC.
 The gateway explicitly clears its former schedules. No bucket, database,
@@ -95,6 +101,7 @@ the non-secret bindings from Terraform's staging handoff:
 # A private JSON file containing distinct staging ADMIN_SECRET and JWT_SECRET.
 # Do not copy production values or commit this file.
 pnpm exec wrangler deploy --config workers/nix/wrangler.jsonc --env staging --secrets-file /private/staging-nix.json
+pnpm exec wrangler deploy --config workers/go/wrangler.jsonc --env staging --secrets-file /private/staging-go.json
 pnpm exec wrangler deploy --config workers/control/wrangler.jsonc --env staging --secrets-file /private/staging-control.json
 pnpm exec wrangler deploy --env staging
 ```
