@@ -73,7 +73,7 @@ const NewToken = v.object({
 		v.maxLength(MAX_PERMS_PER_TOKEN, `perms exceeds maximum of ${MAX_PERMS_PER_TOKEN}`),
 	),
 	expiresInDays: v.optional(
-		v.pipe(v.number(EXPIRES), v.integer(EXPIRES), v.minValue(1, EXPIRES), v.maxValue(MAX_TOKEN_LIFETIME_DAYS, EXPIRES)),
+		v.nullable(v.pipe(v.number(EXPIRES), v.integer(EXPIRES), v.minValue(1, EXPIRES), v.maxValue(MAX_TOKEN_LIFETIME_DAYS, EXPIRES))),
 		DEFAULT_TOKEN_LIFETIME_DAYS,
 	),
 });
@@ -118,7 +118,7 @@ export async function handleCreateToken(
 
 	const now = Date.now() / 1000;
 	const jti = crypto.randomUUID();
-	const exp = now + expiresInDays * 86400;
+	const exp = expiresInDays === null ? null : now + expiresInDays * 86400;
 
 	const claims: TokenClaims = {
 		jti,
@@ -129,12 +129,12 @@ export async function handleCreateToken(
 		perms: dedupedPerms,
 		...(tokenOrg === undefined ? {} : { org: tokenOrg }),
 		iat: Math.floor(now),
-		exp: Math.floor(exp),
+		...(exp === null ? {} : { exp: Math.floor(exp) }),
 	};
 
 	const token = await signJwt(claims, config.jwtSecret);
 
-	const expiresAt = new Date(exp * 1000);
+	const expiresAt = exp === null ? null : new Date(exp * 1000);
 
 	await createApiToken(config.db, {
 		jti,
