@@ -4,10 +4,34 @@ import {
 	waitOnExecutionContext,
 	SELF,
 } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import worker from "./worker.js";
 
 describe("cache worker", () => {
+	it("logs database failure codes without leaking connection values or query parameters", async () => {
+		const connection = new URL(env.HYPERDRIVE.connectionString);
+		const missingDatabase = `missing_${crypto.randomUUID().replaceAll("-", "")}`;
+		connection.pathname = `/${missingDatabase}`;
+		const ctx = createExecutionContext();
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const response = await worker.fetch(new Request("http://example.com/_api/v1/admin/orgs", {
+				headers: { authorization: "Bearer test-admin-secret" },
+			}), { ...env, HYPERDRIVE: { ...env.HYPERDRIVE, connectionString: connection.toString() } }, ctx);
+			await waitOnExecutionContext(ctx);
+			expect(response.status).toBe(500);
+			expect(await response.json()).toEqual({ error: "Internal server error" });
+			const output = JSON.stringify(errors.mock.calls);
+			expect(output).toContain("3D000");
+			expect(output).toContain("DatabaseError");
+			for (const value of [missingDatabase, connection.toString(), "params:", "Failed query:"]) {
+				expect(output).not.toContain(value);
+			}
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
 	it("serves service info on /", async () => {
 		const request = new Request<unknown, IncomingRequestCfProperties>(
 			"http://example.com/"

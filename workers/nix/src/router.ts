@@ -3,6 +3,7 @@ import { cacheHasNar, findCacheByPath, recordBandwidth } from "@snowstead/cache-
 import { OrgSlug, cachePath, splitReadPath, DEFAULT_ORG_SLUG } from "@snowstead/cache-core/cache-path";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
+import { errorForLog } from "@snowstead/cache-core/logging";
 import { narinfoCacheKey, privateCacheBase } from "@snowstead/cache-core/narinfo";
 import { bucketFor, narKey, narinfoKey, NARINFO_CACHE_CONTROL } from "@snowstead/cache-core/layout";
 import { actorId, authenticateWrite, authorizeRead } from "@snowstead/cache-core/auth";
@@ -296,7 +297,7 @@ function meter(config: WorkerConfig, scope: PrivateScope, bytes: number): void {
 	config.defer((async () => {
 		const org = scope.org ?? (await findCacheByPath(config.db, scope.slug, scope.name))?.orgId;
 		if (org !== undefined) await recordBandwidth(config.db, org, bytes, new Date());
-	})().catch((err) => console.error("Recording bandwidth failed", err)));
+	})().catch((err) => console.error("Recording bandwidth failed", errorForLog(err))));
 }
 
 async function privateCacheHasNar(config: WorkerConfig, scope: PrivateScope, fileHash: string, compression: string): Promise<boolean> {

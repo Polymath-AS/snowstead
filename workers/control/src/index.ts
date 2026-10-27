@@ -3,6 +3,8 @@ import { resolveConfig } from "@snowstead/cache-core/config";
 import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
 import { retryCdnPurges } from "@snowstead/cache-core/cdn";
+import { DrizzleQueryError } from "drizzle-orm";
+import { errorForLog } from "@snowstead/cache-core/logging";
 
 export default {
 	fetch(request, env, ctx): Promise<Response> {
@@ -33,6 +35,10 @@ export default {
 			} else {
 				console.log("GC completed", counts);
 			}
+		} catch (err) {
+			if (!(err instanceof DrizzleQueryError)) throw err;
+			console.error("Scheduled database work failed", errorForLog(err));
+			throw new Error("Scheduled database work failed");
 		} finally {
 			const closing = config.close();
 			if (closing) ctx.waitUntil(closing);

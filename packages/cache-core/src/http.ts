@@ -1,7 +1,7 @@
 import { tracing } from "cloudflare:workers";
 import { resolveConfig } from "./config.js";
 import type { WorkerConfig } from "./config.js";
-import { logRequest } from "./logging.js";
+import { errorForLog, logRequest } from "./logging.js";
 import { routeOf } from "./route.js";
 import { errorResponse } from "./responses.js";
 
@@ -27,7 +27,7 @@ export async function serve(
 		}
 		return response;
 	} catch (err) {
-		console.error("Unhandled error", err);
+		console.error("Unhandled error", errorForLog(err));
 		const response = errorResponse("Internal server error", 500);
 		logRequest(request, response, start, route());
 		return response;
