@@ -259,6 +259,19 @@ importers:
         specifier: ^4.152.0
         version: 4.152.0(@types/node@26.6.5)
 
+  workers/go:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
+      drizzle-orm:
+        specifier: ^0.45.4
+        version: 0.45.4(@types/pg@8.23.1)(pg@8.23.1)
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
   workers/go-cache:
     devDependencies:
       '@cloudflare/vitest-plugin':

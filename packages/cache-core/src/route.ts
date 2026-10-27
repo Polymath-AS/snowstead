@@ -50,6 +50,8 @@ const API_ROUTES = new Set([
 	"orgs/:org/keys/:key/revoke",
 	"orgs/:org/caches",
 	"orgs/:org/caches/:cache",
+	"orgs/:org/caches/:cache/go",
+	"orgs/:org/caches/:cache/go/reset",
 	"orgs/:org/caches/:cache/purge",
 	"orgs/:org/caches/:cache/paths",
 	"orgs/:org/caches/:cache/delete",
@@ -62,6 +64,9 @@ const API_ROUTES = new Set([
 ]);
 
 function apiTemplate(pathname: string): string | undefined {
+	if (/^\/_api\/v1\/go\/[^/]+\/[^/]+\/v1\/actions\/[a-f0-9]{64}$/.test(pathname)) {
+		return API + "go/:org/:cache/v1/actions/:action";
+	}
 	const segments = pathname.slice(API.length).split("/");
 	const template = segments
 		.map((segment, i) => (segment === "commit" ? segment : (VALUE_AFTER[segments[i - 1] ?? ""] ?? segment)))

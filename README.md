@@ -1,16 +1,35 @@
 # Snowstead
 
-A Cloudflare-native Nix binary cache.
+A Cloudflare-native cache for Nix paths and Go compiler outputs.
+
+The [native Go helper](apps/go-cache/README.md) uses
+`https://cache.snowstead.com/_api/v1/go/<org-slug>/<cache-name>` as its base URL.
+Public caches allow anonymous reads; private reads require `go:read`, and every
+upload requires `go:write`. Nix permissions do not grant Go access. Give write
+access only to protected CI jobs building reviewed code: hashes detect
+corruption, not malicious outputs from authorized writers.
+
+Go objects use the private bucket and internal Cache API, expire seven days
+after upload, and count toward organization storage limits. Resetting Go leaves
+Nix paths intact. Apply the included database migrations before deploying the
+updated services. Management and garbage collection belong to control; artifact
+reads and writes belong to the private Go Worker.
+
+The isolated [Go prototype](workers/go-cache/README.md) and its Terraform build
+gate remain disposable local benchmarks, not the hosted named-cache API.
 
 ## Workspace
 
 ```
 workers/gateway/      Public URL routing through service bindings
 workers/nix/          Nix reads and upload protocol
+workers/go/           Hosted Go action-cache protocol
+workers/go-cache/     Isolated prototype for disposable benchmark harnesses
 workers/control/      Organizations, caches, tokens, signing management, and maintenance
 packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
+apps/go-cache/        Native GOCACHEPROG helper
 scripts/              smoke-test.sh
 ```
 
@@ -29,7 +48,7 @@ pnpm check # type-check + tests across the workspace
 
 The worker's tests run against a throwaway Postgres that
 `scripts/with-postgres.sh` starts (or the server `SNOWSTEAD_TEST_DATABASE_URL`
-names). To run all three Workers locally through the gateway on http://localhost:8787:
+names). To run all four hosted Workers locally through the gateway on http://localhost:8787:
 
 ```bash
 pnpm dev
@@ -48,12 +67,12 @@ After changing `packages/cache-core/src/db/schema.ts`, run
 
 See [docs.md](docs.md) for resource setup, secret provisioning, and the
 existing-installation cutover. The gateway has no storage or secrets;
-Nix and control share the existing database, buckets, and authorization state.
+Nix, Go, and control share the existing database, buckets, and authorization state.
 Hosted reads enter through the web gateway, which uses the existing R2/CDN
 origin for public objects. Production cache Worker routes remain API-only.
 
 ```bash
-# With resources and service secrets provisioned: migrate, deploy Nix and
+# With resources and service secrets provisioned: migrate, deploy Nix, Go, and
 # control, then switch the existing public Worker to the gateway.
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```

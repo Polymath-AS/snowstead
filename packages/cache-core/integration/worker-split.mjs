@@ -6,7 +6,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { createTestHarness } from "wrangler";
 
-test("gateway streams Nix artifacts and shares control-plane policy across real Workers", { timeout: 120_000 }, async () => {
+test("gateway streams Nix and Go artifacts and shares control-plane policy across real Workers", { timeout: 120_000 }, async () => {
 	const database = new URL(process.env.SNOWSTEAD_TEST_DATABASE_URL);
 	const name = `snowstead_split_${process.pid}`;
 	const admin = new Client({ connectionString: database.toString() });
@@ -36,6 +36,7 @@ test("gateway streams Nix artifacts and shares control-plane policy across real 
 				{ configPath: "wrangler.jsonc" },
 				{ configPath: "workers/nix/wrangler.jsonc", vars, secrets },
 				{ configPath: "workers/control/wrangler.jsonc", vars, secrets },
+				{ configPath: "workers/go/wrangler.jsonc", vars, secrets },
 			],
 		});
 		const { url } = await server.listen();
@@ -101,6 +102,34 @@ test("gateway streams Nix artifacts and shares control-plane policy across real 
 			assert.equal(Number(head.headers.get("content-length")), bytes.length);
 			assert.equal((await head.arrayBuffer()).byteLength, 0);
 			assert.equal((await call(path)).status, privateCache ? 401 : 200);
+			const { token: goToken } = await (await api("/admin/tokens", {
+				subject: "go-split-test", caches: [cache], perms: ["go:read", "go:write"],
+			})).json();
+			const goPath = `/_api/v1/go/default/${cache}/v1/actions/${"c".repeat(64)}`;
+			const goHeaders = { authorization: `Bearer ${goToken}`, "x-snowstead-output-id": fileHash };
+			assert.equal((await call(goPath, { method: "PUT", headers: { ...goHeaders, authorization: `Bearer ${token}` }, body: bytes })).status, 403);
+			assert.equal((await call(goPath, { method: "PUT", headers: goHeaders, body: bytes })).status, 201);
+			assert.equal((await call(goPath, { method: "PUT", headers: goHeaders, body: bytes })).status, 204);
+			for (let pass = 0; pass < 2; pass++) {
+				const response = await call(goPath, { headers: goHeaders });
+				assert.equal(response.status, 200);
+				assert.equal(response.headers.get("x-snowstead-output-id"), fileHash);
+				assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+			}
+			const goAnonymous = await call(goPath);
+			assert.equal(goAnonymous.status, privateCache ? 401 : 200);
+			await goAnonymous.arrayBuffer();
+			const goHead = await call(goPath, { method: "HEAD", headers: goHeaders });
+			assert.equal(goHead.status, 200);
+			assert.equal(Number(goHead.headers.get("content-length")), bytes.length);
+			assert.equal((await goHead.arrayBuffer()).byteLength, 0);
+			const management = `/_api/v1/orgs/default/caches/${cache}/go`;
+			const totals = await (await call(management, { headers: { authorization: `Bearer ${secrets.ADMIN_SECRET}` } })).json();
+			assert.equal(totals.entries, 1);
+			assert.equal(totals.size, bytes.length);
+			assert.equal((await api(`/orgs/default/caches/${cache}/go/reset`, {})).status, 200);
+			assert.equal((await call(goPath, { headers: goHeaders })).status, 404);
+			assert.equal((await call(path, { headers })).status, 200);
 			if (privateCache) {
 				assert.equal((await fetch(artifactUrl)).status, 401);
 				await api(`/admin/tokens/${jti}/revoke`, { reason: "worker split regression" });
@@ -113,6 +142,7 @@ test("gateway streams Nix artifacts and shares control-plane policy across real 
 		// Each service rejects the other service's routes even when called directly.
 		assert.equal((await server.getWorker("snowstead-nix").fetch("http://test/_api/v1/admin/caches")).status, 404);
 		assert.equal((await server.getWorker("snowstead-control").fetch("http://test/open/nix-cache-info")).status, 404);
+		assert.equal((await server.getWorker("snowstead-go").fetch("http://test/_api/v1/admin/caches")).status, 404);
 	} catch (error) {
 		console.error(server?.getLogs());
 		throw error;

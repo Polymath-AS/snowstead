@@ -1,4 +1,5 @@
 import { bucketForKey, narKey } from "@snowstead/cache-core/layout";
+import { sweepGoEntries } from "@snowstead/cache-core/go-cache";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import {
 	findExpiredSessions,
@@ -56,6 +57,11 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	let expiredAuditLogs = 0;
 
 	const now = new Date();
+	try {
+		await sweepGoEntries(config);
+	} catch (error) {
+		errors.push(`Go sweep: ${messageOf(error)}`);
+	}
 	const expired = await findExpiredSessions(config.db, now);
 
 	for (const session of expired) {

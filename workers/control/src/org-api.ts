@@ -2,6 +2,7 @@ import * as v from "valibot";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import { actorId, authenticateOrg, generateOrgApiKey } from "@snowstead/cache-core/auth";
 import { handleSigningApi } from "./signing-api.js";
+import { handleGoManagement } from "@snowstead/cache-core/go-cache";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { MoveCursor, moveSlugPage } from "./slug-move.js";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
@@ -104,6 +105,12 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 
 	if (route === "caches" && method === "GET") return handleListCaches(config, url, org);
+	if (rest[0] === "caches" && rest[2] === "go") {
+		if (rest.length === 3 && method === "GET") return handleGoManagement(config, org, value(1), false);
+		if (rest.length === 4 && rest[3] === "reset" && method === "POST") {
+			return audit("go.reset", await handleGoManagement(config, org, value(1), true), value(1));
+		}
+	}
 	if (rest[0] === "caches" && rest[2] === "signing-keys" && (
 		(rest.length === 3 && (method === "GET" || method === "POST")) ||
 		(rest.length === 5 && rest[4] === "activate" && method === "POST")

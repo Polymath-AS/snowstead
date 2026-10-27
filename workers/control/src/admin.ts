@@ -27,6 +27,7 @@ import {
 	startSlugMove,
 	setCacheSigningKey,
 	cacheHasPaths,
+	cacheHasGoEntries,
 	listPublishedPathsAfter,
 	findOrg,
 	putOrg,
@@ -266,6 +267,9 @@ export async function handleCreateCache(
 	if (changing && existing && (await cacheHasPaths(config.db, existing.id))) {
 		return errorResponse("only a cache without published paths can change visibility", 409);
 	}
+	if (changing && existing && (await cacheHasGoEntries(config.db, existing.id))) {
+		return errorResponse("only a cache without Go entries or uploads can change visibility; reset Go data first", 409);
+	}
 
 	// The marker before the database when turning private, after it when
 	// turning public: a failure in between leaves the cache private.
@@ -288,7 +292,9 @@ export async function handleCreateCache(
 	const changed = !created && changing;
 	if (changed) {
 		isPublic = !body.private;
-		await setCachePublic(config.db, cache.id, isPublic);
+		if (!await setCachePublic(config.db, cache.id, isPublic)) {
+			return errorResponse("only a cache without Go entries or uploads can change visibility; reset Go data first", 409);
+		}
 	}
 	if (isPublic) {
 		await setPrivate(config, path, false, { org, id: cache.id });

@@ -22,11 +22,11 @@ Keep deployable runtime code inside `workers/`. Move shared protocol, parsing, a
 - Before changing Workers, R2, Hyperdrive, Durable Objects, Queues, or platform limits, fetch current Cloudflare docs.
 - Prefer platform-native APIs such as `fetch`, Web Streams, and Web Crypto.
 - Do not enable `nodejs_compat` unless a concrete dependency requires it.
-- The root `wrangler.jsonc` deploys the routing-only gateway. `workers/nix/wrangler.jsonc` and `workers/control/wrangler.jsonc` deploy its private services. Only control owns scheduled maintenance. Keep public URLs and the public R2/CDN bypass unchanged. After changing bindings, run `pnpm cf-typegen`.
-- `packages/cache-core` owns shared authentication, storage policy, database schema, migrations, and integration tests. Protocol handlers belong in `workers/nix`; management APIs belong in `workers/control`. Do not import one Worker's runtime into another.
+- The root `wrangler.jsonc` deploys the routing-only gateway. `workers/nix/wrangler.jsonc`, `workers/go/wrangler.jsonc`, and `workers/control/wrangler.jsonc` deploy its private services. Only control owns scheduled maintenance. Keep public URLs and the public R2/CDN bypass unchanged. After changing bindings, run `pnpm cf-typegen`.
+- `packages/cache-core` owns shared authentication, storage policy, database schema, migrations, and integration tests. Protocol handlers belong in `workers/nix` and `workers/go`; management APIs belong in `workers/control`. Do not import one Worker's runtime into another. `workers/go-cache` is the isolated benchmark prototype, not the hosted service.
 
 ## Verification
 
 - Install dependencies with `pnpm install` from the repo root.
 - Run `pnpm check` before finishing substantial changes.
-- `pnpm dev` runs all three Workers locally with service bindings.
+- `pnpm dev` runs all four hosted Workers locally with service bindings.
