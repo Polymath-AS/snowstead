@@ -8,6 +8,9 @@
 	"compatibility_date": "2026-03-10",
 	// Required by the pg driver, which reaches Postgres through Hyperdrive.
 	"compatibility_flags": ["nodejs_compat"],
+	"placement": {
+		"mode": "smart"
+	},
 	"observability": {
 		"enabled": true,
 		// Every request's logs: errors and the API's request lines are worth
