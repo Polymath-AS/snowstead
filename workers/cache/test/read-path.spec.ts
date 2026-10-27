@@ -123,6 +123,26 @@ describe("nar download", () => {
 		expect(body).toEqual(R2_BODY);
 	});
 
+	it("checks public NAR membership for each cache and org, even after a warm read", async () => {
+		await createCache(db, "empty-cache");
+		const org = "read-isolation";
+		const api = (path: string, method: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1/orgs/${org}${path}`, {
+			method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
+		});
+		expect((await api("", "PUT", { slug: org })).status).toBe(200);
+		expect((await api("/caches", "POST", { name: "test-cache" })).status).toBe(201);
+		const suffix = `nar/${FILE_HASH}/zstd.nar`;
+		const warm = await SELF.fetch(`http://example.com/test-cache/${suffix}`);
+		expect(warm.status).toBe(200);
+		expect(new Uint8Array(await warm.arrayBuffer())).toEqual(R2_BODY);
+		for (const method of ["GET", "HEAD"]) {
+			for (const path of ["empty-cache", `${org}/test-cache`, "missing-cache"]) {
+				expect((await SELF.fetch(`http://example.com/${path}/${suffix}`, { method })).status).toBe(404);
+			}
+			expect((await SELF.fetch(`http://example.com/test-cache/${suffix}`, { method })).status).toBe(200);
+		}
+	});
+
 	it("returns 404 for a non-existent blob", async () => {
 		const res = await SELF.fetch(`http://example.com/test-cache/nar/${"b".repeat(64)}/zstd.nar`);
 
