@@ -183,20 +183,11 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
-  packages/cache-domain:
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
-      vitest:
-        specifier: ~5.0.5
-        version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(esbuild@0.28.2)(tsx@4.23.15))
-
-  workers/cache:
+  packages/cache-core:
     dependencies:
       '@snowstead/cache-domain':
         specifier: workspace:*
-        version: link:../../packages/cache-domain
+        version: link:../cache-domain
       aws4fetch:
         specifier: ^1.0.20
         version: 1.0.20
@@ -231,6 +222,56 @@ importers:
       wrangler:
         specifier: ^4.152.0
         version: 4.152.0(@types/node@26.6.5)
+
+  packages/cache-domain:
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ~5.0.5
+        version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(esbuild@0.28.2)(tsx@4.23.15))
+
+  workers/control:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
+      drizzle-orm:
+        specifier: ^0.45.4
+        version: 0.45.4(@types/pg@8.23.1)(pg@8.23.1)
+      valibot:
+        specifier: ^1.5.0
+        version: 1.5.0(typescript@7.0.2)
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
+  workers/gateway:
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      wrangler:
+        specifier: ^4.152.0
+        version: 4.152.0(@types/node@26.6.5)
+
+  workers/nix:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
+      '@snowstead/cache-domain':
+        specifier: workspace:*
+        version: link:../../packages/cache-domain
+      valibot:
+        specifier: ^1.5.0
+        version: 1.5.0(typescript@7.0.2)
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
 
 packages:
 

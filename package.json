@@ -7,20 +7,11 @@
   "description": "Cloudflare-native Nix binary cache",
   "scripts": {
     "build": "echo 'wrangler bundles at deploy time'",
-    "deploy": "pnpm --filter @snowstead/cache-worker db:migrate && pnpm exec wrangler deploy --env production",
+    "deploy": "scripts/deploy.sh production",
     "dev": "scripts/dev.sh",
     "dev:profile": "scripts/dev-profile.sh",
-    "check": "pnpm -r check"
-  },
-  "cloudflare": {
-    "bindings": {
-      "AUTH_TOKEN": {
-        "description": "Bearer token for write operations (push). Generate with `openssl rand -hex 32`."
-      },
-      "SIGNING_PRIVATE_KEY": {
-        "description": "Ed25519 private key in PEM format for signing narinfo. Generate with `nix key generate-secret --key-name your-cache-1`."
-      }
-    }
+    "check": "pnpm -r check && scripts/with-postgres.sh node --test packages/cache-core/integration/worker-split.mjs",
+    "cf-typegen": "pnpm --filter @snowstead/cache-core cf-typegen && pnpm --filter @snowstead/gateway-worker cf-typegen"
   },
   "devDependencies": {
     "wrangler": "^4.152.0"

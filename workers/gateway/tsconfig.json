@@ -1,0 +1,6 @@
+{
+	"extends": "../../packages/cache-core/tsconfig.json",
+	"compilerOptions": { "types": ["../../packages/cache-core/worker-configuration.d.ts"] },
+	"include": ["src/**/*.ts", "worker-configuration.d.ts", "../../packages/cache-core/src/env.d.ts"],
+	"exclude": []
+}

@@ -35,7 +35,7 @@ if ! PGPASSWORD=postgres psql -h 127.0.0.1 -p "$PORT" -U postgres -tAc "select 1
   PGPASSWORD=postgres psql -h 127.0.0.1 -p "$PORT" -U postgres -qc "create database snowstead"
 fi
 
-DATABASE_URL="$DATABASE_URL" pnpm --filter @snowstead/cache-worker db:migrate >/dev/null
+DATABASE_URL="$DATABASE_URL" pnpm --filter @snowstead/cache-core db:migrate >/dev/null
 
 if [ ! -f "$ROOT/.dev.vars" ]; then
   cat >"$ROOT/.dev.vars" <<EOF
@@ -52,5 +52,18 @@ if ! grep -q '^SIGNING_MASTER_KEY=' "$ROOT/.dev.vars"; then
   echo "SIGNING_MASTER_KEY=$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))')" >>"$ROOT/.dev.vars"
 fi
 
+# Wrangler loads .dev.vars beside each service's config in multi-Worker mode.
+# Share the generated local source, preserving any service-local overrides.
+for worker in nix control; do
+  if [ ! -e "$ROOT/workers/$worker/.dev.vars" ]; then
+    ln -s ../../.dev.vars "$ROOT/workers/$worker/.dev.vars"
+  fi
+done
+
 echo "Postgres: $DATABASE_URL"
-CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" pnpm --filter @snowstead/cache-worker dev "$@"
+# One local secret source for both services; never load deployment credentials.
+CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=true \
+CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" \
+pnpm exec wrangler dev --local --config "$ROOT/wrangler.jsonc" \
+  --config "$ROOT/workers/nix/wrangler.jsonc" --config "$ROOT/workers/control/wrangler.jsonc" \
+  --env-file "$ROOT/.dev.vars" "$@"
