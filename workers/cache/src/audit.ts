@@ -3,6 +3,7 @@ import type { AuthIdentity } from "./auth.js";
 import { actorId } from "./auth.js";
 import { createAuditLog } from "./db/repository.js";
 import { DEFAULT_ORG_ID } from "./db/schema.js";
+import { errorForLog } from "./logging.js";
 
 /**
  * The org an entry belongs to: an API key's or a token's own, which is the
@@ -40,7 +41,7 @@ export function writeAuditLog(
 			status,
 			orgId: org,
 		}).catch((err) => {
-			console.error("Failed to write audit log", err);
+			console.error("Failed to write audit log", errorForLog(err));
 		}),
 	);
 }

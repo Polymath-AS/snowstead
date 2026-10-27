@@ -23,6 +23,8 @@ import {
 } from "../src/db/repository.js";
 import { createApiToken, listApiTokens, ensureCache } from "../src/db/repository.js";
 import { DEFAULT_ORG_ID } from "../src/db/schema.js";
+import { errorForLog } from "../src/logging.js";
+import { messageOf } from "../src/responses.js";
 
 const db = testDb();
 
@@ -72,11 +74,26 @@ describe("caches", () => {
 		expect(found).toBeUndefined();
 	});
 
-	it("createCache with duplicate name throws", async () => {
+	it("reports a duplicate cache's SQLSTATE without logging its parameters or Postgres detail", async () => {
 		const name = `cache-dup-${crypto.randomUUID()}`;
 		await createCache(getDb(), name);
 
-		await expect(createCache(getDb(), name)).rejects.toThrow();
+		const error = await createCache(getDb(), name).catch((err: unknown) => err);
+		expect(error).toBeInstanceOf(Error);
+		// Both Drizzle's params and Postgres's unique-violation detail echo this value.
+		expect((error as Error).message).toContain(name);
+		const diagnostic = errorForLog(error);
+		expect(diagnostic).toMatchObject({
+			name: "DatabaseError",
+			operation: "INSERT",
+			causes: [{ code: "23505", severity: "ERROR", routine: "_bt_check_unique" }],
+		});
+		for (const output of [JSON.stringify(diagnostic), messageOf(error)]) {
+			expect(output).not.toContain(name);
+			expect(output).not.toContain("params");
+			expect(output).not.toContain("insert into");
+			expect(output).not.toContain("detail");
+		}
 	});
 });
 

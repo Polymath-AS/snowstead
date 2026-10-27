@@ -1,9 +1,10 @@
 import { tracing } from "cloudflare:workers";
+import { DrizzleQueryError } from "drizzle-orm";
 import { resolveConfig } from "./config.js";
 import type { WorkerConfig } from "./config.js";
 import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
-import { logRequest } from "./logging.js";
+import { errorForLog, logRequest } from "./logging.js";
 import { routeOf } from "./route.js";
 import { retryCdnPurges } from "./cdn.js";
 import { errorResponse } from "./responses.js";
@@ -30,7 +31,7 @@ export default {
 			}
 			return response;
 		} catch (err) {
-			console.error("Unhandled error", err);
+			console.error("Unhandled error", errorForLog(err));
 			const response = errorResponse("Internal server error", 500);
 			logRequest(request, response, start, route());
 			return response;
@@ -65,6 +66,11 @@ export default {
 			} else {
 				console.log("GC completed", counts);
 			}
+		} catch (err) {
+			if (!(err instanceof DrizzleQueryError)) throw err;
+			console.error("Scheduled database work failed", errorForLog(err));
+			// Preserve the failed invocation without letting the runtime log parameters.
+			throw new Error("Scheduled database work failed");
 		} finally {
 			const closing = config.close();
 			if (closing) ctx.waitUntil(closing);

@@ -1,3 +1,6 @@
+import { DrizzleQueryError } from "drizzle-orm";
+import { errorForLog } from "./logging.js";
+
 const JSON_HEADERS: Record<string, string> = {
 	"content-type": "application/json; charset=utf-8",
 	"cache-control": "no-store",
@@ -24,5 +27,6 @@ export async function parseJsonBody<T>(request: Request): Promise<T | Response> 
 
 /** What went wrong, for a log line or an error list. */
 export function messageOf(err: unknown): string {
+	if (err instanceof DrizzleQueryError) return JSON.stringify(errorForLog(err));
 	return err instanceof Error ? err.message : String(err);
 }

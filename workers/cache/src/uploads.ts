@@ -35,6 +35,7 @@ import { checkUpstream, knownUpstream } from "./upstream.js";
 import { jsonResponse, errorResponse, messageOf } from "./responses.js";
 import { Compression, FileHash, NarHash, StorePathBasename, StorePathHash, parseBody } from "./schemas.js";
 import type { Db } from "./db/connection.js";
+import { errorForLog } from "./logging.js";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
 // visibility don't change once it has paths. Its path does when its org's
@@ -588,7 +589,7 @@ async function publishSessions(
 			await storeNarinfo(config, cache, path, blob, isPrivate);
 			rows.push({ ...path, session });
 		} catch (err) {
-			console.error("Failed to publish", { sessionId: session.id }, err);
+			console.error("Failed to publish", { sessionId: session.id }, errorForLog(err));
 			results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
 		}
 	}));
@@ -864,7 +865,7 @@ export async function handleGetMissingPaths(
 	const existingHashes = await findPublishedHashes(config.db, cache.id, body.storePathHashes);
 	// A push that still has these paths keeps them from retention.
 	config.defer(touchPublishedPaths(config.db, cache.id, existingHashes, new Date()).catch((err) => {
-		console.error("Failed to mark paths pushed", err);
+		console.error("Failed to mark paths pushed", errorForLog(err));
 	}));
 	const existingSet = new Set(existingHashes);
 	const absent = body.storePathHashes.filter((h) => !existingSet.has(h));
@@ -876,7 +877,7 @@ export async function handleGetMissingPaths(
 	const served = await knownUpstream(config, absent);
 	const unchecked = config.upstreams.length > 0 ? absent.filter((h) => !served.has(h)) : [];
 	if (unchecked.length > 0) {
-		config.defer(checkUpstream(config, unchecked).catch((err) => console.error("Upstream check failed", err)));
+		config.defer(checkUpstream(config, unchecked).catch((err) => console.error("Upstream check failed", errorForLog(err))));
 	}
 
 	return jsonResponse({
