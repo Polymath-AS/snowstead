@@ -1,0 +1,23 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "snowstead-go-cache",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "vars": {
+    // One deployment is one trust boundary. Change this to quarantine a cache.
+    "CACHE_NAMESPACE": "go-v1",
+    "RETENTION_SECONDS": "604800"
+  },
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "snowstead-go-private" }
+  ],
+  "ratelimits": [
+    { "name": "REQUEST_LIMIT", "namespace_id": "3001", "simple": { "limit": 12000, "period": 60 } }
+  ]
+  // Set READ_TOKEN and WRITE_TOKEN with `wrangler secret put`; never reuse
+  // credentials across deployments. Bind a dedicated custom domain before
+  // deployment. No public R2 domain, r2.dev URL, or unauthenticated read route.
+}
