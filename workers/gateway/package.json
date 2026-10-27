@@ -1,0 +1,14 @@
+{
+  "name": "@snowstead/gateway-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "cf-typegen": "wrangler types --config ../../wrangler.jsonc --env-interface GatewayEnv --include-runtime false"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "wrangler": "^4.152.0"
+  }
+}

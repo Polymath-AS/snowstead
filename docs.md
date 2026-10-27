@@ -2,6 +2,18 @@
 
 ## Deployment
 
+The root `wrangler.jsonc` is the public **gateway** (`snowstead`). It routes
+management APIs to `snowstead-control` and Nix reads/uploads to `snowstead-nix`
+over HTTP service bindings, forwarding the original URL, headers, and body.
+It has no database, storage, signing, or authorization logic. The service
+configs are `workers/control/wrangler.jsonc` and `workers/nix/wrangler.jsonc`.
+Only control runs garbage collection and CDN-purge retries. Public Nix objects
+still bypass all Workers through the existing R2 custom domain and CDN.
+
+Both services share the environment's existing R2 buckets, AUTH_KV, Hyperdrive,
+database, and signing-master-key source. Shared code and unchanged migrations
+live in `packages/cache-core`; this split needs no schema or data migration.
+
 ```bash
 wrangler r2 bucket create snowstead-private
 # Uploads land near the pusher and replicate to the bucket; reads stay
@@ -11,9 +23,11 @@ wrangler r2 bucket local-uploads enable snowstead-private
 # pg_write_all_data. Query caching off: uploads must read their own writes.
 wrangler hyperdrive create snowstead --caching-disabled \
   --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
-# set the production Hyperdrive id in wrangler.jsonc
-wrangler secret put JWT_SECRET --env production
-wrangler secret put ADMIN_SECRET --env production
+# Set the production Hyperdrive id in both service configs.
+# Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
+wrangler secret put JWT_SECRET --config workers/nix/wrangler.jsonc --env production
+wrangler secret put JWT_SECRET --config workers/control/wrangler.jsonc --env production
+wrangler secret put ADMIN_SECRET --config workers/control/wrangler.jsonc --env production
 # Generate 32 cryptographically random bytes, base64; keep a private backup
 # separately from Postgres. Paste through the hidden prompt, not shell arguments.
 # The account store container is owned by the infrastructure Terraform stack.
@@ -23,9 +37,9 @@ wrangler secrets-store secret create <STORE_ID> \
 # secret: the SHA-256 of its value). With them uploads go straight to R2
 # through presigned URLs; without them they go through the Worker. Private
 # NARs are always served by the Worker, which checks the reader.
-wrangler secret put R2_ACCESS_KEY_ID --env production
-wrangler secret put R2_SECRET_ACCESS_KEY --env production
-wrangler secret put R2_ENDPOINT --env production # https://<account id>.r2.cloudflarestorage.com
+wrangler secret put R2_ACCESS_KEY_ID --config workers/nix/wrangler.jsonc --env production
+wrangler secret put R2_SECRET_ACCESS_KEY --config workers/nix/wrangler.jsonc --env production
+wrangler secret put R2_ENDPOINT --config workers/nix/wrangler.jsonc --env production # https://<account id>.r2.cloudflarestorage.com
 # migrates the database directly (not through Hyperdrive), then deploys
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
@@ -37,12 +51,32 @@ DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm 
 | `SIGNING_MASTER_KEY_STORE` | Secrets Store binding to the 32-byte base64 AES-GCM key sealing per-cache signing keys |
 | `SIGNING_PRIVATE_KEY` | Legacy shared Ed25519 key; only for explicit self-hosted shared-key mode |
 
-`SIGNING_KEY_NAME` is a non-secret key-name prefix in `wrangler.jsonc`.
+`SIGNING_KEY_NAME` is a non-secret key-name prefix in both service configs.
 Hosted deployment explicitly selects `--env production`, whose bindings are
 not inherited from the local configuration. Staging must use its own R2, KV,
 database, Hyperdrive and environment-prefixed secret source. Cloudflare permits
 one Secrets Store per account: source names isolate deployment configuration,
 not account-level IAM. Terraform owns the store, never secret values.
+
+### Existing-installation cutover
+
+Deploy Nix and control **before** replacing the existing `snowstead` Worker
+with the gateway. Keep the original JWT secret, signing-master-key source,
+bucket names, KV namespace, and database; generating replacement secrets would
+invalidate tokens or make existing sealed keys unreadable. Give both services
+the same `CDN_PURGE_TOKEN` when CDN purging is enabled. Legacy self-hosted
+installations also move `AUTH_TOKEN` to Nix and shared signing settings to both.
+No secret belongs on the gateway; remove its obsolete secrets after acceptance.
+
+For first deployment, private per-service JSON secret files can be supplied
+with Wrangler's `--secrets-file` option. Do not commit them. Test the private
+services through a local gateway before switching public traffic. Keep the
+old deployment available for rollback. `pnpm deploy` migrates the existing
+schema, deploys Nix, deploys control, then updates the gateway last. The old
+Worker and control may briefly both run maintenance during this sequence;
+schedule the cutover between cron invocations rather than running concurrent GC.
+The gateway explicitly clears its former schedules. No bucket, database,
+KV namespace, public object key, cache URL, or CDN rule is replaced.
 
 The master key is loaded lazily through `SIGNING_MASTER_KEY_STORE.get()` only
 when signing or creating keys. Successful reads are reused by the isolate;
@@ -60,7 +94,9 @@ the non-secret bindings from Terraform's staging handoff:
 ```bash
 # A private JSON file containing distinct staging ADMIN_SECRET and JWT_SECRET.
 # Do not copy production values or commit this file.
-pnpm exec wrangler deploy --env staging --secrets-file /private/staging-worker.json
+pnpm exec wrangler deploy --config workers/nix/wrangler.jsonc --env staging --secrets-file /private/staging-nix.json
+pnpm exec wrangler deploy --config workers/control/wrangler.jsonc --env staging --secrets-file /private/staging-control.json
+pnpm exec wrangler deploy --env staging
 ```
 
 Staging uses authenticated proxied uploads until its own bucket-scoped R2
@@ -134,7 +170,7 @@ alone cannot shorten an already-cached response's TTL.
 
 ## Setup
 
-Configure the CLI with your server URL and admin secret:
+Configure the CLI with your gateway URL and admin secret:
 
 ```bash
 snowstead login prod https://your-worker.workers.dev $ADMIN_SECRET

@@ -2,11 +2,13 @@
 
 A Cloudflare-native Nix binary cache.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Polymath-AS/snowstead)
 ## Workspace
 
 ```
-workers/cache/        Cloudflare Worker (main service)
+workers/gateway/      Public URL routing through service bindings
+workers/nix/          Nix reads and upload protocol
+workers/control/      Organizations, caches, tokens, signing management, and maintenance
+packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
 scripts/              smoke-test.sh
@@ -27,7 +29,7 @@ pnpm check # type-check + tests across the workspace
 
 The worker's tests run against a throwaway Postgres that
 `scripts/with-postgres.sh` starts (or the server `SNOWSTEAD_TEST_DATABASE_URL`
-names). To run the worker locally on http://localhost:8787:
+names). To run all three Workers locally through the gateway on http://localhost:8787:
 
 ```bash
 pnpm dev
@@ -38,35 +40,20 @@ between runs, migrates it, and on the first run writes `.dev.vars` with
 local secrets (`ADMIN_SECRET=local-admin-secret`, a fresh signing key).
 Delete `.dev/` to start over.
 
-After changing `workers/cache/src/db/schema.ts`, run
-`pnpm --filter @snowstead/cache-worker db:generate` and commit the migration.
+After changing `packages/cache-core/src/db/schema.ts`, run
+`pnpm --filter @snowstead/cache-core db:generate` and commit the migration.
 
 
 ## Deploy
 
-See [docs.md](docs.md) for the full reference. Short version:
+See [docs.md](docs.md) for resource setup, secret provisioning, and the
+existing-installation cutover. The gateway has no storage or secrets;
+Nix and control share the existing database, buckets, and authorization state.
+Public objects still go directly through the R2 custom domain and CDN.
 
 ```bash
-wrangler r2 bucket create snowstead-private
-# Postgres on PlanetScale, with a role holding pg_read_all_data and
-# pg_write_all_data. Query caching off: uploads must read their own writes.
-wrangler hyperdrive create snowstead --caching-disabled \
-  --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
-# set the Hyperdrive id in wrangler.jsonc
-wrangler secret put JWT_SECRET
-wrangler secret put ADMIN_SECRET
-# Required: 32 random bytes, base64 (openssl rand -base64 32). Each new
-# cache gets its own signing key, encrypted under this master key.
-# Back it up separately from the database; losing it prevents signing.
-wrangler secret put SIGNING_MASTER_KEY
-# S3 keys of an R2 token limited to the two buckets (key id: the token id,
-# secret: the SHA-256 of its value). With them uploads go straight to R2
-# through presigned URLs; without them uploads go through the Worker.
-# Private downloads always go through the Worker for authorization.
-wrangler secret put R2_ACCESS_KEY_ID
-wrangler secret put R2_SECRET_ACCESS_KEY
-wrangler secret put R2_ENDPOINT        # https://<account id>.r2.cloudflarestorage.com
-# migrates the database directly (not through Hyperdrive), then deploys
+# With resources and service secrets provisioned: migrate, deploy Nix and
+# control, then switch the existing public Worker to the gateway.
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
 

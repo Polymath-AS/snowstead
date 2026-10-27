@@ -1,0 +1,152 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "snowstead-nix",
+	// The account that owns snowstead.com: R2 custom domains and Worker routes
+	// need the zone in the same account.
+	"account_id": "a5af70f803f5950f325622198dbd50a2",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-10",
+	// Required by the pg driver, which reaches Postgres through Hyperdrive.
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true,
+		// Every request's logs: errors and the API's request lines are worth
+		// more than they cost, and public reads never reach the Worker.
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": true
+		},
+		// Traces of fetch, R2, KV, the Cache API and (as custom spans) Postgres.
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.4
+		},
+		// Groups uncaught exceptions, 5xx responses and logged errors. Wrangler
+		// turns it off on the next deploy if this is removed.
+		"issues": {
+			"enabled": true
+		}
+	},
+	// Source-mapped stack traces in logs and Issues.
+	"upload_source_maps": true,
+	// esbuild otherwise wraps every function the code creates to keep its name,
+	// a twenty-fifth of a cache read's CPU; nothing reads those names.
+	"keep_names": false,
+	"workers_dev": false,
+	"preview_urls": false,
+	"vars": {
+		"SIGNING_KEY_NAME": "snowstead-1",
+		// Hosted caches must never fall back to the service's shared key.
+		"REQUIRE_CACHE_SIGNING_KEYS": "true",
+		// Space-separated binary caches whose paths pushes skip; empty pushes everything.
+		"UPSTREAM_CACHES": "https://cache.nixos.org",
+		// The CDN in front of the public bucket, purged when paths are published
+		// or deleted; with the secret CDN_PURGE_TOKEN. Unset, nothing is purged.
+		"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
+		"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
+	},
+	"r2_buckets": [
+		{
+			"binding": "CACHE_BUCKET",
+			"bucket_name": "snowstead-private"
+		},
+		// Public caches, served straight from R2 and the CDN on cache.snowstead.com;
+		// every object in it is world-readable.
+		{
+			"binding": "PUBLIC_BUCKET",
+			"bucket_name": "snowstead-public"
+		}
+	],
+	// What authorization reads per request, cached at the edge: token
+	// revocations, so checking a token never touches the database.
+	"kv_namespaces": [
+		{
+			"binding": "AUTH_KV",
+			"id": "5600f9fcae284ef6b92a0d809068d44d"
+		}
+	],
+	// Postgres (PlanetScale) through Hyperdrive. Create the config with query
+	// caching off (`wrangler hyperdrive create snowstead --caching-disabled
+	// --connection-string ...`): upload sessions and token revocation must
+	// read their own writes. Local runs connect directly via
+	// CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE.
+	"hyperdrive": [
+		{
+			"binding": "HYPERDRIVE",
+			"id": "9c99efdbc9964220995416b4ea44e111"
+		}
+	],
+	// Requests a caller may make a minute, by who they are (rate-limit.ts):
+	// pushes by token, the org API by key or dashboard user, private reads by
+	// pull token. Generous: they stop runaway loops, not real work. Public
+	// reads never reach the Worker.
+	"ratelimits": [
+		{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+		{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+	],
+	// Only the gateway has public routes; maintenance belongs to control.
+	"routes": [],
+	"triggers": { "crons": [] },
+	"env": {
+		// Bindings are intentionally explicit: Wrangler does not inherit them.
+		"production": {
+			"name": "snowstead-nix",
+			"vars": {
+				"SIGNING_KEY_NAME": "snowstead-1",
+				"REQUIRE_CACHE_SIGNING_KEYS": "true",
+				"UPSTREAM_CACHES": "https://cache.nixos.org",
+				"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
+				"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "5600f9fcae284ef6b92a0d809068d44d" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "9c99efdbc9964220995416b4ea44e111" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+			],
+			"secrets_store_secrets": [{
+				"binding": "SIGNING_MASTER_KEY_STORE",
+				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",
+				"secret_name": "snowstead-production-signing-master-key"
+			}]
+		},
+		"staging": {
+			"name": "snowstead-staging-nix",
+			"workers_dev": false,
+			"preview_urls": false,
+			"routes": [],
+			"vars": {
+				"SIGNING_KEY_NAME": "snowstead-staging-1",
+				"REQUIRE_CACHE_SIGNING_KEYS": "true",
+				"UPSTREAM_CACHES": "https://cache.nixos.org",
+				"CDN_ZONE_ID": "",
+				"PUBLIC_CACHE_ORIGIN": "",
+				"R2_BUCKET_NAME": "snowstead-staging-private",
+				"R2_PUBLIC_BUCKET_NAME": "snowstead-staging-public"
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-staging-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-staging-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "896fb71e5f8f44dda6c6331227eb5a04" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "78a7b1b04a314a79ba614e11c5b0ede5" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "2001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "API_LIMIT", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "2003", "simple": { "limit": 12000, "period": 60 } }
+			],
+			"secrets_store_secrets": [{
+				"binding": "SIGNING_MASTER_KEY_STORE",
+				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",
+				"secret_name": "snowstead-staging-signing-master-key"
+			}]
+		}
+	}
+}
