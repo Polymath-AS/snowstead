@@ -85,7 +85,7 @@ func newCache() (*cache, error) {
 		Timeout:       5 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
-	if validEndpoint(endpoint) && token != "" {
+	if validEndpoint(endpoint) && (token != "" || readOnly) {
 		c.endpoint = strings.TrimRight(endpoint, "/")
 	}
 	return c, nil
@@ -162,15 +162,18 @@ func (c *cache) store(action, output string, body io.Reader, size int64) (string
 }
 
 func (c *cache) remote(method, action, output string, body io.Reader, size int64) (*http.Response, error) {
-	// Never make an anonymous request, including when configuration is absent or invalid.
-	if c.endpoint == "" || c.token == "" || c.remoteDisabled.Load() {
+	// Anonymous reads require explicit read-only mode. Writes always need a
+	// credential, even if a public endpoint were to accept anonymous uploads.
+	if c.endpoint == "" || (c.token == "" && (!c.readOnly || method != http.MethodGet)) || c.remoteDisabled.Load() {
 		return nil, errors.New("remote cache disabled")
 	}
 	req, err := http.NewRequest(method, c.endpoint+"/v1/actions/"+action, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if method == http.MethodPut {
 		req.Header.Set("X-Snowstead-Output-ID", output)
 		req.ContentLength = size

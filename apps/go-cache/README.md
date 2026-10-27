@@ -25,10 +25,14 @@ Set `SNOWSTEAD_GO_CACHE_READ_ONLY=true` to disable remote uploads; local puts
 remain available. Protect this directory as you would Go's normal build cache.
 There is no automatic eviction; do not delete its files while builds are running.
 
-Remote requests require a nonempty token and HTTPS, except HTTP on localhost or
-a loopback IP. Invalid/missing remote configuration disables remote access.
-Redirects are never followed. Every request carries bearer authentication and
-has a five-second timeout. Remote errors, misses, invalid headers, oversized
+Remote requests require HTTPS, except HTTP on localhost or a loopback IP.
+For public reads, explicitly set `SNOWSTEAD_GO_CACHE_READ_ONLY=true` and leave
+`SNOWSTEAD_GO_CACHE_TOKEN` unset. Writes always require a nonempty token. The
+standalone prototype still requires a token on reads; anonymous access is for
+public named caches in the main service. Invalid/missing remote configuration
+disables remote access. Redirects are never followed. Credentials, when present,
+use bearer authentication. Requests have a five-second timeout. Remote errors,
+misses, invalid headers, oversized
 downloads, and digest mismatches are cache misses, not build failures. Puts are
 published locally before uploading; failed uploads never prevent local reuse.
 The first network failure (including a download-body timeout), HTTP 401, 403,
