@@ -330,6 +330,35 @@ func TestScopesAndCredentials(t *testing.T) {
 	}
 }
 
+func TestAnonymousReadOnly(t *testing.T) {
+	a, o, body := artifact()
+	var requests atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" {
+			t.Errorf("anonymous request must only read without an authorization header: %s", r.Method)
+		}
+		w.Header().Set("X-Snowstead-Output-ID", hex.EncodeToString(o))
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Write(body)
+	}))
+	defer s.Close()
+	setup(t, s.URL)
+	t.Setenv("SNOWSTEAD_GO_CACHE_TOKEN", "")
+	t.Setenv("SNOWSTEAD_GO_CACHE_READ_ONLY", "true")
+	c, err := newCache()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := exchange(t, c, []request{{ID: 1, Command: "get", ActionID: a}}, nil)
+	assertFile(t, r[0], body)
+	r, _ = exchange(t, c, []request{{ID: 2, Command: "put", ActionID: a, OutputID: o, BodySize: int64(len(body))}}, map[int64][]byte{2: body})
+	assertFile(t, r[0], body)
+	if requests.Load() != 1 {
+		t.Fatal("read-only helper attempted an anonymous upload")
+	}
+}
+
 func TestEndpointPolicy(t *testing.T) {
 	for _, raw := range []string{"https://cache.example", "https://cache.example/base", "http://127.0.0.1:1234", "http://[::1]:1234", "http://localhost:1234"} {
 		if !validEndpoint(raw) {
