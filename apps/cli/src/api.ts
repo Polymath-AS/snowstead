@@ -279,7 +279,7 @@ export interface TokenInfo {
   readonly caches: string[];
   readonly perms: string[];
   readonly createdAt: string;
-  readonly expiresAt: string;
+  readonly expiresAt: string | null;
   readonly createdBy: string;
   readonly revokedAt: string | null;
   readonly revokedBy: string | null;
@@ -292,7 +292,7 @@ export interface CreateTokenResponse {
   readonly subject: string;
   readonly caches: string[];
   readonly perms: string[];
-  readonly expiresAt: string;
+  readonly expiresAt: string | null;
 }
 
 export async function createToken(

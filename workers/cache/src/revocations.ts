@@ -3,7 +3,8 @@ import type { WorkerConfig } from "./config.js";
 /**
  * Token revocations, in KV, so checking a token never touches the
  * database: a JWT carries its own permissions, and this is the only state
- * its holder's requests need. An entry expires with the token it revokes.
+ * its holder's requests need. An entry expires with the token it revokes,
+ * or stays permanently for a token with no expiry.
  *
  * KV reads are cached at the edge for KV_CACHE_TTL_SECONDS, and so are
  * misses, so a revocation reaches every location within that time; tokens
@@ -35,8 +36,12 @@ export async function isRevoked(config: WorkerConfig, jti: string): Promise<bool
 }
 
 /** Records a revocation; the database stays the record of who revoked what and why. */
-export async function recordRevocation(config: WorkerConfig, jti: string, expiresAt: Date): Promise<void> {
+export async function recordRevocation(config: WorkerConfig, jti: string, expiresAt: Date | null): Promise<void> {
 	notRevokedUntil.delete(jti);
+	if (expiresAt === null) {
+		await config.authKv.put(revokedKey(jti), "1");
+		return;
+	}
 	const expiration = Math.floor(expiresAt.getTime() / 1000);
 	// KV expirations must be at least 60 seconds ahead; a token expiring
 	// sooner than that is refused for its expiry anyway.

@@ -12,7 +12,7 @@ export type TokenClaims = {
 	readonly perms: readonly TokenPermission[];
 	/** The org the token's caches belong to; it may push to no other org's. */
 	readonly org?: string;
-	readonly exp: number;
+	readonly exp?: number;
 	readonly iat: number;
 };
 
@@ -90,12 +90,12 @@ const Claims = v.pipe(
 		caches: v.pipe(v.array(NonEmpty), v.nonEmpty(), v.maxLength(MAX_CACHES_PER_TOKEN)),
 		perms: v.pipe(v.array(Permission), v.nonEmpty(), v.maxLength(MAX_PERMS_PER_TOKEN)),
 		org: v.optional(NonEmpty),
-		exp: v.pipe(v.number(), v.safeInteger()),
+		exp: v.optional(v.pipe(v.number(), v.safeInteger())),
 		iat: v.pipe(v.number(), v.safeInteger()),
 	}),
 	// Not issued in the future, allowing a small clock skew between nodes.
 	v.check(({ iat }) => iat <= Date.now() / 1000 + MAX_CLOCK_SKEW_SECONDS),
-	v.check(({ exp, iat }) => exp > iat),
+	v.check(({ exp, iat }) => exp === undefined || exp > iat),
 );
 
 function validateClaims(payload: unknown): JwtVerifyResult {
@@ -121,7 +121,7 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtVerif
 	const result = await verifyToken(token, secret);
 	if (result.kind === "ok") {
 		if (verified.size >= VERIFIED_MAX_ENTRIES) verified.clear();
-		const expires = (result.claims.exp + MAX_CLOCK_SKEW_SECONDS) * 1000;
+		const expires = result.claims.exp === undefined ? Infinity : (result.claims.exp + MAX_CLOCK_SKEW_SECONDS) * 1000;
 		verified.set(token, { claims: result.claims, secret, until: Math.min(expires, now + VERIFIED_MAX_MS) });
 	}
 	return result;

@@ -21,8 +21,8 @@ function admin(path: string, body?: unknown): Promise<Response> {
 	});
 }
 
-async function token(caches: string[], perms: string[]): Promise<{ token: string; jti: string }> {
-	const res = await admin("/tokens", { subject: "test", caches, perms });
+async function token(caches: string[], perms: string[], expiresInDays?: number | null): Promise<{ token: string; jti: string }> {
+	const res = await admin("/tokens", { subject: "test", caches, perms, expiresInDays });
 	expect(res.status).toBe(201);
 	return res.json();
 }
@@ -70,6 +70,29 @@ beforeAll(async () => {
 const nar = (cache: string) => `/${cache}/nar/${fileHash(cache)}/zstd.nar`;
 
 describe("private caches", () => {
+	it.each([null, 30, undefined])("honor a token lifetime of %s and keep it revocable", async (expiresInDays) => {
+		const response = await admin("/tokens", { subject: "lifetime-test", caches: [PRIVATE], perms: ["pull"], expiresInDays });
+		expect(response.status).toBe(201);
+		const issued = await response.json<{ token: string; jti: string; expiresAt: string | null }>();
+		const claims = JSON.parse(atob(issued.token.split(".")[1].replaceAll("-", "+").replaceAll("_", "/")));
+		if (expiresInDays === null) {
+			expect(issued.expiresAt).toBeNull();
+			expect(claims).not.toHaveProperty("exp");
+		} else {
+			expect(Date.parse(issued.expiresAt!)).toBeGreaterThan(Date.now());
+			expect(claims.exp - claims.iat).toBe((expiresInDays ?? 90) * 86400);
+		}
+		const listed = await (await admin("/tokens")).json<{ tokens: { jti: string; expiresAt: string | null }[] }>();
+		expect(listed.tokens.find((t) => t.jti === issued.jti)?.expiresAt).toBe(issued.expiresAt);
+		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(issued.token))).status).toBe(200);
+		expect((await admin(`/tokens/${issued.jti}/revoke`, { reason: "lifetime test" })).status).toBe(200);
+		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(issued.token))).status).toBe(401);
+		if (expiresInDays === null) {
+			const entries = await env.AUTH_KV.list({ prefix: `revoked/${issued.jti}` });
+			expect(entries.keys).toEqual([{ name: `revoked/${issued.jti}` }]);
+		}
+	});
+
 	it.each([
 		{ label: "narinfo", path: `/${PRIVATE}/${HASH}.narinfo` },
 		{ label: "NARs", path: nar(PRIVATE) },
@@ -115,8 +138,8 @@ describe("private caches", () => {
 		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(revoked))).status).toBe(401);
 	});
 
-	it("refuse a token revoked before KV held revocations, once synced", async () => {
-		const { token: old, jti } = await token([PRIVATE], ["pull"]);
+	it.each([null, 90])("refuse a token with lifetime %s revoked before KV held revocations, once synced", async (expiresInDays) => {
+		const { token: old, jti } = await token([PRIVATE], ["pull"], expiresInDays);
 		await revokeApiToken(db, jti, "admin", "revoked in the database only");
 		expect((await read(`/${PRIVATE}/${HASH}.narinfo`, basic(old))).status).toBe(200);
 

@@ -258,7 +258,7 @@ export async function globalOverview(db: Db, now: Date) {
 		pendingBytes: sql`(select coalesce(sum(${uploadSessions.fileSize}), 0) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
 		uploadsPending: sql`(select count(*) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
 		privateServedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.bytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
-		activeTokens: sql`(select count(*) from ${apiTokens} where ${apiTokens.revokedAt} is null and ${apiTokens.expiresAt} > ${now})`.mapWith(Number),
+		activeTokens: sql`(select count(*) from ${apiTokens} where ${apiTokens.revokedAt} is null and (${apiTokens.expiresAt} is null or ${apiTokens.expiresAt} > ${now}))`.mapWith(Number),
 		apiKeys: sql`(select count(*) from ${orgApiKeys} where ${orgApiKeys.revokedAt} is null)`.mapWith(Number),
 	}).from(sql`(select 1) as singleton`);
 	return row;
@@ -785,7 +785,7 @@ export async function createApiToken(
 		readonly subject: string;
 		readonly caches: readonly string[];
 		readonly permsJson: string;
-		readonly expiresAt: Date;
+		readonly expiresAt: Date | null;
 		readonly createdBy: string;
 		readonly orgId?: string | null;
 	},
@@ -860,7 +860,7 @@ export async function listRevokedTokens(db: Db, now: Date): Promise<ApiToken[]> 
 	return db
 		.select()
 		.from(apiTokens)
-		.where(and(isNotNull(apiTokens.revokedAt), gt(apiTokens.expiresAt, now)));
+		.where(and(isNotNull(apiTokens.revokedAt), or(isNull(apiTokens.expiresAt), gt(apiTokens.expiresAt, now))));
 }
 
 export async function deleteExpiredApiTokens(

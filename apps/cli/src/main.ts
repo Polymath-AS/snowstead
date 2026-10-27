@@ -152,7 +152,7 @@ async function main(): Promise<void> {
       console.log(`  JTI:     ${result.jti}`);
       console.log(`  Caches:  ${result.caches.join(", ")}`);
       console.log(`  Perms:   ${result.perms.join(", ")}`);
-      console.log(`  Expires: ${result.expiresAt}`);
+      console.log(`  Expires: ${result.expiresAt ?? "never"}`);
       console.log("");
       console.log(result.token);
       return;
@@ -166,7 +166,7 @@ async function main(): Promise<void> {
       }
       for (const t of tokens) {
         const status = t.revokedAt ? `revoked (${t.revokedAt})` : "active";
-        console.log(`${t.jti}  ${t.subject}  [${t.perms.join(",")}]  caches=[${t.caches.join(",")}]  ${status}  expires=${t.expiresAt}`);
+        console.log(`${t.jti}  ${t.subject}  [${t.perms.join(",")}]  caches=[${t.caches.join(",")}]  ${status}  expires=${t.expiresAt ?? "never"}`);
       }
       return;
     }

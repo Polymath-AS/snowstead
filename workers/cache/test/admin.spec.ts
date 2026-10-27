@@ -71,7 +71,7 @@ describe("admin cache stats", () => {
 			await db.insert(uploadSessions).values({ id: crypto.randomUUID(), cacheId: a.id, storePathHash: crypto.randomUUID(), storePath: "private-path",
 				narHash: "hash", narSize: size, fileHash: crypto.randomUUID(), fileSize: size, compression: "zstd", status, expiresAt });
 		}
-		for (const [expiresAt, revokedAt] of [[future, null], [past, null], [future, now]]) {
+		for (const [expiresAt, revokedAt] of [[future, null], [past, null], [future, now], [null, null], [null, now]]) {
 			await db.insert(apiTokens).values({ jti: crypto.randomUUID(), subject: "hidden-person", caches: ["*"], permsJson: '["push"]', expiresAt, revokedAt, createdBy: "admin" });
 		}
 		for (const revokedAt of [null, now]) await db.insert(orgApiKeys).values({ id: crypto.randomUUID(), orgId: org, name: "hidden-key", secretHash: "hidden-secret", revokedAt });
@@ -83,7 +83,7 @@ describe("admin cache stats", () => {
 			orgs: before.orgs + 1, caches: before.caches + 2, paths: before.paths + 2,
 			storedBytes: before.storedBytes + 800, physicalStoredBytes: before.physicalStoredBytes + 400,
 			pendingBytes: before.pendingBytes + 333, uploadsPending: before.uploadsPending + 2,
-			privateServedThisMonth: before.privateServedThisMonth + 1234, activeTokens: before.activeTokens + 1, apiKeys: before.apiKeys + 1,
+			privateServedThisMonth: before.privateServedThisMonth + 1234, activeTokens: before.activeTokens + 2, apiKeys: before.apiKeys + 1,
 		});
 	});
 
