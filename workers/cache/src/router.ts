@@ -122,6 +122,15 @@ export async function handleRequest(
 
 	const scope = visibility.isPrivate ? { path, gen: visibility.gen, id: visibility.id, org: visibility.org, slug, name: cacheName } : undefined;
 	if (rest[0] === "nar" && rest.length === 3 && rest[2].endsWith(".nar")) {
+		// A scoped public URL must not expose another cache's shared blob.
+		// Check before the NAR cache lookup, including for HEAD guards used by
+		// hosted gateways before their native CDN fetch.
+		if (!isPrivate) {
+			const cache = await findCacheByPath(config.db, slug, cacheName);
+			if (!cache?.isPublic || !(await cacheHasNar(config.db, cache.id, rest[1], rest[2].slice(0, -".nar".length)))) {
+				return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+			}
+		}
 		return handleNarDownload(config, rest[1], rest[2].slice(0, -".nar".length), request, method, scope);
 	}
 
