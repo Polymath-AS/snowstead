@@ -155,7 +155,7 @@ export const apiTokens = pgTable("api_tokens", {
 	cachesJson: text("caches_json").notNull().default("[]"),
 	permsJson: text("perms_json").notNull(),
 	createdAt: createdAt("created_at"),
-	expiresAt: timestamptz("expires_at").notNull(),
+	expiresAt: timestamptz("expires_at"),
 	createdBy: text("created_by").notNull(),
 	revokedAt: timestamptz("revoked_at"),
 	revokedBy: text("revoked_by"),

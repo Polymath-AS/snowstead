@@ -29,6 +29,13 @@
       "when": 1792844210513,
       "tag": "0003_org_signing_permissions",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793097334307,
+      "tag": "0004_optional_token_expiry",
+      "breakpoints": true
     }
   ]
 }
