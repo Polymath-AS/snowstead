@@ -93,6 +93,12 @@ describe("named Go caches", () => {
 		const second = { org: a.org, name: "second" };
 		await api(a.org, "/caches", "POST", { name: second.name });
 		const writer = await token(a);
+		// A missing action must not bypass the private cache's authorization.
+		for (const method of ["GET", "HEAD"]) {
+			expect((await transfer(a, undefined, undefined, undefined, method)).status).toBe(401);
+			expect((await transfer(a, await token(b), undefined, undefined, method)).status).toBe(403);
+			expect((await transfer(a, writer, undefined, undefined, method)).status).toBe(404);
+		}
 		expect((await transfer(a, writer, "compiler output")).status).toBe(201);
 		const read = await transfer(a, writer);
 		expect(await read.text()).toBe("compiler output");

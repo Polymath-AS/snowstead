@@ -1,7 +1,7 @@
-import { and, eq, isNotNull, lt, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, lt, sql } from "drizzle-orm";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
-import { caches as cacheRows, goEntries } from "@snowstead/cache-core/db/schema";
+import { caches as cacheRows, goEntries, orgs } from "@snowstead/cache-core/db/schema";
 import { findCacheByPath, findOrg, orgUsage } from "@snowstead/cache-core/db/repository";
 import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
@@ -19,8 +19,16 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 	const url = new URL(request.url);
 	const match = /^\/_api\/v1\/go\/([a-z0-9-]+)\/([a-z0-9-]+)\/v1\/actions\/([a-f0-9]{64})$/.exec(url.pathname);
 	if (!match) return errorResponse("Not Found", 404);
-	const cache = await findCacheByPath(config.db, match[1], match[2]);
-	if (!cache) return errorResponse("Not Found", 404);
+	const read = request.method === "GET" || request.method === "HEAD";
+	const target = read ? (await config.db.select({ cache: cacheRows, entry: goEntries }).from(cacheRows)
+		.innerJoin(orgs, eq(cacheRows.orgId, orgs.id))
+		.leftJoin(goEntries, and(eq(goEntries.cacheId, cacheRows.id), eq(goEntries.generation, cacheRows.goGeneration),
+			eq(goEntries.action, match[3]), gt(goEntries.expiresAt, new Date()), isNotNull(goEntries.uploadedAt)))
+		.where(and(eq(orgs.slug, match[1]), eq(cacheRows.name, match[2]))).limit(1))[0]
+		: { cache: await findCacheByPath(config.db, match[1], match[2]), entry: null };
+	// Keep the cache even when its action is missing: private misses still authenticate.
+	if (!target?.cache) return errorResponse("Not Found", 404);
+	const { cache, entry } = target;
 	const write = request.method === "PUT";
 	if (!write && request.method !== "GET" && request.method !== "HEAD") {
 		return errorResponse("Method Not Allowed", 405, { allow: "GET, HEAD, PUT" });
@@ -37,10 +45,8 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 		if (limited) return limited;
 	}
 	if (write) return putAction(request, config, cache, match[3]);
-	// Resolve visibility, membership, generation, and expiry before the Cache API.
-	const [entry] = await config.db.select().from(goEntries)
-		.where(and(activeGoEntries(cache), eq(goEntries.action, match[3]), isNotNull(goEntries.uploadedAt))).limit(1);
-	if (!entry) return errorResponse("Not Found", 404);
+	// Authentication may have taken time; recheck expiry before the Cache API.
+	if (!entry || entry.expiresAt.getTime() <= Date.now()) return errorResponse("Not Found", 404);
 	const key = new Request(`${url.origin}/_snowstead_go_cdn/${entry.r2Key}`);
 	const head = request.method === "HEAD";
 	const edgeCache = await caches.open("snowstead-go");
