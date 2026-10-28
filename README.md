@@ -26,6 +26,9 @@ workers/nix/          Nix reads and upload protocol
 workers/go/           Hosted Go action-cache protocol
 workers/go-cache/     Isolated prototype for disposable benchmark harnesses
 workers/control/      Organizations, caches, tokens, signing management, and maintenance
+workers/download/     Gated SQL-free publication admission (no public routes yet)
+workers/bytes/        Binding-only immutable bytes (native caching disabled)
+workers/storage/      Isolated read-only authority and publication RPC capabilities
 packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
@@ -70,6 +73,10 @@ existing-installation cutover. The gateway has no storage or secrets;
 Nix, Go, and control share the existing database, buckets, and authorization state.
 Hosted reads enter through the web gateway, which uses the existing R2/CDN
 origin for public objects. Production cache Worker routes remain API-only.
+That is the legacy deployment. The strong publication implementation is gated
+off by default; the existing deploy script does not deploy its new Workers.
+Do not deploy the companion web gateway removal independently. See the
+[publication cutover and release gates](docs.md#strong-publication-cutover).
 
 ```bash
 # With resources and service secrets provisioned: migrate, deploy Nix, Go, and

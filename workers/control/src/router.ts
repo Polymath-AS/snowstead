@@ -2,7 +2,8 @@ import type { WorkerConfig } from "@snowstead/cache-core/config";
 import { findOrg, globalOverview, listOrgs } from "@snowstead/cache-core/db/repository";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { actorId, authenticateAdmin } from "@snowstead/cache-core/auth";
-import { jsonResponse } from "@snowstead/cache-core/responses";
+import { jsonResponse, errorResponse } from "@snowstead/cache-core/responses";
+import { handlePublicationApi } from "./publication-api.js";
 import { handleOrgApi } from "./org-api.js";
 import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths, handlePurgeCache, handleDeleteCache } from "./admin.js";
 
@@ -31,6 +32,10 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 async function handleAdminApi(request: Request, config: WorkerConfig, pathname: string): Promise<Response> {
 	const authResult = await authenticateAdmin(request, config);
 	if (authResult.kind === "error") return authResult.response;
+	if (pathname.startsWith("/_api/v1/admin/publications/")) {
+		if (authResult.identity.kind !== "admin" || authResult.identity.onBehalfOf !== undefined) return errorResponse("Operator authorization required", 403);
+		return handlePublicationApi(request, config, pathname.slice("/_api/v1/admin/publications/".length));
+	}
 
 	if (pathname === "/_api/v1/admin/orgs" && request.method === "GET") {
 		return jsonResponse({ orgs: await listOrgs(config.db) });

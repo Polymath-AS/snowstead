@@ -234,6 +234,16 @@ importers:
         specifier: ~5.0.5
         version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(esbuild@0.28.2)(tsx@4.23.15))
 
+  workers/bytes:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
   workers/control:
     dependencies:
       '@snowstead/cache-core':
@@ -245,6 +255,16 @@ importers:
       valibot:
         specifier: ^1.5.0
         version: 1.5.0(typescript@7.0.2)
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
+  workers/download:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
     devDependencies:
       typescript:
         specifier: ^7.0.2
@@ -301,6 +321,16 @@ importers:
       valibot:
         specifier: ^1.5.0
         version: 1.5.0(typescript@7.0.2)
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
+  workers/storage:
+    dependencies:
+      '@snowstead/cache-core':
+        specifier: workspace:*
+        version: link:../../packages/cache-core
     devDependencies:
       typescript:
         specifier: ^7.0.2

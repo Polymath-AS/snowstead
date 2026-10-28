@@ -1,0 +1,18 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "snowstead-bytes",
+	"main": "workers/bytes/src/index.ts",
+	"compatibility_date": "2026-10-26",
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [],
+	// Enable only alongside an exact, staging-qualified gateway byte ceiling.
+	// No cross-version cache: rollback must not reuse unqualified responses.
+	"cache": { "enabled": false, "cross_version_cache": false },
+	"vars": { "BYTE_NAMESPACE": "snowstead-production-bytes-v2" },
+	// Data-only RPC capabilities; no authority, raw R2, or write credentials.
+	"services": [
+		{ "binding": "PRIVATE_BYTES", "service": "snowstead-storage", "entrypoint": "PrivateReader" },
+		{ "binding": "PUBLIC_BYTES", "service": "snowstead-storage", "entrypoint": "PublicReader" }
+	]
+}

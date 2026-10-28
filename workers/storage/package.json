@@ -1,0 +1,9 @@
+{
+  "name": "@snowstead/storage-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "tsc --noEmit" },
+  "dependencies": { "@snowstead/cache-core": "workspace:*" },
+  "devDependencies": { "typescript": "^7.0.2" }
+}

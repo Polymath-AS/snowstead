@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { pgTable, text, integer, bigint, boolean, timestamp, date, primaryKey, uniqueIndex, index, check } from "drizzle-orm/pg-core";
+import { DEFAULT_ORG_ID } from "@snowstead/cache-domain";
 
 const timestamptz = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 const createdAt = (name: string) => timestamptz(name).notNull().defaultNow();
@@ -14,7 +15,7 @@ const id = () => bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAs
  * has one: a self-hosted install's are all the default org's, which has no
  * limit, and so are tokens made without an org.
  */
-export const DEFAULT_ORG_ID = "default";
+export { DEFAULT_ORG_ID };
 
 export const orgs = pgTable("orgs", {
 	id: text("id").primaryKey(),
@@ -217,6 +218,113 @@ export const upstreamPaths = pgTable("upstream_paths", {
 	upstream: text("upstream").notNull(),
 	foundAt: createdAt("found_at"),
 });
+
+/** Permanent exact-CAS commands; unresolved rows are the durable per-key barrier. */
+export const authorityJournal = pgTable("authority_journal", {
+	operationId: text("operation_id").primaryKey(),
+	resourceKey: text("resource_key").notNull(),
+	predecessorEtag: text("predecessor_etag"),
+	payload: text("payload").notNull(),
+	nonce: text("nonce").notNull().unique(),
+	successor: text("successor").notNull(),
+	state: text("state").notNull().default("pending"),
+	fenceNonce: text("fence_nonce").unique(),
+	fenceSuccessor: text("fence_successor"),
+	winningEtag: text("winning_etag"),
+	createdAt: createdAt("created_at"),
+}, (table) => [
+	uniqueIndex("authority_journal_unresolved_key").on(table.resourceKey)
+		.where(sql`${table.state} in ('pending', 'fencing', 'frozen')`),
+	check("authority_journal_state", sql`${table.state} in ('pending', 'fencing', 'accepted', 'excluded', 'frozen')`),
+	check("authority_journal_fence", sql`(${table.fenceNonce} is null) = (${table.fenceSuccessor} is null)`),
+	check("authority_journal_outcome", sql`(${table.state} in ('accepted', 'excluded')) = (${table.winningEtag} is not null)`),
+]);
+
+/** Permanent lifecycle identity and mutation barrier. Never cascade with caches. */
+export const publicationCaches = pgTable("publication_caches", {
+	// Historical identity, deliberately not an FK to the deletable live catalog.
+	cacheId: integer("cache_id").primaryKey(),
+	orgId: text("org_id").notNull(),
+	path: text("path").notNull().unique(),
+	name: text("name").notNull(),
+	epoch: text("epoch").notNull(),
+	isPublic: boolean("is_public").notNull(),
+	state: text("state").notNull(),
+	phase: text("phase"),
+	targetEpoch: text("target_epoch"),
+	targetPublic: boolean("target_public"),
+	statusBytes: text("status_bytes"),
+	statusEtag: text("status_etag"),
+	routeBytes: text("route_bytes"),
+	routeEtag: text("route_etag"),
+	commandId: text("command_id"),
+	commandKey: text("command_key"),
+	commandExpected: text("command_expected"),
+	commandBytes: text("command_bytes"),
+}, (table) => [
+	check("publication_caches_state", sql`${table.state} in ('inactive', 'initializing', 'migrating', 'active', 'changing', 'retiring', 'retired')`),
+]);
+
+/** One revision owns both immutable representations; no key is ever recycled. */
+export const publicationRevisions = pgTable("publication_revisions", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").notNull().references(() => publicationCaches.cacheId),
+	epoch: text("epoch").notNull(),
+	storePathHash: text("store_path_hash").notNull(),
+	// Canonical GC coordinates prepared/active pins, not historical foreign keys.
+	blobId: bigint("blob_id", { mode: "number" }).notNull(),
+	isPublic: boolean("is_public").notNull(),
+	narKey: text("nar_key").notNull().unique(),
+	narinfoKey: text("narinfo_key").notNull().unique(),
+	narinfo: text("narinfo"),
+	narPhase: text("nar_phase").notNull().default("new"),
+	narinfoPhase: text("narinfo_phase").notNull().default("new"),
+	narEtag: text("nar_etag"),
+	narinfoEtag: text("narinfo_etag"),
+	state: text("state").notNull().default("prepared"),
+}, (table) => [
+	check("publication_revision_state", sql`${table.state} in ('prepared', 'active', 'retired', 'deleting', 'deleted')`),
+	check("publication_revision_uploads", sql`${table.narPhase} in ('new', 'issued', 'complete') and ${table.narinfoPhase} in ('new', 'issued', 'complete')`),
+]);
+
+/** Idempotent prepared/active pin sets, never reference-count increments. */
+export const publicationPins = pgTable("publication_pins", {
+	revisionId: text("revision_id").notNull().references(() => publicationRevisions.id),
+	kind: text("kind").notNull(),
+}, (table) => [
+	primaryKey({ columns: [table.revisionId, table.kind] }),
+	check("publication_pin_kind", sql`${table.kind} in ('prepared', 'active')`),
+]);
+
+export const publicationJobs = pgTable("publication_jobs", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").notNull().references(() => publicationCaches.cacheId),
+	epoch: text("epoch").notNull(),
+	storePathHash: text("store_path_hash").notNull(),
+	kind: text("kind").notNull(),
+	revisionId: text("revision_id").notNull().references(() => publicationRevisions.id),
+	pathJson: text("path_json").notNull(),
+	blobJson: text("blob_json").notNull(),
+	predecessorEtag: text("predecessor_etag"),
+	grantBytes: text("grant_bytes"),
+	state: text("state").notNull().default("pending"),
+	/** During backfill, grants alone cannot make the cache ready for cutover. */
+	witnessReady: boolean("witness_ready").notNull().default(false),
+}, (table) => [
+	uniqueIndex("publication_jobs_unresolved_path").on(table.cacheId, table.epoch, table.storePathHash).where(sql`${table.state} = 'pending'`),
+	check("publication_job_kind", sql`${table.kind} in ('publish', 'backfill', 'withdraw')`),
+	check("publication_job_state", sql`${table.state} in ('pending', 'done', 'excluded')`),
+]);
+
+export const publicationPaths = pgTable("publication_paths", {
+	cacheId: integer("cache_id").notNull().references(() => publicationCaches.cacheId),
+	epoch: text("epoch").notNull(),
+	storePathHash: text("store_path_hash").notNull(),
+	activeRevision: text("active_revision").references(() => publicationRevisions.id),
+	pendingJob: text("pending_job").references(() => publicationJobs.id),
+	grantBytes: text("grant_bytes"),
+	grantEtag: text("grant_etag"),
+}, (table) => [primaryKey({ columns: [table.cacheId, table.epoch, table.storePathHash] })]);
 
 /**
  * NAR bytes the Worker served for an org's private caches, by UTC day.

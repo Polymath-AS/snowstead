@@ -463,3 +463,142 @@ Existing v1 sealed keys remain readable; newly sealed keys use v2 identity
 authentication. Do not replace the master secret to rotate cache keys:
 that makes existing ciphertext unreadable. Master-key rotation and
 emergency compromise recovery need a separate, tested migration plan.
+
+## Strong publication cutover
+
+This implementation is **not enabled by the default deployment**. Keep
+`PUBLICATION_READS` and `STRONG_TOKEN_POLICIES` false until an explicitly
+authorized migration. The download and byte Worker configurations have no
+routes, no workers.dev/preview ingress, and native caching disabled. The
+existing deployment script is intentionally unchanged. Never deploy the
+companion website's cache-gateway removal before cache traffic has moved.
+
+### Contract and isolation
+
+The v2 reader checks R2 route, cache status/epoch, and the store-path grant
+on every request, including HEAD, Range, and conditional hits. Private reads
+also check positive token and verifier-key authority. It never reads SQL/KV,
+falls back to legacy reads, or defers bandwidth writes. Responses carry
+`Cache-Control: no-store` and `Cloudflare-CDN-Cache-Control: no-store`.
+These are new-request admission guarantees, not erasure of downloaded bytes
+or termination of a stream already admitted before withdrawal.
+
+Every publication owns immutable narinfo and NAR copies. Ordinary reuploads
+preserve publication identity, metadata, and NAR URL; withdrawal followed by
+republishing gets a new identity. Publication authority commands persist exact
+CAS bytes and their predecessor before dispatch. Permanent tombstones, SQL
+prepared/active pins, and retained lifecycle/alias history must not be deleted
+or reused. Unknown absent immutable PUTs deliberately stay pending and pinned;
+do not clear them using a timeout, DELETE, or an unconditional retry.
+
+The download Worker has no database, static admin bearer, or control binding,
+but its HS256 secret retains JWT signing capability. Positive token authority
+restricts accepted claims; it does **not** turn a shared symmetric secret into
+a verification-only credential. This trust boundary still needs security
+acceptance. Public and private buckets must both be Internet-inaccessible
+before hosting v2 objects: the historical public R2/CDN origin is a bypass,
+not an acceptable v2 serving path.
+
+Neither download nor bytes has a raw R2 binding or storage credentials. R2
+bindings are writable, so a separate, binding-only storage Worker holds them
+and exposes named read-only RPC entrypoints. Download receives authority GET
+and public/private publication GET/HEAD; bytes receives only the publication
+entrypoints. These return copied sizes and streams, never bucket capabilities.
+The publication entrypoints reject authority, staging, and canonical keys.
+This is a runtime isolation boundary, not just a TypeScript restriction.
+The storage Worker remains trusted and adds an internal RPC hop per R2 read;
+benchmark that cost before cutover. It must have no public ingress, caching,
+write methods, or additional untrusted consumers. Deploy it before bytes and
+download, with environment-specific bucket/service names. Control and Nix
+retain their existing write bindings for mutations; isolate them accordingly.
+Read-only storage does not make compromised admission code trustworthy or
+prevent it from leaking bytes it can read.
+
+### Operator API
+
+All routes below are under `/_api/v1/admin/publications/` and require the
+operator admin credential. Dashboard on-behalf-of actors and organization
+keys cannot use them. Never log the body of legacy-token enrollment.
+
+| Method | Suffix | Effect |
+| --- | --- | --- |
+| POST | `key/initialize` | Explicitly initialize the legacy verifier policy; never resurrect a revoked key. |
+| POST | `key/revoke` | Permanently revoke that verifier; affects every enrolled token. |
+| POST | `tokens/enroll` | Validate a legacy signed token against SQL/KV inventory, then enroll it; body `{ "token": "…" }`. |
+| POST | `tokens/recover` | Retry a bounded batch of durable token-policy operations. |
+| GET | `cache/:id` | Read lifecycle state and epoch; `active` alone does not certify every path job is settled. |
+| POST | `cache/:id/initialize` | Initialize an empty cache; populated legacy caches remain inactive. |
+| POST | `cache/:id/backfill/start` | Enter the draining migration barrier. |
+| POST | `cache/:id/backfill/batch` | Process at most `limit` jobs; body `{ "limit": 25 }`, maximum 100. |
+| POST | `cache/:id/backfill/finish` | Verify complete, unchanged membership/witness coverage and activate. |
+| POST | `cache/:id/recover` | Drive migration batches, or run bounded general recovery. |
+| POST | `recover` | Bounded token/lifecycle/job recovery and retired-copy collection. |
+
+202 means pending, not successful activation/revocation/withdrawal. 503 may
+mean authority storage failed after issuance: retain the returned one-time
+token and JTI instead of issuing a replacement. Retry the same operation.
+Five-minute maintenance also drives bounded recovery. A frozen or permanently
+pending record needs operator investigation; bounded batches are not a
+guarantee of queue drain. Backfill counters describe only that batch. Only
+successful `backfill/finish` returning `active` certifies backfill completion.
+
+### Staged migration order
+
+1. In an isolated staging environment, apply migration 0006 with the
+   existing migration tooling. Back up SQL, R2 authority, and signing keys
+   together; loss of journal/reservation history requires mutation quarantine.
+2. Initialize verifier authority explicitly and enroll retained legacy tokens
+   using their signed credentials. Inventory alone cannot reconstruct a JWT.
+   Newly issued tokens enroll automatically. Resolve pending/frozen operations.
+3. Enable `STRONG_TOKEN_POLICIES` across **every** legacy private-read and
+   write ingress before per-cache cutover. Unenrolled tokens then fail closed.
+   Stop old writers that do not honor lifecycle barriers. Do not rely on KV's
+   propagation or its old isolate cache as a revocation bound.
+4. Before writing v2 objects, inventory and close every public R2 origin,
+   workers.dev/preview bypass, binding bypass, Worker Cache rule, and alternate
+   read ingress. This can interrupt legacy reads; approve that outage/cutoff
+   explicitly. Confirm real Nix compatibility and approve the cutoff of old
+   **unscoped** global public NAR URLs; only scoped URLs have a witness adapter.
+5. Initialize empty caches, or start/backfill/finish populated ones. Ordinary
+   mutations are barred while migrating. Existing membership metadata and
+   timestamps are preserved. Visibility changes require an empty cache with
+   no pending publications; retired aliases and org slug changes are blocked.
+6. Enable `PUBLICATION_READS` consistently on direct Nix ingress and move
+   canonical/owner-host reads to the download Worker. Then remove the website
+   cache gateway. Keep external cache bypass disabled. Missing v2 authority
+   must fail closed, never fall back to legacy bytes.
+
+The checked-in `false` flags must be overridden explicitly in each deployed
+environment; environment variable sets are not implicitly inherited. This
+order is an operator runbook, not permission to execute it in production.
+
+### Remaining release gates and rollback
+
+Native tiering/collapsing remains off (`NATIVE_MAX_BYTES=0`, byte Worker cache
+disabled). Before enabling it, qualify account/runtime availability, exact
+byte ceiling, actual service-binding transport, cold-fill amplification, and
+global tail latency/cost. HEAD and **all** requests carrying Range bypass
+native fill, including ignored ranges. Large-object/Range acceleration is
+not implemented or promised. Use a new `BYTE_NAMESPACE` when changing cache
+policy; private bytes must never become independently routable.
+
+The SQL-free reader currently emits **no replacement usage telemetry**.
+Its traffic is not included in legacy `bandwidth_daily`, usage limits based
+on that counter, or billing. The product contract and telemetry sink must be
+decided before rollout; a telemetry plan is not delivered-byte accounting.
+Per-path copy storage cost, mutation throughput (including R2 same-key write
+limits), queue behavior, alias policy, retained HS256 exposure, legacy client
+cutoff, and real Nix transport remain explicit acceptance gates. Local tests
+do not establish production latency, native cache semantics, or a formal
+concurrency proof.
+Canonical GC retains its pre-existing assumption that a rejected DELETE
+cannot commit after its SQL barrier rolls back. Validate that failure model
+before rollout; if delayed effects are possible, add durable canonical-delete
+quarantine before relying on prepared pins as source-retention guarantees.
+
+Rollback must preserve the positive token perimeter and retained v2
+authority/pins. Do not re-enable public origins, old mutable byte routes,
+legacy cache namespaces, or earlier auth code to restore availability. If a
+safe reader cannot run, fail closed and repair forward. A rollback that
+serves legacy bytes again needs a separately reviewed migration and explicit
+authorization; toggling a flag is not such a protocol.

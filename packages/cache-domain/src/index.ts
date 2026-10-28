@@ -19,3 +19,6 @@ export {
   parseFileHash,
   parseCompression,
 } from './parsers.js';
+
+/** Tenant used by self-hosted installs and tokens predating organizations. */
+export const DEFAULT_ORG_ID = "default";

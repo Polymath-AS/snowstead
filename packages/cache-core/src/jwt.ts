@@ -1,7 +1,6 @@
 import * as v from "valibot";
 import type { TokenPermission } from "./db/types.js";
-import { DEFAULT_ORG_ID } from "./db/schema.js";
-import { valueOf } from "./schemas.js";
+import { DEFAULT_ORG_ID } from "@snowstead/cache-domain";
 
 export type TokenClaims = {
 	readonly jti: string;
@@ -99,8 +98,8 @@ const Claims = v.pipe(
 );
 
 function validateClaims(payload: unknown): JwtVerifyResult {
-	const claims = valueOf(Claims, payload);
-	return claims ? { kind: "ok", claims } : { kind: "error", reason: "invalid token" };
+	const result = v.safeParse(Claims, payload);
+	return result.success ? { kind: "ok", claims: result.output } : { kind: "error", reason: "invalid token" };
 }
 
 // Tokens verified recently, so a client sending one with every request pays
@@ -165,8 +164,8 @@ async function verifyToken(token: string, secret: string): Promise<JwtVerifyResu
 		return { kind: "error", reason: "invalid token" };
 	}
 
-	const early = valueOf(v.object({ exp: v.number() }), rawParsed);
-	if (early && early.exp <= Date.now() / 1000 - MAX_CLOCK_SKEW_SECONDS) {
+	const early = v.safeParse(v.object({ exp: v.number() }), rawParsed);
+	if (early.success && early.output.exp <= Date.now() / 1000 - MAX_CLOCK_SKEW_SECONDS) {
 		return { kind: "error", reason: "invalid token" };
 	}
 

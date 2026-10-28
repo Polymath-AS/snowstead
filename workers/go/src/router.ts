@@ -1,7 +1,7 @@
 import { and, eq, gt, isNotNull, lt, sql } from "drizzle-orm";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
-import { caches as cacheRows, goEntries, orgs } from "@snowstead/cache-core/db/schema";
+import { caches as cacheRows, goEntries, orgs, publicationCaches } from "@snowstead/cache-core/db/schema";
 import { findCacheByPath, findOrg, orgUsage } from "@snowstead/cache-core/db/repository";
 import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
@@ -97,6 +97,8 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 		// reset/delete/visibility without waiting for unrelated publishing bodies.
 		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
 		if (!current || current.goGeneration !== cache.goGeneration) return errorResponse("Cache changed; retry", 409);
+		const [lifecycle] = await tx.select({ state: publicationCaches.state }).from(publicationCaches).where(eq(publicationCaches.cacheId, cache.id));
+		if (lifecycle && lifecycle.state !== "active") return errorResponse("Cache lifecycle transition is pending", 409);
 		const org = await findOrg(tx, cache.orgId);
 		if (!org) return errorResponse("Not Found", 404);
 		if (!current.isPublic && !org.privateCaches) return errorResponse(PRIVATE_CACHES_REFUSED, 403);
