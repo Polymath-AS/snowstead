@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { testDb } from "./db.js";
 import { goEntries } from "../src/db/schema.js";
 import { findCache, createBlobObject, createPublishedPath } from "../src/db/repository.js";
@@ -47,6 +47,60 @@ async function transfer(target: Target, credential?: string, body?: string, outp
 }
 
 describe("named Go caches", () => {
+	it("does not wait for another reservation's org quota lock when storage is unlimited", async () => {
+		const target = await setup();
+		const writer = await token(target);
+		let upload: Promise<Response> | undefined;
+		let completed = false;
+		try {
+			await db.transaction(async tx => {
+				await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + target.org}, 0))`);
+				upload = transfer(target, writer, "independent").then(response => { completed = true; return response; });
+				await expect.poll(() => completed, { timeout: 2000 }).toBe(true);
+			});
+		} finally {
+			// Release the held lock before draining, including on the old code.
+			await upload;
+		}
+		expect((await upload)!.status).toBe(201);
+		expect(await (await transfer(target)).text()).toBe("independent");
+	});
+
+	it.each([null, 5])("publishes one immutable output when same-action uploads race with storage limit %s", async storageLimit => {
+		const target = await setup();
+		await api(target.org, "", "PUT", { storageLimit });
+		const writer = await token(target);
+		const bodies = ["first", "other", "first", "other", "first", "other", "first", "other"];
+		const responses = await Promise.all(bodies.map(body => transfer(target, writer, body)));
+		expect(responses.filter(response => response.status === 201)).toHaveLength(1);
+		const winner = responses.findIndex(response => response.status === 201);
+		const stored = await (await transfer(target)).text();
+		expect(stored).toBe(bodies[winner]);
+		expect(responses.map(response => response.status)).toEqual(bodies.map((body, i) =>
+			i === winner ? 201 : body === bodies[winner] ? 204 : 409));
+		expect(await (await api(target.org, `/caches/${target.name}/go`)).json()).toMatchObject({ entries: 1, size: 5 });
+	});
+
+	it("shares finite storage reservations with concurrent Nix pushes across caches", async () => {
+		for (let round = 0; round < 4; round++) {
+			const target = await setup();
+			await api(target.org, "", "PUT", { storageLimit: 100 });
+			await api(target.org, "/caches", "POST", { name: "nix" });
+			const writer = await token(target, ["push", "go:write"], [target.name, "nix"]);
+			const [go, nix] = await Promise.all([
+				transfer(target, writer, "g".repeat(60)),
+				SELF.fetch("http://example.com/_api/v1/caches/nix/upload-sessions/batch", {
+					method: "POST", headers: { authorization: `Bearer ${writer}`, "content-type": "application/json" },
+					body: JSON.stringify({ paths: [{ storePath: `/nix/store/${"1".repeat(32)}-quota`, storePathHash: "1".repeat(32),
+						narHash: `sha256:${"1".repeat(52)}`, narSize: 50, fileHash: "b".repeat(64), fileSize: 50, compression: "zstd" }] }),
+				}),
+			]);
+			expect([go.status, nix.status]).toEqual(go.status === 201 ? [201, 507] : [413, 201]);
+			expect(await (await api(target.org, "")).json()).toMatchObject(go.status === 201
+				? { used: 60, pending: 0 } : { used: 0, pending: 50 });
+		}
+	});
+
 	it("completes a distinct upload while an earlier upload body is paused", async () => {
 		const target = await setup();
 		const writer = await token(target);
