@@ -1,0 +1,5 @@
+{
+  "name": "@snowstead/zig-cache-client",
+  "private": true,
+  "scripts": { "check": "go test -race ./... && go vet ./..." }
+}

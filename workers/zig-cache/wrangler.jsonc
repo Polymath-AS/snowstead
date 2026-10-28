@@ -1,0 +1,14 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "snowstead-zig-snapshot-spike",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": { "CACHE_NAMESPACE": "zig-spike-v1", "PUBLIC_READ": "false" },
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "snowstead-zig-snapshot-spike-private" }
+  ]
+  // Not provisioned. Never bind the hosted Go/Nix buckets here.
+  // READ_TOKEN and WRITE_TOKEN are separate deployment secrets.
+}

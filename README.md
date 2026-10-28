@@ -18,6 +18,10 @@ reads and writes belong to the private Go Worker.
 The isolated [Go prototype](workers/go-cache/README.md) and its Terraform build
 gate remain disposable local benchmarks, not the hosted named-cache API.
 
+The isolated [stock Zig snapshot spike](apps/zig-cache/README.md) restores
+compatible completed caches before normal `zig build` and saves after success.
+It is not a hosted protocol or transparent per-action cache.
+
 ## Workspace
 
 ```
@@ -25,11 +29,13 @@ workers/gateway/      Public URL routing through service bindings
 workers/nix/          Nix reads and upload protocol
 workers/go/           Hosted Go action-cache protocol
 workers/go-cache/     Isolated prototype for disposable benchmark harnesses
+workers/zig-cache/    Isolated stock-Zig snapshot service prototype
 workers/control/      Organizations, caches, tokens, signing management, and maintenance
 packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
 packages/cache-domain/  Shared types and input parsers
 apps/cli/             CLI for pushing store paths
 apps/go-cache/        Native GOCACHEPROG helper
+apps/zig-cache/       Disposable stock-Zig restore/build/save client
 scripts/              smoke-test.sh
 ```
 
