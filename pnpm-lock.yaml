@@ -185,6 +185,8 @@ importers:
 
   apps/go-cache: {}
 
+  apps/zig-cache: {}
+
   packages/cache-core:
     dependencies:
       '@snowstead/cache-domain':
@@ -305,6 +307,15 @@ importers:
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
+
+  workers/zig-cache:
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      wrangler:
+        specifier: ^4.152.0
+        version: 4.152.0(@types/node@26.6.5)
 
 packages:
 

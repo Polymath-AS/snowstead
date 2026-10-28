@@ -1,0 +1,7 @@
+{
+  "name": "@snowstead/zig-cache-worker",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "tsc --noEmit && node --test test/contract.mjs" },
+  "devDependencies": { "typescript": "^7.0.2", "wrangler": "^4.152.0" }
+}
