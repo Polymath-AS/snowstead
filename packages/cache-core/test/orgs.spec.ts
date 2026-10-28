@@ -116,7 +116,7 @@ describe("orgs", () => {
 		}
 		const inventory = await admin("/orgs");
 		expect(inventory.headers.get("cache-control")).toBe("no-store");
-		expect((await inventory.json<{ orgs: unknown[] }>()).orgs).toContainEqual({ id: org, slug: org, ...limits });
+		expect((await inventory.json<{ orgs: unknown[] }>()).orgs).toContainEqual({ id: org, slug: org, movingFrom: null, ...limits });
 		expect((await SELF.fetch("http://example.com/_api/v1/admin/orgs")).status).toBe(401);
 		expect((await SELF.fetch("http://example.com/_api/v1/admin/orgs", { headers: { authorization: `Bearer ${key}` } })).status).toBe(403);
 
