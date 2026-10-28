@@ -37,6 +37,9 @@
 	"workers_dev": false,
 	"preview_urls": false,
 	"vars": {
+		// Global cutover remains disabled pending migration and ingress gates.
+		"PUBLICATION_READS": "false",
+		"STRONG_TOKEN_POLICIES": "false",
 		"SIGNING_KEY_NAME": "snowstead-1",
 		// Hosted caches must never fall back to the service's shared key.
 		"REQUIRE_CACHE_SIGNING_KEYS": "true",

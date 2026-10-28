@@ -1,0 +1,25 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "snowstead-download",
+	"main": "workers/download/src/index.ts",
+	"compatibility_date": "2026-10-26",
+	"workers_dev": false,
+	"preview_urls": false,
+	// Authorization MUST execute before every native byte-cache hit.
+	"cache": { "enabled": false },
+	// Routes are deliberately absent until the ingress inventory and migration
+	// gates pass. No smart placement: admission executes at the requesting edge.
+	"vars": {
+		"OWNER_HOST_SUFFIX": ".snowstead.com",
+		"CANONICAL_HOST": "cache.snowstead.com",
+		"BYTE_NAMESPACE": "snowstead-production-bytes-v2",
+		"NATIVE_MAX_BYTES": "0"
+	},
+	// No raw R2 bindings: these RPC entrypoints expose only reads.
+	"services": [
+		{ "binding": "BYTES", "service": "snowstead-bytes" },
+		{ "binding": "AUTHORITY", "service": "snowstead-storage", "entrypoint": "AuthorityReader" },
+		{ "binding": "PRIVATE_BYTES", "service": "snowstead-storage", "entrypoint": "PrivateReader" },
+		{ "binding": "PUBLIC_BYTES", "service": "snowstead-storage", "entrypoint": "PublicReader" }
+	]
+}

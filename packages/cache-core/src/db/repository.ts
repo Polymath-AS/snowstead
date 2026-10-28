@@ -18,6 +18,9 @@ import {
 	upstreamPaths,
 	bandwidthDaily,
 	goEntries,
+	publicationRevisions,
+	publicationPins,
+	publicationCaches,
 	DEFAULT_ORG_ID,
 } from "./schema.js";
 import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
@@ -48,6 +51,14 @@ async function first<T>(rows: Promise<T[]>): Promise<T | undefined> {
  */
 function anyOf(column: AnyColumn, values: readonly (string | number)[], type: "text" | "bigint" = "text"): SQL {
 	return sql`${column} = ANY(${sql.param([...values])}::${sql.raw(type)}[])`;
+}
+
+/** Serialize legacy mutations against first initialization; never dual-write. */
+async function requireLegacyCaches(db: Db, ids: readonly number[]): Promise<void> {
+	await db.select({ id: caches.id }).from(caches).where(inArray(caches.id, [...ids])).orderBy(caches.id).for("update");
+	const [initialized] = await db.select({ id: publicationCaches.cacheId }).from(publicationCaches)
+		.where(inArray(publicationCaches.cacheId, [...ids])).limit(1);
+	if (initialized) throw new Error("Cache requires the publication mutation protocol");
 }
 
 /** The first row of a write with RETURNING, which must produce one. */
@@ -105,10 +116,17 @@ export async function ensureCache(
 	isPublic = true,
 	orgId: string = DEFAULT_ORG_ID,
 ): Promise<{ cache: CacheAt; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning({ id: caches.id }));
-	const cache = await findCache(db, orgId, name);
-	if (!cache) throw new Error(`cache ${name} vanished`);
-	return { cache, created: inserted !== undefined };
+	return db.transaction(async (tx) => {
+		const [org] = await tx.select().from(orgs).where(eq(orgs.id, orgId)).for("update");
+		if (!org) throw new Error("Organization is missing");
+		const existing = await findCache(tx, orgId, name);
+		const [reserved] = await tx.select().from(publicationCaches).where(eq(publicationCaches.path, cachePath(org.slug, name)));
+		if (reserved && reserved.cacheId !== existing?.id) throw new Error("Retired publication aliases cannot be reused");
+		const inserted = await first(tx.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning({ id: caches.id }));
+		const cache = await findCache(tx, orgId, name);
+		if (!cache) throw new Error(`cache ${name} vanished`);
+		return { cache, created: inserted !== undefined };
+	});
 }
 
 /** Gives a cache its own signing key, once. */
@@ -141,6 +159,7 @@ export async function cacheHasGoEntries(db: Db, cacheId: number): Promise<boolea
 
 export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean): Promise<boolean> {
 	return db.transaction(async tx => {
+		await requireLegacyCaches(tx, [cacheId]);
 		// Go reservation and publication take this row's lock as well.
 		const [cache] = await tx.select().from(caches).where(eq(caches.id, cacheId)).for("update");
 		if (!cache || (cache.isPublic !== isPublic && await cacheHasGoEntries(tx, cacheId))) return false;
@@ -198,7 +217,12 @@ export async function findOrgHoldingSlug(db: Db, slug: string): Promise<Org | un
 
 /** Gives the org a new slug, keeping the old one while its objects move (slug-move.ts). */
 export async function startSlugMove(db: Db, id: string, slug: string, from: string): Promise<void> {
-	await db.update(orgs).set({ slug, movingFrom: from }).where(eq(orgs.id, id));
+	await db.transaction(async (tx) => {
+		await tx.select().from(orgs).where(eq(orgs.id, id)).for("update");
+		const rows = await tx.select({ id: caches.id }).from(caches).where(eq(caches.orgId, id));
+		if (rows.length) await requireLegacyCaches(tx, rows.map((row) => row.id));
+		await tx.update(orgs).set({ slug, movingFrom: from }).where(eq(orgs.id, id));
+	});
 }
 
 export async function finishSlugMove(db: Db, id: string): Promise<void> {
@@ -511,7 +535,10 @@ export async function createPublishedPath(
 		readonly signaturesJson: string;
 	},
 ): Promise<PublishedPath> {
-	return returned(db.insert(publishedPaths).values(params).returning());
+	return db.transaction(async (tx) => {
+		await requireLegacyCaches(tx, [params.cacheId]);
+		return returned(tx.insert(publishedPaths).values(params).returning());
+	});
 }
 
 export async function findPublishedHashes(
@@ -666,6 +693,7 @@ export async function deleteUnreferencedBlobObjects(
 			.from(blobObjects)
 			.where(and(
 				sql`not exists (select 1 from ${publishedPaths} where ${publishedPaths.blobObjectId} = ${blobObjects.id})`,
+				sql`not exists (select 1 from ${publicationRevisions} r join ${publicationPins} p on p.revision_id = r.id where r.blob_id = ${blobObjects.id})`,
 				sql`not exists (select 1 from ${uploadSessions} where ${uploadSessions.fileHash} = ${blobObjects.fileHash} and ${uploadSessions.compression} = ${blobObjects.compression} and ${uploadSessions.expiresAt} > ${now.toISOString()}::timestamptz)`,
 			))
 			.limit(limit);
@@ -692,13 +720,15 @@ export type PathSelection =
  */
 export async function touchPublishedPaths(db: Db, cacheId: number, storePathHashes: readonly string[], now: Date): Promise<void> {
 	if (storePathHashes.length === 0) return;
-	await db.update(publishedPaths)
-		.set({ lastPushedAt: now })
-		.where(and(
-			eq(publishedPaths.cacheId, cacheId),
-			anyOf(publishedPaths.storePathHash, storePathHashes),
+	await db.transaction(async (tx) => {
+		await tx.select({ id: caches.id }).from(caches).where(eq(caches.id, cacheId)).for("update");
+		const [lifecycle] = await tx.select().from(publicationCaches).where(eq(publicationCaches.cacheId, cacheId));
+		if (lifecycle && lifecycle.state !== "active") return;
+		await tx.update(publishedPaths).set({ lastPushedAt: now }).where(and(
+			eq(publishedPaths.cacheId, cacheId), anyOf(publishedPaths.storePathHash, storePathHashes),
 			lt(publishedPaths.lastPushedAt, new Date(now.getTime() - 24 * 60 * 60 * 1000)),
 		));
+	});
 }
 
 export async function listCachesWithRetention(db: Db): Promise<CacheAt[]> {
@@ -716,6 +746,7 @@ export async function deletePublishedPaths(
 	withdraw: (storePathHashes: readonly string[]) => Promise<void>,
 ): Promise<string[]> {
 	return db.transaction(async (tx) => {
+		await requireLegacyCaches(tx, [cacheId]);
 		const column = "lastPushedBefore" in which ? publishedPaths.lastPushedAt : publishedPaths.createdAt;
 		const before = "lastPushedBefore" in which ? which.lastPushedBefore : "before" in which ? which.before : undefined;
 		const match = "storePathHashes" in which
@@ -881,7 +912,7 @@ export async function listRevokedTokens(db: Db, now: Date): Promise<ApiToken[]> 
 	return db
 		.select()
 		.from(apiTokens)
-		.where(and(isNotNull(apiTokens.revokedAt), or(isNull(apiTokens.expiresAt), gt(apiTokens.expiresAt, now))));
+		.where(and(isNotNull(apiTokens.revokedAt), or(isNull(apiTokens.expiresAt), gt(apiTokens.expiresAt, new Date(now.getTime() - 60_000)))));
 }
 
 export async function deleteExpiredApiTokens(
@@ -890,7 +921,7 @@ export async function deleteExpiredApiTokens(
 ): Promise<number> {
 	const result = await db
 		.delete(apiTokens)
-		.where(lt(apiTokens.expiresAt, now));
+		.where(lt(apiTokens.expiresAt, new Date(now.getTime() - 60_000)));
 	return result.rowCount ?? 0;
 }
 
@@ -1009,12 +1040,12 @@ export async function createPublishedPaths(
 	rows: ReadonlyArray<Parameters<typeof createPublishedPath>[1]>,
 ): Promise<string[]> {
 	if (rows.length === 0) return [];
-	const inserted = await db
-		.insert(publishedPaths)
-		.values([...rows])
-		.onConflictDoNothing()
-		.returning({ storePathHash: publishedPaths.storePathHash });
-	return inserted.map((r) => r.storePathHash);
+	return db.transaction(async (tx) => {
+		await requireLegacyCaches(tx, [...new Set(rows.map((row) => row.cacheId))]);
+		const inserted = await tx.insert(publishedPaths).values([...rows]).onConflictDoNothing()
+			.returning({ storePathHash: publishedPaths.storePathHash });
+		return inserted.map((r) => r.storePathHash);
+	});
 }
 
 /** The hashes among `storePathHashes` known to be served by one of `upstreams`. */
@@ -1068,6 +1099,8 @@ export async function cacheHasNar(db: Db, cacheId: number, fileHash: string, com
 export async function deleteEmptyCache(db: Db, cacheId: number): Promise<{ deleted: boolean; staged: string[] }> {
 	return db.transaction(async (tx) => {
 		await tx.execute(sql`select id from ${caches} where ${caches.id} = ${cacheId} for update`);
+		const [lifecycle] = await tx.select().from(publicationCaches).where(eq(publicationCaches.cacheId, cacheId));
+		if (lifecycle && lifecycle.state !== "retired") return { deleted: false, staged: [] };
 		const [published] = await tx.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1);
 		if (published) return { deleted: false, staged: [] };
 

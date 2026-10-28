@@ -1,0 +1,14 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "snowstead-storage",
+	"main": "workers/storage/src/index.ts",
+	"compatibility_date": "2026-10-26",
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [],
+	"cache": { "enabled": false },
+	"r2_buckets": [
+		{ "binding": "PRIVATE_BUCKET", "bucket_name": "snowstead-private" },
+		{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-public" }
+	]
+}

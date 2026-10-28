@@ -31,6 +31,10 @@ export interface WorkerConfig {
 	readonly r2PublicBucketName: string;
 	readonly jwtSecret: string;
 	readonly adminSecret: string;
+	/** Global reader cutover, only after inventory/backfill and ingress isolation. */
+	readonly publicationReads?: boolean;
+	/** Enable the global positive token perimeter before any cache cutover. */
+	readonly strongTokenPolicies?: boolean;
 	/** Binary caches whose paths pushes skip, as Nix substituter URLs. */
 	readonly upstreams: readonly string[];
 	/** The CDN in front of the public bucket, when purges are configured. */
@@ -101,6 +105,8 @@ function readSettings(env: Env): Settings {
 		r2PublicBucketName: env.R2_PUBLIC_BUCKET_NAME || "snowstead-public",
 		jwtSecret: env.JWT_SECRET || "",
 		adminSecret: env.ADMIN_SECRET || "",
+		publicationReads: String(env.PUBLICATION_READS) === "true",
+		strongTokenPolicies: String(env.STRONG_TOKEN_POLICIES) === "true" || String(env.PUBLICATION_READS) === "true",
 		upstreams: (env.UPSTREAM_CACHES ?? "").split(/\s+/).filter(Boolean).map((u) => u.replace(/\/$/, "")),
 		cdn: env.CDN_ZONE_ID && env.CDN_PURGE_TOKEN && env.PUBLIC_CACHE_ORIGIN
 			? { zoneId: env.CDN_ZONE_ID, token: env.CDN_PURGE_TOKEN, origin: env.PUBLIC_CACHE_ORIGIN.replace(/\/$/, "") }

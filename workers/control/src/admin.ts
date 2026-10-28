@@ -6,7 +6,8 @@ import { signingPublicKey } from "@snowstead/cache-core/signing";
 import { newCacheKey } from "@snowstead/cache-core/cache-keys";
 import { deleteCachePaths } from "@snowstead/cache-core/path-deletion";
 import { purgeCache, purgeNarinfo, scheduleNarinfoPurge } from "@snowstead/cache-core/cdn";
-import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
+import { DEFAULT_ORG_ID, publicationCaches } from "@snowstead/cache-core/db/schema";
+import { eq } from "drizzle-orm";
 import { OrgSlug, cachePath } from "@snowstead/cache-core/cache-path";
 import {
 	createApiToken,
@@ -38,6 +39,8 @@ import { storeNarinfo } from "@snowstead/cache-core/narinfo";
 import { readyNewPath } from "./slug-move.js";
 import { PRIVATE_CACHES_REFUSED, setPrivate, isPrivateCache } from "@snowstead/cache-core/visibility";
 import { recordRevocation } from "@snowstead/cache-core/revocations";
+import { enrollToken } from "@snowstead/cache-core/token-policy";
+import { readPublicationCache, initializePublicationCache, changePublicationVisibility, retirePublicationCache } from "@snowstead/cache-core/publications";
 import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "@snowstead/cache-core/layout";
 import * as v from "valibot";
 import { CacheName, OrgId, StorePathHash, parseBody, parsed } from "@snowstead/cache-core/schemas";
@@ -146,6 +149,9 @@ export async function handleCreateToken(
 		createdBy: actor,
 		orgId: tokenOrg ?? null,
 	});
+	// Issuance has already committed. Preserve the only copy of the secret
+	// even when authority storage is unavailable; never claim it is ready.
+	const authority = await enrollToken(config, claims).catch(() => ({ state: "unavailable" as const }));
 
 	return jsonResponse({
 		token,
@@ -155,7 +161,8 @@ export async function handleCreateToken(
 		perms: dedupedPerms,
 		org: tokenOrg ?? null,
 		expiresAt,
-	}, 201);
+		...(authority.state === "committed" ? {} : { authority }),
+	}, authority.state === "committed" ? 201 : authority.state === "pending" ? 202 : 503);
 }
 
 /** All tokens, or one org's with `?org=`. */
@@ -205,10 +212,10 @@ export async function handleRevokeToken(
 	if (!token || token.revokedAt || (scope !== undefined && token.orgId !== scope)) {
 		return errorResponse("Token not found or already revoked", 404);
 	}
-	// KV first: requests check revocation there, and a failure after it still
-	// leaves the token refused, while the reverse would leave it working with
-	// the database saying otherwise.
-	await recordRevocation(config, jti, token.expiresAt);
+	// A confirmed permanent serving fence precedes the SQL audit record.
+	// Unknown external writes are pending, not a completed revocation.
+	const authority = await recordRevocation(config, jti);
+	if (authority.state !== "committed") return jsonResponse({ revoked: false, jti, authority }, authority.state === "pending" ? 202 : 503);
 	await revokeApiToken(config.db, jti, actor, body.reason);
 
 	return jsonResponse({ revoked: true, jti });
@@ -261,7 +268,24 @@ export async function handleCreateCache(
 		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 	}
 	const path = cachePath(orgRow.slug, name);
+	if (!existing) {
+		const [reserved] = await config.db.select().from(publicationCaches).where(eq(publicationCaches.path, path));
+		if (reserved) return errorResponse("This retired cache address cannot be reused", 409);
+	}
 	const changing = existing !== undefined && body.private !== undefined && existing.isPublic === body.private;
+	const lifecycle = existing && await readPublicationCache(config, existing.id);
+	if (existing && lifecycle) {
+		if (lifecycle.state !== "active" && lifecycle.state !== "changing") return errorResponse("Cache lifecycle transition is pending", 409);
+		let isPublic = existing.isPublic;
+		if (changing || lifecycle.state === "changing") {
+			const result = await changePublicationVisibility(config, existing, body.private === undefined ? lifecycle.targetPublic! : !body.private);
+			if (result.state !== "active") return jsonResponse({ pending: true, state: result.state }, 202);
+			isPublic = result.isPublic;
+		}
+		if (retention !== undefined) await setCacheRetention(config.db, existing.id, retention);
+		return jsonResponse({ name, path, private: !isPublic,
+			retentionDays: retention === undefined ? existing.retentionDays : retention, createdAt: existing.createdAt, created: false, changed: changing });
+	}
 	// A published path's objects live in its visibility's bucket; moving them
 	// is not supported yet, so only an empty cache can change.
 	if (changing && existing && (await cacheHasPaths(config.db, existing.id))) {
@@ -285,6 +309,12 @@ export async function handleCreateCache(
 		}
 		return result;
 	});
+	if (created && config.publicationReads) {
+		const initialized = await initializePublicationCache(config, cache);
+		if (retention !== undefined) await setCacheRetention(config.db, cache.id, retention);
+		return jsonResponse({ name, path, private: !initialized.isPublic, retentionDays: retention ?? cache.retentionDays,
+			createdAt: cache.createdAt, created: true, changed: false, state: initialized.state }, initialized.state === "active" ? 201 : 202);
+	}
 	if (created) {
 		if (!cache.isPublic) await setPrivate(config, path, true, { org, id: cache.id });
 	}
@@ -447,6 +477,9 @@ export async function handlePutOrg(request: Request, config: WorkerConfig, rawId
 	try {
 		if (existing && slug !== existing.slug) {
 			const orgCaches = await listCaches(config.db, id);
+			for (const cache of orgCaches) {
+				if (await readPublicationCache(config, cache.id)) return errorResponse("Migrated cache addresses cannot move until alias migration is supported", 409);
+			}
 			if (orgCaches.length > 0) {
 				const to = slug;
 				await Promise.all(orgCaches.map((c) => readyNewPath(config, c, cachePath(to, c.name))));
@@ -530,7 +563,8 @@ export async function handleSyncAuth(config: WorkerConfig): Promise<Response> {
 	}
 	const revoked = await listRevokedTokens(config.db, new Date());
 	for (const token of revoked) {
-		await recordRevocation(config, token.jti, token.expiresAt);
+		const authority = await recordRevocation(config, token.jti);
+		if (authority.state !== "committed") return jsonResponse({ synced: false, authority }, authority.state === "pending" ? 202 : 503);
 	}
 	return jsonResponse({ caches: caches.length, private: caches.filter((c) => !c.isPublic).length, revocations: revoked.length });
 }
@@ -686,6 +720,15 @@ export async function handleDeleteCache(config: WorkerConfig, rawName: string, o
 	if (cache instanceof Response) return cache;
 
 	let paths = 0;
+	if (await readPublicationCache(config, cache.id)) {
+		paths = cache.pathCount;
+		const retired = await retirePublicationCache(config, cache);
+		if (retired.state !== "retired") return jsonResponse({ deleted: false, pending: true, name }, 202);
+		const result = await deleteEmptyCache(config.db, cache.id);
+		if (!result.deleted) return jsonResponse({ deleted: false, pending: true, name }, 202);
+		await Promise.all(result.staged.map((key) => bucketForKey(config, key).delete(key).catch(() => undefined)));
+		return jsonResponse({ deleted: true, name, paths });
+	}
 	for (let attempt = 1; ; attempt++) {
 		for (;;) {
 			const deleted = await deleteCachePaths(config, cache, { before: new Date(Date.now() + 60_000), limit: MAX_DELETE_BATCH }, origin);

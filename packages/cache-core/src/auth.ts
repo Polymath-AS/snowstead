@@ -5,6 +5,7 @@ import { privateCache } from "./visibility.js";
 import { isRevoked } from "./revocations.js";
 import { findOrgApiKey } from "./db/repository.js";
 import { errorResponse } from "./responses.js";
+import { extractCredential, tokenIsActive } from "./credentials.js";
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
 function authError(message: string, status: number): Response {
@@ -48,29 +49,6 @@ async function timingSafeEqual(a: string, b: string): Promise<boolean> {
 	return diff === 0;
 }
 
-/**
- * The token in a request: a bearer token, or the password of HTTP Basic auth,
- * which is what Nix sends for a substituter listed in its netrc file.
- */
-function extractCredential(request: Request): string | undefined {
-	const header = request.headers.get("authorization");
-	if (!header) return undefined;
-	const space = header.indexOf(" ");
-	if (space === -1) return undefined;
-	const scheme = header.slice(0, space).toLowerCase();
-	const value = header.slice(space + 1).trim();
-	if (scheme === "bearer") return value || undefined;
-	if (scheme !== "basic") return undefined;
-	let decoded: string;
-	try {
-		decoded = atob(value);
-	} catch {
-		return undefined;
-	}
-	const colon = decoded.indexOf(":");
-	return colon === -1 ? undefined : decoded.slice(colon + 1) || undefined;
-}
-
 function readAuthError(message: string, status: number): Response {
 	// Basic, so Nix and curl answer with their netrc credentials.
 	return errorResponse(message, status, status === 401 ? { "www-authenticate": 'Basic realm="snowstead"' } : {});
@@ -92,7 +70,9 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 	const result = await verifyJwt(token, config.jwtSecret);
 	// The signature vouches for the claims; only revocation needs looking up,
 	// and that is in KV, so private reads never touch the database.
-	if (result.kind !== "ok" || (await isRevoked(config, result.claims.jti))) {
+	if (result.kind !== "ok" || (config.strongTokenPolicies
+		? !await tokenIsActive(config.bucket, result.claims)
+		: await isRevoked(config, result.claims.jti))) {
 		return readAuthError("Unauthorized", 401);
 	}
 	// The cache's org and id are in its private entry; one from before them
@@ -144,7 +124,9 @@ export async function authenticateWrite(
 	if (config.jwtSecret) {
 		const result = await verifyJwt(bearer, config.jwtSecret);
 		if (result.kind === "ok") {
-			if (await isRevoked(config, result.claims.jti)) {
+			if (config.strongTokenPolicies
+				? !await tokenIsActive(config.bucket, result.claims)
+				: await isRevoked(config, result.claims.jti)) {
 				return { kind: "error", response: authError("Unauthorized", 401) };
 			}
 			return { kind: "ok", identity: { kind: "jwt", claims: result.claims } };

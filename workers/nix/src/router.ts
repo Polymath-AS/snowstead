@@ -10,6 +10,7 @@ import { actorId, authenticateWrite, authorizeRead } from "@snowstead/cache-core
 import { privateCache } from "@snowstead/cache-core/visibility";
 import type { AuthIdentity } from "@snowstead/cache-core/auth";
 import { hasPermission } from "@snowstead/cache-core/jwt";
+import { handleDownload } from "@snowstead/cache-core/download";
 import { errorResponse } from "@snowstead/cache-core/responses";
 import { CacheName, Compression, FileHash, StorePathHash, valueOf } from "@snowstead/cache-core/schemas";
 import {
@@ -53,6 +54,15 @@ export async function handleRequest(
 			});
 		}
 		return handleWriteApi(request, config, url.pathname);
+	}
+
+	// Direct/binding ingress must enforce the same admission after cutover.
+	// Missing or denied v2 grants never fall back to a legacy read.
+	if (config.publicationReads) {
+		return handleDownload(request, {
+			authority: config.bucket, privateBucket: config.bucket,
+			publicBucket: config.publicBucket, jwtSecret: config.jwtSecret,
+		});
 	}
 
 	// Read paths (GET/HEAD only)

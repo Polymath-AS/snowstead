@@ -25,6 +25,7 @@ import {
 import type { UploadSession } from "@snowstead/cache-core/db/types";
 import type { CacheAt, OrgUsage } from "@snowstead/cache-core/db/repository";
 import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
+import { publishPublication, readPublicationCache } from "@snowstead/cache-core/publications";
 import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "@snowstead/cache-core/narinfo";
 import { scheduleNarinfoPurge } from "@snowstead/cache-core/cdn";
@@ -193,7 +194,9 @@ async function createSessions(
 	// Seed the ID → cache map so session-scoped requests skip the database lookup.
 	cacheById.set(cache.id, cache);
 	// Straight into the bucket the cache is served from.
-	const isPrivate = await isPrivateCache(config, cache.path);
+	const lifecycle = await readPublicationCache(config, cache.id);
+	if (lifecycle && lifecycle.state !== "active") return errorResponse("Cache publication transition is pending", 503);
+	const isPrivate = lifecycle ? !lifecycle.isPublic : await isPrivateCache(config, cache.path);
 	if (isPrivate && (await findOrg(config.db, cache.orgId))?.privateCaches === false) {
 		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 	}
@@ -538,6 +541,34 @@ async function publishSessions(
 		return sessions.map((s) => ({ sessionId: s.id, error: "Internal error", status: 500 }));
 	}
 	cacheById.set(cache.id, cache);
+	const lifecycle = await readPublicationCache(config, cache.id);
+	if (lifecycle) {
+		// An initialized cache never falls back to an unjournaled legacy write.
+		if (lifecycle.state !== "active") {
+			return sessions.map((s) => ({ sessionId: s.id, error: "Cache publication transition is pending", status: 503 }));
+		}
+		const blobs = await ensureBlobObjects(config.db, sessions.map((s) => ({
+			fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression,
+			r2Key: narKey(s.fileHash, s.compression, !cache.isPublic),
+		})));
+		const results: PublishResult[] = [];
+		for (const session of sessions) {
+			const blob = blobs.find((b) => b.fileHash === session.fileHash && b.compression === session.compression);
+			if (!blob) {
+				results.push({ sessionId: session.id, error: "Canonical upload is unavailable", status: 503 });
+				continue;
+			}
+			const result = await publishPublication(config, cache, {
+				storePathHash: session.storePathHash, storePath: session.storePath,
+				narHash: session.narHash, narSize: session.narSize, referencesJson: session.referencesJson,
+				deriver: session.deriver, system: session.system, signaturesJson: "[]",
+			}, blob);
+			results.push(result.state === "active"
+				? { sessionId: session.id, storePathHash: session.storePathHash, published: true, ...(result.alreadyExisted ? { alreadyExisted: true as const } : {}) }
+				: { sessionId: session.id, error: "Publication pending; retry the same upload session", status: 503 });
+		}
+		return results;
+	}
 	const visibility = await privateCache(config, cache.path);
 	const isPrivate = visibility.isPrivate;
 	const privateGen = visibility.isPrivate ? visibility.gen : undefined;
@@ -715,7 +746,9 @@ async function promoteStaged(config: WorkerConfig, session: UploadSession, parts
 		}
 	}
 	try {
-		const isPrivate = await isPrivateCache(config, cache.path);
+		const lifecycle = await readPublicationCache(config, cache.id);
+		if (lifecycle && lifecycle.state !== "active") return "Cache publication transition is pending";
+		const isPrivate = lifecycle ? !lifecycle.isPublic : await isPrivateCache(config, cache.path);
 		const target = narKey(session.fileHash, session.compression, isPrivate);
 		const bucket = bucketFor(config, isPrivate);
 		if (session.fileSize > PRESIGNED_PUT_MAX_BYTES) {

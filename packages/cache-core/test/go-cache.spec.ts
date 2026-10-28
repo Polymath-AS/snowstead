@@ -7,6 +7,7 @@ import { findCache, createBlobObject, createPublishedPath } from "../src/db/repo
 import { resolveConfig } from "../src/config.js";
 import { sweepGoEntries } from "../src/go-cache.js";
 import { handleRequest } from "../../../workers/go/src/router.js";
+import { initializePublicationCache, changePublicationVisibility } from "../src/publications.js";
 
 const db = testDb();
 const action = "a".repeat(64);
@@ -47,6 +48,26 @@ async function transfer(target: Target, credential?: string, body?: string, outp
 }
 
 describe("named Go caches", () => {
+	it("preserves the Go visibility barrier during publication lifecycle changes", async () => {
+		const target = await setup();
+		const writer = await token(target);
+		const config = resolveConfig(env);
+		try {
+			const cache = (await findCache(config.db, target.org, target.name))!;
+			expect((await initializePublicationCache(config, cache)).state).toBe("active");
+			expect((await transfer(target, writer, "go output")).status).toBe(201);
+			await expect(changePublicationVisibility(config, cache, false)).rejects.toThrow("Go uploads");
+			expect((await api(target.org, `/caches/${target.name}/go/reset`, "POST", {})).status).toBe(200);
+			const blocked = { ...config, bucket: new Proxy(config.bucket, { get(bucket, property) {
+				if (property === "put") return async () => { throw new Error("authority unavailable"); };
+				const value = Reflect.get(bucket, property);
+				return typeof value === "function" ? value.bind(bucket) : value;
+			} }) };
+			expect((await changePublicationVisibility(blocked, cache, false)).state).toBe("changing");
+			expect((await transfer(target, writer, "new output")).status).toBe(409);
+		} finally { await config.close(); }
+	});
+
 	it("completes a distinct upload while an earlier upload body is paused", async () => {
 		const target = await setup();
 		const writer = await token(target);

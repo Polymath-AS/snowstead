@@ -5,6 +5,7 @@ import { errorForLog } from "@snowstead/cache-core/logging";
 import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
 import { retryCdnPurges } from "@snowstead/cache-core/cdn";
+import { recoverPublicationWork } from "./publication-api.js";
 
 export default {
 	fetch(request, env, ctx): Promise<Response> {
@@ -15,6 +16,7 @@ export default {
 		const config = resolveConfig(env);
 		try {
 			if (event.cron === "*/5 * * * *") {
+				await recoverPublicationWork(config);
 				try {
 					console.log("CDN purge retry completed", { completed: await retryCdnPurges(config) });
 				} catch (err) {

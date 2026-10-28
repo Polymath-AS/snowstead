@@ -1,6 +1,9 @@
 import type { WorkerConfig } from "./config.js";
+import { and, eq, inArray, lt } from "drizzle-orm";
 import type { CacheAt, PathSelection } from "./db/repository.js";
-import { deletePublishedPaths } from "./db/repository.js";
+import { deletePublishedPaths, findCacheById } from "./db/repository.js";
+import { publishedPaths } from "./db/schema.js";
+import { readPublicationCache, withdrawPublications } from "./publications.js";
 import { bucketFor, narinfoKey } from "./layout.js";
 import { narinfoCacheKey } from "./narinfo.js";
 import { scheduleNarinfoPurge } from "./cdn.js";
@@ -23,6 +26,21 @@ export async function deleteCachePaths(
 	which: PathSelection,
 	origin?: string,
 ): Promise<string[]> {
+	const lifecycle = await readPublicationCache(config, cache.id);
+	if (lifecycle) {
+		const current = await findCacheById(config.db, cache.id);
+		if (!current) return [];
+		const named = "storePathHashes" in which ? which.storePathHashes : undefined;
+		const column = "lastPushedBefore" in which ? publishedPaths.lastPushedAt : publishedPaths.createdAt;
+		const before = "lastPushedBefore" in which ? which.lastPushedBefore : "before" in which ? which.before : undefined;
+		const selection = config.db.select({ hash: publishedPaths.storePathHash }).from(publishedPaths)
+			.where(and(eq(publishedPaths.cacheId, cache.id), named ? inArray(publishedPaths.storePathHash, [...named]) : lt(column, before!)))
+			.orderBy(column, publishedPaths.id);
+		const rows = await ("limit" in which ? selection.limit(which.limit) : selection);
+		const result = await withdrawPublications(config, current, named ?? rows.map((row) => row.hash));
+		if (result.pending.length) throw new Error("Path withdrawal is pending; retry the same selection");
+		return rows.map((row) => row.hash);
+	}
 	const isPrivate = !cache.isPublic;
 	const bucket = bucketFor(config, isPrivate);
 	const named = "storePathHashes" in which ? which.storePathHashes : [];
