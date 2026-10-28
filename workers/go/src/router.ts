@@ -2,7 +2,7 @@ import { and, eq, gt, isNotNull, lt } from "drizzle-orm";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
 import { caches as cacheRows, goEntries, orgs } from "@snowstead/cache-core/db/schema";
-import { findCacheByPath, findOrg, lockOrgStorageLimit, checkOrgStorageLimit } from "@snowstead/cache-core/db/repository";
+import { cacheColumns, findCacheByPath, findOrg, lockOrgStorageLimit, checkOrgStorageLimit } from "@snowstead/cache-core/db/repository";
 import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
 import { errorResponse } from "@snowstead/cache-core/responses";
@@ -20,14 +20,14 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 	const match = /^\/_api\/v1\/go\/([a-z0-9-]+)\/([a-z0-9-]+)\/v1\/actions\/([a-f0-9]{64})$/.exec(url.pathname);
 	if (!match) return errorResponse("Not Found", 404);
 	const read = request.method === "GET" || request.method === "HEAD";
-	const target = read ? (await config.db.select({ cache: cacheRows, entry: goEntries }).from(cacheRows)
+	const target = read ? (await config.db.select({ cache: cacheColumns, entry: goEntries }).from(cacheRows)
 		.innerJoin(orgs, eq(cacheRows.orgId, orgs.id))
 		.leftJoin(goEntries, and(eq(goEntries.cacheId, cacheRows.id), eq(goEntries.generation, cacheRows.goGeneration),
 			eq(goEntries.action, match[3]), gt(goEntries.expiresAt, new Date()), isNotNull(goEntries.uploadedAt)))
 		.where(and(eq(orgs.slug, match[1]), eq(cacheRows.name, match[2]))).limit(1))[0]
 		: { cache: await findCacheByPath(config.db, match[1], match[2]), entry: null };
 	// Keep the cache even when its action is missing: private misses still authenticate.
-	if (!target?.cache) return errorResponse("Not Found", 404);
+	if (!target?.cache || !target.cache.protocols.includes("go")) return errorResponse("Not Found", 404);
 	const { cache, entry } = target;
 	const write = request.method === "PUT";
 	if (!write && request.method !== "GET" && request.method !== "HEAD") {

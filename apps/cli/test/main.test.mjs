@@ -36,8 +36,10 @@ before(async () => {
       res.end(JSON.stringify({ missing: [], upstream: [hash] }));
     } else if (req.url === "/_api/v1/admin/tokens") {
       res.end(JSON.stringify({ ...data, token: "issued-token", jti: "new-token", expiresAt: "2027-01-01" }));
+    } else if (req.url === "/_api/v1/admin/caches" && req.method === "GET") {
+      res.end(JSON.stringify({ caches: [{ name: "main", private: false, protocols: ["nix", "go"], createdAt: "2026-01-01" }] }));
     } else {
-      res.end(JSON.stringify({ ...data, created: true }));
+      res.end(JSON.stringify({ protocols: ["nix"], ...data, created: true }));
     }
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -99,6 +101,36 @@ test("cache visibility flags leave the cache name positional", async () => {
     assert.deepEqual(requests.at(-1).body, { name: "main", private: isPrivate });
     assert.equal(requests.at(-1).token, "Bearer selected-token");
   }
+});
+
+test("cache creation requires explicit protocols and sends only the selected protocols", async () => {
+  for (const [value, protocols] of [["nix", ["nix"]], ["go", ["go"]], ["nix,go", ["nix", "go"]]]) {
+    const { stdout } = await run("cache", "create", "--protocols", value, "main", "--private");
+    assert.deepEqual(requests.at(-1).body, { name: "main", private: true, protocols });
+    assert.match(stdout, new RegExp(`protocols=${value}`));
+  }
+});
+
+test("cache set can add protocols alone or together with visibility", async () => {
+  await run("cache", "set", "main", "--protocols", "nix,go");
+  assert.deepEqual(requests.at(-1).body, { name: "main", protocols: ["nix", "go"] });
+  await run("cache", "set", "main", "--protocols", "go,nix", "--public");
+  assert.deepEqual(requests.at(-1).body, { name: "main", protocols: ["go", "nix"], private: false });
+  const { stdout } = await run("cache", "list");
+  assert.match(stdout, /main  public  protocols=nix,go  created=2026-01-01/);
+});
+
+test("cache protocol validation rejects missing, empty, duplicate and unknown selections before HTTP", async () => {
+  const count = requests.length;
+  await assert.rejects(run("cache", "create", "main"), /--protocols/);
+  await assert.rejects(run("cache", "set", "main"), /--protocols/);
+  for (const subcommand of ["create", "set"]) {
+    for (const value of ["", ",", "nix,", "nix,nix", "go,go", "nix,go,nix", "Nix", "rust"]) {
+      await assert.rejects(run("cache", subcommand, "main", "--protocols", value), /--protocols/);
+    }
+    await assert.rejects(run("cache", subcommand, "main", "--protocols", "nix", "--private", "--public"), /cannot be combined/);
+  }
+  assert.equal(requests.length, count);
 });
 
 test("push flags support both explicit paths and closure resolution", async () => {

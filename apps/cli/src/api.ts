@@ -339,16 +339,20 @@ export async function revokeToken(
 export interface CacheInfo {
   readonly name: string;
   readonly private: boolean;
+  readonly protocols: CacheProtocol[];
   readonly createdAt: string;
 }
 
-/** Creates a cache, or sets an existing one's visibility when `isPrivate` is given. */
+export type CacheProtocol = "nix" | "go";
+
+/** Creates or updates a cache. New caches require explicit protocols. */
 export async function createCache(
   client: ApiClient,
   name: string,
   isPrivate?: boolean,
+  protocols?: CacheProtocol[],
 ): Promise<CacheInfo & { readonly created: boolean; readonly changed: boolean }> {
-  const resp = await request(client, "POST", "/_api/v1/admin/caches", { name, private: isPrivate });
+  const resp = await request(client, "POST", "/_api/v1/admin/caches", { name, private: isPrivate, protocols });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`cache create failed (${resp.status}): ${text}`);

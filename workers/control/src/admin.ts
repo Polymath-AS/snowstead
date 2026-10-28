@@ -22,6 +22,7 @@ import {
 	deleteEmptyCache,
 	setCachePublic,
 	setCacheRetention,
+	setCacheProtocols,
 	findCache,
 	findOrgHoldingSlug,
 	startSlugMove,
@@ -228,6 +229,11 @@ const CacheSettings = v.object({
 		v.check((name) => !RESERVED_CACHE_NAMES.has(name), (issue) => `${String(issue.input)} is reserved`),
 	),
 	private: v.optional(v.boolean("private must be a boolean")),
+	protocols: v.optional(v.pipe(
+		v.array(v.picklist(["nix", "go"])),
+		v.nonEmpty("Choose at least one protocol: nix or go"),
+		v.check((values) => new Set(values).size === values.length, "protocols must not contain duplicates"),
+	)),
 });
 
 /**
@@ -253,6 +259,11 @@ export async function handleCreateCache(
 		return errorResponse(`no org ${org}`, 404);
 	}
 	const existing = await findCache(config.db, org, name);
+	const protocols = body.protocols ?? existing?.protocols;
+	if (protocols === undefined) return errorResponse("Choose at least one protocol: nix or go", 400);
+	if (existing?.protocols.some((protocol) => !protocols.includes(protocol))) {
+		return errorResponse("Enabled protocols cannot be removed", 409);
+	}
 	if (!existing && config.requireCacheSigningKeys && !await config.signingMasterKey()) {
 		return errorResponse("cache signing requires SIGNING_MASTER_KEY", 503);
 	}
@@ -278,13 +289,17 @@ export async function handleCreateCache(
 		await setPublicCacheInfo(config, path, false);
 	}
 	const { cache, created } = await config.db.transaction(async tx => {
-		const result = await ensureCache(tx, name, body.private !== true, org);
+		const result = await ensureCache(tx, name, body.private !== true, org, protocols);
 		if (result.created) {
 			const key = await newCacheKey(config, result.cache);
 			if (key) await setCacheSigningKey(tx, result.cache.id, key);
 		}
 		return result;
 	});
+	const protocolsChanged = protocols.some((protocol) => !cache.protocols.includes(protocol));
+	if (!created && body.protocols !== undefined && !await setCacheProtocols(config.db, cache.id, protocols)) {
+		return errorResponse("Enabled protocols cannot be removed; reload the cache settings", 409);
+	}
 	if (created) {
 		if (!cache.isPublic) await setPrivate(config, path, true, { org, id: cache.id });
 	}
@@ -298,7 +313,7 @@ export async function handleCreateCache(
 	}
 	if (isPublic) {
 		await setPrivate(config, path, false, { org, id: cache.id });
-		await setPublicCacheInfo(config, path, true);
+		if (protocols.includes("nix")) await setPublicCacheInfo(config, path, true);
 	}
 
 	let retentionDays = cache.retentionDays;
@@ -307,7 +322,7 @@ export async function handleCreateCache(
 		await setCacheRetention(config.db, cache.id, retentionDays);
 	}
 
-	return jsonResponse({ name: cache.name, path, private: !isPublic, retentionDays, createdAt: cache.createdAt, created, changed }, created ? 201 : 200);
+	return jsonResponse({ name: cache.name, path, private: !isPublic, protocols, retentionDays, createdAt: cache.createdAt, created, changed: changed || protocolsChanged }, created ? 201 : 200);
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -319,6 +334,7 @@ function cacheSummary(stats: CacheStats) {
 		path: stats.cache.path,
 		private: !stats.cache.isPublic,
 		org: stats.cache.orgId,
+		protocols: stats.cache.protocols,
 		retentionDays: stats.cache.retentionDays,
 		createdAt: stats.cache.createdAt,
 		paths: stats.paths,

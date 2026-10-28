@@ -47,7 +47,7 @@ echo "2. Creating a test cache"
 CACHE_NAME="smoke-$(date +%s)"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
   -H "authorization: Bearer $ADMIN_SECRET" -H "content-type: application/json" \
-  -d "{\"name\":\"$CACHE_NAME\"}" "$BASE/_api/v1/admin/caches")
+  -d "{\"name\":\"$CACHE_NAME\",\"protocols\":[\"nix\"]}" "$BASE/_api/v1/admin/caches")
 check "admin creates cache $CACHE_NAME" "201" "$STATUS"
 echo
 

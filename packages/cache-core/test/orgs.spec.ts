@@ -62,7 +62,7 @@ async function orgWithCache(storageLimit: number | null, isPrivate = false) {
 	const org = unique("org");
 	const cache = unique("cache");
 	expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit })).status).toBe(200);
-	expect((await orgApi(`/${org}/caches`, "POST", { name: cache, private: isPrivate })).status).toBe(201);
+	expect((await orgApi(`/${org}/caches`, "POST", { name: cache, private: isPrivate, protocols: ["nix"] })).status).toBe(201);
 	return { org, cache, token: await sign(["*"], ["push", "pull"], org) };
 }
 
@@ -157,14 +157,14 @@ describe("orgs", () => {
 		const a = await orgWithCache(null);
 		const b = await orgWithCache(null);
 
-		const res = await orgApi(`/${b.org}/caches`, "POST", { name: a.cache });
+		const res = await orgApi(`/${b.org}/caches`, "POST", { name: a.cache, protocols: ["nix"] });
 		expect(await res.json()).toMatchObject({ created: true, path: `${b.org}/${a.cache}` });
 		expect((await SELF.fetch(`http://example.com/${a.org}/${a.cache}/nix-cache-info`)).status).toBe(200);
 		expect((await SELF.fetch(`http://example.com/${b.org}/${a.cache}/nix-cache-info`)).status).toBe(200);
 	});
 
 	it("needs the org to exist before its caches", async () => {
-		expect((await admin("/caches", "POST", { name: unique("cache"), org: unique("org") })).status).toBe(404);
+		expect((await admin("/caches", "POST", { name: unique("cache"), org: unique("org"), protocols: ["nix"] })).status).toBe(404);
 	});
 });
 
@@ -203,7 +203,7 @@ describe("storage limit", () => {
 		expect((await createSessions(cache, [10 ** 12], token)).status).toBe(201);
 
 		const loose = unique("cache");
-		expect((await admin("/caches", "POST", { name: loose })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: loose, protocols: ["nix"] })).status).toBe(201);
 		expect((await createSessions(loose, [10 ** 12], "test-auth-token")).status).toBe(201);
 	});
 });
@@ -211,7 +211,7 @@ describe("storage limit", () => {
 describe("the default org", () => {
 	it("holds caches made without an org, at their name, as on a self-hosted install", async () => {
 		const name = unique("cache");
-		expect(await (await admin("/caches", "POST", { name })).json()).toMatchObject({ created: true, path: name });
+		expect(await (await admin("/caches", "POST", { name, protocols: ["nix"] })).json()).toMatchObject({ created: true, path: name });
 
 		const res = await orgApi(`/default/caches/${name}`);
 		expect(await res.json()).toMatchObject({ name, org: "default", path: name });
@@ -220,7 +220,7 @@ describe("the default org", () => {
 
 	it("is where a token without an org, or the push secret, pushes", async () => {
 		const name = unique("cache");
-		expect((await admin("/caches", "POST", { name })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name, protocols: ["nix"] })).status).toBe(201);
 		const other = await orgWithCache(null);
 		const orgless = await sign(["*"], ["push"]);
 
@@ -259,7 +259,7 @@ describe("org tokens", () => {
 
 	it("from the admin API are the default org's", async () => {
 		const name = unique("cache");
-		expect((await admin("/caches", "POST", { name })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name, protocols: ["nix"] })).status).toBe(201);
 		const res = await admin("/tokens", "POST", { subject: "ci", caches: [name], perms: ["push"] });
 		expect(await res.json()).toMatchObject({ org: "default" });
 	});
@@ -352,10 +352,10 @@ describe("token caches", () => {
 
 	it("take in caches a pattern matches, made before or after", async () => {
 		const { org } = await orgWithCache(null);
-		await orgApi(`/${org}/caches`, "POST", { name: "ci-linux" });
+		await orgApi(`/${org}/caches`, "POST", { name: "ci-linux", protocols: ["nix"] });
 		const { token: jwt } = await (await token(org, ["ci-*"])).json<{ token: string }>();
-		await orgApi(`/${org}/caches`, "POST", { name: "ci-darwin" });
-		await orgApi(`/${org}/caches`, "POST", { name: "release" });
+		await orgApi(`/${org}/caches`, "POST", { name: "ci-darwin", protocols: ["nix"] });
+		await orgApi(`/${org}/caches`, "POST", { name: "release", protocols: ["nix"] });
 
 		expect((await createSessions("ci-linux", [10], jwt)).status).toBe(201);
 		expect((await createSessions("ci-darwin", [10], jwt)).status).toBe(201);
@@ -473,11 +473,11 @@ describe("orgs without private-cache permission", () => {
 		expect(await refused.json()).toMatchObject({ error: expect.stringContaining("private caches") });
 		expect((await pull()).status).toBe(200);
 		expect((await SELF.fetch(`http://example.com/${org}/${cache}/nix-cache-info`)).status).toBe(401);
-		expect((await orgApi(`/${org}/caches`, "POST", { name: unique("cache"), private: true })).status).toBe(403);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: unique("cache"), private: true, protocols: ["nix"] })).status).toBe(403);
 		// Its own settings still change, and public caches are as before.
 		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, private: true, retentionDays: 30 })).status).toBe(200);
 		const open = unique("cache");
-		expect((await orgApi(`/${org}/caches`, "POST", { name: open })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: open, protocols: ["nix"] })).status).toBe(201);
 		expect((await pushTo(open)).status).toBe(201);
 
 		expect((await orgApi(`/${org}`, "PUT", { privateCaches: true })).status).toBe(200);

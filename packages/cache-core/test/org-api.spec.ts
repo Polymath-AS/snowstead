@@ -17,7 +17,7 @@ async function orgWithKey() {
 	const org = unique("org");
 	const cache = unique("cache");
 	expect((await orgApi(`/${org}`, OPERATOR, "PUT", { slug: org })).status).toBe(200);
-	expect((await orgApi(`/${org}/caches`, OPERATOR, "POST", { name: cache })).status).toBe(201);
+	expect((await orgApi(`/${org}/caches`, OPERATOR, "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 	const res = await orgApi(`/${org}/keys`, OPERATOR, "POST", { name: "terraform" });
 	expect(res.status).toBe(201);
 	const { id, key } = await res.json<{ id: string; key: string }>();
@@ -42,7 +42,7 @@ describe("org API keys", () => {
 		const list = await orgApi(`/${org}/caches`, key);
 		expect((await list.json<{ caches: { name: string }[] }>()).caches.map((c) => c.name)).toEqual([cache]);
 
-		const created = await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache") });
+		const created = await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache"), protocols: ["nix"] });
 		expect(await created.json()).toMatchObject({ created: true });
 	});
 
@@ -58,7 +58,7 @@ describe("org API keys", () => {
 		const del = await orgApi(`/${a.org}/caches/${b.cache}/paths/delete`, a.key, "POST", { before: new Date().toISOString() });
 		expect(del.status).toBe(404);
 		// A cache of the same name in its own org is its own.
-		expect(await (await orgApi(`/${a.org}/caches`, a.key, "POST", { name: b.cache })).json()).toMatchObject({ created: true, path: `${a.org}/${b.cache}` });
+		expect(await (await orgApi(`/${a.org}/caches`, a.key, "POST", { name: b.cache, protocols: ["nix"] })).json()).toMatchObject({ created: true, path: `${a.org}/${b.cache}` });
 	});
 
 	it("can't set the storage limit or make keys", async () => {
@@ -179,7 +179,7 @@ describe("org audit log", () => {
 			SELF.fetch(`http://example.com/_api/v1/orgs/${org}/caches`, {
 				method: "POST",
 				headers: { authorization: `Bearer ${credential}`, "content-type": "application/json", "x-snowstead-actor": "dev@example.com" },
-				body: JSON.stringify({ name }),
+				body: JSON.stringify({ name, protocols: ["nix"] }),
 			});
 		const byUser = unique("cache");
 		const byKey = unique("cache");
@@ -227,7 +227,7 @@ describe("org audit log", () => {
 	it("pages newest first", async () => {
 		const { org, key } = await orgWithKey();
 		for (let i = 0; i < 3; i++) {
-			await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache") });
+			await orgApi(`/${org}/caches`, key, "POST", { name: unique("cache"), protocols: ["nix"] });
 		}
 		const all = await auditUntil(org, key, (e) => e.filter((x) => x.action === "cache.create").length === 4);
 		const ids = all.map((e) => e.id);

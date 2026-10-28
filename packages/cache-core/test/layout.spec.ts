@@ -47,8 +47,8 @@ async function publish(cache: string): Promise<{ hash: string; fileHash: string;
 }
 
 beforeAll(async () => {
-	expect((await api("/admin/caches", { name: "open" }, "test-admin-secret")).status).toBe(201);
-	expect((await api("/admin/caches", { name: "closed", private: true }, "test-admin-secret")).status).toBe(201);
+	expect((await api("/admin/caches", { name: "open", protocols: ["nix"] }, "test-admin-secret")).status).toBe(201);
+	expect((await api("/admin/caches", { name: "closed", private: true, protocols: ["nix"] }, "test-admin-secret")).status).toBe(201);
 });
 
 describe("public caches live in the public bucket as Nix requests them", () => {
@@ -95,7 +95,7 @@ describe("private caches never reach the public bucket", () => {
 
 describe("cache names and visibility", () => {
 	it.each(["nar", "private"])("reserves %s", async (name) => {
-		expect((await api("/admin/caches", { name }, "test-admin-secret")).status).toBe(400);
+		expect((await api("/admin/caches", { name, protocols: ["nix"] }, "test-admin-secret")).status).toBe(400);
 	});
 
 	it("refuses to change the visibility of a cache with published paths", async () => {

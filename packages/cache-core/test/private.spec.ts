@@ -36,9 +36,9 @@ const basic = (secret: string) => `Basic ${btoa(`nix:${secret}`)}`;
 let pull: string;
 
 beforeAll(async () => {
-	expect((await admin("/caches", { name: PRIVATE, private: true })).status).toBe(201);
-	expect((await admin("/caches", { name: OTHER, private: true })).status).toBe(201);
-	expect((await admin("/caches", { name: PUBLIC })).status).toBe(201);
+	expect((await admin("/caches", { name: PRIVATE, private: true, protocols: ["nix"] })).status).toBe(201);
+	expect((await admin("/caches", { name: OTHER, private: true, protocols: ["nix"] })).status).toBe(201);
+	expect((await admin("/caches", { name: PUBLIC, protocols: ["nix"] })).status).toBe(201);
 
 	for (const name of [PRIVATE, PUBLIC]) {
 		const cache = await findCache(db, "default", name);
@@ -161,7 +161,7 @@ describe("private caches", () => {
 
 	it("pick up visibility set only in the database once synced", async () => {
 		const name = `synced-${crypto.randomUUID().slice(0, 8)}`;
-		expect((await admin("/caches", { name })).status).toBe(201);
+		expect((await admin("/caches", { name, protocols: ["nix"] })).status).toBe(201);
 		await setCachePublic(db, (await findCache(db, "default", name))?.id ?? 0, false);
 		expect((await read(`/${name}/nix-cache-info`)).status).toBe(200);
 
@@ -177,7 +177,7 @@ describe("private caches", () => {
 
 	it("switch visibility both ways", async () => {
 		const name = `flip-${crypto.randomUUID().slice(0, 8)}`;
-		expect((await admin("/caches", { name })).status).toBe(201);
+		expect((await admin("/caches", { name, protocols: ["nix"] })).status).toBe(201);
 		expect((await read(`/${name}/nix-cache-info`)).status).toBe(200);
 
 		const toPrivate = await admin("/caches", { name, private: true });
@@ -206,7 +206,7 @@ describe("private NARs", () => {
 		const name = "private-deleted";
 		const hash = "4".repeat(32);
 		const file = `e0${FILE_HASH.slice(2)}`;
-		expect((await admin("/caches", { name, private: true })).status).toBe(201);
+		expect((await admin("/caches", { name, private: true, protocols: ["nix"] })).status).toBe(201);
 		const cache = await findCache(db, "default", name);
 		const blob = await createBlobObject(db, { fileHash: file, fileSize: NAR.byteLength, compression: "zstd", r2Key: `nars/sha256/${file}/zstd.nar` });
 		await createPublishedPath(db, {

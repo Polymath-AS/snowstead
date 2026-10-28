@@ -64,18 +64,18 @@ async function lookup(cache: string, hashes: string[]): Promise<void> {
 describe("retention", () => {
 	it("is set per cache, and can be turned off", async () => {
 		const name = unique("ret");
-		expect(await (await orgApi("/caches", "POST", { name, retentionDays: 30 })).json()).toMatchObject({ retentionDays: 30 });
+		expect(await (await orgApi("/caches", "POST", { name, retentionDays: 30, protocols: ["nix"] })).json()).toMatchObject({ retentionDays: 30 });
 		expect(await (await orgApi(`/caches/${name}`)).json()).toMatchObject({ retentionDays: 30 });
 		expect(await (await orgApi("/caches", "POST", { name, retentionDays: null })).json()).toMatchObject({ retentionDays: null });
 	});
 
 	it.each([0, 1.5, 4000, "30"])("refuses %s days", async (retentionDays) => {
-		expect((await orgApi("/caches", "POST", { name: unique("ret"), retentionDays })).status).toBe(400);
+		expect((await orgApi("/caches", "POST", { name: unique("ret"), retentionDays, protocols: ["nix"] })).status).toBe(400);
 	});
 
 	it("deletes paths last pushed longer ago than it, and keeps the rest", async () => {
 		const name = unique("ret");
-		await orgApi("/caches", "POST", { name, retentionDays: 7 });
+		await orgApi("/caches", "POST", { name, retentionDays: 7, protocols: ["nix"] });
 		const [old, recent] = ["6".repeat(32), "7".repeat(32)];
 		await pathPushed(name, old, 10);
 		await pathPushed(name, recent, 2);
@@ -89,7 +89,7 @@ describe("retention", () => {
 
 	it("keeps an old path a push still has", async () => {
 		const name = unique("ret");
-		await orgApi("/caches", "POST", { name, retentionDays: 7 });
+		await orgApi("/caches", "POST", { name, retentionDays: 7, protocols: ["nix"] });
 		const hash = "8".repeat(32);
 		await pathPushed(name, hash, 10);
 
@@ -106,7 +106,7 @@ describe("retention", () => {
 
 	it("leaves a cache without it alone", async () => {
 		const name = unique("ret");
-		await orgApi("/caches", "POST", { name });
+		await orgApi("/caches", "POST", { name, protocols: ["nix"] });
 		const hash = "9".repeat(32);
 		await pathPushed(name, hash, 400);
 
@@ -116,7 +116,7 @@ describe("retention", () => {
 
 	it("is how long after the last push, not the first", async () => {
 		const name = unique("ret");
-		await orgApi("/caches", "POST", { name, retentionDays: 7 });
+		await orgApi("/caches", "POST", { name, retentionDays: 7, protocols: ["nix"] });
 		const hash = "a".repeat(32);
 		await pathPushed(name, hash, 3);
 		await db.execute(`update published_paths p set created_at = now() - interval '90 days' from caches c where c.id = p.cache_id and c.name = '${name}'`);

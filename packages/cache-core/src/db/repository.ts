@@ -1,4 +1,4 @@
-import { eq, and, or, notInArray, inArray, lt, gt, gte, isNull, isNotNull, sql, desc } from "drizzle-orm";
+import { eq, and, or, notInArray, inArray, lt, gt, gte, isNull, isNotNull, sql, desc, getTableColumns } from "drizzle-orm";
 import type { AnyColumn, SQL } from "drizzle-orm";
 import type { Db } from "./connection.js";
 import { cachePath } from "../cache-path.js";
@@ -6,6 +6,7 @@ import {
 	orgs,
 	orgApiKeys,
 	caches,
+	cacheProtocols,
 	cacheSigningKeys,
 	blobObjects,
 	publishedPaths,
@@ -62,12 +63,19 @@ async function returned<T>(rows: Promise<T[]>): Promise<T> {
 /** A cache, with the path it's served at (cache-path.ts). */
 export type CacheAt = Cache & { readonly path: string };
 
+/** Include enabled products without multiplying cache or artifact rows in joins. */
+export const cacheColumns = {
+	...getTableColumns(caches),
+	protocols: sql<Cache["protocols"]>`ARRAY(SELECT ${cacheProtocols.protocol} FROM ${cacheProtocols}
+		WHERE ${cacheProtocols.cacheId} = ${caches.id} ORDER BY ${cacheProtocols.protocol} DESC)`,
+};
+
 function located(row: { cache: Cache; slug: string }): CacheAt {
 	return { ...row.cache, path: cachePath(row.slug, row.cache.name) };
 }
 
 function selectCachesAt(db: Db) {
-	return db.select({ cache: caches, slug: orgs.slug }).from(caches).innerJoin(orgs, eq(caches.orgId, orgs.id));
+	return db.select({ cache: cacheColumns, slug: orgs.slug }).from(caches).innerJoin(orgs, eq(caches.orgId, orgs.id));
 }
 
 /** An org's cache by its name. */
@@ -92,10 +100,13 @@ export async function createCache(
 	db: Db,
 	name: string,
 ): Promise<CacheAt> {
-	await db.insert(caches).values({ name });
-	const cache = await findCache(db, DEFAULT_ORG_ID, name);
-	if (!cache) throw new Error(`cache ${name} vanished`);
-	return cache;
+	return db.transaction(async tx => {
+		const row = await returned(tx.insert(caches).values({ name }).returning({ id: caches.id }));
+		await tx.insert(cacheProtocols).values([{ cacheId: row.id, protocol: "nix" }, { cacheId: row.id, protocol: "go" }]);
+		const cache = await findCache(tx, DEFAULT_ORG_ID, name);
+		if (!cache) throw new Error(`cache ${name} vanished`);
+		return cache;
+	});
 }
 
 /** Creates the org's cache `name` unless it exists; returns the cache and whether it is new. */
@@ -104,11 +115,27 @@ export async function ensureCache(
 	name: string,
 	isPublic = true,
 	orgId: string = DEFAULT_ORG_ID,
+	protocols: Cache["protocols"] = ["nix", "go"],
 ): Promise<{ cache: CacheAt; created: boolean }> {
-	const inserted = await first(db.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning({ id: caches.id }));
-	const cache = await findCache(db, orgId, name);
-	if (!cache) throw new Error(`cache ${name} vanished`);
-	return { cache, created: inserted !== undefined };
+	return db.transaction(async tx => {
+		const inserted = await first(tx.insert(caches).values({ name, isPublic, orgId }).onConflictDoNothing().returning({ id: caches.id }));
+		if (inserted) await tx.insert(cacheProtocols).values(protocols.map(protocol => ({ cacheId: inserted.id, protocol })));
+		const cache = await findCache(tx, orgId, name);
+		if (!cache) throw new Error(`cache ${name} vanished`);
+		return { cache, created: inserted !== undefined };
+	});
+}
+
+/** Protocols may only be added, including when settings requests race. */
+export async function setCacheProtocols(db: Db, cacheId: number, protocols: Cache["protocols"]): Promise<boolean> {
+	return db.transaction(async tx => {
+		const cache = await first(tx.select({ id: caches.id }).from(caches).where(eq(caches.id, cacheId)).for("update"));
+		if (!cache) return false;
+		const enabled = await tx.select().from(cacheProtocols).where(eq(cacheProtocols.cacheId, cacheId));
+		if (enabled.some(row => !protocols.includes(row.protocol))) return false;
+		await tx.insert(cacheProtocols).values(protocols.map(protocol => ({ cacheId, protocol }))).onConflictDoNothing();
+		return true;
+	});
 }
 
 /** Gives a cache its own signing key, once. */
@@ -167,7 +194,7 @@ export interface CacheStats {
 export async function listCacheStats(db: Db, since: Date, filter: { name?: string; orgId?: string } = {}): Promise<CacheStats[]> {
 	const rows = await db
 		.select({
-			cache: caches,
+			cache: cacheColumns,
 			slug: orgs.slug,
 			paths: sql`${caches.pathCount}`.mapWith(Number),
 			size: sql`${caches.size}`.mapWith(Number),
@@ -485,7 +512,7 @@ export async function listPublishedPathsAfter(
 	limit: number,
 ): Promise<{ path: PublishedPath; blob: BlobObject; cache: CacheAt }[]> {
 	const rows = await db
-		.select({ path: publishedPaths, blob: blobObjects, cache: caches, slug: orgs.slug })
+		.select({ path: publishedPaths, blob: blobObjects, cache: cacheColumns, slug: orgs.slug })
 		.from(publishedPaths)
 		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
 		.innerJoin(caches, eq(publishedPaths.cacheId, caches.id))

@@ -43,6 +43,13 @@
       "when": 1793103118996,
       "tag": "0005_lucky_bromley",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793227522456,
+      "tag": "0006_cache_protocols",
+      "breakpoints": true
     }
   ]
 }

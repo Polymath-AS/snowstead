@@ -95,6 +95,13 @@ export async function handleRequest(
 		if (limited) return limited;
 	}
 
+	// Product admission precedes every cached response. Authenticate old
+	// private slug markers first so those addresses never become public.
+	const cache = await findCacheByPath(config.db, slug, cacheName);
+	if (!cache?.protocols.includes("nix")) {
+		return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+	}
+
 	if (rest[0] === "nix-cache-info" && rest.length === 1) {
 		const response = NIX_CACHE_INFO_RESPONSE();
 		if (isPrivate) response.headers.set("cache-control", "private, no-cache");
@@ -107,8 +114,7 @@ export async function handleRequest(
 		// Check before the NAR cache lookup, including for HEAD guards used by
 		// hosted gateways before their native CDN fetch.
 		if (!isPrivate) {
-			const cache = await findCacheByPath(config.db, slug, cacheName);
-			if (!cache?.isPublic || !(await cacheHasNar(config.db, cache.id, rest[1], rest[2].slice(0, -".nar".length)))) {
+			if (!cache.isPublic || !(await cacheHasNar(config.db, cache.id, rest[1], rest[2].slice(0, -".nar".length)))) {
 				return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
 			}
 		}

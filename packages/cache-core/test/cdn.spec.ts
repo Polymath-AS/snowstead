@@ -117,7 +117,7 @@ describe("CDN purges", () => {
 		const failed = api(503, false);
 		const outbound = vi.spyOn(globalThis, "fetch").mockImplementation(failed.fetcher);
 		try {
-			expect((await post("/admin/caches", { name }, "test-admin-secret")).status).toBe(201);
+			expect((await post("/admin/caches", { name, protocols: ["nix"] }, "test-admin-secret")).status).toBe(201);
 			const session = await (await post(`/caches/${name}/upload-sessions`, {
 				storePathHash: hash, storePath: `/nix/store/${hash}-purged`, narHash: `sha256:${"1".repeat(52)}`,
 				narSize: bytes.length, fileHash, fileSize: bytes.length, compression: "zstd",
@@ -152,7 +152,7 @@ describe("org-scoped manual purges", () => {
 		});
 		for (const id of [org, other]) {
 			expect((await setup(id, { slug: id })).status).toBe(200);
-			expect((await setup(`${id}/caches`, { name: "main" })).status).toBe(201);
+			expect((await setup(`${id}/caches`, { name: "main", protocols: ["nix"] })).status).toBe(201);
 		}
 		const key = await (await setup(`${org}/keys`, { name: "purger" })).json<{ key: string }>();
 		const purge = (id: string, body: unknown) => handleRequest(new Request(`http://example.com/_api/v1/orgs/${id}/caches/main/purge`, {
