@@ -124,6 +124,25 @@ describe("private caches", () => {
 		expect((await read(nar(PRIVATE))).status).toBe(401);
 	});
 
+	it("authorizes conditional metadata and HEAD before using cached validators", async () => {
+		const url = `http://example.com/${PRIVATE}/${HASH}.narinfo`;
+		const initial = await SELF.fetch(url, { headers: { authorization: basic(pull), "x-snowstead-cdn-read": "1" } });
+		expect(initial.status).toBe(200);
+		expect(initial.headers.get("x-snowstead-cdn-read")).toBeNull();
+		const etag = initial.headers.get("etag")!;
+		expect(etag).toBeTruthy();
+		await initial.text();
+		const wrongCache = (await token([OTHER], ["pull"])).token;
+		for (const method of ["GET", "HEAD"]) {
+			for (const [auth, status] of [[basic(pull), 304], [basic(wrongCache), 403], ["", 401]] as const) {
+				const response = await SELF.fetch(url, { method, headers: { authorization: auth, "if-none-match": etag, "x-snowstead-cdn-read": "1" } });
+				expect(response.status).toBe(status);
+				if (status === 304) expect(response.headers.get("cache-control")).toBe("private, no-cache");
+				await response.text();
+			}
+		}
+	});
+
 	it("refuse tokens without pull on this cache", async () => {
 		const pushOnly = (await token([PRIVATE], ["push"])).token;
 		const otherCache = (await token([OTHER], ["pull"])).token;
@@ -164,6 +183,13 @@ describe("private caches", () => {
 		expect((await admin("/caches", { name, protocols: ["nix"] })).status).toBe(201);
 		await setCachePublic(db, (await findCache(db, "default", name))?.id ?? 0, false);
 		expect((await read(`/${name}/nix-cache-info`)).status).toBe(200);
+		for (const method of ["GET", "HEAD"]) {
+			for (const suffix of ["nix-cache-info", `${HASH}.narinfo`, `nar/${fileHash(PRIVATE)}/zstd.nar`]) {
+				const response = await SELF.fetch(`http://example.com/${name}/${suffix}`, { method, headers: { "x-snowstead-cdn-read": "1" } });
+				expect(response.status).toBe(404);
+				expect(response.headers.get("x-snowstead-cdn-read")).toBeNull();
+			}
+		}
 
 		expect((await admin("/auth/sync", {})).status).toBe(200);
 		expect((await read(`/${name}/nix-cache-info`)).status).toBe(401);

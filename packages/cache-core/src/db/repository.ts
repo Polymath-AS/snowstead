@@ -252,8 +252,9 @@ export async function putOrg(db: Db, id: string, slug: string, limits: Partial<P
 	return (await db.update(orgs).set({ slug, ...limits }).where(eq(orgs.id, id)).returning({ id: orgs.id })).length > 0;
 }
 
-export async function listOrgs(db: Db): Promise<Pick<Org, "id" | "slug" | "storageLimit" | "privateCaches" | "customSigningKeys">[]> {
-	return db.select({ id: orgs.id, slug: orgs.slug, storageLimit: orgs.storageLimit, privateCaches: orgs.privateCaches, customSigningKeys: orgs.customSigningKeys }).from(orgs).orderBy(orgs.id);
+export async function listOrgs(db: Db, ids?: readonly string[]): Promise<Pick<Org, "id" | "slug" | "movingFrom" | "storageLimit" | "privateCaches" | "customSigningKeys">[]> {
+	return db.select({ id: orgs.id, slug: orgs.slug, movingFrom: orgs.movingFrom, storageLimit: orgs.storageLimit, privateCaches: orgs.privateCaches, customSigningKeys: orgs.customSigningKeys }).from(orgs)
+		.where(ids === undefined ? undefined : inArray(orgs.id, [...ids])).orderBy(orgs.id);
 }
 
 export async function createOrgApiKey(

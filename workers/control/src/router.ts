@@ -2,7 +2,7 @@ import type { WorkerConfig } from "@snowstead/cache-core/config";
 import { findOrg, globalOverview, listOrgs } from "@snowstead/cache-core/db/repository";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { actorId, authenticateAdmin } from "@snowstead/cache-core/auth";
-import { jsonResponse } from "@snowstead/cache-core/responses";
+import { errorResponse, jsonResponse } from "@snowstead/cache-core/responses";
 import { handleOrgApi } from "./org-api.js";
 import { handleCreateToken, handleListTokens, handleRevokeToken, handleCreateCache, handleListCaches, handleGetCache, handleBackfillNarinfo, handleSyncAuth, handleDeletePaths, handlePurgeCache, handleDeleteCache } from "./admin.js";
 
@@ -33,7 +33,19 @@ async function handleAdminApi(request: Request, config: WorkerConfig, pathname: 
 	if (authResult.kind === "error") return authResult.response;
 
 	if (pathname === "/_api/v1/admin/orgs" && request.method === "GET") {
-		return jsonResponse({ orgs: await listOrgs(config.db) });
+		const { search, searchParams } = new URL(request.url);
+		if (search.length > 8192) return errorResponse("Organization filter is too long", 414);
+		// No query means operator inventory. Any supplied query must explicitly
+		// name 1–50 IDs: typos or empty filters must never broaden into inventory.
+		// URL.search loses a bare ?, and searchParams drops empty & components.
+		const ids = request.url.includes("?") ? searchParams.getAll("id") : undefined;
+		if (ids !== undefined && (ids.length === 0 || ids.length > 50
+			|| search.slice(1).split("&").includes("")
+			|| [...searchParams.keys()].some(key => key !== "id")
+			|| ids.some(id => !/^[A-Za-z0-9_-]{1,128}$/.test(id)))) {
+			return errorResponse("Use 1 to 50 id parameters, each containing 1 to 128 letters, numbers, underscores, or dashes", 400);
+		}
+		return jsonResponse({ orgs: await listOrgs(config.db, ids) });
 	}
 	if (pathname === "/_api/v1/admin/overview" && request.method === "GET") {
 		return jsonResponse(await globalOverview(config.db, new Date()));

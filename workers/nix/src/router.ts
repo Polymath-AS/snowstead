@@ -101,8 +101,15 @@ export async function handleRequest(
 	if (!cache?.protocols.includes("nix")) {
 		return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
 	}
+	// A stale public KV marker must never authorize a CDN handoff once the
+	// authoritative cache row is private. The caller can retry after KV catches up.
+	if (!isPrivate && !cache.isPublic && request.headers.get("x-snowstead-cdn-read") === "1") {
+		return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+	}
 
 	if (rest[0] === "nix-cache-info" && rest.length === 1) {
+		const handoff = !isPrivate && publicCdnRead(request);
+		if (handoff) return handoff;
 		const response = NIX_CACHE_INFO_RESPONSE();
 		if (isPrivate) response.headers.set("cache-control", "private, no-cache");
 		return response;
@@ -129,9 +136,6 @@ export async function handleRequest(
 	return new Response("Not Found", { status: 404 });
 }
 
-// Reused across requests — avoids per-request allocation
-const textEncoder = new TextEncoder();
-
 // Pre-computed static nix-cache-info body — avoids per-request string allocation
 const NIX_CACHE_INFO_BODY = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
 
@@ -145,6 +149,12 @@ function NIX_CACHE_INFO_RESPONSE(): Response {
 // narinfo lookups are misses. Cache 404s briefly at the edge to keep that
 // negative-lookup storm off the database. Short TTL so newly published paths appear quickly.
 const NARINFO_NEGATIVE_TTL_SECONDS = 60;
+
+/** Admission-only opt-in for hosted gateways. Never a cacheable authorization. */
+function publicCdnRead(request: Request): Response | undefined {
+	if (request.headers.get("x-snowstead-cdn-read") !== "1") return undefined;
+	return new Response(null, { status: 204, headers: { "x-snowstead-cdn-read": "1", "cache-control": "no-store" } });
+}
 
 /**
  * What a client may cache: private caches' responses only by the client
@@ -161,6 +171,31 @@ function forClient(response: Response, isPrivate: boolean, method: string): Resp
 	return new Response(method === "HEAD" ? null : response.body, { status: response.status, headers });
 }
 
+/** Apply validators to the stored representation, also on Cache API hits. */
+function narinfoForClient(response: Response, isPrivate: boolean, request: Request): Response {
+	if (response.ok) {
+		const etag = response.headers.get("etag");
+		const modified = Date.parse(response.headers.get("last-modified") ?? "");
+		const matches = (value: string, weak: boolean) => value.split(",").some((tag) => {
+			const candidate = tag.trim();
+			return candidate === "*" || (etag !== null && (weak ? candidate.replace(/^W\//, "") === etag.replace(/^W\//, "") : candidate === etag));
+		});
+		const match = request.headers.get("if-match");
+		const none = request.headers.get("if-none-match");
+		const unmodified = Date.parse(request.headers.get("if-unmodified-since") ?? "");
+		const since = Date.parse(request.headers.get("if-modified-since") ?? "");
+		const failed = match !== null ? !matches(match, false) : modified > unmodified;
+		const unchanged = none !== null ? matches(none, true) : modified <= since;
+		if (failed || unchanged) {
+			void response.body?.cancel();
+			const headers = new Headers(response.headers);
+			headers.delete("content-length");
+			return forClient(new Response(null, { status: failed ? 412 : 304, headers }), isPrivate, request.method);
+		}
+	}
+	return forClient(response, isPrivate, request.method);
+}
+
 async function handleNarinfo(
 	config: WorkerConfig,
 	cachePath: string,
@@ -174,18 +209,26 @@ async function handleNarinfo(
 	if (storePathHash === undefined) {
 		return new Response("Not Found", { status: 404 });
 	}
+	// Public metadata is scoped by its R2 key. Product admission has already
+	// passed; let the CDN resolve existence, validators, and negative entries.
+	const handoff = !isPrivate && publicCdnRead(request);
+	if (handoff) return handoff;
 
 	// HEAD and GET share the entry.
 	const cacheKey = narinfoCacheKey(new URL(request.url).origin, cachePath, storePathHash, privateGen);
 	const cache = await caches.open("snowstead-narinfo");
 	const cached = await cache.match(cacheKey);
 	if (cached) {
-		return forClient(cached, isPrivate, method);
+		return narinfoForClient(cached, isPrivate, request);
 	}
 
 	// The narinfo was rendered and signed at publish. An unknown cache and an
 	// unpublished path are both a missing object: a (negatively cached) 404.
-	const object = await bucketFor(config, isPrivate).get(narinfoKey(cachePath, storePathHash, isPrivate));
+	const bucket = bucketFor(config, isPrivate);
+	const key = narinfoKey(cachePath, storePathHash, isPrivate);
+	// A cold HEAD needs only metadata. Do not download, decode, and cache a
+	// body merely to throw it away (nor populate the GET cache with no body).
+	const object = await (method === "HEAD" ? bucket.head(key) : bucket.get(key));
 	if (!object) {
 		const notFound = () =>
 			new Response("Not Found", { status: 404, headers: { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` } });
@@ -197,18 +240,19 @@ async function handleNarinfo(
 		return forClient(notFound(), isPrivate, method);
 	}
 
-	const body = await object.text();
-	const response = new Response(body, {
+	const response = new Response(method === "HEAD" ? null : (object as R2ObjectBody).body, {
 		headers: {
 			"content-type": "text/x-nix-narinfo",
-			"content-length": String(textEncoder.encode(body).byteLength),
+			"content-length": String(object.size),
 			"cache-control": NARINFO_CACHE_CONTROL,
+			"etag": object.httpEtag,
+			"last-modified": object.uploaded.toUTCString(),
 		},
 	});
-	if (config.ctx) {
+	if (config.ctx && method !== "HEAD") {
 		config.ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	}
-	return forClient(response, isPrivate, method);
+	return narinfoForClient(response, isPrivate, request);
 }
 
 /** The private cache a NAR is asked for through, past authorization. */
@@ -241,6 +285,9 @@ async function handleNarDownload(
 	}
 
 	const isPrivate = scope !== undefined;
+	// Scoped public requests arrive only after the fresh DB membership check.
+	const handoff = !isPrivate && publicCdnRead(request);
+	if (handoff) return handoff;
 	// NAR keys are content-addressed, so the key comes from the URL alone.
 	const r2Key = narKey(fileHash, compression, isPrivate);
 	const bucket = bucketFor(config, isPrivate);

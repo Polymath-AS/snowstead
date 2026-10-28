@@ -74,6 +74,10 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 				const put = () => call(go, { method: "PUT", headers: goHeaders, body: data });
 				for (const method of ["GET", "HEAD"]) {
 					assert.equal((await call(`${nix}/nix-cache-info`, { method, headers })).status, protocol === "nix" ? 200 : 404);
+					const admitted = await call(`${nix}/nix-cache-info`, { method, headers: { ...headers, "x-snowstead-cdn-read": "1" } });
+					assert.equal(admitted.status, protocol !== "nix" ? 404 : privateCache ? 200 : 204);
+					assert.equal(admitted.headers.get("x-snowstead-cdn-read"), protocol === "nix" && !privateCache ? "1" : null);
+					await admitted.arrayBuffer();
 					assert.equal((await call(go, { method, headers })).status, 404);
 				}
 				assert.equal((await put()).status, protocol === "go" ? 201 : 404);
@@ -138,6 +142,17 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 			assert.ok(narinfo.includes(`Sig: ${publicKey.split(":")[0]}:`));
 			const relative = /^URL: (.+)$/m.exec(narinfo)[1];
 			const artifactUrl = new URL(relative, new URL(path, url));
+			const scopedNar = `/${privateCache ? "private/" : ""}${cache}/nar/${fileHash}/zstd.nar`;
+			for (const method of ["GET", "HEAD"]) {
+				for (const resource of [path, scopedNar]) {
+					const response = await call(resource, { method, headers: { ...headers, "x-snowstead-cdn-read": "1" } });
+					assert.equal(response.status, privateCache ? 200 : 204);
+					assert.equal(response.headers.get("x-snowstead-cdn-read"), privateCache ? null : "1");
+					if (!privateCache) assert.equal(response.headers.get("cache-control"), "no-store");
+					const body = Buffer.from(await response.arrayBuffer());
+					assert.deepEqual(body, !privateCache || method === "HEAD" ? Buffer.alloc(0) : resource === path ? Buffer.from(narinfo) : bytes);
+				}
+			}
 			for (let pass = 0; pass < 2; pass++) {
 				const response = await fetch(artifactUrl, { headers });
 				assert.equal(response.status, 200);
@@ -183,6 +198,13 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 				await new Promise(resolve => setTimeout(resolve, 31_000));
 				assert.equal((await call(path, { headers })).status, 401);
 				assert.equal((await fetch(artifactUrl, { headers })).status, 401);
+				assert.equal((await call(path, { headers: { ...headers, "x-snowstead-cdn-read": "1" } })).status, 401);
+			} else {
+				await api(`/admin/caches/${cache}/paths/delete`, { storePathHashes: [hash] });
+				for (const method of ["GET", "HEAD"]) {
+					assert.equal((await call(scopedNar, { method, headers: { "x-snowstead-cdn-read": "1" } })).status, 404);
+					assert.equal((await call(path, { method })).status, 404);
+				}
 			}
 		}
 		// Each service rejects the other service's routes even when called directly.
