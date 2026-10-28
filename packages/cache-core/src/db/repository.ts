@@ -327,6 +327,31 @@ export async function bandwidthThisMonth(db: Db, orgId: string, now: Date): Prom
 }
 
 /**
+ * Serialize finite-quota reservations across protocols. Call inside the
+ * transaction that records the reservation, before taking any cache locks.
+ * A limit set on an unlimited org meanwhile applies from the next push.
+ */
+export async function lockOrgStorageLimit(tx: Db, org: Org): Promise<Org | undefined> {
+	if (org.storageLimit === null) return org;
+	await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + org.id}, 0))`);
+	return findOrg(tx, org.id);
+}
+
+/** Check live Nix and Go usage while holding the finite-quota reservation lock. */
+export async function checkOrgStorageLimit(
+	db: Db,
+	org: Org,
+	requested: number,
+): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
+	if (org.storageLimit === null) return undefined;
+	const usage = await orgUsage(db, org.id, new Date());
+	if (usage.used + usage.pending + requested > org.storageLimit) {
+		return { ...usage, limit: org.storageLimit, requested };
+	}
+	return undefined;
+}
+
+/**
  * Records upload sessions for an org's cache unless they would take it past
  * its storage limit; returns the usage that refused them, or undefined once
  * they are recorded. Locked per org, so concurrent pushes can't both fit
@@ -338,22 +363,16 @@ export async function createUploadSessionsWithinLimit(
 	orgId: string,
 	rows: Parameters<typeof createUploadSessions>[1],
 ): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
-	if ((await findOrg(db, orgId))?.storageLimit == null) {
+	const org = await findOrg(db, orgId);
+	if (org?.storageLimit == null) {
 		// A limit set meanwhile applies from the next push.
 		await createUploadSessions(db, rows);
 		return undefined;
 	}
 	return db.transaction(async (tx) => {
-		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + orgId}, 0))`);
-		const org = await findOrg(tx, orgId);
-		const limit = org?.storageLimit ?? null;
-		if (limit !== null) {
-			const usage = await orgUsage(tx, orgId, new Date());
-			const requested = rows.reduce((sum, r) => sum + r.fileSize, 0);
-			if (usage.used + usage.pending + requested > limit) {
-				return { ...usage, limit, requested };
-			}
-		}
+		const current = await lockOrgStorageLimit(tx, org);
+		const refused = current && await checkOrgStorageLimit(tx, current, rows.reduce((sum, r) => sum + r.fileSize, 0));
+		if (refused) return refused;
 		await createUploadSessions(tx, rows);
 		return undefined;
 	});

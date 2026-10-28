@@ -1,8 +1,8 @@
-import { and, eq, gt, isNotNull, lt, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, lt } from "drizzle-orm";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
 import { caches as cacheRows, goEntries, orgs } from "@snowstead/cache-core/db/schema";
-import { findCacheByPath, findOrg, orgUsage } from "@snowstead/cache-core/db/repository";
+import { findCacheByPath, findOrg, lockOrgStorageLimit, checkOrgStorageLimit } from "@snowstead/cache-core/db/repository";
 import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
 import { errorResponse } from "@snowstead/cache-core/responses";
@@ -92,13 +92,14 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 	// Reserve quota and a durable cleanup record before R2: a disconnect or a
 	// failed SQL finalization cannot leave an untracked object behind.
 	const reservation = await config.db.transaction(async (tx) => {
-		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + cache.orgId}, 0))`);
-		// The org lock serializes reservations; a shared cache lock fences
+		const initialOrg = await findOrg(tx, cache.orgId);
+		if (!initialOrg) return errorResponse("Not Found", 404);
+		const org = await lockOrgStorageLimit(tx, initialOrg);
+		if (!org) return errorResponse("Not Found", 404);
+		// Only finite quotas need the org lock. The shared cache lock fences
 		// reset/delete/visibility without waiting for unrelated publishing bodies.
 		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
 		if (!current || current.goGeneration !== cache.goGeneration) return errorResponse("Cache changed; retry", 409);
-		const org = await findOrg(tx, cache.orgId);
-		if (!org) return errorResponse("Not Found", 404);
 		if (!current.isPublic && !org.privateCaches) return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 		const now = new Date();
 		// Expired entries lose their action slot, not their cleanup record/key.
@@ -106,19 +107,19 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 			eq(goEntries.generation, cache.goGeneration), eq(goEntries.action, action), lt(goEntries.expiresAt, now)));
 		const [existing] = await tx.select().from(goEntries).where(and(activeGoEntries(cache, now), eq(goEntries.action, action)));
 		if (existing) return existing;
-		if (org.storageLimit !== null) {
-			const usage = await orgUsage(tx, cache.orgId, now);
-			if (usage.used + usage.pending + size > org.storageLimit) return errorResponse("Not enough storage", 413);
-		}
+		if (await checkOrgStorageLimit(tx, org, size)) return errorResponse("Not enough storage", 413);
 		const id = crypto.randomUUID();
 		const [entry] = await tx.insert(goEntries).values({ id, cacheId: cache.id, generation: cache.goGeneration, action,
 			r2Key: `go/${cache.id}/${cache.goGeneration}/${action}/${id}`, output, size,
 			expiresAt: new Date(now.getTime() + 3600_000),
-		}).returning();
-		return entry;
+		}).onConflictDoNothing({ target: [goEntries.cacheId, goEntries.generation, goEntries.action] }).returning();
+		if (entry) return entry;
+		// An unlimited org has no reservation mutex: the unique action index
+		// chooses a winner, and this fresh statement sees its committed row.
+		const [winner] = await tx.select().from(goEntries).where(and(activeGoEntries(cache), eq(goEntries.action, action)));
+		return winner ?? errorResponse("Action changed; retry", 409);
 	});
 	if (reservation instanceof Response) return reservation;
-	if (!reservation) throw new Error("Go reservation returned no row");
 	return config.db.transaction(async (tx) => {
 		// Reset and cache deletion wait for a transfer already publishing. GC
 		// locks the entry too, so it cannot remove an in-flight R2 put.
