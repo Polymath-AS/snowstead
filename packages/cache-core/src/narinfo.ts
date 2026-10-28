@@ -1,5 +1,6 @@
 import { NarHash, valueOf } from "./schemas.js";
 import type { PublishedPath, BlobObject } from "./db/types.js";
+import type { CacheAt } from "./db/repository.js";
 import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
 import { signingKeyFor } from "./cache-keys.js";
@@ -71,13 +72,13 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
  */
 export async function storeNarinfo(
 	config: WorkerConfig,
-	cache: { readonly id: number; readonly path: string },
+	cache: CacheAt,
 	path: NarinfoPath,
 	blob: NarinfoBlob,
 	isPrivate: boolean,
 ): Promise<void> {
 	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
-	const body = await signedNarinfo(await signingKeyFor(config, cache.id), path, blob, isPrivate, cache.path);
+	const body = await signedNarinfo(await signingKeyFor(config, cache), path, blob, isPrivate, cache.path);
 	await bucketFor(config, isPrivate).put(narinfoKey(cache.path, path.storePathHash, isPrivate), body, {
 		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: NARINFO_CACHE_CONTROL },
 	});

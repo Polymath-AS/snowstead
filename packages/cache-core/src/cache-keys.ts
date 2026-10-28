@@ -1,6 +1,5 @@
 import type { WorkerConfig } from "./config.js";
 import type { Cache } from "./db/types.js";
-import { findCacheById } from "./db/repository.js";
 import { importSigningKey } from "./signing.js";
 
 /**
@@ -155,17 +154,17 @@ async function unseal(config: WorkerConfig, cache: Cache): Promise<SigningKey> {
 	}
 }
 
-// Re-read the active sealed version at every publish. No isolate can keep
-// selecting an obsolete key indefinitely after activation elsewhere.
+// Callers supply a fresh cache row for each publish batch or backfill page.
+// Compare its active sealed version, so an isolate never keeps selecting an
+// obsolete key indefinitely after activation elsewhere.
 const keys = new Map<number, { version: string; master: CryptoKey; key: Promise<SigningKey> }>();
 const MAX_KEYS = 256;
 // Only the explicitly configured self-hosted service key remains in env.
 let shared: { material: string; key: Promise<CryptoKey> } | undefined;
 
 /** The key a cache's narinfo is signed with. */
-export async function signingKeyFor(config: WorkerConfig, cacheId: number): Promise<SigningKey> {
-	const cache = await findCacheById(config.db, cacheId);
-	if (!cache) throw new Error("no cache for signing");
+export async function signingKeyFor(config: WorkerConfig, cache: Cache): Promise<SigningKey> {
+	const cacheId = cache.id;
 	if (cache.signingKeySealed || cache.signingKeyName || cache.signingPublicKey) {
 		const master = await importMasterKey(await config.signingMasterKey());
 		const version = JSON.stringify([cache.signingKeyName, cache.signingPublicKey, cache.signingKeySealed]);
