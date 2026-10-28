@@ -88,11 +88,10 @@
 		{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
 		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
 	],
-	// cache.snowstead.com itself is the public bucket; the Worker takes only the
-	// API and private caches there.
+	// Hosted reads go through snowstead-web's owner/cache gateway. The R2
+	// hostname is its internal CDN origin; expose only the management API here.
 	"routes": [
-		{ "pattern": "cache.snowstead.com/_api/*", "zone_name": "snowstead.com" },
-		{ "pattern": "cache.snowstead.com/private/*", "zone_name": "snowstead.com" }
+		{ "pattern": "cache.snowstead.com/_api/*", "zone_name": "snowstead.com" }
 	],
 	"triggers": {
 		"crons": ["0 */6 * * *", "*/5 * * * *"]
@@ -101,6 +100,8 @@
 		// Bindings are intentionally explicit: Wrangler does not inherit them.
 		"production": {
 			"name": "snowstead",
+			"workers_dev": false,
+			"preview_urls": false,
 			"vars": {
 				"SIGNING_KEY_NAME": "snowstead-1",
 				"REQUIRE_CACHE_SIGNING_KEYS": "true",
@@ -130,7 +131,11 @@
 			"workers_dev": false,
 			"preview_urls": false,
 			// Staging serves reads through the Worker, not production's public CDN.
-			"routes": [{ "pattern": "cache-staging.snowstead.com", "custom_domain": true }],
+			// Keep the production web gateway's wildcard off this existing host.
+			"routes": [
+				{ "pattern": "cache-staging.snowstead.com", "custom_domain": true },
+				{ "pattern": "cache-staging.snowstead.com/*", "zone_name": "snowstead.com" }
+			],
 			"vars": {
 				"SIGNING_KEY_NAME": "snowstead-staging-1",
 				"REQUIRE_CACHE_SIGNING_KEYS": "true",
