@@ -21,7 +21,7 @@
 		// Traces of fetch, R2, KV, the Cache API and (as custom spans) Postgres.
 		"traces": {
 			"enabled": true,
-			"head_sampling_rate": 0.4
+			"head_sampling_rate": 0.1
 		},
 		// Groups uncaught exceptions, 5xx responses and logged errors. Wrangler
 		// turns it off on the next deploy if this is removed.
