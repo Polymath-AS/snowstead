@@ -3,6 +3,7 @@ import type {
 	orgs,
 	orgApiKeys,
 	caches,
+	cacheProtocols,
 	blobObjects,
 	publishedPaths,
 	uploadSessions,
@@ -16,7 +17,9 @@ export type Org = InferSelectModel<typeof orgs>;
 
 export type OrgApiKey = InferSelectModel<typeof orgApiKeys>;
 
-export type Cache = InferSelectModel<typeof caches>;
+export type Cache = InferSelectModel<typeof caches> & {
+	protocols: InferSelectModel<typeof cacheProtocols>["protocol"][];
+};
 
 export type BlobObject = InferSelectModel<typeof blobObjects>;
 

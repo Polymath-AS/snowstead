@@ -2,7 +2,7 @@ import { env, SELF, createExecutionContext, waitOnExecutionContext } from "cloud
 import { eq } from "drizzle-orm";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createBlobObject, createPublishedPath, findCache } from "../src/db/repository.js";
+import { createCache, createBlobObject, createPublishedPath, findCache } from "../src/db/repository.js";
 import { caches, cacheSigningKeys } from "../src/db/schema.js";
 import worker from "../../../workers/control/src/index.js";
 
@@ -23,7 +23,7 @@ async function admin(path: string, method = "GET", body?: unknown, overrides?: P
 
 async function createdCache(): Promise<{ name: string; publicKey: string }> {
 	const name = `keys-${crypto.randomUUID().slice(0, 8)}`;
-	expect((await admin("/caches", "POST", { name })).status).toBe(201);
+	expect((await admin("/caches", "POST", { name, protocols: ["nix"] })).status).toBe(201);
 	const { publicKey } = await (await admin(`/caches/${name}`)).json<{ publicKey: string }>();
 	return { name, publicKey };
 }
@@ -102,7 +102,7 @@ describe("cache signing keys", () => {
 		const name = `store-${crypto.randomUUID().slice(0, 8)}`;
 		const request = () => new Request("http://example.com/_api/v1/admin/caches", {
 			method: "POST", headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
-			body: JSON.stringify({ name }),
+			body: JSON.stringify({ name, protocols: ["nix"] }),
 		});
 		async function create() {
 			const ctx = createExecutionContext();
@@ -126,7 +126,7 @@ describe("cache signing keys", () => {
 				method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
 			});
 			expect((await call("", "PUT", { slug: name, customSigningKeys: true })).status).toBe(200);
-			expect((await call("/caches", "POST", { name: "main" })).status).toBe(201);
+			expect((await call("/caches", "POST", { name: "main", protocols: ["nix"] })).status).toBe(201);
 			const { key } = await (await call("/keys", "POST", { name: "test" })).json<{ key: string }>();
 			return { name, key };
 		}
@@ -309,24 +309,24 @@ describe("cache signing keys", () => {
 	it("requires per-cache keys in hosted mode and rolls back creation when sealing fails", async () => {
 		const name = `hosted-${crypto.randomUUID().slice(0, 8)}`;
 		const hosted = { REQUIRE_CACHE_SIGNING_KEYS: "true", SIGNING_MASTER_KEY: "" };
-		expect((await admin("/caches", "POST", { name }, hosted)).status).toBe(503);
+		expect((await admin("/caches", "POST", { name, protocols: ["nix"] }, hosted)).status).toBe(503);
 		expect(await findCache(db, "default", name)).toBeUndefined();
-		expect((await admin("/caches", "POST", { name }, { ...hosted, SIGNING_MASTER_KEY: "invalid" })).status).toBe(500);
+		expect((await admin("/caches", "POST", { name, protocols: ["nix"] }, { ...hosted, SIGNING_MASTER_KEY: "invalid" })).status).toBe(500);
 		expect(await findCache(db, "default", name)).toBeUndefined();
-		expect((await admin("/caches", "POST", { name }, { REQUIRE_CACHE_SIGNING_KEYS: "true" })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name, protocols: ["nix"] }, { REQUIRE_CACHE_SIGNING_KEYS: "true" })).status).toBe(201);
 		const publicKey = (await (await admin(`/caches/${name}`)).json<{ publicKey: string }>()).publicKey;
 		const hash = "f".repeat(32);
 		expect(await backfill(name, hash, { REQUIRE_CACHE_SIGNING_KEYS: "true" })).toMatchObject({ written: 1 });
 		const narinfo = await (await env.PUBLIC_BUCKET.get(`${name}/${hash}.narinfo`))!.text();
 		expect(await verifies(narinfo, publicKey, `/nix/store/${hash}-signed`)).toBe(true);
 		const old = `old-${crypto.randomUUID().slice(0, 8)}`;
-		await db.insert(caches).values({ name: old });
+		await createCache(db, old);
 		expect(await backfill(old, "g".repeat(32), { REQUIRE_CACHE_SIGNING_KEYS: "true" })).toMatchObject({ written: 0 });
 	});
 
 	it("leaves a cache from before keys on the service's key", async () => {
 		const name = `old-${crypto.randomUUID().slice(0, 8)}`;
-		await db.execute(`insert into caches (name) values ('${name}')`);
+		await createCache(db, name);
 		const { publicKey } = await (await admin(`/caches/${name}`)).json<{ publicKey: string }>();
 		expect(publicKey.split(":")[0]).toBe(env.SIGNING_KEY_NAME);
 
@@ -336,7 +336,7 @@ describe("cache signing keys", () => {
 
 	it("moves a cache from before keys onto a key of its own", async () => {
 		const name = `old-${crypto.randomUUID().slice(0, 8)}`;
-		await db.execute(`insert into caches (name) values ('${name}')`);
+		await createCache(db, name);
 		const before = await (await keysApi(name)).json<{ shared: boolean; activePublicKey: string }>();
 		expect(before.shared).toBe(true);
 

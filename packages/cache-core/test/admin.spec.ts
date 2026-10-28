@@ -16,13 +16,13 @@ function admin(path: string, init: RequestInit = {}, secret = "test-admin-secret
 
 describe("admin caches", () => {
 	it("requires the admin secret", async () => {
-		const res = await admin("/caches", { method: "POST", body: JSON.stringify({ name: "nope" }) }, "test-auth-token");
+		const res = await admin("/caches", { method: "POST", body: JSON.stringify({ name: "nope", protocols: ["nix"] }) }, "test-auth-token");
 		expect(res.status).toBe(403);
 	});
 
 	it("creates a cache once and lists it", async () => {
 		const name = `admin-${crypto.randomUUID().slice(0, 8)}`;
-		const first = await admin("/caches", { method: "POST", body: JSON.stringify({ name }) });
+		const first = await admin("/caches", { method: "POST", body: JSON.stringify({ name, protocols: ["nix"] }) });
 		expect(first.status).toBe(201);
 		expect(await first.json()).toMatchObject({ name, created: true });
 
@@ -45,7 +45,7 @@ describe("admin caches", () => {
 		{ label: "a slash", name: "a/b" },
 		{ label: "an empty name", name: "" },
 	])("rejects $label", async ({ name }) => {
-		const res = await admin("/caches", { method: "POST", body: JSON.stringify({ name }) });
+		const res = await admin("/caches", { method: "POST", body: JSON.stringify({ name, protocols: ["nix"] }) });
 		expect(res.status).toBe(400);
 	});
 });

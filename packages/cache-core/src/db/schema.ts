@@ -59,6 +59,15 @@ export const caches = pgTable("caches", {
 	uniqueIndex("caches_org_name_unique").on(table.orgId, table.name),
 ]);
 
+/** One row per enabled product, with room for product-specific configuration. */
+export const cacheProtocols = pgTable("cache_protocols", {
+	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
+	protocol: text("protocol").$type<"nix" | "go">().notNull(),
+}, (table) => [
+	primaryKey({ columns: [table.cacheId, table.protocol] }),
+	check("cache_protocols_protocol_valid", sql`${table.protocol} IN ('nix', 'go')`),
+]);
+
 export const cacheSigningKeys = pgTable("cache_signing_keys", {
 	id: text("id").primaryKey(),
 	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),

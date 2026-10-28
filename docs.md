@@ -204,9 +204,20 @@ bearer token or as the password of HTTP Basic auth, which is what Nix sends
 from a netrc file.
 
 ```bash
-snowstead cache create team --private        # or: snowstead cache set team --private
+snowstead cache create team --protocols nix --private
+# For an existing cache: snowstead cache set team --private
 snowstead token create builders --caches team --perms pull
 ```
+
+New caches require an explicit protocol selection: `--protocols nix`,
+`--protocols go`, or `--protocols nix,go` (no default). API creation payloads
+likewise require `"protocols": ["nix"]`, `["go"]`, or `["nix", "go"]` on
+`POST /_api/v1/admin/caches` and `POST /_api/v1/orgs/:org/caches`.
+Existing caches keep their protocols when omitted on updates. To add Go to a
+Nix cache, use `snowstead cache set team --protocols nix,go`; updates must keep
+all enabled protocols and cannot remove them. Cache lists, details, and creation
+responses include the `protocols` array. Existing database caches migrate with
+both protocols enabled.
 
 On the machines that substitute from it:
 
