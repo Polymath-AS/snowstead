@@ -10,7 +10,7 @@
 	"observability": {
 		"enabled": true,
 		"logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true },
-		"traces": { "enabled": true, "head_sampling_rate": 0.4 },
+		"traces": { "enabled": true, "head_sampling_rate": 0.1 },
 		"issues": { "enabled": true }
 	},
 	"services": [
