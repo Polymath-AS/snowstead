@@ -23,7 +23,7 @@ function api(org: string, path: string, method = "GET", body?: unknown, credenti
 async function setup(privateCache = false, name = "main") {
 	const org = unique();
 	expect((await api(org, "", "PUT", { slug: org })).status).toBe(200);
-	expect((await api(org, "/caches", "POST", { name, private: privateCache })).status).toBe(201);
+	expect((await api(org, "/caches", "POST", { name, private: privateCache, protocols: ["nix", "go"] })).status).toBe(201);
 	return { org, name };
 }
 
@@ -85,7 +85,7 @@ describe("named Go caches", () => {
 		for (let round = 0; round < 4; round++) {
 			const target = await setup();
 			await api(target.org, "", "PUT", { storageLimit: 100 });
-			await api(target.org, "/caches", "POST", { name: "nix" });
+			await api(target.org, "/caches", "POST", { name: "nix", protocols: ["nix"] });
 			const writer = await token(target, ["push", "go:write"], [target.name, "nix"]);
 			const [go, nix] = await Promise.all([
 				transfer(target, writer, "g".repeat(60)),
@@ -145,7 +145,7 @@ describe("named Go caches", () => {
 		const a = await setup(true);
 		const b = await setup(true);
 		const second = { org: a.org, name: "second" };
-		await api(a.org, "/caches", "POST", { name: second.name });
+		await api(a.org, "/caches", "POST", { name: second.name, protocols: ["nix", "go"] });
 		const writer = await token(a);
 		// A missing action must not bypass the private cache's authorization.
 		for (const method of ["GET", "HEAD"]) {
@@ -240,7 +240,7 @@ describe("named Go caches", () => {
 		expect(await sweepGoEntries(resolveConfig(env))).toBeGreaterThan(0);
 		expect(await (await transfer(a)).text()).toBe("new");
 		await api(a.org, `/caches/${a.name}/delete`, "POST");
-		await api(a.org, "/caches", "POST", { name: a.name });
+		await api(a.org, "/caches", "POST", { name: a.name, protocols: ["nix", "go"] });
 		expect((await transfer(a)).status).toBe(404);
 		expect((await transfer(a, writer, "recreated")).status).toBe(403);
 	});

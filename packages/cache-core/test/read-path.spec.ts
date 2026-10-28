@@ -54,13 +54,23 @@ beforeAll(async () => {
 });
 
 describe("nix-cache-info", () => {
-	it("returns cache info even for a cache that has not been created", async () => {
-		for (const name of ["test-cache", "nonexistent"]) {
+	it("returns cache info for existing populated and empty Nix caches", async () => {
+		const created = await SELF.fetch("http://example.com/_api/v1/admin/caches", {
+			method: "POST",
+			headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
+			body: JSON.stringify({ name: "info-only", protocols: ["nix"] }),
+		});
+		expect(created.status).toBe(201);
+		for (const name of ["test-cache", "info-only"]) {
 			const res = await SELF.fetch(`http://example.com/${name}/nix-cache-info`);
 			expect(res.status).toBe(200);
 			expect(res.headers.get("content-type")).toBe("text/x-nix-cache-info");
 			expect(await res.text()).toContain("StoreDir: /nix/store\n");
 		}
+	});
+
+	it("returns 404 for a cache that has not been created", async () => {
+		expect((await SELF.fetch("http://example.com/nonexistent/nix-cache-info")).status).toBe(404);
 	});
 });
 
@@ -130,7 +140,7 @@ describe("nar download", () => {
 			method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
 		});
 		expect((await api("", "PUT", { slug: org })).status).toBe(200);
-		expect((await api("/caches", "POST", { name: "test-cache" })).status).toBe(201);
+		expect((await api("/caches", "POST", { name: "test-cache", protocols: ["nix"] })).status).toBe(201);
 		const suffix = `nar/${FILE_HASH}/zstd.nar`;
 		const warm = await SELF.fetch(`http://example.com/test-cache/${suffix}`);
 		expect(warm.status).toBe(200);

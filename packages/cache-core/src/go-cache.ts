@@ -5,12 +5,12 @@ import { caches as cacheRows, goEntries } from "./db/schema.js";
 import { findCache } from "./db/repository.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 
-export function activeGoEntries(cache: Cache, now = new Date()) {
+export function activeGoEntries(cache: Pick<Cache, "id" | "goGeneration">, now = new Date()) {
 	return and(eq(goEntries.cacheId, cache.id), eq(goEntries.generation, cache.goGeneration), gt(goEntries.expiresAt, now));
 }
 
 /** Exact live, completed Go totals; pending transfers are never dashboard entries. */
-async function stats(config: WorkerConfig, cache: Cache) {
+async function stats(config: WorkerConfig, cache: Pick<Cache, "id" | "goGeneration">) {
 	const [row] = await config.db.select({
 		entries: sql`count(*)`.mapWith(Number),
 		size: sql`coalesce(sum(${goEntries.size}), 0)`.mapWith(Number),
@@ -24,6 +24,7 @@ export async function handleGoManagement(config: WorkerConfig, org: string, name
 	const cache = await findCache(config.db, org, name);
 	if (!cache) return errorResponse("Not Found", 404);
 	if (reset) {
+		if (!cache.protocols.includes("go")) return errorResponse("Not Found", 404);
 		const [updated] = await config.db.update(cacheRows).set({ goGeneration: crypto.randomUUID() })
 			.where(eq(cacheRows.id, cache.id)).returning();
 		if (!updated) return errorResponse("Not Found", 404);

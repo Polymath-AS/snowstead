@@ -94,7 +94,7 @@ describe("deleting published paths", () => {
 		const org = unique("org");
 		const cache = unique("cache");
 		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 100 })).status).toBe(200);
-		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] })).json<{ token: string }>();
 		const hash = storePathHash();
 		expect(await push(cache, hash, await nar(40), token)).toBe(201);
@@ -115,7 +115,7 @@ describe("deleting published paths", () => {
 		const org = unique("org");
 		const cache = unique("cache");
 		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 100 })).status).toBe(200);
-		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const made = await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] });
 		const { token } = await made.json<{ token: string }>();
 		const a = storePathHash();
@@ -132,7 +132,7 @@ describe("deleting published paths", () => {
 
 	it("withdraws the narinfo, and a repeat is not an error", async () => {
 		const cache = unique("cache");
-		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const hash = storePathHash();
 		const body = await nar(16);
 		expect(await push(cache, hash, body)).toBe(201);
@@ -156,7 +156,7 @@ describe("deleting published paths", () => {
 
 	it("withdraws a private cache's narinfo", async () => {
 		const cache = unique("cache");
-		expect((await admin("/caches", "POST", { name: cache, private: true })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: cache, private: true, protocols: ["nix"] })).status).toBe(201);
 		const pull = await admin("/tokens", "POST", { subject: "test", caches: [cache], perms: ["pull"] });
 		const { token } = await pull.json<{ token: string }>();
 		const hash = storePathHash();
@@ -173,7 +173,7 @@ describe("deleting published paths", () => {
 
 	it("also withdraws cached orphan narinfo when no database row exists", async () => {
 		const cache = unique("orphan");
-		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const hash = storePathHash();
 		await env.PUBLIC_BUCKET.put(`${cache}/${hash}.narinfo`, "orphan narinfo");
 		const url = `http://example.com/${cache}/${hash}.narinfo`;
@@ -184,7 +184,7 @@ describe("deleting published paths", () => {
 
 	it("deletes only paths published before the cutoff", async () => {
 		const cache = unique("cache");
-		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const hashes = [storePathHash(), storePathHash()];
 		for (const hash of hashes) expect(await push(cache, hash, await nar(16))).toBe(201);
 		await db.update(publishedPaths).set({ createdAt: new Date("2000-01-01T00:00:00Z") }).where(eq(publishedPaths.storePathHash, hashes[0]));
@@ -201,7 +201,7 @@ describe("deleting published paths", () => {
 	it("leaves another cache's path to the same NAR, and GC deletes the NAR after the last", async () => {
 		const first = unique("cache");
 		const second = unique("cache");
-		for (const name of [first, second]) expect((await admin("/caches", "POST", { name })).status).toBe(201);
+		for (const name of [first, second]) expect((await admin("/caches", "POST", { name, protocols: ["nix"] })).status).toBe(201);
 		const shared = await nar(16);
 		const [a, b] = [storePathHash(), storePathHash()];
 		expect(await push(first, a, shared)).toBe(201);
@@ -223,7 +223,7 @@ describe("deleting published paths", () => {
 
 	it("keeps a NAR while an upload session names it", async () => {
 		const cache = unique("cache");
-		expect((await admin("/caches", "POST", { name: cache })).status).toBe(201);
+		expect((await admin("/caches", "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const hash = storePathHash();
 		const body = await nar(16);
 		expect(await push(cache, hash, body)).toBe(201);
@@ -253,7 +253,7 @@ describe("deleting published paths", () => {
 		const org = unique("org");
 		const cache = unique("cache");
 		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
-		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache], perms: ["push"] })).json<{ token: string }>();
 		const [hello, world, openssl] = [storePathHash(), storePathHash(), storePathHash()];
 		expect(await push(cache, hello, await nar(10), token, "hello-2.12")).toBe(201);
@@ -289,9 +289,9 @@ describe("deleting published paths", () => {
 		const org = unique("org");
 		const cache = unique("cache");
 		expect((await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: null })).status).toBe(200);
-		expect((await orgApi(`/${org}/caches`, "POST", { name: cache })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: cache, protocols: ["nix"] })).status).toBe(201);
 		const keep = unique("cache");
-		expect((await orgApi(`/${org}/caches`, "POST", { name: keep })).status).toBe(201);
+		expect((await orgApi(`/${org}/caches`, "POST", { name: keep, protocols: ["nix"] })).status).toBe(201);
 		const { token } = await (await orgApi(`/${org}/tokens`, "POST", { subject: "ci", caches: [cache, keep], perms: ["push"] })).json<{ token: string }>();
 		const [a, b, c] = [storePathHash(), storePathHash(), storePathHash()];
 		const shared = await nar(30);
@@ -316,7 +316,7 @@ describe("deleting published paths", () => {
 		expect(await findBlobObject(db, shared.fileHash, "zstd")).toBeDefined();
 
 		// The name is free, and a cache made under it starts empty.
-		const again = await orgApi(`/${org}/caches`, "POST", { name: cache });
+		const again = await orgApi(`/${org}/caches`, "POST", { name: cache, protocols: ["nix"] });
 		expect(await again.json()).toMatchObject({ created: true });
 		expect(await (await orgApi(`/${org}/caches/${cache}`)).json()).toMatchObject({ paths: 0 });
 		expect((await orgApi(`/${org}/caches/${unique("cache")}/delete`, "POST")).status).toBe(404);

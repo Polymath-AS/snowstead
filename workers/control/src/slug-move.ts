@@ -122,7 +122,7 @@ export async function moveSlugPage(config: WorkerConfig, orgId: string, at: Move
 /** Readies a cache's new path before the database points at it, so a private cache never reads as public there. */
 export async function readyNewPath(config: WorkerConfig, cache: CacheAt, newPath: string): Promise<void> {
 	if (cache.isPublic) {
-		await setPublicCacheInfo(config, newPath, true);
+		if (cache.protocols.includes("nix")) await setPublicCacheInfo(config, newPath, true);
 	} else {
 		await setPrivate(config, newPath, true, { org: cache.orgId, id: cache.id });
 	}

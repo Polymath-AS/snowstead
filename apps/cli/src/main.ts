@@ -3,6 +3,7 @@
 import { parseArgs } from "node:util";
 import { login, getServer } from "./config.js";
 import { createClient, createToken, listTokens, revokeToken, createCache, listCaches } from "./api.js";
+import type { CacheProtocol } from "./api.js";
 import { pushPaths } from "./push.js";
 import { getClosurePaths } from "./nix.js";
 
@@ -12,8 +13,10 @@ Commands:
   snowstead login <name> <server-url> <token>   Save server credentials
   snowstead push <cache> <paths...>             Push store paths to a cache
   snowstead push <cache> --closure <path>       Push a store path and its closure
-  snowstead cache create <name> [--private]     Create a cache (admin)
-  snowstead cache set <name> --private|--public Change who can read a cache (admin)
+  snowstead cache create <name> --protocols nix|go|nix,go [--private]
+                                               Create a cache (admin; no protocol default)
+  snowstead cache set <name> [--private|--public] [--protocols nix|go|nix,go]
+                                               Update visibility or add protocols (admin)
   snowstead cache list                          List caches (admin)
   snowstead token create <subject>              Create a new API token
   snowstead token list                          List all API tokens
@@ -31,6 +34,7 @@ Token create options:
 
 Examples:
   snowstead login prod https://cache.example.com my-admin-secret
+  snowstead cache create main --protocols nix
   snowstead push main /nix/store/abc...-hello
   snowstead push main --closure /run/current-system
   snowstead token create ci-runner --caches main --perms push --expires 90
@@ -55,6 +59,7 @@ async function main(): Promise<void> {
       jobs: { type: "string" },
       closure: { type: "string" },
       caches: { type: "string" },
+      protocols: { type: "string" },
       perms: { type: "string" },
       expires: { type: "string" },
       private: { type: "boolean" },
@@ -195,25 +200,36 @@ async function main(): Promise<void> {
     if (subcommand === "create" || subcommand === "set") {
       const name = args[2];
       const wantPrivate = values.private ? true : values.public ? false : undefined;
-      if (!name || (subcommand === "set" && wantPrivate === undefined)) {
-        console.error(subcommand === "set" ? "Usage: snowstead cache set <name> --private|--public" : "Usage: snowstead cache create <name> [--private]");
+      if (values.private && values.public) {
+        throw new Error("--private and --public cannot be combined");
+      }
+      let protocols: CacheProtocol[] | undefined;
+      if (values.protocols !== undefined) {
+        const parsed = values.protocols.split(",").map(s => s.trim());
+        if (!parsed.every((p): p is CacheProtocol => p === "nix" || p === "go") || new Set(parsed).size !== parsed.length) {
+          throw new Error("--protocols must be a nonempty, unique comma-separated list of nix and/or go");
+        }
+        protocols = parsed;
+      }
+      if (!name || (subcommand === "create" && protocols === undefined) || (subcommand === "set" && wantPrivate === undefined && protocols === undefined)) {
+        console.error(subcommand === "set" ? "Usage: snowstead cache set <name> [--private|--public] [--protocols nix|go|nix,go]" : "Usage: snowstead cache create <name> --protocols nix|go|nix,go [--private]");
         process.exit(1);
       }
-      const result = await createCache(client, name, wantPrivate);
+      const result = await createCache(client, name, wantPrivate, protocols);
       const visibility = result.private ? "private" : "public";
       if (result.created) {
-        console.log(`Cache '${result.name}' created (${visibility})`);
+        console.log(`Cache '${result.name}' created (${visibility}; protocols=${result.protocols.join(",")})`);
       } else if (result.changed) {
-        console.log(`Cache '${result.name}' is now ${visibility}`);
+        console.log(`Cache '${result.name}' is now ${visibility} (protocols=${result.protocols.join(",")})`);
       } else {
-        console.log(`Cache '${result.name}' already exists (${visibility})`);
+        console.log(`Cache '${result.name}' already exists (${visibility}; protocols=${result.protocols.join(",")})`);
       }
       return;
     }
 
     if (subcommand === "list") {
       for (const c of await listCaches(client)) {
-        console.log(`${c.name}  ${c.private ? "private" : "public"}  created=${c.createdAt}`);
+        console.log(`${c.name}  ${c.private ? "private" : "public"}  protocols=${c.protocols.join(",")}  created=${c.createdAt}`);
       }
       return;
     }

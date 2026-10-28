@@ -51,8 +51,54 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 		};
 		assert.equal((await call("/healthz")).status, 200);
 		assert.equal((await call("/_api/v1/admin/caches")).status, 401);
+		const post = (path, body) => call(`/_api/v1${path}`, {
+			method: "POST", headers: { authorization: `Bearer ${secrets.ADMIN_SECRET}`, "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		for (const protocols of [undefined, [], ["ruby"], ["nix", "nix"]]) {
+			assert.equal((await post("/admin/caches", { name: "invalid-choice", protocols })).status, 400);
+		}
+		for (const privateCache of [false, true]) {
+			for (const protocol of ["nix", "go"]) {
+				const name = `${protocol}-${privateCache ? "private" : "public"}`;
+				const created = await api("/admin/caches", { name, private: privateCache, protocols: [protocol] });
+				assert.deepEqual((await created.json()).protocols, [protocol]);
+				const { token } = await (await api("/admin/tokens", {
+					subject: "protocol-policy", caches: [name], perms: ["push", "pull", "go:read", "go:write"],
+				})).json();
+				const headers = { authorization: `Bearer ${token}` };
+				const nix = `/${privateCache ? "private/" : ""}${name}`;
+				const go = `/_api/v1/go/default/${name}/v1/actions/${"d".repeat(64)}`;
+				const data = Buffer.from(`output for ${name}`);
+				const goHeaders = { ...headers, "x-snowstead-output-id": createHash("sha256").update(data).digest("hex") };
+				const put = () => call(go, { method: "PUT", headers: goHeaders, body: data });
+				for (const method of ["GET", "HEAD"]) {
+					assert.equal((await call(`${nix}/nix-cache-info`, { method, headers })).status, protocol === "nix" ? 200 : 404);
+					assert.equal((await call(go, { method, headers })).status, 404);
+				}
+				assert.equal((await put()).status, protocol === "go" ? 201 : 404);
+				if (protocol === "go") {
+					assert.equal((await call(go, { headers })).status, 200);
+					assert.equal((await call(`${nix}/${"e".repeat(32)}.narinfo`, { headers })).status, 404);
+					const session = { storePath: `/nix/store/${"a".repeat(32)}-disabled`, storePathHash: "a".repeat(32),
+						narHash: `sha256:${"1".repeat(52)}`, narSize: data.length, fileHash: "f".repeat(64), fileSize: data.length, compression: "zstd" };
+					for (const [path, body] of [[`/caches/${name}/upload-sessions`, session], [`/caches/${name}/upload-sessions/batch`, { paths: [session] }], ["/get-missing-paths", { cache: name, storePathHashes: ["a".repeat(32)] }]]) {
+						const response = await call(`/_api/v1${path}`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
+						assert.equal(response.status, 404, path);
+					}
+				}
+				// Omitted protocols on a settings update never enable another product.
+				assert.deepEqual((await (await api("/admin/caches", { name, retentionDays: 14 })).json()).protocols, [protocol]);
+				await api("/admin/caches", { name, protocols: ["nix", "go"] });
+				assert.equal((await call(`${nix}/nix-cache-info`, { headers })).status, 200);
+				assert.equal((await put()).status, protocol === "go" ? 204 : 201);
+				assert.equal((await post("/admin/caches", { name, protocols: [protocol] })).status, 409);
+				const listed = await (await call(`/_api/v1/admin/caches/${name}`, { headers: { authorization: `Bearer ${secrets.ADMIN_SECRET}` } })).json();
+				assert.deepEqual(listed.protocols, ["nix", "go"]);
+			}
+		}
 		for (const [cache, privateCache] of [["open", false], ["closed", true]]) {
-			const created = await api("/admin/caches", { name: cache, private: privateCache });
+			const created = await api("/admin/caches", { name: cache, private: privateCache, protocols: ["nix", "go"] });
 			assert.equal(created.status, 201);
 			await created.arrayBuffer();
 			const { publicKey } = await (await call(`/_api/v1/admin/caches/${cache}`, {

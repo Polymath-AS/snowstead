@@ -74,9 +74,10 @@ async function sessionAccessError(
 	if (!session || session.expiresAt <= new Date()) {
 		return { error: "Not found", status: 404 };
 	}
+	const cache = await resolveCache(config.db, session.cacheId);
+	if (!cache?.protocols.includes("nix")) return { error: "Not found", status: 404 };
 	if (identity.kind === "jwt") {
-		const cache = await resolveCache(config.db, session.cacheId);
-		if (cache === undefined || !hasCacheAccess(identity.claims, cache) || !isOrgsToken(identity.claims, cache.orgId)) {
+		if (!hasCacheAccess(identity.claims, cache) || !isOrgsToken(identity.claims, cache.orgId)) {
 			return { error: "Forbidden", status: 403 };
 		}
 	}
@@ -190,6 +191,7 @@ async function createSessions(
 	cache: CacheAt,
 	items: readonly SessionParams[],
 ): Promise<SessionResponse[] | Response> {
+	if (!cache.protocols.includes("nix")) return errorResponse("Cache not found", 404);
 	// Seed the ID → cache map so session-scoped requests skip the database lookup.
 	cacheById.set(cache.id, cache);
 	// Straight into the bucket the cache is served from.
@@ -534,6 +536,9 @@ async function publishSessions(
 	// Fresh, not resolveCache's copy: narinfo goes to the cache's path now,
 	// which an org's slug change moves (slug-move.ts).
 	const cache = await findCacheById(config.db, cacheId);
+	if (cache && !cache.protocols.includes("nix")) {
+		return sessions.map((s) => ({ sessionId: s.id, error: "Not found", status: 404 }));
+	}
 	if (cache === undefined) {
 		return sessions.map((s) => ({ sessionId: s.id, error: "Internal error", status: 500 }));
 	}
@@ -854,7 +859,7 @@ export async function handleGetMissingPaths(
 	if (body instanceof Response) return body;
 
 	const cache = await findCache(config.db, orgOfPusher(identity), body.cache);
-	if (!cache) {
+	if (!cache?.protocols.includes("nix")) {
 		return errorResponse("Cache not found", 404);
 	}
 

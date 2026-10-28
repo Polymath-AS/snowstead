@@ -9,6 +9,13 @@ upload requires `go:write`. Nix permissions do not grant Go access. Give write
 access only to protected CI jobs building reviewed code: hashes detect
 corruption, not malicious outputs from authorized writers.
 
+New caches require explicit protocols: `snowstead cache create main --protocols nix`
+for Nix, `--protocols go` for Go, or `--protocols nix,go` for both; there is no
+default. API creation requests require the corresponding `protocols` array.
+Existing-cache updates may omit it to preserve the selection, or add protocols
+but not remove them (for example, `snowstead cache set main --protocols nix,go`).
+Existing database caches migrate with both protocols enabled.
+
 Go objects use the private bucket and internal Cache API, expire seven days
 after upload, and count toward organization storage limits. Resetting Go leaves
 Nix paths intact. Apply the included database migrations before deploying the

@@ -124,8 +124,8 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		// The same request creates a cache or sets an existing one's settings,
 		// so the entry keeps the settings it left, not only that it ran.
 		const response = await handleCreateCache(request, config, org);
-		const cache = await answered<{ name: string; private: boolean; retentionDays: number | null }>(response);
-		return audit("cache.create", response, cache.name ?? null, { private: cache.private, retentionDays: cache.retentionDays });
+		const cache = await answered<{ name: string; private: boolean; protocols: string[]; retentionDays: number | null }>(response);
+		return audit("cache.create", response, cache.name ?? null, { private: cache.private, protocols: cache.protocols, retentionDays: cache.retentionDays });
 	}
 	if (rest.length === 2 && rest[0] === "caches" && method === "GET") return handleGetCache(config, value(1), org);
 	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "purge" && method === "POST") {
