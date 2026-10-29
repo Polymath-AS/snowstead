@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -24,6 +25,14 @@ import (
 
 const maxArtifact = 64 << 20
 const maxConcurrent = 16
+const remoteIdleTimeout = 5 * time.Second
+
+// Allow a maximum-size artifact at 1 MiB/s plus connection/header time.
+// The progress deadline still stops a stalled remote in five seconds;
+// this absolute ceiling also bounds peers that keep trickling bytes.
+const remoteRequestTimeout = remoteIdleTimeout + maxArtifact/(1<<20)*time.Second
+
+var errRemoteDisabled = errors.New("remote cache disabled")
 
 type request struct {
 	ID                 int64
@@ -44,6 +53,7 @@ type response struct {
 
 type stats struct {
 	localHits, remoteHits, misses, uploads, uploadErrors, conflicts, downloadedBytes, uploadedBytes atomic.Int64
+	readErrors, readTimeouts                                                                        atomic.Int64
 }
 
 type cache struct {
@@ -80,9 +90,10 @@ func newCache() (*cache, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = maxConcurrent
 	transport.MaxConnsPerHost = maxConcurrent
+	transport.ResponseHeaderTimeout = remoteIdleTimeout
 	c := &cache{dir: dir, token: token, readOnly: readOnly, client: &http.Client{
 		Transport:     transport,
-		Timeout:       5 * time.Second,
+		Timeout:       remoteRequestTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
 	if validEndpoint(endpoint) && (token != "" || readOnly) {
@@ -161,14 +172,82 @@ func (c *cache) store(action, output string, body io.Reader, size int64) (string
 	return path, nil
 }
 
+// Watch each request, not the shared connection: another HTTP/2 stream must
+// not keep a stalled transfer alive. Upload pulls and download reads refresh
+// the deadline without buffering artifacts or starting a polling goroutine.
+type requestProgress struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	mu     sync.Mutex
+	closed bool
+}
+
+func (p *requestProgress) touch() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.closed {
+		p.timer.Reset(remoteIdleTimeout)
+	}
+}
+
+func (p *requestProgress) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	p.timer.Stop()
+	p.cancel(nil)
+}
+
+func (p *requestProgress) read(reader io.Reader, body []byte) (int, error) {
+	n, err := reader.Read(body)
+	if n > 0 {
+		p.touch()
+	}
+	if err != nil && errors.Is(context.Cause(p.ctx), context.DeadlineExceeded) {
+		err = context.DeadlineExceeded
+	}
+	return n, err
+}
+
+type progressReader struct {
+	io.Reader
+	progress *requestProgress
+}
+
+func (r progressReader) Read(body []byte) (int, error) {
+	return r.progress.read(r.Reader, body)
+}
+
+type progressBody struct {
+	io.ReadCloser
+	progress *requestProgress
+}
+
+func (b progressBody) Read(body []byte) (int, error) {
+	return b.progress.read(b.ReadCloser, body)
+}
+
+func (b progressBody) Close() error {
+	b.progress.close()
+	return b.ReadCloser.Close()
+}
+
 func (c *cache) remote(method, action, output string, body io.Reader, size int64) (*http.Response, error) {
 	// Anonymous reads require explicit read-only mode. Writes always need a
 	// credential, even if a public endpoint were to accept anonymous uploads.
 	if c.endpoint == "" || (c.token == "" && (!c.readOnly || method != http.MethodGet)) || c.remoteDisabled.Load() {
-		return nil, errors.New("remote cache disabled")
+		return nil, errRemoteDisabled
 	}
-	req, err := http.NewRequest(method, c.endpoint+"/v1/actions/"+action, body)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	progress := &requestProgress{ctx: ctx, cancel: cancel}
+	progress.timer = time.AfterFunc(remoteIdleTimeout, func() { cancel(context.DeadlineExceeded) })
+	if body != nil {
+		body = progressReader{Reader: body, progress: progress}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+"/v1/actions/"+action, body)
 	if err != nil {
+		progress.close()
 		return nil, err
 	}
 	if c.token != "" {
@@ -183,11 +262,27 @@ func (c *cache) remote(method, action, output string, body io.Reader, size int64
 	}
 	res, err := c.client.Do(req)
 	if err != nil {
+		if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			err = context.DeadlineExceeded
+		}
+		progress.close()
 		c.remoteDisabled.Store(true)
-	} else if res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 429 || res.StatusCode >= 500 {
-		c.remoteDisabled.Store(true)
+	} else {
+		progress.touch()
+		res.Body = progressBody{ReadCloser: res.Body, progress: progress}
+		if res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 429 || res.StatusCode >= 500 {
+			c.remoteDisabled.Store(true)
+		}
 	}
 	return res, err
+}
+
+func (c *cache) recordReadError(err error) {
+	c.stats.readErrors.Add(1)
+	var timeout net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+		c.stats.readTimeouts.Add(1)
+	}
 }
 
 func (c *cache) get(req request) response {
@@ -220,9 +315,14 @@ func (c *cache) get(req request) response {
 				id, _ := hex.DecodeString(output)
 				return response{ID: req.ID, OutputID: id, Size: res.ContentLength, DiskPath: path}
 			} else {
+				c.recordReadError(err)
 				c.remoteDisabled.Store(true)
 			}
+		} else if res.StatusCode != http.StatusNotFound {
+			c.recordReadError(nil)
 		}
+	} else if !errors.Is(err, errRemoteDisabled) {
+		c.recordReadError(err)
 	}
 	c.stats.misses.Add(1)
 	return r
@@ -293,7 +393,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 func (c *cache) serve(in io.Reader, out, stderr io.Writer) (result error) {
 	defer func() {
 		s := &c.stats
-		fmt.Fprintf(stderr, "snowstead-go-cache: local_hits=%d remote_hits=%d misses=%d uploads=%d upload_errors=%d conflicts=%d downloaded_bytes=%d uploaded_bytes=%d\n", s.localHits.Load(), s.remoteHits.Load(), s.misses.Load(), s.uploads.Load(), s.uploadErrors.Load(), s.conflicts.Load(), s.downloadedBytes.Load(), s.uploadedBytes.Load())
+		fmt.Fprintf(stderr, "snowstead-go-cache: local_hits=%d remote_hits=%d misses=%d uploads=%d upload_errors=%d conflicts=%d downloaded_bytes=%d uploaded_bytes=%d read_errors=%d read_timeouts=%d remote_disabled=%t\n", s.localHits.Load(), s.remoteHits.Load(), s.misses.Load(), s.uploads.Load(), s.uploadErrors.Load(), s.conflicts.Load(), s.downloadedBytes.Load(), s.uploadedBytes.Load(), s.readErrors.Load(), s.readTimeouts.Load(), c.remoteDisabled.Load())
 	}()
 	reader, enc := bufio.NewReaderSize(in, 64<<10), json.NewEncoder(out)
 	if err := enc.Encode(response{KnownCommands: []string{"get", "put", "close"}}); err != nil {

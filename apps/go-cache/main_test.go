@@ -238,7 +238,165 @@ func TestRemoteReads(t *testing.T) {
 			if redirects != 0 {
 				t.Fatal("redirect followed")
 			}
+			wantErrors := int64(1)
+			if mode == "hit" || mode == "missing" {
+				wantErrors = 0
+			}
+			if c.stats.readErrors.Load() != wantErrors || c.stats.readTimeouts.Load() != 0 {
+				t.Fatalf("read errors=%d timeouts=%d: %s", c.stats.readErrors.Load(), c.stats.readTimeouts.Load(), summary)
+			}
 		})
+	}
+}
+
+func TestRemoteLargeArtifactMakesProgress(t *testing.T) {
+	// The hosted Kubernetes benchmark timed out twice on this exact size,
+	// despite receiving 17,039,360 and 23,117,824 bytes before the 5s cutoff.
+	// Reproduce the size and sustained progress, not the old premature cutoff.
+	body := bytes.Repeat([]byte{'k'}, 23_345_386)
+	a, output := sha256.Sum256([]byte("large-progress")), sha256.Sum256(body)
+	var calls atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Header().Set("X-Snowstead-Output-ID", hex.EncodeToString(output[:]))
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for offset := 0; offset < len(body); offset += 1 << 20 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+			}
+			end := min(offset+1<<20, len(body))
+			if _, err := w.Write(body[offset:end]); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer s.Close()
+	c := setup(t, s.URL)
+	start := time.Now()
+	r, summary := exchange(t, c, []request{{ID: 1, Command: "get", ActionID: a[:]}, {ID: 2, Command: "close"}}, nil)
+	assertFile(t, r[0], body)
+	if elapsed := time.Since(start); elapsed < 5*time.Second {
+		t.Fatalf("regression did not cross the old total timeout: %s", elapsed)
+	}
+	if calls.Load() != 1 || c.remoteDisabled.Load() || !strings.Contains(summary, "remote_hits=1") || !strings.Contains(summary, "read_errors=0 read_timeouts=0 remote_disabled=false") {
+		t.Fatal(summary)
+	}
+	t.Logf("23,345,386-byte verified download completed in %s: %s", time.Since(start), summary)
+}
+
+func TestRemoteLargeUploadMakesProgress(t *testing.T) {
+	body := bytes.Repeat([]byte{'u'}, 23_345_386)
+	a, output := sha256.Sum256([]byte("large-upload")), sha256.Sum256(body)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hash := sha256.New()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for remaining := len(body); remaining > 0; remaining -= min(1<<20, remaining) {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+			}
+			if _, err := io.CopyN(hash, r.Body, int64(min(1<<20, remaining))); err != nil {
+				return
+			}
+		}
+		if r.Method != http.MethodPut || r.ContentLength != int64(len(body)) || r.Header.Get("Authorization") != "Bearer test-secret" || r.Header.Get("X-Snowstead-Output-ID") != hex.EncodeToString(hash.Sum(nil)) {
+			t.Error("upload headers or digest differ")
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer s.Close()
+	c := setup(t, s.URL)
+	path, err := c.store(hex.EncodeToString(a[:]), hex.EncodeToString(output[:]), bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	r := c.put(request{ID: 1, ActionID: a[:], OutputID: output[:], BodySize: int64(len(body))}, path)
+	assertFile(t, r, body)
+	if elapsed := time.Since(start); elapsed < 5*time.Second {
+		t.Fatalf("regression did not cross the old total timeout: %s", elapsed)
+	}
+	if c.stats.uploads.Load() != 1 || c.stats.uploadedBytes.Load() != int64(len(body)) || c.stats.uploadErrors.Load() != 0 || c.remoteDisabled.Load() {
+		t.Fatalf("uploads=%d errors=%d disabled=%t", c.stats.uploads.Load(), c.stats.uploadErrors.Load(), c.remoteDisabled.Load())
+	}
+}
+
+func TestRemoteProgressDeadline(t *testing.T) {
+	for _, stage := range []string{"headers", "body"} {
+		t.Run(stage, func(t *testing.T) {
+			var calls atomic.Int64
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if stage == "body" {
+					_, output, body := artifact()
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					w.Header().Set("X-Snowstead-Output-ID", hex.EncodeToString(output))
+					w.Write(body[:1])
+					w.(http.Flusher).Flush()
+				}
+				<-r.Context().Done()
+			}))
+			defer s.Close()
+			c := setup(t, s.URL)
+			a, _, _ := artifact()
+			start := time.Now()
+			r, summary := exchange(t, c, []request{{ID: 1, Command: "get", ActionID: a}}, nil)
+			if !r[0].Miss || r[0].Err != "" || time.Since(start) > remoteIdleTimeout+3*time.Second {
+				t.Fatalf("stalled remote did not fall back promptly: %+v in %s", r[0], time.Since(start))
+			}
+			// A disabled remote is a local miss, not another failed HTTP attempt.
+			r, summary = exchange(t, c, []request{{ID: 2, Command: "get", ActionID: a}, {ID: 3, Command: "close"}}, nil)
+			if !r[0].Miss || calls.Load() != 1 || !strings.Contains(summary, "read_errors=1 read_timeouts=1 remote_disabled=true") {
+				t.Fatal(summary)
+			}
+			entries, err := os.ReadDir(c.dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("partial artifact published or retained: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestRemoteTrickleHasAbsoluteDeadline(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, output, _ := artifact()
+		w.Header().Set("Content-Length", "100")
+		w.Header().Set("X-Snowstead-Output-ID", hex.EncodeToString(output))
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				if _, err := w.Write([]byte{'x'}); err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+			}
+		}
+	}))
+	defer s.Close()
+	c := setup(t, s.URL)
+	if c.client.Timeout != 69*time.Second {
+		t.Fatalf("absolute production transfer budget=%s", c.client.Timeout)
+	}
+	// Exercise the same absolute deadline without making the unit suite wait 69s.
+	c.client.Timeout = 120 * time.Millisecond
+	a, _, _ := artifact()
+	start := time.Now()
+	r, summary := exchange(t, c, []request{{ID: 1, Command: "get", ActionID: a}, {ID: 2, Command: "close"}}, nil)
+	if !r[0].Miss || r[0].Err != "" || time.Since(start) > time.Second || !strings.Contains(summary, "read_errors=1 read_timeouts=1 remote_disabled=true") {
+		t.Fatalf("trickling remote was not bounded: %+v, %s", r[0], summary)
 	}
 }
 
