@@ -10,7 +10,7 @@
     "deploy": "scripts/deploy.sh production",
     "dev": "scripts/dev.sh",
     "dev:profile": "scripts/dev-profile.sh",
-    "check": "pnpm -r check && scripts/with-postgres.sh node --test packages/cache-core/integration/worker-split.mjs",
+    "check": "pnpm -r check && scripts/with-postgres.sh node --test packages/cache-core/integration/worker-split.mjs apps/cli/test/upload.test.mjs",
     "cf-typegen": "pnpm --filter @snowstead/cache-core cf-typegen && pnpm --filter @snowstead/gateway-worker cf-typegen"
   },
   "devDependencies": {
