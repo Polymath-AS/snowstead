@@ -23,7 +23,9 @@ function getClient(accessKeyId: string, secretAccessKey: string): AwsClient {
  * the checksum header is signed, and R2 rejects a body that does not match
  * it (400 BadDigest), so uploads stay content-addressed though the Worker
  * never sees the bytes. `metadata` is stored with the object as
- * x-amz-meta-* headers, signed like the rest.
+ * x-amz-meta-* headers, signed like the rest. Canonical writes also sign
+ * If-None-Match, so neither concurrent clients nor URL replays can replace
+ * another session's ownership metadata.
  */
 export async function createPresignedPut(
 	endpoint: string,
@@ -33,7 +35,8 @@ export async function createPresignedPut(
 	key: string,
 	sha256Hex: string,
 	expiresIn: number,
-	metadata: Readonly<Record<string, string>> = {},
+	metadata: Readonly<Record<string, string>>,
+	createOnly: boolean,
 ): Promise<{ url: string; headers: Record<string, string> }> {
 	const client = getClient(accessKeyId, secretAccessKey);
 	const url = new URL(`/${bucket}/${key}`, endpoint);
@@ -44,6 +47,7 @@ export async function createPresignedPut(
 		"x-amz-checksum-sha256": hexToBase64(sha256Hex),
 		"content-type": "application/x-nix-nar",
 		"cache-control": "public, max-age=31536000, immutable",
+		...(createOnly ? { "if-none-match": "*" } : {}),
 		...Object.fromEntries(Object.entries(metadata).map(([k, v]) => [`x-amz-meta-${k}`, v])),
 	};
 	const signed = await client.sign(new Request(url, { method: "PUT", headers }), {
