@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Semaphore};
 use tracing::Instrument;
@@ -142,21 +142,39 @@ pub async fn push(
         Arc::new(Mutex::new(HashMap::new()));
     let session_client = client.clone();
     let cache_owned = cache.to_owned();
-    let sessions: Batcher<SessionParams, Session> = Batcher::new(move |specs| {
-        let client = session_client.clone();
-        let cache = cache_owned.clone();
-        async move { client.create_sessions(&cache, &specs).await }
-    });
+    let sessions: Batcher<SessionParams, Session> =
+        Batcher::new(100, Duration::from_millis(50), move |specs| {
+            let client = session_client.clone();
+            let cache = cache_owned.clone();
+            async move { client.create_sessions(&cache, &specs).await }
+        });
     let commit_client = client.clone();
-    let commits: Batcher<String, CommitResult> = Batcher::new(move |ids| {
-        let client = commit_client.clone();
-        async move { client.commit(&ids, None).await }
-    });
+    let commits: Batcher<String, CommitResult> =
+        Batcher::new(100, Duration::from_millis(50), move |ids| {
+            let client = commit_client.clone();
+            async move { client.commit(&ids, None).await }
+        });
+    // Multipart commits assemble and verify whole NARs. Keep them out of
+    // small-path batches and bound the server's concurrent promotions.
+    let multipart_client = client.clone();
+    let multipart_commits = Batcher::new(
+        jobs.min(8),
+        Duration::from_millis(10),
+        move |uploads: Vec<(String, Vec<api::UploadedPart>)>| {
+            let client = multipart_client.clone();
+            async move {
+                let ids: Vec<_> = uploads.iter().map(|(id, _)| id.clone()).collect();
+                let parts = uploads.into_iter().collect();
+                client.commit(&ids, Some(&parts)).await
+            }
+        },
+    );
     let mut work = futures_util::stream::iter(ordered.into_iter().map(|info| {
         let compression = compression.clone();
         let parts = parts.clone();
         let sessions = sessions.clone();
         let commits = commits.clone();
+        let multipart_commits = multipart_commits.clone();
         let locks = object_locks.clone();
         let span = tracing::debug_span!("push_path",path=%info.store_path);
         async move {
@@ -210,13 +228,9 @@ pub async fn push(
                         let uploaded = client
                             .upload_presigned_parts(&session, &encoded.path, parts)
                             .await?;
-                        let map = HashMap::from([(session.session_id.clone(), uploaded)]);
-                        client
-                            .commit(std::slice::from_ref(&session.session_id), Some(&map))
+                        multipart_commits
+                            .request((session.session_id.clone(), uploaded))
                             .await?
-                            .into_iter()
-                            .next()
-                            .context("empty commit response")?
                     }
                     "direct" if encoded.digest.file_size > api::MULTIPART_THRESHOLD => {
                         client
