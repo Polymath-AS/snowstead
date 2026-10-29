@@ -100,6 +100,11 @@ Build the CLI (or `nix run .` for one-off use):
 nix build       # produces ./result/bin/snowstead
 ```
 
+The flake packages only the CLI bundle, a minimal Node runtime, and zstd;
+it does not install the workspace's development or Worker dependencies.
+Push commands use your existing `nix` executable from `PATH`.
+The full development environment is separate (`nix develop`).
+
 Save credentials once:
 
 ```bash
