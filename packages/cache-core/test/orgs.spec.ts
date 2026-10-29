@@ -169,6 +169,41 @@ describe("orgs", () => {
 });
 
 describe("storage limit", () => {
+	it("recovers a canonical collision without reserving more quota", async () => {
+		const bytes = crypto.getRandomValues(new Uint8Array(16));
+		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+		const { org, cache, token } = await orgWithCache(32);
+		const post = (path: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1${path}`, {
+			method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body),
+		});
+		const create = async (digit: string) => {
+			const hash = digit.repeat(32);
+			return post(`/caches/${cache}/upload-sessions`, {
+				storePath: `/nix/store/${hash}-quota`, storePathHash: hash,
+				narHash: `sha256:${"1".repeat(52)}`, narSize: 32, fileHash, fileSize: 16, compression: "zstd",
+			});
+		};
+		const first = await create("1");
+		const second = await create("2");
+		expect(first.status).toBe(201);
+		expect(second.status).toBe(201);
+		const a = await first.json<{ sessionId: string }>();
+		const b = await second.json<{ sessionId: string }>();
+		const put = (id: string, suffix: string) => SELF.fetch(`http://example.com/_api/v1/uploads/${id}/${suffix}`, {
+			method: "PUT", headers: { authorization: `Bearer ${token}` }, body: bytes,
+		});
+		expect((await put(a.sessionId, "blob")).status).toBe(200);
+		expect((await put(b.sessionId, "blob")).status).toBe(412);
+		expect((await create("3")).status).toBe(507);
+		expect((await post(`/uploads/${b.sessionId}/multipart`, {})).status).toBe(200);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 32, used: 0 });
+		expect((await put(b.sessionId, "part/1")).status).toBe(200);
+		expect((await post(`/uploads/${b.sessionId}/complete`, {})).status).toBe(200);
+		for (const sessionId of [b.sessionId, a.sessionId]) {
+			expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
+		}
+	});
+
 	it("accepts pushes that fit and refuses one that doesn't", async () => {
 		const { org, cache, token } = await orgWithCache(1000);
 

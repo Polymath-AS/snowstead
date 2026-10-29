@@ -85,6 +85,8 @@ interface SessionParams {
   system?: string;
 }
 
+class UploadPreconditionFailed extends Error {}
+
 export async function uploadBlob(
   client: ApiClient,
   sessionId: string,
@@ -100,6 +102,7 @@ export async function uploadBlob(
   });
   if (!resp.ok) {
     const text = await resp.text();
+    if (resp.status === 412) throw new UploadPreconditionFailed(`blob upload failed (412): ${text}`);
     throw new Error(`blob upload failed (${resp.status}): ${text}`);
   }
 }
@@ -126,8 +129,34 @@ export async function uploadPresigned(
   }));
   if (!resp.ok) {
     const text = await resp.text();
+    if (resp.status === 412) throw new UploadPreconditionFailed(`presigned upload failed (412): ${text}`);
     throw new Error(`presigned upload failed (${resp.status}): ${text}`);
   }
+}
+
+/** A canonical collision reuses the reservation, with at most one retarget. */
+export async function uploadSingle(
+  client: ApiClient,
+  session: Exclude<SessionResponse, { uploadMethod: "presigned-parts" }>,
+  filePath: string,
+  limit: <R>(fn: () => Promise<R>) => Promise<R>,
+): Promise<CommitResult | undefined> {
+  try {
+    if (session.uploadMethod === "presigned") {
+      await uploadPresigned(session.uploadUrl, session.uploadHeaders, filePath);
+    } else {
+      await uploadBlob(client, session.sessionId, filePath);
+    }
+  } catch (error) {
+    if (!(error instanceof UploadPreconditionFailed) || session.r2Key.startsWith("staging/")) throw error;
+    // An earlier PUT may have succeeded even though its response was lost.
+    // Only this session's proof can complete it; another's object cannot.
+    const [result] = await commitUploads(client, [session.sessionId]);
+    if (result.published || result.status !== 400 || result.error !== "Upload incomplete") return result;
+    await uploadBlobMultipart(client, session.sessionId, filePath, limit);
+    await completeUpload(client, session.sessionId);
+  }
+  return undefined;
 }
 
 const PUT_ATTEMPTS = 4;

@@ -269,6 +269,7 @@ async function createSessions(
 			row.fileHash,
 			SESSION_TTL_SECONDS,
 			{ [SESSION_METADATA]: row.id },
+			!isStaged(row),
 		);
 		return {
 			sessionId: row.id,
@@ -338,12 +339,15 @@ export async function handleMultipart(
 	if (result.error) return result.error;
 	const session = result.session;
 
-	if (session.status !== "pending") {
+	if (session.status !== "pending" && session.status !== "uploading") {
 		return errorResponse("Conflict", 409);
 	}
 
 	if (!session.r2UploadKey) {
 		return errorResponse("Internal error", 500);
+	}
+	if (session.r2UploadId) {
+		return jsonResponse({ uploadId: session.r2UploadId, r2Key: session.r2UploadKey });
 	}
 
 	// Parts assemble at a staging key, unless the NAR is too large to move
@@ -353,9 +357,14 @@ export async function handleMultipart(
 		customMetadata: { [SESSION_METADATA]: session.id },
 	});
 
-	const transitioned = await transitionToMultipart(config.db, sessionId, multipart.uploadId, key);
+	const transitioned = await transitionToMultipart(config.db, session, multipart.uploadId, key);
 	if (!transitioned) {
 		try { await multipart.abort(); } catch { /* best effort */ }
+		const current = await loadSessionWithAuthCheck(config, sessionId, identity);
+		if (current.error) return current.error;
+		if (current.session.status === "uploading" && current.session.r2UploadId && current.session.r2UploadKey) {
+			return jsonResponse({ uploadId: current.session.r2UploadId, r2Key: current.session.r2UploadKey });
+		}
 		return errorResponse("Conflict", 409);
 	}
 
@@ -411,7 +420,7 @@ export async function handleUploadBlob(
 	if (result.error) return result.error;
 	const session = result.session;
 
-	if (session.status !== "pending" && session.status !== "uploading") {
+	if ((session.status !== "pending" && session.status !== "uploading") || session.r2UploadId) {
 		return errorResponse("Conflict", 409);
 	}
 
@@ -423,14 +432,14 @@ export async function handleUploadBlob(
 		return errorResponse("Request body is empty", 400);
 	}
 
-	// Blob upload is idempotent (PUT overwrites), so allow both pending and uploading states.
-	// Attempt pending→uploading; if already uploading the transition fails but that is acceptable.
+	// A canonical retry is create-only too. The caller can complete its own
+	// earlier successful upload, or retarget this reservation to multipart.
 	if (session.status === "pending") {
 		const transitioned = await transitionSessionStatus(config.db, sessionId, "pending", "uploading");
 		if (!transitioned) {
 			// Re-read to check if someone else moved it to uploading (retry-safe)
 			const current = await findUploadSession(config.db, sessionId);
-			if (!current || current.status !== "uploading") {
+			if (!current || current.status !== "uploading" || current.r2UploadId || current.r2UploadKey !== session.r2UploadKey) {
 				return errorResponse("Conflict", 409);
 			}
 		}
@@ -438,11 +447,13 @@ export async function handleUploadBlob(
 
 	// R2 rejects a body whose SHA-256 is not the session's file hash, as it
 	// does for presigned uploads.
-	await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
+	const uploaded = await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
 		sha256: session.fileHash,
 		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
 		customMetadata: { [SESSION_METADATA]: session.id },
+		...(!isStaged(session) ? { onlyIf: { etagDoesNotMatch: "*" } } : {}),
 	});
+	if (!uploaded) return errorResponse("Precondition failed", 412);
 
 	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
 }
@@ -454,7 +465,7 @@ const SESSION_METADATA = "session";
 async function hashesTo(bucket: R2Bucket, key: string, sha256Hex: string): Promise<boolean> {
 	const object = await bucket.get(key);
 	if (!object) return false;
-	const digest = new DigestStream("SHA-256");
+	const digest = new crypto.DigestStream("SHA-256");
 	await object.body.pipeTo(digest);
 	return hex(await digest.digest) === sha256Hex;
 }
@@ -499,8 +510,8 @@ export async function handleComplete(
 	const invalid = await completionError(config, session, parts);
 	if (invalid) return errorResponse(invalid.error, invalid.status);
 
-	const transitioned = await transitionSessionStatus(config.db, sessionId, session.status === "pending" ? "pending" : "uploading", "completed");
-	if (!transitioned) {
+	const completed = await completeUploadSessions(config.db, [session]);
+	if (!completed.includes(sessionId)) {
 		return errorResponse("Conflict", 409);
 	}
 
@@ -700,13 +711,14 @@ async function completionError(config: WorkerConfig, session: UploadSession, par
 }
 
 /**
- * Checks a staged upload against the file hash and moves it to the NAR's
- * key: assembling its parts first, if it came in parts. The move is a put
- * R2 refuses unless the body hashes to the file hash, made even when the
- * NAR is stored already, since that's how this pusher shows it has it;
- * a refused put leaves the stored NAR as it was. NARs too large for one put
- * are hashed in the Worker instead, and only staged when stored already.
- * The staging object goes either way.
+ * Checks this session's own staged bytes, assembling parts first. A missing
+ * NAR is installed with a checksum-checked, create-only PUT; a stored one
+ * is verified and left alone. Replacing it would erase an outstanding
+ * canonical uploader's session metadata, invalidating its proof before it
+ * can complete. Checking for absence alone isn't enough: another client's
+ * PUT can arrive between the check and promotion.
+ * NARs too large for one PUT can only reuse an existing object. The staging
+ * object goes either way; a completed session records its verified proof.
  */
 async function promoteStaged(config: WorkerConfig, session: UploadSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
@@ -723,24 +735,40 @@ async function promoteStaged(config: WorkerConfig, session: UploadSession, parts
 		const isPrivate = await isPrivateCache(config, cache.path);
 		const target = narKey(session.fileHash, session.compression, isPrivate);
 		const bucket = bucketFor(config, isPrivate);
-		if (session.fileSize > PRESIGNED_PUT_MAX_BYTES) {
-			if (!(await hashesTo(config.bucket, key, session.fileHash))) return "File hash mismatch";
-			return (await bucket.head(target)) ? undefined : "Upload incomplete: the stored NAR is gone, push again";
+		let stored = await bucket.head(target);
+		if (!stored && session.fileSize <= PRESIGNED_PUT_MAX_BYTES) {
+			const staged = await config.bucket.get(key);
+			if (!staged) return "Upload incomplete";
+			if (staged.size !== session.fileSize) {
+				await staged.body.cancel();
+				return "File size mismatch";
+			}
+			try {
+				const installed = await bucket.put(target, staged.body, {
+					sha256: session.fileHash,
+					httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
+					onlyIf: { etagDoesNotMatch: "*" },
+				});
+				if (installed) return undefined;
+			} catch {
+				return "File hash mismatch";
+			}
+			if (!staged.bodyUsed) await staged.body.cancel();
+			stored = await bucket.head(target);
 		}
-		const staged = await config.bucket.get(key);
+		// A failed conditional PUT need not consume or checksum its body.
+		// Never accept the canonical NAR as proof of this session's upload.
+		const staged = await config.bucket.head(key);
 		if (!staged) return "Upload incomplete";
-		if (staged.size !== session.fileSize) {
-			await staged.body.cancel();
-			return "File size mismatch";
-		}
-		try {
-			await bucket.put(target, staged.body, {
-				sha256: session.fileHash,
-				httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
-			});
-		} catch {
-			return "File hash mismatch";
-		}
+		if (staged.size !== session.fileSize) return "File size mismatch";
+		if (staged.checksums.sha256
+			? hex(staged.checksums.sha256) !== session.fileHash
+			: !(await hashesTo(config.bucket, key, session.fileHash))) return "File hash mismatch";
+		if (!stored) return "Upload incomplete: the stored NAR is gone, push again";
+		if (stored.size !== session.fileSize) return "File size mismatch";
+		if (stored.checksums.sha256
+			? hex(stored.checksums.sha256) !== session.fileHash
+			: !(await hashesTo(bucket, target, session.fileHash))) return "File hash mismatch";
 		return undefined;
 	} finally {
 		await config.bucket.delete(key);
@@ -790,7 +818,7 @@ export async function handleCommit(
 		if (error) fail(s.id, error.error, error.status);
 		return !error;
 	});
-	const moved = new Set(await completeUploadSessions(config.db, verified.map((s) => s.id)));
+	const moved = new Set(await completeUploadSessions(config.db, verified));
 	for (const s of verified) {
 		if (!moved.has(s.id)) fail(s.id, "Conflict", 409);
 	}

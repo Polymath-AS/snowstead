@@ -6,9 +6,8 @@ import {
   getMissingPaths,
   createUploadSessions,
   commitUploads,
-  uploadBlob,
+  uploadSingle,
   shouldUseMultipart,
-  uploadPresigned,
   uploadPresignedParts,
   uploadBlobMultipart,
   completeUpload,
@@ -56,9 +55,8 @@ function pathPusher(client: ApiClient, cache: string) {
   );
   const commit = batcher(BATCH_SIZE, BATCH_DELAY_MS, (ids: string[]) => commitUploads(client, ids));
   const partSlot = limiter(PART_CONCURRENCY);
-  // Each session must upload its own proof of possession. Sessions sharing
-  // a NAR key wait through commit, not just PUT: overwriting its metadata
-  // before verification would invalidate the preceding session's proof.
+  // Avoid needless collision recovery within this push. Independent
+  // clients are protected by the server's create-only canonical writes.
   const uploads = new Map<string, ReturnType<typeof limiter>>();
 
   return async (storePath: string, info: PathInfo): Promise<{ sizeKb: number }> => {
@@ -90,15 +88,12 @@ function pathPusher(client: ApiClient, cache: string) {
           // On its own: the server assembles and checks the NAR, which would
           // hold up a batch of small paths.
           [result] = await commitUploads(client, [session.sessionId], { [session.sessionId]: parts });
-        } else if (session.uploadMethod === "presigned") {
-          // Straight to R2; the API never handles the NAR.
-          await uploadPresigned(session.uploadUrl, session.uploadHeaders, narFile);
-        } else if (shouldUseMultipart(fileSize)) {
+        } else if (session.uploadMethod === "direct" && shouldUseMultipart(fileSize)) {
           await uploadBlobMultipart(client, session.sessionId, narFile, partSlot);
           // A commit takes multipart sessions only once completed.
           await completeUpload(client, session.sessionId);
         } else {
-          await uploadBlob(client, session.sessionId, narFile);
+          result = await uploadSingle(client, session, narFile, partSlot);
         }
         result ??= await commit(session.sessionId);
         if (!result.published) {

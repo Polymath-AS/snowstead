@@ -1,12 +1,13 @@
-import { env, SELF } from "cloudflare:test";
+import { env, SELF, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createCache } from "../src/db/repository.js";
+import { createCache, findUploadSession } from "../src/db/repository.js";
 import { narKey } from "../src/layout.js";
 import { eq } from "drizzle-orm";
 import { uploadSessions } from "../src/db/schema.js";
 import { runGarbageCollection } from "../../../workers/control/src/gc.js";
 import { resolveConfig } from "../src/config.js";
+import nix from "../../../workers/nix/src/index.js";
 
 // NARs are shared by every cache that has them. These push one into one
 // cache, then try to get it into another without having its bytes.
@@ -24,7 +25,7 @@ function post(path: string, body: unknown): Promise<Response> {
 }
 
 function put(path: string, body: Uint8Array): Promise<Response> {
-	return SELF.fetch(`http://example.com${path}`, { method: "PUT", headers: AUTH, body });
+	return SELF.fetch(`http://example.com${path}`, { method: "PUT", headers: AUTH, body: body.slice() });
 }
 
 async function nar(): Promise<{ bytes: Uint8Array; fileHash: string }> {
@@ -164,5 +165,350 @@ describe("proof of possession", () => {
 		} finally {
 			await config.close();
 		}
+	});
+});
+
+describe("canonical and staged upload interleaving", () => {
+	// Real duplicate NARs from the reported closure: nix-store --dump on
+	// either PAM path yields the same 1152 bytes; zstd -q -c -T1 yields this.
+	const bytes = Uint8Array.from(atob("KLUv/QRYnQsABpZDITBN3cA0Zcqg5f0J3CyRsUCGQ14VwTho0nkfwaA8qOY6BTgAPgA5AMtsNdobG9rtUJ5VUojGTVrP8TnHsJACf9bn53Igu0URQjsFMjMVVp8BaZAAmckkOu3juiXUchIE1HJcyHquUMuRITXIqt+OTp09bMQUykJhEqnBhIq8UcJESA0nPLgG4TxMFfEo+MSzjcUDqYkFajQUmPZ7Z1QS7q0BQVGxNhVrs3BvkPHe6zCqfoU2UizQ+/f6Wdet40Rfz0d++83tsz4fGRZyHAfLsjDMam36GayZmZl5wEysC1nLwsTaNO31rBK/3omVSQ0y98oWNFrH4efWc2VidXd1WMjxsGrnWi3oRVFk2PQLJyCgIpkR4w1bRIANH4wmYEkNjL205g1mJ2ZcZxfJyGYbgBBQpUBsndI0lGCjTyS3S3agScUBdsP1itFTsQRlnAANNMAWP6fEP0DnodiNUUXglJSvXaO4I0YNZGAG9giDagNjm63H"), c => c.charCodeAt(0));
+	const fileHash = "f0db3d2a2fadbc56937dde94e78d4a2d73a945d00511a5211d66fe370a940eb3";
+	const canonical = narKey(fileHash, "zstd", false);
+	const paths = [
+		"7kmbcwnb53sc5s2scg1qimxags7xaair-userdel.pam",
+		"l1n3aywf08rj0jv62ryc2nc3hnyz9hch-useradd.pam",
+	];
+
+	async function pamSession(cache: string, index: number) {
+		const response = await post(`/_api/v1/caches/${cache}/upload-sessions`, {
+			storePath: `/nix/store/${paths[index]}`, storePathHash: paths[index].slice(0, 32),
+			narHash: "sha256-0CszDDh/wN3/LZKd90rIIRYLmGc0kOKYCTxZcQcq0Fk=", narSize: 1152,
+			fileHash, fileSize: bytes.length, compression: "zstd",
+			references: ["9qqk0zxph7qihzs9hjy1hfgacb6ndmj1-linux-pam-1.7.2"],
+		});
+		expect(response.status).toBe(201);
+		return response.json<{ sessionId: string; r2Key: string }>();
+	}
+
+	async function upload(s: { sessionId: string; r2Key: string }, method: string) {
+		if (method === "presigned") {
+			// The S3 transport leaves the session pending. Supply the object R2
+			// stores, including its verified checksum and signed session metadata.
+			await (s.r2Key.startsWith("staging/") ? env.CACHE_BUCKET : env.PUBLIC_BUCKET).put(s.r2Key, bytes, {
+				sha256: fileHash, customMetadata: { session: s.sessionId },
+			});
+		} else if (method === "multipart") {
+			expect((await post(`/_api/v1/uploads/${s.sessionId}/multipart`, {})).status).toBe(200);
+			expect((await put(`/_api/v1/uploads/${s.sessionId}/part/1`, bytes)).status).toBe(200);
+		} else {
+			expect((await put(`/_api/v1/uploads/${s.sessionId}/blob`, bytes)).status).toBe(200);
+		}
+	}
+
+	it("returns signed create-only instructions only for canonical single PUTs", async () => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const cache = await freshCache();
+		for (const index of [0, 1]) {
+			const ctx = createExecutionContext();
+			const request = new Request(`http://example.com/_api/v1/caches/${cache}/upload-sessions`, {
+				method: "POST", headers: { ...AUTH, "content-type": "application/json" },
+				body: JSON.stringify({
+					storePath: `/nix/store/${paths[index]}`, storePathHash: paths[index].slice(0, 32),
+					narHash: "sha256-0CszDDh/wN3/LZKd90rIIRYLmGc0kOKYCTxZcQcq0Fk=", narSize: 1152,
+					fileHash, fileSize: bytes.length, compression: "zstd",
+				}),
+			});
+			const response = await nix.fetch(request as Parameters<typeof nix.fetch>[0], {
+				...env, R2_ACCESS_KEY_ID: "test-signing-key", R2_SECRET_ACCESS_KEY: "test-signing-secret", R2_ENDPOINT: "https://example.r2.cloudflarestorage.com",
+			}, ctx);
+			await waitOnExecutionContext(ctx);
+			expect(response.status).toBe(201);
+			const s = await response.json<{ sessionId: string; r2Key: string; uploadMethod: string; uploadUrl: string; uploadHeaders: Record<string, string> }>();
+			expect(s.uploadMethod).toBe("presigned");
+			expect(s.uploadHeaders["if-none-match"]).toBe(index === 0 ? "*" : undefined);
+			expect(new URL(s.uploadUrl).searchParams.get("X-Amz-SignedHeaders")?.split(";").includes("if-none-match")).toBe(index === 0);
+			expect(s.uploadHeaders["x-amz-meta-session"]).toBe(s.sessionId);
+			if (index === 0) await upload(s, "presigned");
+		}
+	});
+
+	it.each([
+		["direct", false], ["direct", true], ["presigned", false], ["presigned", true],
+	] as const)("recovers initial canonical %s collisions with the same reservation (bad parts %s)", async (method, badParts) => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const cache = await freshCache();
+		const a = await pamSession(cache, 0);
+		const b = await pamSession(cache, 1);
+		expect(a.r2Key).toBe(canonical);
+		expect(b.r2Key).toBe(canonical);
+		const before = await findUploadSession(db, b.sessionId);
+		await upload(a, "direct");
+		const winner = await env.PUBLIC_BUCKET.head(canonical);
+		if (method === "direct") {
+			expect((await put(`/_api/v1/uploads/${b.sessionId}/blob`, bytes)).status).toBe(412);
+		} else {
+			// Exercise R2's conditional object state without simulating S3 signing.
+			expect(await env.PUBLIC_BUCKET.put(canonical, bytes, {
+				sha256: fileHash, customMetadata: { session: b.sessionId }, onlyIf: { etagDoesNotMatch: "*" },
+			})).toBeNull();
+			expect((await findUploadSession(db, b.sessionId))?.status).toBe("pending");
+		}
+		expect(await commit(b.sessionId)).toMatchObject({ error: "Upload incomplete", status: 400 });
+		const start = await post(`/_api/v1/uploads/${b.sessionId}/multipart`, {});
+		expect(start.status).toBe(200);
+		const instructions = await start.json<{ uploadId: string; r2Key: string }>();
+		expect(instructions.r2Key).toBe(`staging/${b.sessionId}`);
+		expect(await (await post(`/_api/v1/uploads/${b.sessionId}/multipart`, {})).json()).toEqual(instructions);
+		const after = await findUploadSession(db, b.sessionId);
+		expect(after).toMatchObject({ id: before?.id, fileSize: before?.fileSize, expiresAt: before?.expiresAt, status: "uploading" });
+		expect((await put(`/_api/v1/uploads/${b.sessionId}/blob`, bytes)).status).toBe(409);
+		expect((await put(`/_api/v1/uploads/${b.sessionId}/part/1`, badParts ? new Uint8Array(bytes.length) : bytes)).status).toBe(200);
+		const complete = await post(`/_api/v1/uploads/${b.sessionId}/complete`, {});
+		expect(complete.status).toBe(badParts ? 400 : 200);
+		if (!badParts) {
+			expect(await commit(b.sessionId)).toMatchObject({ published: true });
+			expect(await commit(b.sessionId)).toMatchObject({ published: true });
+		}
+		expect((await env.PUBLIC_BUCKET.head(canonical))?.version).toBe(winner?.version);
+		expect(await storedBytes(fileHash)).toEqual(bytes);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+	});
+
+	it("recognizes its own canonical upload after a lost response without overwriting it", async () => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const a = await pamSession(await freshCache(), 0);
+		await upload(a, "direct");
+		const winner = await env.PUBLIC_BUCKET.head(canonical);
+		expect((await put(`/_api/v1/uploads/${a.sessionId}/blob`, bytes)).status).toBe(412);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		expect((await env.PUBLIC_BUCKET.head(canonical))?.version).toBe(winner?.version);
+	});
+
+	it.each([
+		["complete", "direct"], ["commit", "direct"], ["complete", "presigned"], ["commit", "presigned"],
+	])("fences a stale %s after %s multipart retarget", async (endpoint, method) => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const a = await pamSession(await freshCache(), 0);
+		await upload(a, method);
+		let retargeted = false;
+		const bucket = new Proxy(env.PUBLIC_BUCKET, {
+			get(target, property) {
+				if (property === "head") return async (key: string) => {
+					const observed = await target.head(key);
+					if (key === canonical && !retargeted) {
+						retargeted = true;
+						expect((await post(`/_api/v1/uploads/${a.sessionId}/multipart`, {})).status).toBe(200);
+					}
+					return observed;
+				};
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const ctx = createExecutionContext();
+		const request = new Request(`http://example.com/_api/v1/uploads/${endpoint === "commit" ? "commit" : `${a.sessionId}/complete`}`, {
+			method: "POST", headers: { ...AUTH, "content-type": "application/json" },
+			body: JSON.stringify(endpoint === "commit" ? { sessionIds: [a.sessionId] } : {}),
+		});
+		const response = await nix.fetch(request as Parameters<typeof nix.fetch>[0], { ...env, PUBLIC_BUCKET: bucket }, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(retargeted).toBe(true);
+		if (endpoint === "commit") {
+			expect(await response.json()).toMatchObject({ results: [{ status: 409 }] });
+		} else {
+			expect(response.status).toBe(409);
+		}
+		expect(await findUploadSession(db, a.sessionId)).toMatchObject({ status: "uploading", r2UploadKey: `staging/${a.sessionId}` });
+		expect(await commit(a.sessionId)).toMatchObject({ status: 409 });
+		// The stale verification must not complete the empty multipart session.
+		expect((await put(`/_api/v1/uploads/${a.sessionId}/part/1`, bytes)).status).toBe(200);
+		expect((await post(`/_api/v1/uploads/${a.sessionId}/complete`, {})).status).toBe(200);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+	});
+
+	it("aborts the losing multipart allocation and returns the active instructions", async () => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const a = await pamSession(await freshCache(), 0);
+		let active: unknown;
+		let aborted = false;
+		const bucket = new Proxy(env.CACHE_BUCKET, {
+			get(target, property) {
+				if (property === "createMultipartUpload") return async (key: string, options?: R2MultipartOptions) => {
+					const orphan = await target.createMultipartUpload(key, options);
+					const winner = await post(`/_api/v1/uploads/${a.sessionId}/multipart`, {});
+					expect(winner.status).toBe(200);
+					active = await winner.json();
+					return new Proxy(orphan, {
+						get(upload, property) {
+							if (property === "abort") return async () => { aborted = true; await upload.abort(); };
+							const value = Reflect.get(upload, property, upload);
+							return typeof value === "function" ? value.bind(upload) : value;
+						},
+					});
+				};
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const ctx = createExecutionContext();
+		const request = new Request(`http://example.com/_api/v1/uploads/${a.sessionId}/multipart`, {
+			method: "POST", headers: { ...AUTH, "content-type": "application/json" }, body: "{}",
+		});
+		const response = await nix.fetch(request as Parameters<typeof nix.fetch>[0], { ...env, CACHE_BUCKET: bucket }, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(active);
+		expect(aborted).toBe(true);
+		expect((await put(`/_api/v1/uploads/${a.sessionId}/part/1`, bytes)).status).toBe(200);
+		expect((await post(`/_api/v1/uploads/${a.sessionId}/complete`, {})).status).toBe(200);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+	});
+
+	it.each([
+		["direct", "direct"], ["direct", "presigned"], ["direct", "multipart"],
+		["presigned", "direct"], ["presigned", "presigned"], ["presigned", "multipart"],
+	])("keeps canonical %s proof when staged %s completes first", async (firstMethod, secondMethod) => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const [first, second] = [await freshCache(), await freshCache()];
+		const a = await pamSession(first, 0);
+		expect(a.r2Key).toBe(canonical);
+		await upload(a, firstMethod);
+		const before = await env.PUBLIC_BUCKET.head(canonical);
+		expect(before?.customMetadata).toEqual({ session: a.sessionId });
+
+		const b = await pamSession(second, 1);
+		expect(b.r2Key).toMatch(/^staging\//);
+		await upload(b, secondMethod);
+		// Exercise both completion contracts, without publishing A early.
+		if (secondMethod === "multipart") {
+			expect((await post(`/_api/v1/uploads/${b.sessionId}/complete`, {})).status).toBe(200);
+			expect((await post(`/_api/v1/uploads/${b.sessionId}/publish`, {})).status).toBe(200);
+		} else {
+			expect(await commit(b.sessionId)).toMatchObject({ published: true });
+		}
+		const after = await env.PUBLIC_BUCKET.head(canonical);
+		expect(after?.version).toBe(before?.version);
+		expect(after?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await env.CACHE_BUCKET.head(b.r2Key)).toBeNull();
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		expect(await commit(b.sessionId)).toMatchObject({ published: true });
+		for (const [cache, index] of [[first, 0], [second, 1]] as const) {
+			expect(await narinfoStatus(cache, paths[index].slice(0, 32))).toBe(200);
+		}
+		expect(await storedBytes(fileHash)).toEqual(bytes);
+	});
+
+	it.each([false, true])("doesn't clobber a canonical PUT arriving during promotion (bad parts: %s)", async badParts => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const [first, second] = [await freshCache(), await freshCache()];
+		const a = await pamSession(first, 0);
+		const b = await pamSession(second, 1);
+		// Both were created before the NAR exists; multipart B moves to staging.
+		expect((await post(`/_api/v1/uploads/${b.sessionId}/multipart`, {})).status).toBe(200);
+		const body = badParts ? new Uint8Array(bytes.length).fill(1) : bytes;
+		const uploaded = await put(`/_api/v1/uploads/${b.sessionId}/part/1`, body);
+		expect(uploaded.status).toBe(200);
+		const part = await uploaded.json<{ partNumber: number; etag: string }>();
+		let interleaved = false;
+		const bucket = new Proxy(env.PUBLIC_BUCKET, {
+			get(target, property) {
+				if (property === "head") return async (key: string) => {
+					const observed = await target.head(key);
+					if (key === canonical && !interleaved) {
+						expect(observed).toBeNull();
+						interleaved = true;
+						await upload(a, "direct");
+					}
+					return observed;
+				};
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const ctx = createExecutionContext();
+		// Real public Worker routing/auth/DB/R2; only delay the HEAD result so
+		// another real API request installs A before B's conditional PUT.
+		const request = new Request("http://example.com/_api/v1/uploads/commit", {
+			method: "POST", headers: { ...AUTH, "content-type": "application/json" },
+			body: JSON.stringify({ sessionIds: [b.sessionId], parts: { [b.sessionId]: [part] } }),
+		});
+		// Test-created requests have no incoming Cloudflare metadata.
+		const response = await nix.fetch(request as Parameters<typeof nix.fetch>[0], { ...env, PUBLIC_BUCKET: bucket }, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ results: [badParts
+			? { error: "File hash mismatch", status: 400 }
+			: { published: true }] });
+		expect(interleaved).toBe(true);
+		expect((await env.PUBLIC_BUCKET.head(canonical))?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		expect(await storedBytes(fileHash)).toEqual(bytes);
+	});
+
+	it("keeps private cross-org proof and refuses another org's session", async () => {
+		const key = narKey(fileHash, "zstd", true);
+		await env.CACHE_BUCKET.delete(key);
+		await env.PUBLIC_BUCKET.delete(canonical);
+		async function request(path: string, method: string, body: unknown, token: string) {
+			return SELF.fetch(`http://example.com/_api/v1${path}`, {
+				method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		}
+		async function client() {
+			const org = `possession-${crypto.randomUUID().slice(0, 8)}`;
+			expect((await request(`/orgs/${org}`, "PUT", { slug: org }, "test-admin-secret")).status).toBe(200);
+			expect((await request(`/orgs/${org}/caches`, "POST", { name: "team", private: true, protocols: ["nix"] }, "test-admin-secret")).status).toBe(201);
+			const response = await request(`/orgs/${org}/tokens`, "POST", { subject: "possession", caches: ["team"], perms: ["push", "pull"] }, "test-admin-secret");
+			expect(response.status).toBe(201);
+			const { token } = await response.json<{ token: string }>();
+			const create = async (index: number) => {
+				const response = await request("/caches/team/upload-sessions", "POST", {
+					storePath: `/nix/store/${paths[index]}`, storePathHash: paths[index].slice(0, 32),
+					narHash: "sha256-0CszDDh/wN3/LZKd90rIIRYLmGc0kOKYCTxZcQcq0Fk=", narSize: 1152,
+					fileHash, fileSize: bytes.length, compression: "zstd",
+				}, token);
+				expect(response.status).toBe(201);
+				return response.json<{ sessionId: string; r2Key: string }>();
+			};
+			return { token, create };
+		}
+		const [first, second] = [await client(), await client()];
+		const a = await first.create(0);
+		expect((await SELF.fetch(`http://example.com/_api/v1/uploads/${a.sessionId}/blob`, {
+			method: "PUT", headers: { authorization: `Bearer ${first.token}` }, body: bytes,
+		})).status).toBe(200);
+		const b = await second.create(1);
+		expect(b.r2Key).toMatch(/^staging\//);
+		expect((await SELF.fetch(`http://example.com/_api/v1/uploads/${b.sessionId}/blob`, {
+			method: "PUT", headers: { authorization: `Bearer ${second.token}` }, body: bytes,
+		})).status).toBe(200);
+		for (const endpoint of ["complete", "publish", "multipart"]) {
+			expect((await request(`/uploads/${a.sessionId}/${endpoint}`, "POST", {}, second.token)).status).toBe(403);
+		}
+		const refused = await request("/uploads/commit", "POST", { sessionIds: [a.sessionId] }, second.token);
+		expect(await refused.json()).toMatchObject({ results: [{ error: "Forbidden", status: 403 }] });
+		for (const [s, owner] of [[b, second], [a, first]] as const) {
+			const response = await request("/uploads/commit", "POST", { sessionIds: [s.sessionId] }, owner.token);
+			expect(await response.json()).toMatchObject({ results: [{ published: true }] });
+		}
+		expect((await env.CACHE_BUCKET.head(key))?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await env.PUBLIC_BUCKET.head(canonical)).toBeNull();
+	});
+
+	it.each(["size", "hash"])("refuses staged %s tampering without replacing another session's object", async mismatch => {
+		const { bytes, fileHash } = await nar();
+		const [first, second] = [await freshCache(), await freshCache()];
+		const a = await session(first, fileHash);
+		expect((await put(`/_api/v1/uploads/${a.sessionId}/blob`, bytes)).status).toBe(200);
+		const b = await session(second, fileHash);
+		// Fault injection bypasses PUT's checksum to exercise completion itself.
+		await env.CACHE_BUCKET.put(b.r2Key, mismatch === "size" ? bytes.slice(1) : new Uint8Array(SIZE));
+		expect(await commit(b.sessionId)).toMatchObject({ status: 400, error: mismatch === "size" ? "File size mismatch" : "File hash mismatch" });
+		expect(await env.CACHE_BUCKET.head(b.r2Key)).toBeNull();
+		expect((await env.PUBLIC_BUCKET.head(a.r2Key))?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		expect(await narinfoStatus(second, b.hash)).toBe(404);
 	});
 });

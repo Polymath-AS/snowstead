@@ -627,7 +627,7 @@ export async function transitionSessionStatus(
 
 export async function transitionToMultipart(
 	db: Db,
-	sessionId: string,
+	session: Pick<UploadSession, "id" | "status" | "r2UploadKey">,
 	r2UploadId: string,
 	r2UploadKey: string,
 ): Promise<UploadSession | undefined> {
@@ -635,7 +635,13 @@ export async function transitionToMultipart(
 		db
 			.update(uploadSessions)
 			.set({ status: "uploading", r2UploadId, r2UploadKey })
-			.where(and(eq(uploadSessions.id, sessionId), eq(uploadSessions.status, "pending")))
+			.where(and(
+				eq(uploadSessions.id, session.id),
+				eq(uploadSessions.status, session.status),
+				sql`${uploadSessions.r2UploadKey} IS NOT DISTINCT FROM ${session.r2UploadKey}`,
+				isNull(uploadSessions.r2UploadId),
+				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
+			))
 			.returning(),
 	);
 }
@@ -994,16 +1000,28 @@ export async function findUploadSessions(db: Db, ids: readonly string[]): Promis
 
 /**
  * Marks uploaded sessions completed: presigned ones are still pending,
- * the others uploading. Returns the ids that moved.
+ * the others uploading. Fence against a retarget since verification:
+ * possession at the old key cannot complete a new multipart upload.
  */
-export async function completeUploadSessions(db: Db, ids: readonly string[]): Promise<string[]> {
-	if (ids.length === 0) return [];
+export async function completeUploadSessions(
+	db: Db,
+	sessions: readonly Pick<UploadSession, "id" | "status" | "r2UploadKey" | "r2UploadId">[],
+): Promise<string[]> {
+	if (sessions.length === 0) return [];
+	const expected = sessions.map(({ id, status, r2UploadKey, r2UploadId }) => ({ id, status, r2UploadKey, r2UploadId }));
 	const rows = await db
 		.update(uploadSessions)
 		.set({ status: "completed" })
 		.where(
 			and(
-				anyOf(uploadSessions.id, ids),
+				anyOf(uploadSessions.id, sessions.map((session) => session.id)),
+				// Keep batch SQL and parameter count fixed while matching each
+				// session's verified state, including nullable upload coordinates.
+				sql`EXISTS (SELECT 1 FROM jsonb_to_recordset(${JSON.stringify(expected)}::jsonb)
+					AS verified(id text, status text, "r2UploadKey" text, "r2UploadId" text)
+					WHERE verified.id = ${uploadSessions.id} AND verified.status = ${uploadSessions.status}
+					AND verified."r2UploadKey" IS NOT DISTINCT FROM ${uploadSessions.r2UploadKey}
+					AND verified."r2UploadId" IS NOT DISTINCT FROM ${uploadSessions.r2UploadId})`,
 				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
 			),
 		)

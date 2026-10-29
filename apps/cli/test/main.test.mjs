@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
-import { uploadBlobMultipart, uploadPresignedParts } from "../dist/api.js";
+import { uploadBlobMultipart, uploadPresignedParts, uploadSingle } from "../dist/api.js";
 import { limiter } from "../dist/batch.js";
 
 const exec = promisify(execFile);
@@ -264,3 +264,66 @@ test("proxied and presigned parts share a concurrency budget, including after fa
     await new Promise((resolve) => api.close(resolve));
   }
 });
+
+for (const method of ["direct", "presigned"]) {
+  for (const outcome of ["collision", "own-upload", "bad-checksum", "forbidden", "commit-conflict", "bad-parts", "staged-conflict"]) {
+    test(`${method} single PUT recovery: ${outcome}`, async () => {
+      const bytes = Buffer.from("small collision proof");
+      const file = join(home, `${method}-${outcome}.nar`);
+      await writeFile(file, bytes);
+      const calls = [];
+      const api = createServer(async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const body = Buffer.concat(chunks);
+        calls.push(req.url);
+        if (req.method === "PUT") {
+          assert.deepEqual(body, bytes);
+          if (req.url.endsWith("/blob")) {
+            res.statusCode = outcome === "bad-checksum" ? 400 : outcome === "forbidden" ? 403 : 412;
+            return res.end("upload refused");
+          }
+          assert.equal(req.url, "/_api/v1/uploads/same-session/part/1");
+          res.statusCode = outcome === "bad-parts" ? 400 : 200;
+          return res.end(JSON.stringify({ partNumber: 1, etag: "part-etag" }));
+        }
+        if (req.url === "/_api/v1/uploads/commit") {
+          assert.deepEqual(JSON.parse(body), { sessionIds: ["same-session"] });
+          return res.end(JSON.stringify({ results: [{ sessionId: "same-session", ...(outcome === "own-upload"
+            ? { published: true }
+            : outcome === "commit-conflict" ? { error: "Conflict", status: 409 }
+              : { error: "Upload incomplete", status: 400 }) }] }));
+        }
+        assert.ok(req.url === "/_api/v1/uploads/same-session/multipart" || req.url === "/_api/v1/uploads/same-session/complete");
+        return res.end(JSON.stringify({ uploadId: "multipart", r2Key: "staging/same-session" }));
+      });
+      await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+      const url = `http://127.0.0.1:${api.address().port}`;
+      const session = {
+        sessionId: "same-session", r2Key: outcome === "staged-conflict" ? "staging/same-session" : "nar/hash/zstd.nar",
+        expiresAt: "2027-01-01", uploadMethod: method, uploadUrl: `${url}/signed/blob`, uploadHeaders: { "if-none-match": "*" },
+      };
+      try {
+        const upload = uploadSingle({ server: url, token: "push-token" }, session, file, limiter(1));
+        if (["bad-checksum", "forbidden", "bad-parts", "staged-conflict"].includes(outcome)) {
+          await assert.rejects(upload, /upload failed/);
+        } else {
+          const result = await upload;
+          if (outcome === "own-upload") assert.equal(result.published, true);
+          else if (outcome === "commit-conflict") assert.equal(result.status, 409);
+          else assert.equal(result, undefined);
+        }
+        const first = method === "direct" ? "/_api/v1/uploads/same-session/blob" : "/signed/blob";
+        const expected = [first];
+        if (!["bad-checksum", "forbidden", "staged-conflict"].includes(outcome)) expected.push("/_api/v1/uploads/commit");
+        if (["collision", "bad-parts"].includes(outcome)) {
+          expected.push("/_api/v1/uploads/same-session/multipart", "/_api/v1/uploads/same-session/part/1");
+          if (outcome === "collision") expected.push("/_api/v1/uploads/same-session/complete");
+        }
+        assert.deepEqual(calls, expected);
+      } finally {
+        await new Promise((resolve) => api.close(resolve));
+      }
+    });
+  }
+}
