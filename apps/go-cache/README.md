@@ -31,16 +31,31 @@ For public reads, explicitly set `SNOWSTEAD_GO_CACHE_READ_ONLY=true` and leave
 standalone prototype still requires a token on reads; anonymous access is for
 public named caches in the main service. Invalid/missing remote configuration
 disables remote access. Redirects are never followed. Credentials, when present,
-use bearer authentication. Requests have a five-second timeout. Remote errors,
-misses, invalid headers, oversized
-downloads, and digest mismatches are cache misses, not build failures. Puts are
-published locally before uploading; failed uploads never prevent local reuse.
+use bearer authentication. Requests stop after five seconds without body-stream
+progress; response headers also have a five-second deadline. Healthy transfers
+may take longer than five seconds. There is also a 69-second absolute request
+limit: five seconds plus the 64 MiB maximum artifact at 1 MiB/s. This bounds
+trickling peers without imposing the old five-second whole-body cutoff on large
+artifacts. The observed 23,345,386-byte Kubernetes artifact crossed that cutoff
+while still transferring data. Progress is tracked per request, including when
+HTTP/2 multiplexes requests on one connection. Remote errors, misses, invalid
+headers, oversized downloads, and digest mismatches are cache misses, not build
+failures. Puts are published locally before uploading; failed uploads never
+prevent local reuse.
 The first network failure (including a download-body timeout), HTTP 401, 403,
 429, or 5xx disables remote reads and writes for the rest of that helper process.
 Already-started requests can finish or time out; later requests use local data
 or miss immediately. A new helper process retries the remote. HTTP 404 and 409
 do not disable it. Invalid artifacts are never served. Local filesystem errors
 on put are reported to Go.
+
+The stderr summary includes `read_errors`, `read_timeouts`, and `remote_disabled`.
+Read errors count failed remote attempts, including invalid responses, digest or
+size mismatches, and download persistence failures; timeouts are a subset.
+Expected HTTP 404 misses, local-only misses, and requests skipped after the
+circuit breaker opens do not increment these error counters. `remote_disabled`
+reports whether that circuit breaker opened during this helper process. Upload
+errors remain separate: `upload_errors=0` does not imply successful downloads.
 
 GET and PUT use `/v1/actions/<lowercase hex action ID>` relative to the endpoint
 base. Remote artifacts are limited to 64 MiB; larger Go puts remain local-only.
