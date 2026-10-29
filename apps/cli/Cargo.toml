@@ -1,0 +1,42 @@
+[package]
+name = "snowstead-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "../../LICENSE"
+description = "Snowstead binary cache upload client"
+
+[[bin]]
+name = "snowstead"
+path = "src/main.rs"
+
+[[example]]
+name = "snowstead"
+path = "examples/hotpath.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snowstead_hotpath)'] }
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+hotpath = { version = "0.16.1", features = ["hotpath"] }
+zstd = { version = "0.13", features = ["pkg-config"] }
