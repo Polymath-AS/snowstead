@@ -20,37 +20,43 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        default = pkgs.stdenv.mkDerivation {
+        default = pkgs.stdenvNoCC.mkDerivation {
           pname = "snowstead";
           version = "0.0.0";
-          src = self;
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = ./apps/cli/src;
+          };
 
           nativeBuildInputs = [
-            pkgs.nodejs_22
-            pkgs.pnpm
-            pkgs.pnpmConfigHook
+            pkgs.esbuild
             pkgs.makeWrapper
           ];
 
-          pnpmDeps = pnpmDepsFor pkgs;
-
           buildPhase = ''
-            pnpm --filter @snowstead/cli exec tsc
+            runHook preBuild
+            # The CLI has only Node built-ins at runtime; domain imports are types.
+            esbuild apps/cli/src/main.ts --bundle --platform=node --format=esm \
+              --target=node22 --outfile=dist/main.js
+            runHook postBuild
           '';
 
           installPhase = ''
+            runHook preInstall
             mkdir -p $out/lib/snowstead $out/bin
+            cp dist/main.js $out/lib/snowstead/main.mjs
 
-            # Copy the full workspace structure so pnpm symlinks resolve
-            cp -r apps $out/lib/snowstead/apps
-            cp -r packages $out/lib/snowstead/packages
-            cp -r workers $out/lib/snowstead/workers
-            cp -r node_modules $out/lib/snowstead/node_modules
-            cp package.json $out/lib/snowstead/package.json
+            makeWrapper ${pkgs.nodejs-slim_22}/bin/node $out/bin/snowstead \
+              --add-flags "$out/lib/snowstead/main.mjs" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zstd ]}
+            runHook postInstall
+          '';
 
-            makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/snowstead \
-              --add-flags "$out/lib/snowstead/apps/cli/dist/main.js" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix pkgs.zstd ]}
+          doInstallCheck = true;
+          installCheckPhase = ''
+            runHook preInstallCheck
+            $out/bin/snowstead --help
+            runHook postInstallCheck
           '';
         };
       });
