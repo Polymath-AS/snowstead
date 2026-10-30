@@ -277,15 +277,19 @@ snowstead login prod https://your-worker.workers.dev $PUSH_TOKEN
 Then push:
 
 ```bash
-# Single path
-snowstead push main /nix/store/abc...-hello
+# A path and its runtime closure
+snowstead push main /run/current-system
 
-# Full closure
-snowstead push main --closure /run/current-system
+# Built flake outputs, read from stdin
+nix build --no-link --print-out-paths .#nixosConfigurations.myhost.config.system.build.toplevel \
+  | snowstead push main
 
-# Flake output closure
-snowstead push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
+# Only the exact path, without its references
+snowstead push main /nix/store/abc...-hello --no-deps
 ```
+
+References are published before the paths that need them. `.drv` paths are
+rejected unless you pass `--allow-drv`.
 
 Use `--jobs <n>` to control how many paths are in flight (default 32).
 

@@ -28,7 +28,7 @@ pub struct Options {
 pub async fn run(options: &Options) -> Result<()> {
     let start = Instant::now();
     let mut paths = match &options.closure {
-        Some(root) => nix::closure(root).await?,
+        Some(root) => nix::closure(&[nix::resolve(root)?]).await?,
         None => options
             .paths
             .iter()
