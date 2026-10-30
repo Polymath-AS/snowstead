@@ -3,6 +3,9 @@ node_modules/
 .wrangler/
 coverage/
 dist/
+/target/
+.zig-cache/
+zig-out/
 *.log
 .DS_Store
 result
