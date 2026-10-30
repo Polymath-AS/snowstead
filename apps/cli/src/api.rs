@@ -70,10 +70,15 @@ pub struct Finalize {
 // Never log signed instructions.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Part {
+pub struct Part {
     part_number: u32,
     url: String,
     headers: HashMap<String, String>,
+}
+pub struct PartReservation {
+    pub session_id: String,
+    pub part_number: u32,
+    pub size: usize,
 }
 fn status_ok(operation: &str, response: Response) -> Result<Response> {
     if response.status().is_success() {
@@ -271,45 +276,128 @@ impl Client {
         )?;
         Ok(())
     }
-    /// Reserve this exact part's quota before sending bytes. Retries retain the
-    /// same immutable allocation and supplied headers, never the API credential.
+    /// Grants charge exact immutable lengths. Retry only transiently rejected
+    /// sessions, preserving every successful grant and its original caller.
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-    pub async fn upload_part(
+    pub async fn reserve_parts(
         &self,
-        id: &str,
-        number: u32,
-        bytes: bytes::Bytes,
-    ) -> Result<UploadedPart> {
-        if !(1..=10_000).contains(&number) || bytes.is_empty() {
-            bail!("invalid upload part");
+        requests: &[PartReservation],
+    ) -> Result<Vec<std::result::Result<Part, String>>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Reservation {
+            session_id: String,
+            parts: Option<Vec<Part>>,
+            status: Option<u16>,
         }
         #[derive(Deserialize)]
-        struct Parts {
-            parts: Vec<Part>,
+        struct Results {
+            results: Vec<Reservation>,
         }
-        let path = format!("/_api/v1/uploads/{}/parts", segment(id)?);
-        let mut reserved = None;
+        if requests.is_empty() || requests.len() > 100 {
+            bail!("invalid part reservations");
+        }
+        let mut groups: Vec<(&str, Vec<(usize, &PartReservation)>)> = Vec::new();
+        for (index, request) in requests.iter().enumerate() {
+            if !(1..=10_000).contains(&request.part_number) || request.size == 0 {
+                bail!("invalid part reservation");
+            }
+            if let Some((_, parts)) = groups.iter_mut().find(|(id, _)| *id == request.session_id) {
+                if parts
+                    .iter()
+                    .any(|(_, p)| p.part_number == request.part_number)
+                {
+                    bail!("duplicate part reservation");
+                }
+                parts.push((index, request));
+            } else {
+                groups.push((&request.session_id, vec![(index, request)]));
+            }
+        }
+        let mut pending: Vec<_> = groups.iter().collect();
+        let mut results: Vec<_> = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect();
         for attempt in 1..=4 {
-            reserved = self
-                .replayable_post::<Parts>(
-                    "reserve part",
-                    &path,
-                    json!({"parts":[{"partNumber":number,"size":bytes.len()}]}),
+            let uploads: Vec<_> = pending.iter().map(|(id, parts)| json!({
+                "sessionId":id,
+                "parts":parts.iter().map(|(_, p)| json!({"partNumber":p.part_number,"size":p.size})).collect::<Vec<_>>()
+            })).collect();
+            if let Some(data) = self
+                .replayable_post::<Results>(
+                    "reserve parts",
+                    "/_api/v1/uploads/parts",
+                    json!({"uploads":uploads}),
                 )
-                .await?;
-            if reserved.is_some() {
-                break;
+                .await?
+            {
+                if data.results.len() != pending.len()
+                    || data
+                        .results
+                        .iter()
+                        .zip(&pending)
+                        .any(|(row, (id, _))| row.session_id != *id)
+                {
+                    bail!("reserve parts: response count or order differs from request");
+                }
+                let mut retry = Vec::new();
+                for (group, row) in pending.into_iter().zip(data.results) {
+                    if let Some(parts) = row.parts {
+                        if row.status.is_some()
+                            || parts.len() != group.1.len()
+                            || parts
+                                .iter()
+                                .zip(&group.1)
+                                .any(|(part, (_, request))| part.part_number != request.part_number)
+                        {
+                            bail!("reserve parts: invalid part instructions");
+                        }
+                        for (part, (index, _)) in parts.into_iter().zip(&group.1) {
+                            results[*index] = Some(Ok(part));
+                        }
+                    } else {
+                        let status = row
+                            .status
+                            .ok_or_else(|| anyhow!("reserve parts: invalid result"))?;
+                        if attempt < 4 && transient(status) {
+                            retry.push(group);
+                        } else {
+                            for (index, _) in &group.1 {
+                                results[*index] =
+                                    Some(Err(format!("reserve parts: rejected (status {status})")));
+                            }
+                        }
+                    }
+                }
+                pending = retry;
+                if pending.is_empty() {
+                    break;
+                }
             }
             if attempt == 4 {
-                bail!("reserve part: transient HTTP failure after 4 attempts");
+                for (_, parts) in pending {
+                    for (index, _) in parts {
+                        results[*index] = Some(Err(
+                            "reserve parts: transient HTTP failure after 4 attempts".into(),
+                        ));
+                    }
+                }
+                break;
             }
             backoff(attempt).await;
         }
-        let mut data = reserved.ok_or_else(|| anyhow!("reserve part: missing instructions"))?;
-        if data.parts.len() != 1 || data.parts[0].part_number != number {
-            bail!("invalid part instructions");
+        results
+            .into_iter()
+            .map(|result| result.ok_or_else(|| anyhow!("reserve parts: missing result")))
+            .collect()
+    }
+    /// Send only the headers supplied with this grant. Retries retain the same
+    /// immutable allocation, never copying the body or adding API credentials.
+    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    pub async fn upload_part(&self, part: Part, bytes: bytes::Bytes) -> Result<UploadedPart> {
+        if !(1..=10_000).contains(&part.part_number) || bytes.is_empty() {
+            bail!("invalid upload part");
         }
-        let part = data.parts.remove(0);
         let url = Url::parse(&part.url).map_err(|_| anyhow!("invalid upload URL"))?;
         if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
@@ -353,7 +441,7 @@ impl Client {
                             .ok_or_else(|| anyhow!("part upload returned no ETag"))?
                             .to_owned();
                         return Ok(UploadedPart {
-                            part_number: number,
+                            part_number: part.part_number,
                             etag,
                         });
                     }
@@ -467,6 +555,18 @@ pub(crate) mod tests {
     pub async fn reply(socket: &mut tokio::net::TcpStream, status: u16, body: &str, extra: &str) {
         socket.write_all(format!("HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).as_bytes()).await.unwrap();
     }
+    async fn upload_one(client: &Client, bytes: bytes::Bytes) -> Result<UploadedPart> {
+        let part = client
+            .reserve_parts(&[PartReservation {
+                session_id: "s1".into(),
+                part_number: 1,
+                size: bytes.len(),
+            }])
+            .await?
+            .remove(0)
+            .map_err(anyhow::Error::msg)?;
+        client.upload_part(part, bytes).await
+    }
     #[tokio::test]
     async fn stream_wire_contract_retries_exact_bytes_and_only_supplied_headers() {
         for supplied_auth in [false, true] {
@@ -492,10 +592,10 @@ pub(crate) mod tests {
                         )
                         .await;
                     } else if step <= 2 {
-                        assert!(headers.starts_with("POST /_api/v1/uploads/s1/parts "));
+                        assert!(headers.starts_with("POST /_api/v1/uploads/parts "));
                         assert_eq!(
                             serde_json::from_slice::<Value>(&body).unwrap(),
-                            json!({"parts":[{"partNumber":1,"size":6}]})
+                            json!({"uploads":[{"sessionId":"s1","parts":[{"partNumber":1,"size":6}]}]})
                         );
                         if step == 1 {
                             reply(&mut socket, 429, "private queue full", "").await;
@@ -506,7 +606,7 @@ pub(crate) mod tests {
                         } else {
                             json!({})
                         };
-                        reply(&mut socket, 200, &json!({"parts":[{"partNumber":1,"url":format!("{origin}/signed?private-signature"),"headers":supplied}]}).to_string(), "").await;
+                        reply(&mut socket, 200, &json!({"results":[{"sessionId":"s1","parts":[{"partNumber":1,"url":format!("{origin}/signed?private-signature"),"headers":supplied}]}]}).to_string(), "").await;
                     } else if step <= 5 {
                         assert!(headers.starts_with("PUT /signed?private-signature "));
                         assert_eq!(body, b"abcdef");
@@ -562,8 +662,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(sessions[0].part_size, 8388608);
-            let part = client
-                .upload_part("s1", 1, bytes::Bytes::from_static(b"abcdef"))
+            let part = upload_one(&client, bytes::Bytes::from_static(b"abcdef"))
                 .await
                 .unwrap();
             assert!(
@@ -593,7 +692,7 @@ pub(crate) mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read(&mut socket).await;
-                reply(&mut socket, 200, &json!({"parts":[{"partNumber":1,"url":format!("{origin}/private-signature"),"headers":{}}]}).to_string(), "").await;
+                reply(&mut socket, 200, &json!({"results":[{"sessionId":"s1","parts":[{"partNumber":1,"url":format!("{origin}/private-signature"),"headers":{}}]}]}).to_string(), "").await;
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read(&mut socket).await;
                 reply(
@@ -604,8 +703,7 @@ pub(crate) mod tests {
                 )
                 .await;
             });
-            let error = client(&url)
-                .upload_part("s1", 1, bytes::Bytes::from_static(b"abc"))
+            let error = upload_one(&client(&url), bytes::Bytes::from_static(b"abc"))
                 .await
                 .unwrap_err();
             let text = format!("{error:#}");
@@ -651,6 +749,79 @@ pub(crate) mod tests {
             requests
         });
         (client(&url), task)
+    }
+    #[tokio::test]
+    async fn reservations_group_parts_and_retry_only_busy_sessions_without_losing_grants() {
+        let grant =
+            |number| json!({"partNumber":number,"url":"https://example.com/signed","headers":{}});
+        let (client, server) = scripted(vec![
+            (0, Value::Null),
+            (
+                200,
+                json!({"results":[
+                    {"sessionId":"a","parts":[grant(2),grant(1)]},
+                    {"sessionId":"b","status":503,"error":"private busy"},
+                    {"sessionId":"c","status":403,"error":"secret-token"}
+                ]}),
+            ),
+            (503, Value::Null),
+            (
+                200,
+                json!({"results":[{"sessionId":"b","parts":[grant(3)]}]}),
+            ),
+        ])
+        .await;
+        let requests: Vec<_> = [("a", 2, 9), ("b", 3, 7), ("a", 1, 5), ("c", 1, 3)]
+            .into_iter()
+            .map(|(id, number, size)| PartReservation {
+                session_id: id.into(),
+                part_number: number,
+                size,
+            })
+            .collect();
+        let mut results = client.reserve_parts(&requests).await.unwrap().into_iter();
+        assert_eq!(results.next().unwrap().ok().unwrap().part_number, 2);
+        assert_eq!(results.next().unwrap().ok().unwrap().part_number, 3);
+        assert_eq!(results.next().unwrap().ok().unwrap().part_number, 1);
+        let denied = results.next().unwrap().err().unwrap();
+        assert!(denied.contains("403") && !denied.contains("secret-token"));
+        let bodies = server.await.unwrap();
+        assert_eq!(
+            bodies[0],
+            json!({"uploads":[
+                {"sessionId":"a","parts":[{"partNumber":2,"size":9},{"partNumber":1,"size":5}]},
+                {"sessionId":"b","parts":[{"partNumber":3,"size":7}]},
+                {"sessionId":"c","parts":[{"partNumber":1,"size":3}]}
+            ]})
+        );
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(
+            bodies[2],
+            json!({"uploads":[{"sessionId":"b","parts":[{"partNumber":3,"size":7}]}]})
+        );
+        assert_eq!(bodies[2], bodies[3]);
+    }
+    #[tokio::test]
+    async fn reservations_reject_mismatched_sessions_or_parts_without_retry() {
+        for rows in [
+            json!([]),
+            json!([{"sessionId":"other","parts":[]}]),
+            json!([{"sessionId":"s1","parts":[]}]),
+            json!([{"sessionId":"s1","parts":[{"partNumber":2,"url":"https://example.com","headers":{}}]}]),
+        ] {
+            let (client, server) = scripted(vec![(200, json!({"results":rows}))]).await;
+            assert!(
+                client
+                    .reserve_parts(&[PartReservation {
+                        session_id: "s1".into(),
+                        part_number: 1,
+                        size: 9
+                    }])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
     }
     #[tokio::test]
     async fn lost_finalize_response_replays_then_only_busy_rows_retry_in_original_order() {
@@ -722,7 +893,7 @@ pub(crate) mod tests {
             } else { json!({"error":"private secret-token"}) };
             let (client, server) = scripted(statuses.into_iter().map(|status| (status, response.clone())).collect()).await;
             let error = match operation {
-                "reserve" => client.upload_part("s1", 1, bytes::Bytes::from_static(b"abcdef")).await.unwrap_err(),
+                "reserve" => upload_one(&client, bytes::Bytes::from_static(b"abcdef")).await.unwrap_err(),
                 "finalize" => client.finalize(&[upload("s1")]).await.unwrap_err(),
                 "busy" => {
                     let result = client.finalize(&[upload("s1")]).await.unwrap();
