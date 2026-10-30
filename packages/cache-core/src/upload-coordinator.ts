@@ -2,7 +2,7 @@ import { DurableObject, tracing } from "cloudflare:workers";
 import { connect } from "./db/connection.js";
 import type { Db } from "./db/connection.js";
 import type { Cache } from "./db/types.js";
-import { createUploadSessionsWithinLimit, reserveStreamParts } from "./db/repository.js";
+import { createUploadSessionsWithinLimit, reserveStreamPartsBatch } from "./db/repository.js";
 import { reserveGoUpload } from "./go-cache.js";
 import { errorResponse } from "./responses.js";
 import { errorForLog } from "./logging.js";
@@ -16,8 +16,8 @@ export class UploadCoordinator extends DurableObject<Env> {
 		return this.run("nix", db => createUploadSessionsWithinLimit(db, org, rows));
 	}
 
-	reserveNixParts(org: string, sessionId: string, parts: readonly { partNumber: number; size: number }[]) {
-		return this.run("nix", db => reserveStreamParts(db, org, sessionId, parts));
+	reserveNixParts(org: string, inputs: Parameters<typeof reserveStreamPartsBatch>[2]) {
+		return this.run("nix", db => reserveStreamPartsBatch(db, org, inputs));
 	}
 
 	reserveGo(cache: Cache, action: string, output: string, size: number) {

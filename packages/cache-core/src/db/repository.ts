@@ -696,64 +696,122 @@ export async function findUploadParts(
 
 type StreamError = { readonly error: string; readonly status: number };
 
-/** Reserve immutable part lengths before handing out upload authority. */
-export async function reserveStreamParts(
+/** Reserve immutable part lengths for an org before handing out upload authority. */
+export async function reserveStreamPartsBatch(
 	db: Db,
 	orgId: string,
-	sessionId: string,
-	parts: readonly { partNumber: number; size: number }[],
-): Promise<StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
+	inputs: readonly { sessionId: string; parts: readonly { partNumber: number; size: number }[] }[],
+): Promise<Map<string, StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined>> {
+	if (inputs.length === 0) return new Map();
+	if (inputs.length > 100 || new Set(inputs.map(i => i.sessionId)).size !== inputs.length) throw new Error("Invalid reservation batch");
 	return db.transaction(async tx => {
+		const results = new Map<string, StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined>();
 		const org = await findOrg(tx, orgId);
-		if (!org) return { error: "Not found", status: 404 };
+		if (!org) return new Map(inputs.map(i => [i.sessionId, { error: "Not found", status: 404 }]));
 		const currentOrg = await lockOrgStorageLimit(tx, org);
-		const session = await first(tx.select().from(uploadSessions).where(eq(uploadSessions.id, sessionId)).for("update"));
-		const cache = session && await findCacheById(tx, session.cacheId);
-		if (!session || cache?.orgId !== orgId || session.expiresAt <= new Date()) return { error: "Not found", status: 404 };
-		if (session.status !== "streaming" || !session.partSize) return { error: "Conflict", status: 409 };
-		if (parts.length === 0 || parts.length > 100 || new Set(parts.map(p => p.partNumber)).size !== parts.length
-			|| parts.some(p => !Number.isSafeInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || !Number.isSafeInteger(p.size) || p.size < 1 || p.size > (session.partSize ?? 0))) {
-			return { error: "Invalid part reservations", status: 400 };
+		const ids = inputs.map(i => i.sessionId);
+		const sessions = new Map((await tx.select().from(uploadSessions).where(anyOf(uploadSessions.id, ids))
+			.orderBy(uploadSessions.id).for("update")).map(s => [s.id, s]));
+		const memberships = new Map((await tx.select({ id: caches.id, orgId: caches.orgId }).from(caches)
+			.where(anyOf(caches.id, [...sessions.values()].map(s => s.cacheId), "bigint"))).map(c => [c.id, c.orgId]));
+		const existing = new Map<string, Map<number, number>>();
+		for (const part of await tx.select().from(uploadParts).where(anyOf(uploadParts.sessionId, ids))) {
+			const parts = existing.get(part.sessionId) ?? new Map<number, number>();
+			parts.set(part.partNumber, part.size);
+			existing.set(part.sessionId, parts);
 		}
-		const existing = new Map((await findUploadParts(tx, sessionId)).map(p => [p.partNumber, p]));
-		if (parts.some(p => existing.has(p.partNumber) && existing.get(p.partNumber)?.size !== p.size)) return { error: "Part size cannot change", status: 409 };
-		const fresh = parts.filter(p => !existing.has(p.partNumber));
-		const requested = fresh.reduce((n, p) => n + p.size, 0);
-		if (session.fileSize + requested > 5 * 1024 ** 4) return { error: "NAR exceeds the multipart object limit", status: 400 };
-		const refused = currentOrg && await checkOrgStorageLimit(tx, currentOrg, requested);
-		if (refused) return refused;
-		if (fresh.length > 0) {
-			await tx.insert(uploadParts).values(fresh.map(p => ({ ...p, sessionId })));
-			await tx.update(uploadSessions).set({ fileSize: session.fileSize + requested }).where(eq(uploadSessions.id, sessionId));
+		const usage = currentOrg?.storageLimit != null ? await orgUsage(tx, orgId, new Date()) : undefined;
+		let admitted = 0;
+		const freshParts: { sessionId: string; partNumber: number; size: number }[] = [];
+		const totals: { id: string; fileSize: number }[] = [];
+		for (const { sessionId, parts } of inputs) {
+			const session = sessions.get(sessionId);
+			const reserved = existing.get(sessionId) ?? new Map<number, number>();
+			const fresh = parts.filter(p => !reserved.has(p.partNumber));
+			const requested = fresh.reduce((n, p) => n + p.size, 0);
+			let refused: StreamError | (OrgUsage & { limit: number; requested: number }) | undefined;
+			if (!session || memberships.get(session.cacheId) !== orgId || session.expiresAt <= new Date()) refused = { error: "Not found", status: 404 };
+			else if (session.status !== "streaming" || !session.partSize || !session.r2UploadKey || !session.r2UploadId) refused = { error: "Conflict", status: 409 };
+			else if (parts.length === 0 || parts.length > 100 || new Set(parts.map(p => p.partNumber)).size !== parts.length
+				|| parts.some(p => !Number.isSafeInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || !Number.isSafeInteger(p.size) || p.size < 1 || p.size > session.partSize!)) refused = { error: "Invalid part reservations", status: 400 };
+			else if (parts.some(p => reserved.has(p.partNumber) && reserved.get(p.partNumber) !== p.size)) refused = { error: "Part size cannot change", status: 409 };
+			else if (session.fileSize + requested > 5 * 1024 ** 4) refused = { error: "NAR exceeds the multipart object limit", status: 400 };
+			else if (requested > 0 && usage && currentOrg?.storageLimit != null && usage.used + usage.pending + admitted + requested > currentOrg.storageLimit) {
+				refused = { ...usage, pending: usage.pending + admitted, limit: currentOrg.storageLimit, requested };
+			}
+			results.set(sessionId, refused);
+			if (!refused && session && fresh.length > 0) {
+				admitted += requested;
+				freshParts.push(...fresh.map(p => ({ ...p, sessionId })));
+				totals.push({ id: sessionId, fileSize: session.fileSize + requested });
+			}
 		}
-		return undefined;
+		if (freshParts.length > 0) {
+			await tx.insert(uploadParts).values(freshParts);
+			await tx.update(uploadSessions).set({
+				fileSize: sql`(select total."fileSize" from jsonb_to_recordset(${JSON.stringify(totals)}::jsonb)
+					as total(id text, "fileSize" bigint) where total.id = ${uploadSessions.id})`,
+			}).where(anyOf(uploadSessions.id, totals.map(t => t.id)));
+		}
+		return results;
 	});
 }
 
 /** Freeze the exact stream and receipts. Replays cannot change sealed content. */
-export async function sealUploadStream(
+export async function sealUploadStreams(
 	db: Db,
-	sessionId: string,
-	input: { narHash: string; narSize: number; fileHash: string; fileSize: number; parts: readonly { partNumber: number; etag: string }[] },
-): Promise<UploadSession | StreamError> {
+	inputs: readonly { sessionId: string; narHash: string; narSize: number; fileHash: string; fileSize: number; parts: readonly { partNumber: number; etag: string }[] }[],
+): Promise<Map<string, UploadSession | StreamError>> {
+	if (inputs.length === 0) return new Map();
 	return db.transaction(async tx => {
-		const session = await first(tx.select().from(uploadSessions).where(eq(uploadSessions.id, sessionId)).for("update"));
-		if (!session || session.expiresAt <= new Date()) return { error: "Not found", status: 404 };
-		if (!session.partSize || !["streaming", "finalizing", "completed"].includes(session.status)) return { error: "Conflict", status: 409 };
-		const reserved = await findUploadParts(tx, sessionId);
-		const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
-		if (input.narHash !== session.narHash || input.narSize !== session.narSize || input.fileSize !== session.fileSize
-			|| reserved.length === 0 || parts.length !== reserved.length
-			|| reserved.some((p, i) => p.partNumber !== i + 1 || parts[i]?.partNumber !== p.partNumber || !parts[i]?.etag
-				|| (i < reserved.length - 1 && p.size !== session.partSize))) return { error: "Stream metadata or parts do not match reservations", status: 400 };
-		if (session.status !== "streaming") {
-			if (session.fileHash !== input.fileHash || reserved.some((p, i) => p.etag !== parts[i]?.etag)) return { error: "Sealed stream cannot change", status: 409 };
-			return session;
+		const ids = inputs.map(input => input.sessionId);
+		// Overlapping batches take their row locks in the same order.
+		const sessions = new Map((await tx.select().from(uploadSessions)
+			.where(anyOf(uploadSessions.id, ids)).orderBy(uploadSessions.id).for("update")).map(s => [s.id, s]));
+		const reservations = await tx.select().from(uploadParts).where(anyOf(uploadParts.sessionId, ids))
+			.orderBy(uploadParts.sessionId, uploadParts.partNumber);
+		const bySession = new Map<string, UploadPart[]>();
+		for (const part of reservations) {
+			const parts = bySession.get(part.sessionId) ?? [];
+			parts.push(part);
+			bySession.set(part.sessionId, parts);
 		}
-		await tx.execute(sql`update ${uploadParts} set etag = receipts.etag
-			from jsonb_to_recordset(${JSON.stringify(parts)}::jsonb) as receipts("partNumber" integer, etag text)
-			where ${uploadParts.sessionId} = ${sessionId} and ${uploadParts.partNumber} = receipts."partNumber"`);
-		return returned(tx.update(uploadSessions).set({ fileHash: input.fileHash, status: "finalizing" }).where(eq(uploadSessions.id, sessionId)).returning());
+		const results = new Map<string, UploadSession | StreamError>();
+		const fresh: typeof inputs[number][] = [];
+		for (const input of inputs) {
+			const session = sessions.get(input.sessionId);
+			let error: StreamError | undefined;
+			const reserved = bySession.get(input.sessionId) ?? [];
+			const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
+			if (!session || session.expiresAt <= new Date()) error = { error: "Not found", status: 404 };
+			else if (!session.partSize || !["streaming", "finalizing", "completed"].includes(session.status)) error = { error: "Conflict", status: 409 };
+			else if (input.narHash !== session.narHash || input.narSize !== session.narSize || input.fileSize !== session.fileSize
+				|| reserved.length === 0 || parts.length !== reserved.length
+				|| reserved.some((p, i) => p.partNumber !== i + 1 || parts[i]?.partNumber !== p.partNumber || !parts[i]?.etag
+					|| (i < reserved.length - 1 && p.size !== session.partSize))) error = { error: "Stream metadata or parts do not match reservations", status: 400 };
+			else if (session.status !== "streaming" && (session.fileHash !== input.fileHash || reserved.some((p, i) => p.etag !== parts[i]?.etag))) {
+				error = { error: "Sealed stream cannot change", status: 409 };
+			}
+			if (error) results.set(input.sessionId, error);
+			else if (session) {
+				results.set(session.id, session);
+				if (session.status === "streaming") fresh.push(input);
+			}
+		}
+		if (fresh.length > 0) {
+			const receipts = fresh.flatMap(input => input.parts.map(part => ({ ...part, sessionId: input.sessionId })));
+			await tx.execute(sql`update ${uploadParts} set etag = receipts.etag
+				from jsonb_to_recordset(${JSON.stringify(receipts)}::jsonb) as receipts("sessionId" text, "partNumber" integer, etag text)
+				where ${uploadParts.sessionId} = receipts."sessionId" and ${uploadParts.partNumber} = receipts."partNumber"`);
+			const hashes = fresh.map(input => ({ id: input.sessionId, fileHash: input.fileHash }));
+			const sealed = await tx.update(uploadSessions).set({
+				fileHash: sql`(select receipt."fileHash" from jsonb_to_recordset(${JSON.stringify(hashes)}::jsonb)
+					as receipt(id text, "fileHash" text) where receipt.id = ${uploadSessions.id})`,
+				status: "finalizing",
+			}).where(anyOf(uploadSessions.id, fresh.map(input => input.sessionId))).returning();
+			for (const session of sealed) results.set(session.id, session);
+		}
+		return results;
 	});
 }
 
@@ -773,14 +831,23 @@ export async function hasCanonicalUploadReservations(db: Db, key: string): Promi
 }
 
 /** Pins both source and destination outside long-running storage transfers. */
-export async function acquireNarInstallation(db: Db, params: typeof narInstallations.$inferInsert): Promise<boolean> {
+export async function acquireNarInstallations(db: Db, rows: readonly (typeof narInstallations.$inferInsert)[]): Promise<string[]> {
+	if (rows.length === 0) return [];
 	return withUploadSessionLock(db, async tx => {
-		if (params.sourceKey.startsWith("staging/")) {
-			const source = await findUploadSession(tx, params.sourceKey.slice("staging/".length));
-			if (!source || source.expiresAt <= new Date() || source.fileHash !== params.fileHash || source.fileSize !== params.fileSize) return false;
-		}
-		await ensureBlobObjects(tx, [{ fileHash: params.fileHash, fileSize: params.fileSize, compression: params.compression, r2Key: params.key }]);
-		return (await tx.insert(narInstallations).values(params).onConflictDoNothing().returning()).length > 0;
+		const sources = new Map((await findUploadSessions(tx, rows.filter(row => row.sourceKey.startsWith("staging/"))
+			.map(row => row.sourceKey.slice("staging/".length)))).map(source => [source.id, source]));
+		const valid = rows.filter(row => {
+			if (!row.sourceKey.startsWith("staging/")) return true;
+			const source = sources.get(row.sourceKey.slice("staging/".length));
+			return source && source.expiresAt > new Date() && source.fileHash === row.fileHash && source.fileSize === row.fileSize;
+		});
+		if (valid.length === 0) return [];
+		// Overlapping batches acquire unique-index entries in one order too.
+		await ensureBlobObjects(tx, [...valid].sort((a, b) => a.fileHash.localeCompare(b.fileHash) || a.compression.localeCompare(b.compression))
+			.map(row => ({ fileHash: row.fileHash, fileSize: row.fileSize, compression: row.compression, r2Key: row.key })));
+		return (await tx.insert(narInstallations).values(valid.sort((a, b) => a.key.localeCompare(b.key)))
+			.onConflictDoNothing().returning({ operationId: narInstallations.operationId }))
+			.map(row => row.operationId);
 	});
 }
 
@@ -793,21 +860,26 @@ export async function installationOwns(db: Db, key: string, operationId: string)
 	return (await first(db.select().from(narInstallations).where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId))))) !== undefined;
 }
 
-export async function finishNarInstallation(
-	db: Db, key: string, operationId: string, removeSource: (key: string) => Promise<void>,
+export async function finishNarInstallations(
+	db: Db, rows: readonly { key: string; operationId: string }[], removeSource: (key: string) => Promise<void>,
 ): Promise<void> {
+	if (rows.length === 0) return;
 	await withUploadSessionLock(db, async tx => {
-		const installation = await first(tx.select().from(narInstallations)
-			.where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId))));
-		if (!installation) return;
+		const matches = sql`EXISTS (SELECT 1 FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+			AS expected(key text, "operationId" text)
+			WHERE expected.key = ${narInstallations.key} AND expected."operationId" = ${narInstallations.operationId})`;
+		const installations = await tx.select().from(narInstallations).where(matches);
+		const sources = new Set((await findUploadSessions(tx, installations.filter(row => row.sourceKey.startsWith("staging/"))
+			.map(row => row.sourceKey.slice("staging/".length)))).map(source => source.id));
 		// Cache deletion can remove a pinned stage's session, but not its bytes.
 		// Serialize with deletion so either it owns cleanup or we do. A failed
 		// storage delete rolls back, preserving the durable pin for recovery.
-		if (installation.sourceKey.startsWith("staging/") &&
-			!await findUploadSession(tx, installation.sourceKey.slice("staging/".length))) {
-			await removeSource(installation.sourceKey);
+		for (const installation of installations) {
+			if (installation.sourceKey.startsWith("staging/") && !sources.has(installation.sourceKey.slice("staging/".length))) {
+				await removeSource(installation.sourceKey);
+			}
 		}
-		await tx.delete(narInstallations).where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId)));
+		await tx.delete(narInstallations).where(matches);
 	});
 }
 

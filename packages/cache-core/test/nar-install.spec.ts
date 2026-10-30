@@ -4,7 +4,7 @@ import { AwsClient } from "aws4fetch";
 import { eq } from "drizzle-orm";
 import { resolveConfig } from "../src/config.js";
 import type { WorkerConfig } from "../src/config.js";
-import { createCache, createUploadSession, acquireNarInstallation, deleteEmptyCache } from "../src/db/repository.js";
+import { createCache, createUploadSession, acquireNarInstallations, deleteEmptyCache } from "../src/db/repository.js";
 import { narInstallations, uploadSessions } from "../src/db/schema.js";
 import { installStagedNar, installNar, INSTALLATION_BUSY } from "../src/nar-install.js";
 import { narKey, placeNar } from "../src/layout.js";
@@ -162,10 +162,10 @@ describe("verified canonical NAR installation", () => {
 
 	it("does not read an unpinned source when another installer owns the key", async () => {
 		const f = await fixture();
-		expect(await acquireNarInstallation(db, {
+		expect(await acquireNarInstallations(db, [{
 			key: f.key, operationId: "another-operation", sourceKey: f.sourceKey,
 			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
-		})).toBe(true);
+		}])).toEqual(["another-operation"]);
 		const get = vi.fn(() => { throw new Error("must not hash"); });
 		expect(await installStagedNar(config({ bucket: bucket(env.CACHE_BUCKET, { get }) }), f.session)).toBe(INSTALLATION_BUSY);
 		expect(get).not.toHaveBeenCalled();
