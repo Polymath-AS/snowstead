@@ -50,7 +50,11 @@ test("Rust CLI uploads, publishes, and skips a real NAR through the hosted Worke
       ],
     });
     const { url } = await server.listen();
-    const run = (...args) => exec(binary, args, { env: { ...process.env, HOME: home }, maxBuffer: 1024 * 1024 });
+    // A nonexistent spool directory makes any return to disk-backed NAR
+    // preparation fail, while auth's atomic config writes stay in HOME.
+    const run = (...args) => exec(binary, args, {
+      env: { ...process.env, HOME: home, TMPDIR: join(home, "no-upload-spool") }, maxBuffer: 1024 * 1024,
+    });
     const login = (name, token) => {
       const result = run("login", "--token-stdin", "--name", name, "--url", url.toString());
       result.child.stdin.end(token);

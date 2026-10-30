@@ -1,12 +1,11 @@
-//! The Zig NAR core hashes and compresses in-process. Spooling keeps HTTP
-//! retries replayable and supplies the v1 API's required final hash and size.
+//! The Zig NAR core hashes and compresses in-process into a synchronous writer.
 use anyhow::{Context, bail};
 use base64::Engine;
 use std::{
     ffi::{CString, c_char, c_void},
     io::{self, Read, Write},
     os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 #[repr(C)]
@@ -155,6 +154,24 @@ pub fn dump<W: Write>(
 
     // The native filesystem walker is Linux-only. Other supported systems
     // still use in-process compression and hashing over Nix's NAR stream.
+    dump_nix(path, size, level, threads, output.writer)
+}
+
+#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+pub fn dump_nix<W: Write>(
+    path: &Path,
+    size: u64,
+    level: i32,
+    threads: i32,
+    writer: &mut W,
+) -> anyhow::Result<Digest> {
+    let api = api();
+    let mut output = Output {
+        writer,
+        error: None,
+    };
+    let ctx = (&mut output as *mut Output<'_, W>).cast();
+    let mut digest = Digest::default();
     let mut child = std::process::Command::new("nix-store")
         .arg("--dump")
         .arg(path)
@@ -197,38 +214,7 @@ pub fn dump<W: Write>(
     result
 }
 
-pub struct Compressed {
-    pub path: PathBuf,
-    pub digest: Digest,
-    _directory: tempfile::TempDir,
-}
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
-pub fn prepare(
-    path: &Path,
-    size: u64,
-    expected: &str,
-    level: i32,
-    threads: i32,
-) -> anyhow::Result<Compressed> {
-    let directory = tempfile::Builder::new()
-        .prefix("snowstead-nar-")
-        .tempdir()?;
-    let destination = directory.path().join("nar.zst");
-    let mut file = std::fs::File::create(&destination)?;
-    let digest = dump(path, size, level, threads, &mut file)?;
-    if digest.nar_size != size || Some(digest.nar_hash) != parse_hash(expected) {
-        bail!(
-            "NAR hash or size differs from the Nix database for {}",
-            path.display()
-        );
-    }
-    Ok(Compressed {
-        path: destination,
-        digest,
-        _directory: directory,
-    })
-}
-fn parse_hash(hash: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hash(hash: &str) -> Option<[u8; 32]> {
     if let Some(b64) = hash.strip_prefix("sha256-") {
         return base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -264,7 +250,7 @@ mod tests {
     use super::*;
     use sha2::{Digest as _, Sha256};
     #[test]
-    fn native_frames_match_nix_and_reject_changed_metadata() {
+    fn native_frames_match_nix() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir(&root).unwrap();
@@ -283,13 +269,28 @@ mod tests {
             "sha256-{}",
             base64::engine::general_purpose::STANDARD.encode(hash)
         );
-        let spool = prepare(&root, raw.len() as u64, &expected, 3, 0).unwrap();
-        let bytes = std::fs::read(&spool.path).unwrap();
+        let mut bytes = Vec::new();
+        let digest = dump(&root, raw.len() as u64, 3, 0, &mut bytes).unwrap();
+        assert_eq!(Some(digest.nar_hash), parse_hash(&expected));
+        assert_eq!(digest.nar_size, raw.len() as u64);
         assert_eq!(zstd::stream::decode_all(&bytes[..]).unwrap(), *raw);
-        assert_eq!(
-            spool.digest.file_hash,
-            <[u8; 32]>::from(Sha256::digest(&bytes))
-        );
+        assert_eq!(digest.file_hash, <[u8; 32]>::from(Sha256::digest(&bytes)));
+        for level in [0, 3] {
+            let mut fallback = Vec::new();
+            let digest = dump_nix(&root, raw.len() as u64, level, 0, &mut fallback).unwrap();
+            let decoded = if level == 0 {
+                fallback.clone()
+            } else {
+                zstd::stream::decode_all(&fallback[..]).unwrap()
+            };
+            assert_eq!(decoded, *raw);
+            assert_eq!(digest.nar_hash, <[u8; 32]>::from(hash));
+            assert_eq!(
+                digest.file_hash,
+                <[u8; 32]>::from(Sha256::digest(&fallback))
+            );
+            assert_eq!(digest.file_size, fallback.len() as u64);
+        }
         #[cfg(target_os = "linux")]
         {
             let mut portable_bytes = Vec::new();
@@ -315,25 +316,14 @@ mod tests {
             );
             assert_eq!(bytes, portable_bytes);
         }
-        let threaded = prepare(&root, raw.len() as u64, &expected, 3, 2).unwrap();
-        let threaded_bytes = std::fs::read(&threaded.path).unwrap();
+        let mut threaded_bytes = Vec::new();
+        let threaded = dump(&root, raw.len() as u64, 3, 2, &mut threaded_bytes).unwrap();
         assert_eq!(zstd::stream::decode_all(&threaded_bytes[..]).unwrap(), *raw);
         assert_eq!(
-            threaded.digest.file_hash,
+            threaded.file_hash,
             <[u8; 32]>::from(Sha256::digest(&threaded_bytes))
         );
-        assert!(
-            prepare(
-                &root,
-                raw.len() as u64,
-                "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-                3,
-                2
-            )
-            .is_err()
-        );
-        let path = spool.path.clone();
-        drop(spool);
-        assert!(!path.exists());
+        assert_eq!(threaded.nar_hash, digest.nar_hash);
+        assert_eq!(threaded.nar_size, digest.nar_size);
     }
 }

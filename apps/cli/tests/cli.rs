@@ -374,3 +374,82 @@ fn ci_credentials_require_a_pair_and_do_not_write_local_config() {
         "auth status must describe local config only"
     );
 }
+
+#[test]
+fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let path = "/nix/store/00000000000000000000000000000000-snowstead-missing-stream-fixture";
+    let metadata = json!({path:{"narHash":format!("sha256:{}", "0".repeat(64)),"narSize":4096,"references":[]}});
+    let nix = bin.join("nix");
+    std::fs::write(
+        &nix,
+        format!("#!/bin/sh\ncat <<'SNOWSTEAD_METADATA'\n{metadata}\nSNOWSTEAD_METADATA\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for (endpoint, response) in [
+            (
+                "/_api/v1/get-missing-paths",
+                json!({"missing":["00000000000000000000000000000000"]}),
+            ),
+            (
+                "/_api/v1/caches/main/upload-streams/batch",
+                json!({"sessions":[{"sessionId":"s1","partSize":8388608}]}),
+            ),
+            ("/_api/v1/uploads/s1/abort", json!({})),
+        ] {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                bytes.push(byte[0]);
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            assert!(headers.starts_with(&format!("POST {endpoint} HTTP/1.1")));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            if endpoint.ends_with("/batch") {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert!(body["paths"][0].get("fileHash").is_none());
+                assert!(body["paths"][0].get("fileSize").is_none());
+            }
+            let body = response.to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+        .env("HOME", home.path())
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("TMPDIR", home.path().join("no-spooling-here"))
+        .env("SNOWSTEAD_URL", url)
+        .env("SNOWSTEAD_TOKEN", TOKEN)
+        .args(["push", "main", path, "--jobs", "1"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("NAR encoding failed") || stderr.contains("nix-store --dump failed"));
+    assert!(!stderr.contains(TOKEN));
+    server.join().unwrap();
+    assert!(!home.path().join("no-spooling-here").exists());
+}

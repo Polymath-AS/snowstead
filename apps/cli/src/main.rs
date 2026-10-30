@@ -2,6 +2,8 @@ mod api;
 mod auth;
 mod batch;
 mod config;
+#[cfg(any(snowstead_hotpath, snowstead_local))]
+mod local;
 mod nar;
 mod nix;
 mod push;
@@ -28,6 +30,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Benchmark local NAR preparation without credentials or network requests.
+    #[cfg(any(snowstead_hotpath, snowstead_local))]
+    Local(local::Options),
     /// Sign in using a browser, including from an SSH session.
     Login(auth::Login),
     /// Show locally configured authentication (no remote verification).
@@ -228,6 +233,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     match &cli.command {
+        #[cfg(any(snowstead_hotpath, snowstead_local))]
+        Command::Local(options) => return local::run(options).await,
         Command::Login(options) => return auth::login(options).await,
         Command::Logout => return auth::logout(cli.server.as_deref()),
         Command::Auth {
@@ -239,6 +246,8 @@ async fn run(cli: Cli) -> Result<()> {
     let client = api::Client::new(&server)?;
     tracing::debug!(target: "snowstead", "Starting authenticated command");
     match cli.command {
+        #[cfg(any(snowstead_hotpath, snowstead_local))]
+        Command::Local(_) => unreachable!(),
         Command::Login(_) | Command::Auth { .. } | Command::Logout => unreachable!(),
         Command::Push {
             cache,
