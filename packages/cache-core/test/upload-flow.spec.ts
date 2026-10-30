@@ -68,7 +68,7 @@ async function createSessionAndUpload(fileHash: string, storePathHash: string) {
 	);
 	expect(createRes.status).toBe(201);
 	const session = await createRes.json<{ sessionId: string; r2Key: string; uploadMethod: string; expiresAt: string }>();
-	expect(session.r2Key).toBe(`nar/${fileHash}/zstd.nar`);
+	expect(session.r2Key).toBe(`staging/${session.sessionId}`);
 	expect(session.uploadMethod).toBe("direct");
 	expect(Date.parse(session.expiresAt)).toBeGreaterThan(Date.now());
 
@@ -203,7 +203,8 @@ describe("publish", () => {
 
 		const swept = await createSessionAndUpload(await uniqueFileHash(), uniqueStorePathHash());
 		await expire(swept.sessionId);
-		await env.PUBLIC_BUCKET.delete(swept.r2Key);
+		const receipt = await findUploadSession(getDb(), swept.sessionId);
+		await env.PUBLIC_BUCKET.delete(`nar/${receipt!.fileHash}/zstd.nar`);
 		const refused = await post(`/_api/v1/uploads/${swept.sessionId}/publish`, {});
 		expect(refused.status).toBe(400);
 		expect(await refused.text()).toContain("the stored NAR is gone");
@@ -308,7 +309,9 @@ describe("batches", () => {
 		const res = await createBatch(bodies);
 		expect(res.status).toBe(201);
 		const { sessions } = await res.json<{ sessions: Array<{ sessionId: string; r2Key: string; uploadMethod: string }> }>();
-		expect(sessions.map((s) => s.r2Key)).toEqual(bodies.map((b) => `nar/${b.fileHash}/zstd.nar`));
+		expect(sessions.map((s) => s.r2Key)).toEqual(sessions.map((s) => `staging/${s.sessionId}`));
+		const persisted = await Promise.all(sessions.map(s => findUploadSession(getDb(), s.sessionId)));
+		expect(persisted.map(s => s?.fileHash)).toEqual(bodies.map(b => b.fileHash));
 		expect(new Set(sessions.map((s) => s.sessionId)).size).toBe(3);
 	});
 
@@ -372,7 +375,7 @@ describe("staged uploads", () => {
 		const cache = await findCache(getDb(), "default", CACHE_NAME);
 		const id = crypto.randomUUID();
 		const key = `staging/${id}`;
-		const multipart = await env.CACHE_BUCKET.createMultipartUpload(key);
+		const multipart = await env.CACHE_BUCKET.createMultipartUpload(key, { customMetadata: { session: id } });
 		const storePathHash = uniqueStorePathHash();
 		await createUploadSessions(getDb(), [{
 			id,
@@ -429,7 +432,10 @@ describe("staged uploads", () => {
 		}
 		const nar = await env.PUBLIC_BUCKET.get(`nar/${fileHash}/zstd.nar`);
 		expect(new Uint8Array(await nar!.arrayBuffer())).toEqual(blob(fileHash));
-		expect(await env.CACHE_BUCKET.head(staged.key)).toBeNull();
+		const source = await env.CACHE_BUCKET.head(staged.key);
+		expect(source?.customMetadata).toEqual({ session: staged.id });
+		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ published: true });
+		expect((await env.CACHE_BUCKET.head(staged.key))?.version).toBe(source?.version);
 		const res = await SELF.fetch(`http://example.com/${CACHE_NAME}/${staged.storePathHash}.narinfo`);
 		expect(res.status).toBe(200);
 	});
@@ -440,7 +446,10 @@ describe("staged uploads", () => {
 
 		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ error: "File hash mismatch", status: 400 });
 		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
-		expect(await env.CACHE_BUCKET.head(staged.key)).toBeNull();
+		const source = await env.CACHE_BUCKET.head(staged.key);
+		expect(source).not.toBeNull();
+		expect(await commitStaged(staged.id, staged.parts)).toMatchObject({ error: "File hash mismatch", status: 400 });
+		expect((await env.CACHE_BUCKET.head(staged.key))?.version).toBe(source?.version);
 		expect((await findUploadSession(getDb(), staged.id))?.status).toBe("uploading");
 	});
 

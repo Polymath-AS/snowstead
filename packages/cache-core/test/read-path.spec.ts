@@ -6,7 +6,8 @@ import { handleRequest } from "../../../workers/nix/src/router.js";
 import { resolveConfig } from "../src/config.js";
 
 const STORE_PATH_HASH = "0".repeat(32);
-const FILE_HASH = "a".repeat(64);
+// SHA-256 of R2_BODY, independently computed with sha256sum.
+const FILE_HASH = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a";
 const NAR_HASH = `sha256:${"1".repeat(52)}`;
 const R2_KEY = `nars/sha256/${FILE_HASH}/zstd.nar`;
 const R2_BODY = new Uint8Array([1, 2, 3, 4]);
@@ -24,7 +25,7 @@ beforeAll(async () => {
 
 	const blob = await createBlobObject(db, {
 		fileHash: FILE_HASH,
-		fileSize: 1024,
+		fileSize: R2_BODY.byteLength,
 		compression: "zstd",
 		r2Key: R2_KEY,
 	});

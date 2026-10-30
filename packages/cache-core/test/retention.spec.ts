@@ -21,13 +21,15 @@ function orgApi(path: string, method = "GET", body?: unknown): Promise<Response>
 async function pathPushed(cacheName: string, hash: string, daysAgo: number): Promise<void> {
 	const cache = await findCache(db, "default", cacheName);
 	if (!cache) throw new Error(`no cache ${cacheName}`);
+	const body = crypto.getRandomValues(new Uint8Array(10));
+	const fileHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", body)), byte => byte.toString(16).padStart(2, "0")).join("");
 	const blob = await createBlobObject(db, {
-		fileHash: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
-		fileSize: 10,
+		fileHash,
+		fileSize: body.byteLength,
 		compression: "zstd",
 		r2Key: `nars/${crypto.randomUUID()}`,
 	});
-	await env.CACHE_BUCKET.put(blob.r2Key, new Uint8Array(10));
+	await env.CACHE_BUCKET.put(blob.r2Key, body);
 	const path = await createPublishedPath(db, {
 		cacheId: cache.id,
 		storePathHash: hash,

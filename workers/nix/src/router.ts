@@ -22,11 +22,18 @@ import {
 	handleGetMissingPaths,
 	handleCreateSessions,
 	handleCommit,
+	handleCreateUploadStreams,
+	handleReserveUploadParts,
+	handleFinalizeUploadStreams,
+	handleAbortUploadStream,
 } from "./uploads.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
 const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
 const RE_SESSION_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions\/batch$/;
+const RE_STREAM_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-streams\/batch$/;
+const RE_STREAM_PARTS = /^\/_api\/v1\/uploads\/([^/]+)\/parts$/;
+const RE_STREAM_ABORT = /^\/_api\/v1\/uploads\/([^/]+)\/abort$/;
 const RE_MULTIPART = /^\/_api\/v1\/uploads\/([^/]+)\/multipart$/;
 const RE_PART_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/;
 const RE_BLOB = /^\/_api\/v1\/uploads\/([^/]+)\/blob$/;
@@ -395,6 +402,20 @@ async function handleWriteApi(
 		return response;
 	}
 
+	const streamBatch = pathname.match(RE_STREAM_BATCH);
+	if (streamBatch) {
+		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+		const response = await handleCreateUploadStreams(request, config, streamBatch[1], identity);
+		writeAuditLog(config, identity, "push", streamBatch[1], response.status, '{"endpoint":"create-upload-streams"}', ip);
+		return response;
+	}
+	if (pathname === "/_api/v1/uploads/finalize") {
+		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+		const response = await handleFinalizeUploadStreams(request, config, identity, new URL(request.url).origin);
+		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"finalize-upload-streams"}', ip);
+		return response;
+	}
+
 	const sessionBatch = pathname.match(RE_SESSION_BATCH);
 	const sessionCreate = sessionBatch ?? pathname.match(RE_SESSION_CREATE);
 	if (sessionCreate) {
@@ -417,8 +438,21 @@ async function handleWriteApi(
 	const uploadRoutes: ReadonlyArray<{
 		readonly pattern: RegExp;
 		readonly endpoint: string;
+		readonly method?: string;
 		readonly handle: (match: RegExpMatchArray, config: WorkerConfig) => Promise<Response>;
 	}> = [
+		{
+			pattern: RE_STREAM_PARTS,
+			endpoint: "reserve-upload-parts",
+			method: "POST",
+			handle: (m, c) => handleReserveUploadParts(request, c, m[1], identity),
+		},
+		{
+			pattern: RE_STREAM_ABORT,
+			endpoint: "abort-upload-stream",
+			method: "POST",
+			handle: (m, c) => handleAbortUploadStream(c, m[1], identity),
+		},
 		{
 			pattern: RE_MULTIPART,
 			endpoint: "multipart",
@@ -449,6 +483,9 @@ async function handleWriteApi(
 	for (const route of uploadRoutes) {
 		const match = pathname.match(route.pattern);
 		if (match) {
+			if (route.method && request.method !== route.method) {
+				return new Response("Method Not Allowed", { status: 405, headers: { allow: route.method } });
+			}
 			// No transaction around the transfer: publishing fences itself
 			// against the blob sweep, briefly (uploads.ts).
 			const response = await route.handle(match, config);

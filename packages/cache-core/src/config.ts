@@ -17,6 +17,11 @@ export interface WorkerConfig {
 	readonly defer: (task: Promise<unknown>) => void;
 	/** Waits for deferred work, then releases the request's connection; nothing to wait for if it never opened one. */
 	readonly close: () => Promise<void> | undefined;
+	/**
+	 * Release after foreground SQL settles, before transferring NARs. The next
+	 * db access reconnects; callers must not retain db handles across release.
+	 */
+	readonly releaseDb: () => Promise<void>;
 	/** Per-caller request limits (rate-limit.ts); none configured is no limit. */
 	readonly rateLimiters: RateLimiters;
 	readonly signingKeyName: string;
@@ -40,7 +45,7 @@ export interface WorkerConfig {
 	readonly ctx?: ExecutionContext;
 }
 
-type Settings = Omit<WorkerConfig, "db" | "defer" | "close" | "ctx">;
+type Settings = Omit<WorkerConfig, "db" | "defer" | "close" | "releaseDb" | "ctx">;
 
 /**
  * What a config takes from env, worked out once per env rather than per
@@ -56,13 +61,32 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	// never touch the database.
 	let connection: Connection | undefined;
 	const open = () => (connection ??= connect(env.HYPERDRIVE.connectionString));
+	const releasing = new Set<Promise<void>>();
+	const releaseDb = async () => {
+		do {
+			const previous = connection;
+			connection = undefined;
+			if (previous) {
+				const closing = previous.close();
+				releasing.add(closing);
+				try {
+					await closing;
+				} finally {
+					releasing.delete(closing);
+				}
+			} else {
+				await Promise.allSettled(releasing);
+			}
+		} while (connection || releasing.size > 0);
+	};
 	return {
 		...settings,
 		get db() {
 			return open().db;
 		},
 		defer: (task) => open().defer(task),
-		close: () => connection?.close(),
+		releaseDb,
+		close: releaseDb,
 		ctx,
 	};
 }

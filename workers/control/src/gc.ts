@@ -12,12 +12,14 @@ import {
 	deleteExpiredApiTokens,
 	deleteExpiredAuditLogs,
 	listCachesWithRetention,
+	narSourcePinned,
+	withUploadSourceCleanup,
 } from "@snowstead/cache-core/db/repository";
 import { deleteCachePaths } from "@snowstead/cache-core/path-deletion";
 import { messageOf } from "@snowstead/cache-core/responses";
 import type { BlobObject, UploadSessionStatus } from "@snowstead/cache-core/db/types";
 
-const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading"]);
+const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading", "streaming", "finalizing", "aborted"]);
 
 function isTransitionableStatus(s: string): s is UploadSessionStatus {
 	return VALID_TRANSITION_STATUSES.has(s);
@@ -66,47 +68,37 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 
 	for (const session of expired) {
 		try {
-			// findExpiredSessions already excludes "completed" and "expired",
-			// but validate to satisfy the type system without an assertion.
-			if (!isTransitionableStatus(session.status)) continue;
+			// A pre-streaming canonical MPU may still have a completion in flight.
+			// Keep its durable reservation until that outcome has been reconciled.
+			if (session.r2UploadId && session.r2UploadKey && !session.r2UploadKey.startsWith("staging/")) continue;
+			await withUploadSourceCleanup(config.db, async tx => {
+				if (session.r2UploadKey && await narSourcePinned(tx, session.r2UploadKey)) return;
+				if (!isTransitionableStatus(session.status)) return;
 
-			// Canonical keys can be shared with published paths or other uploads.
-			// Adopt abandoned uploads too, so the reference-aware sweep owns all
-			// canonical deletion, including objects never recorded by a publish.
-			if (session.r2UploadKey && !session.r2UploadKey.startsWith("staging/")) {
-				await ensureBlobObjects(config.db, [{
-					fileHash: session.fileHash, fileSize: session.fileSize,
-					compression: session.compression, r2Key: session.r2UploadKey,
-				}]);
-			}
-
-			const transitioned = await transitionSessionStatus(
-				config.db,
-				session.id,
-				session.status,
-				"expired",
-			);
-			if (!transitioned) continue;
-
-			if (session.r2UploadId && session.r2UploadKey) {
-				try {
-					const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
-					await multipart.abort();
-				} catch {
-					// Multipart may already be completed or aborted
+				// Adopt canonical bytes before dropping their last reservation;
+				// the reference-aware blob sweep owns shared-object deletion.
+				if (session.fileHash && session.r2UploadKey && !session.r2UploadKey.startsWith("staging/")) {
+					await ensureBlobObjects(tx, [{
+						fileHash: session.fileHash, fileSize: session.fileSize,
+						compression: session.compression, r2Key: session.r2UploadKey,
+					}]);
 				}
-			}
 
-			if (session.r2UploadKey?.startsWith("staging/")) {
-				try {
-					await bucketForKey(config, session.r2UploadKey).delete(session.r2UploadKey);
-				} catch {
-					// R2 object may not exist
+				const transitioned = await transitionSessionStatus(tx, session.id, session.status, "expired");
+				if (!transitioned) return;
+
+				if (session.r2UploadId && session.r2UploadKey) {
+					try {
+						await bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId).abort();
+					} catch {
+						// Multipart may already be completed or aborted.
+					}
 				}
-			}
 
-			await deleteUploadSession(config.db, session.id);
-			expiredSessions++;
+				if (session.r2UploadKey?.startsWith("staging/")) await config.bucket.delete(session.r2UploadKey);
+				await deleteUploadSession(tx, session.id);
+				expiredSessions++;
+			});
 		} catch (err) {
 			errors.push(`Failed to expire session ${session.id}: ${messageOf(err)}`);
 		}
@@ -118,13 +110,22 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	// completed but never published goes to the sweep instead of staying.
 	for (let batch = 0; batch < GC_BLOB_BATCHES; batch++) {
 		try {
-			const done = await findExpiredCompletedSessions(config.db, now, GC_BLOB_BATCH);
-			await ensureBlobObjects(config.db, done
-				.filter((s) => s.r2UploadKey && !s.r2UploadKey.startsWith("staging/"))
-				.map((s) => ({ fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression, r2Key: s.r2UploadKey ?? "" })));
-			await deleteUploadSessions(config.db, done.map((s) => s.id));
-			expiredSessions += done.length;
-			if (done.length < GC_BLOB_BATCH) break;
+			const count = await withUploadSourceCleanup(config.db, async tx => {
+				const done = await findExpiredCompletedSessions(tx, now, GC_BLOB_BATCH);
+				const unpinned = [];
+				for (const session of done) {
+					if (session.r2UploadKey && await narSourcePinned(tx, session.r2UploadKey)) continue;
+					if (session.r2UploadKey?.startsWith("staging/")) await config.bucket.delete(session.r2UploadKey);
+					unpinned.push(session);
+				}
+				await ensureBlobObjects(tx, unpinned.flatMap(s =>
+					s.fileHash && s.r2UploadKey && !s.r2UploadKey.startsWith("staging/")
+						? [{ fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression, r2Key: s.r2UploadKey }] : []));
+				await deleteUploadSessions(tx, unpinned.map((s) => s.id));
+				return unpinned.length;
+			});
+			expiredSessions += count;
+			if (count < GC_BLOB_BATCH) break;
 		} catch (err) {
 			errors.push(`Failed to delete completed sessions: ${messageOf(err)}`);
 			break;
