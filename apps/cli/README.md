@@ -10,6 +10,10 @@ For SSH or a headless machine, run `snowstead login --no-browser` and open the
 printed URL on another device. Login expires after at most ten minutes. No
 localhost callback is needed.
 
+In the browser, choose the saved token's lifetime: 30 days, 90 days (the
+default), 365 days, or never. This lifetime is separate from the ten-minute
+device approval window; it is selected on the approval page, not with a CLI flag.
+
 - `--name <profile>` overrides the organization slug used for the local profile.
 - `--url <web-origin>` selects a different login website. HTTPS is required,
   except for HTTP loopback origins used in local development.

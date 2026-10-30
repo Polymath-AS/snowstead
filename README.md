@@ -100,16 +100,31 @@ Build the CLI (or `nix run .` for one-off use):
 nix build       # produces ./result/bin/snowstead
 ```
 
-The flake packages only the CLI bundle, a minimal Node runtime, and zstd;
-it does not install the workspace's development or Worker dependencies.
-Push commands use your existing `nix` executable from `PATH`.
-The full development environment is separate (`nix develop`).
+The CLI is a native Rust binary using the Zig NAR core. On Linux, NAR
+serialization, SHA-256, and zstd compression run in-process; Nix is still used
+for path metadata and closure resolution. On macOS, Nix also serializes the
+NAR. The flake includes Nix as a runtime dependency, not Node or the workspace's
+Worker dependencies. Existing credentials in `~/.config/snowstead/config.json`
+continue to work. The full development environment is separate (`nix develop`).
 
-Save credentials once:
+Sign in once (use `--no-browser` over SSH and open the printed URL elsewhere):
 
 ```bash
-snowstead login prod https://your-worker.workers.dev "$PUSH_TOKEN"
+snowstead login
 ```
+
+Approve the organization and token lifetime in your browser: 30 days, 90 days
+(the default), 365 days, or never. The ten-minute device approval window is
+separate from the saved token's lifetime.
+
+For CI, set both `SNOWSTEAD_TOKEN` and `SNOWSTEAD_URL` (the cache base URL).
+For self-hosted manual tokens, use
+`snowstead login --token-stdin --url https://cache.example.com --name prod < token-file`.
+Manual tokens are configured without remote validation; positional login tokens
+are no longer accepted. `snowstead auth status [--server <profile>]` shows local
+configuration, and `snowstead logout [--server <profile>]` removes local
+credentials without revoking the remote token. See the
+[CLI authentication guide](apps/cli/README.md) for profile details.
 
 Push a single path:
 
@@ -128,6 +143,38 @@ Push a flake output closure:
 ```bash
 snowstead push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
 ```
+
+Normal output contains a summary and any errors. Add `--verbose` (or `-v`) for
+`tracing` diagnostics on stderr, including compression sizes/times and upload
+request status/retries. Credentials and signed upload URLs are not logged.
+`RUST_LOG` alone does not enable logging.
+
+```bash
+snowstead push main --closure /run/current-system --verbose
+```
+
+Compression defaults to zstd level 3; use `--compression-level <1-19>` to change
+it. Independent paths use a bounded native worker pool. NARs of at least
+64 MiB use up to four additional zstd workers; the producer and codec workers
+share one CPU budget, rather than multiplying workers by `--jobs`.
+The existing v1 upload protocol still requires the compressed hash and size
+before creating a session, so compressed NARs are spooled to temporary files
+and removed after upload. This also allows retries without recompression.
+
+For local CLI development, run `cargo build -p snowstead-cli` and
+`cargo test -p snowstead-cli` inside `nix develop`. `pnpm check` includes the
+Rust checks and a real CLI upload against disposable Workers and Postgres.
+
+For development-only function and thread profiling, use
+`nix run .#hotpath -- push main /nix/store/…`. This runs the same CLI with
+Hotpath annotations; Hotpath is a Cargo dev-dependency, not linked into the
+normal CLI. Set `HOTPATH_OUTPUT_FORMAT=json` and `HOTPATH_OUTPUT_PATH=report.json`
+to save a report instead of printing it. Reports include metadata queries,
+NAR preparation, spool writes, batch waits, transfers, completion, and commits.
+Async durations include waiting, and concurrent/nested durations overlap;
+do not add them together or treat them as CPU time. `poop` is available in the
+Linux development shell for separate CPU-counter comparisons. Profiling adds
+overhead, so use the normal binary for throughput benchmarks.
 
 See [docs.md](docs.md) for token management and parallelism options.
 
