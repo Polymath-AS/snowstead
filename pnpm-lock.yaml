@@ -170,18 +170,7 @@ importers:
         specifier: ^4.152.0
         version: 4.152.0(@types/node@26.6.5)
 
-  apps/cli:
-    dependencies:
-      '@snowstead/cache-domain':
-        specifier: workspace:*
-        version: link:../../packages/cache-domain
-    devDependencies:
-      '@types/node':
-        specifier: ^26.6.5
-        version: 26.6.5
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
+  apps/cli: {}
 
   apps/go-cache: {}
 
