@@ -200,24 +200,12 @@ fn denial_expiry_and_unknown_errors_never_overwrite_credentials() {
 }
 
 #[test]
-fn non_expiring_device_token_is_saved() {
+fn slow_down_backs_off_and_explicit_name_wins() {
     let home = tempfile::tempdir().unwrap();
     let mut authorized = success();
     authorized["expiresAt"] = Value::Null;
-    let (url, server) = device_server(vec![(200, authorized)], 600);
-    let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
-    assert!(result.status.success());
-    server.join().unwrap();
-    let config: Value =
-        serde_json::from_slice(&std::fs::read(config_path(home.path())).unwrap()).unwrap();
-    assert_eq!(config["servers"]["org-slug"]["token"], TOKEN);
-}
-
-#[test]
-fn slow_down_backs_off_and_explicit_name_wins() {
-    let home = tempfile::tempdir().unwrap();
     let (url, server) = device_server(
-        vec![(429, json!({"error":"slow_down"})), (200, success())],
+        vec![(429, json!({"error":"slow_down"})), (200, authorized)],
         600,
     );
     let result = run(
@@ -230,6 +218,7 @@ fn slow_down_backs_off_and_explicit_name_wins() {
     let config: Value =
         serde_json::from_slice(&std::fs::read(config_path(home.path())).unwrap()).unwrap();
     assert_eq!(config["defaultServer"], "custom");
+    assert_eq!(config["servers"]["custom"]["token"], TOKEN);
 }
 
 #[test]
