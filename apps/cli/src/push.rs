@@ -6,13 +6,14 @@ use crate::{
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, TryStreamExt};
 use std::{
-    collections::{BTreeMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     io::{self, Write},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tracing::Instrument;
 
 pub struct Summary {
@@ -129,8 +130,18 @@ pub async fn push(
                 .with_context(|| format!("missing path info for {path}"))?,
         );
     }
-    // Short paths fill the pipeline while larger paths use codec workers.
-    ordered.sort_unstable_by_key(|i| i.nar_size);
+    let ordered = publish_order(ordered);
+    // Each path publishes only after the references pushed alongside it have.
+    // Paths start in publish order, so every wait is on an earlier path that
+    // already holds a job slot or has finished: waits cannot deadlock.
+    let mut published = HashMap::new();
+    let mut outcomes = Vec::with_capacity(ordered.len());
+    for info in &ordered {
+        let (sender, receiver) = watch::channel(None::<bool>);
+        published.insert(basename(info).to_owned(), receiver);
+        outcomes.push(sender);
+    }
+    let published = &published;
     let cpu = std::thread::available_parallelism().map_or(1, usize::from);
     // Independent paths already use blocking workers. Large NARs get codec
     // workers too, charging the producer and workers to one CPU budget.
@@ -185,8 +196,8 @@ pub async fn push(
             async move { client.finalize(&uploads).await }
         },
     );
-    let mut work = futures_util::stream::iter(ordered.into_iter().zip(sessions).map(
-        |(info, (session, mut guard))| {
+    let mut work = futures_util::stream::iter(ordered.into_iter().zip(sessions).zip(outcomes).map(
+        |((info, (session, mut guard)), outcome)| {
             let compression = compression.clone();
             let parts = parts.clone();
             let buffers = buffers.clone();
@@ -225,6 +236,16 @@ pub async fn push(
                     let digest = producer.await?;
                     let uploaded = uploaded?;
                     let digest = digest?;
+                    let own = basename(&info);
+                    for reference in info.references.iter().filter(|r| *r != own) {
+                        let Some(mut done) = published.get(reference).cloned() else {
+                            continue;
+                        };
+                        let ok = done.wait_for(Option::is_some).await;
+                        if !matches!(ok.as_deref(), Ok(Some(true))) {
+                            bail!("dependency {reference} was not published");
+                        }
+                    }
                     let published = multipart_commits
                         .request(api::Finalize {
                             session_id: session.session_id.clone(),
@@ -254,6 +275,7 @@ pub async fn push(
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
+                outcome.send_replace(Some(result.is_ok()));
                 if result.is_err() {
                     guard.abort().await;
                 }
@@ -292,6 +314,50 @@ pub async fn push(
         }
     }
     Ok(summary)
+}
+
+fn basename(info: &nix::PathInfo) -> &str {
+    &info.store_path["/nix/store/".len()..]
+}
+
+/// Dependencies before dependents, so a published narinfo never names a
+/// reference that is still uploading. Among ready paths, smaller NARs go
+/// first to fill the pipeline while larger ones use codec workers.
+fn publish_order(infos: Vec<nix::PathInfo>) -> Vec<nix::PathInfo> {
+    let index: HashMap<&str, usize> = infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| (basename(info), i))
+        .collect();
+    let mut waiting = vec![0usize; infos.len()];
+    let mut dependents = vec![Vec::new(); infos.len()];
+    for (i, info) in infos.iter().enumerate() {
+        for reference in &info.references {
+            if let Some(&dep) = index.get(reference.as_str())
+                && dep != i
+            {
+                waiting[i] += 1;
+                dependents[dep].push(i);
+            }
+        }
+    }
+    let mut ready: BinaryHeap<_> = (0..infos.len())
+        .filter(|&i| waiting[i] == 0)
+        .map(|i| Reverse((infos[i].nar_size, i)))
+        .collect();
+    let mut order = Vec::with_capacity(infos.len());
+    while let Some(Reverse((_, i))) = ready.pop() {
+        order.push(i);
+        for &next in &dependents[i] {
+            waiting[next] -= 1;
+            if waiting[next] == 0 {
+                ready.push(Reverse((infos[next].nar_size, next)));
+            }
+        }
+    }
+    // Store references are acyclic apart from self-references, skipped above.
+    let mut infos: Vec<_> = infos.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| infos[i].take()).collect()
 }
 
 // The permit belongs to the bytes, including any clones retained by HTTP
@@ -432,6 +498,37 @@ mod tests {
     use crate::api::tests::{client, read, reply};
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::Notify};
+
+    #[test]
+    fn publish_order_puts_references_first_even_when_larger() {
+        let info = |name: &str, size: u64, references: &[&str]| nix::PathInfo {
+            store_path: format!("/nix/store/{name}"),
+            store_path_hash: name[..32].into(),
+            nar_hash: String::new(),
+            nar_size: size,
+            references: references.iter().map(|r| r.to_string()).collect(),
+            deriver: None,
+        };
+        let lib = "00000000000000000000000000000000-lib";
+        let app = "11111111111111111111111111111111-app";
+        let doc = "22222222222222222222222222222222-doc";
+        let tool = "33333333333333333333333333333333-tool";
+        let order: Vec<_> = publish_order(vec![
+            info(
+                app,
+                1,
+                &[app, lib, "44444444444444444444444444444444-elsewhere"],
+            ),
+            info(lib, 1000, &[lib]),
+            info(doc, 5, &[]),
+            info(tool, 500, &[app]),
+        ])
+        .into_iter()
+        .map(|i| i.store_path[11..].to_owned())
+        .collect();
+        // Size alone would give app, doc, tool, lib.
+        assert_eq!(order, [doc, lib, app, tool]);
+    }
 
     #[tokio::test]
     async fn native_stream_starts_before_completion_bounds_all_producers_and_cleans_up() {

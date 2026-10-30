@@ -11,6 +11,7 @@ mod push;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
+use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
@@ -42,13 +43,17 @@ enum Command {
     },
     /// Remove the selected local profile, without revoking its remote token.
     Logout,
-    /// Push existing store paths, or a path and its closure.
+    /// Push store paths and their runtime closures, like cachix push.
     Push {
         cache: String,
-        #[arg(required_unless_present = "closure", conflicts_with = "closure")]
+        /// Store paths or links to them (such as ./result); read from stdin when omitted.
         paths: Vec<String>,
+        /// Push only the given paths, not the paths they reference.
         #[arg(long)]
-        closure: Option<String>,
+        no_deps: bool,
+        /// Upload .drv files (build recipes) instead of rejecting them.
+        #[arg(long)]
+        allow_drv: bool,
         #[arg(long, default_value = "32", value_parser = positive)]
         jobs: usize,
         #[arg(long, default_value = "3", value_parser = clap::value_parser!(i32).range(1..=19))]
@@ -191,6 +196,36 @@ fn main() {
     }
 }
 
+/// The store paths to push, from arguments or else stdin, without consulting Nix.
+fn push_roots(paths: Vec<String>, allow_drv: bool) -> Result<Vec<String>> {
+    let paths = if paths.is_empty() {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            bail!("No store paths given; pass them as arguments or on stdin");
+        }
+        std::io::read_to_string(stdin)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        paths
+    };
+    if paths.is_empty() {
+        bail!("No store paths given on stdin");
+    }
+    let roots = paths
+        .iter()
+        .map(|p| nix::resolve(p))
+        .collect::<Result<Vec<_>>>()?;
+    if !allow_drv && let Some(drv) = roots.iter().find(|p| p.ends_with(".drv")) {
+        bail!(
+            "{drv} is a derivation, not a build output; push outputs from \
+             nix build --print-out-paths, or pass --allow-drv to upload derivations"
+        );
+    }
+    Ok(roots)
+}
+
 #[tokio::main]
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
@@ -205,8 +240,14 @@ async fn async_main() -> Result<()> {
 }
 
 #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-async fn run(cli: Cli) -> Result<()> {
+async fn run(mut cli: Cli) -> Result<()> {
     // Validate command combinations before loading credentials or making requests.
+    if let Command::Push {
+        paths, allow_drv, ..
+    } = &mut cli.command
+    {
+        *paths = push_roots(std::mem::take(paths), *allow_drv)?;
+    }
     match &cli.command {
         Command::Cache {
             command: CacheCommand::Create { protocols, .. },
@@ -252,20 +293,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Push {
             cache,
             paths,
-            closure,
+            no_deps,
+            allow_drv: _,
             jobs,
             compression_level,
         } => {
-            let paths = if let Some(root) = closure {
-                println!("Resolving closure...");
-                let paths = nix::closure(&root).await?;
-                println!("Found {} paths in closure", paths.len());
+            let paths = if no_deps {
                 paths
             } else {
+                println!("Resolving closure...");
+                let paths = nix::closure(&paths).await?;
+                println!("Found {} paths in closure", paths.len());
                 paths
-                    .iter()
-                    .map(|p| nix::resolve(p))
-                    .collect::<Result<Vec<_>>>()?
             };
             tracing::debug!(target: "snowstead", paths = paths.len(), jobs, compression_level, "Starting push");
             let summary = push::push(&client, &cache, paths, jobs, compression_level).await?;

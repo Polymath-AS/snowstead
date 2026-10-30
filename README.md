@@ -141,23 +141,23 @@ configuration, and `snowstead logout [--server <profile>]` removes local
 credentials without revoking the remote token. See the
 [CLI authentication guide](apps/cli/README.md) for profile details.
 
-Push a single path:
+Like `cachix push`, `snowstead push` uploads each given path together with its
+runtime closure (everything it references), and reads paths from stdin when
+none are given as arguments:
 
 ```bash
-snowstead push main /nix/store/abc...-hello
+snowstead push main ./result
+snowstead push main /run/current-system
+nix build --no-link --print-out-paths .#nixosConfigurations.myhost.config.system.build.toplevel \
+  | snowstead push main
 ```
 
-Push a full closure:
-
-```bash
-snowstead push main --closure /run/current-system
-```
-
-Push a flake output closure:
-
-```bash
-snowstead push main --closure .#nixosConfigurations.myhost.config.system.build.toplevel
-```
+Paths must be built first; the CLI never evaluates or builds an installable.
+Each path is published only after the references pushed with it, so an
+interrupted push never leaves a published path whose references are missing.
+Use `--no-deps` to push only the exact paths given; then a path already in the
+cache is skipped without needing a local copy. `.drv` paths are build recipes,
+not outputs, and are rejected unless you pass `--allow-drv`.
 
 Normal output contains a summary and any errors. Add `--verbose` (or `-v`) for
 `tracing` diagnostics on stderr, including compression sizes/times and upload
@@ -165,7 +165,7 @@ request status/retries. Credentials and signed upload URLs are not logged.
 `RUST_LOG` alone does not enable logging.
 
 ```bash
-snowstead push main --closure /run/current-system --verbose
+snowstead push main /run/current-system --verbose
 ```
 
 Compression defaults to zstd level 3; use `--compression-level <1-19>` to change

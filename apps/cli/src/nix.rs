@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tokio::process::Command;
 
 #[derive(Clone, Debug)]
@@ -45,22 +45,39 @@ async fn query(args: &[&str], paths: &[String]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Nix's own "is not valid" error is withheld from output, so name the
+/// unbuilt path here instead of reporting a bare nix exit code.
+fn ensure_local(paths: &[String]) -> Result<()> {
+    for path in paths {
+        if std::fs::symlink_metadata(path).is_err() {
+            bail!(
+                "{path} is not in the local Nix store; build it first (for example with nix build)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The runtime closure of every root: the roots and everything they reference.
 #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-pub async fn closure(path: &str) -> Result<Vec<String>> {
-    // Nix resolves filesystem aliases and flake installables without building
-    // them, just as the existing --closure command does.
-    let bytes = query(&["path-info", "-r"], &[path.to_owned()]).await?;
-    let output = String::from_utf8(bytes).context("Invalid UTF-8 from nix path-info")?;
-    let paths: Vec<String> = output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
+pub async fn closure(roots: &[String]) -> Result<Vec<String>> {
+    ensure_local(roots)?;
+    let mut paths = BTreeSet::new();
+    for chunk in roots.chunks(500) {
+        let bytes = query(&["path-info", "-r"], chunk).await?;
+        let output = String::from_utf8(bytes).context("Invalid UTF-8 from nix path-info")?;
+        paths.extend(
+            output
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        );
+    }
     if paths.is_empty() {
         bail!("nix path-info returned an empty closure");
     }
     tracing::debug!(target: "snowstead", paths = paths.len(), "Resolved closure");
-    Ok(paths)
+    Ok(paths.into_iter().collect())
 }
 
 /// Resolve filesystem aliases only; never evaluate a flake or build an installable.
@@ -73,12 +90,15 @@ pub fn resolve(path: &str) -> Result<String> {
     {
         return Ok(path.to_owned());
     }
-    let path = std::fs::canonicalize(path).context("Could not resolve existing store path")?;
-    let path = path.to_str().context("Store path is not UTF-8")?;
-    if !path.starts_with("/nix/store/") || path[11..].contains('/') {
-        bail!("Expected a top-level /nix/store path");
+    let hint = "pass a store path or a link to one, such as ./result; for a flake output, \
+                run nix build --print-out-paths <installable> | snowstead push <cache>";
+    let resolved = std::fs::canonicalize(path)
+        .with_context(|| format!("{path} is not an existing store path; {hint}"))?;
+    let resolved = resolved.to_str().context("Store path is not UTF-8")?;
+    if !resolved.starts_with("/nix/store/") || resolved[11..].contains('/') {
+        bail!("{path} is not a top-level /nix/store path; {hint}");
     }
-    Ok(path.to_owned())
+    Ok(resolved.to_owned())
 }
 
 #[cfg_attr(snowstead_hotpath, hotpath::measure)]
@@ -86,7 +106,13 @@ pub async fn path_infos(paths: &[String]) -> Result<HashMap<String, PathInfo>> {
     let mut result = HashMap::new();
     for chunk in paths.chunks(500) {
         tracing::debug!(target: "snowstead", paths = chunk.len(), "Querying Nix path metadata");
-        let bytes = query(&["path-info", "--json"], chunk).await?;
+        let bytes = match query(&["path-info", "--json"], chunk).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                ensure_local(chunk)?;
+                return Err(error);
+            }
+        };
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).context("Invalid nix path-info JSON")?;
         let entries: HashMap<String, Entry> = if value.is_object() {

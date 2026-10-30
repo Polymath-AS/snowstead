@@ -69,10 +69,10 @@ test("Rust CLI uploads, publishes, and skips a real NAR through the hosted Worke
     // An immutable toolchain already on this machine; no writes to the Nix store.
     const storePath = /^(\/nix\/store\/[^/]+)/.exec(process.execPath)?.[1];
     assert.ok(storePath, "run inside nix develop so Node is a registered store path");
-    const pushed = await run("push", "native", storePath, "--jobs", "2");
+    const pushed = await run("push", "native", storePath, "--no-deps", "--jobs", "2");
     assert.match(pushed.stdout, /1 pushed, 0 skipped/);
     assert.equal(pushed.stderr, "");
-    const repeated = await run("push", "native", storePath, "--verbose");
+    const repeated = await run("push", "native", storePath, "--no-deps", "--verbose");
     assert.match(repeated.stdout, /0 pushed, 1 skipped/);
     assert.match(repeated.stderr, /checked remote availability/);
     assert.ok(!repeated.stderr.includes(token));
@@ -99,6 +99,43 @@ test("Rust CLI uploads, publishes, and skips a real NAR through the hosted Worke
       return sum.digest("hex");
     }
     assert.equal(await digest("zstd", ["-d", "-q", "-c"], compressed), await digest("nix-store", ["--dump", storePath]));
+
+    // By default, a path read from stdin brings its closure, and every path is
+    // published after the references pushed with it. Node's own closure is too
+    // large, so use its first dependency that has references of its own.
+    const closureOf = async (path) =>
+      (await exec("nix", ["--extra-experimental-features", "nix-command", "path-info", "-r", path])).stdout.trim().split("\n");
+    let root;
+    let closure;
+    for (const candidate of await closureOf(storePath)) {
+      closure = await closureOf(candidate);
+      if (closure.length > 1) {
+        root = candidate;
+        break;
+      }
+    }
+    assert.ok(root, "Node's closure contains a path with references");
+    const piped = run("push", "native");
+    piped.child.stdin.end(`${root}\n`);
+    const withDeps = await piped;
+    assert.match(withDeps.stdout, new RegExp(`Found ${closure.length} paths in closure`));
+    assert.match(withDeps.stdout, new RegExp(`${closure.length} pushed, 0 skipped`));
+    const check = new Client({ connectionString: database.toString() });
+    await check.connect();
+    let rows;
+    try {
+      ({ rows } = await check.query("SELECT store_path, references_json FROM published_paths ORDER BY id"));
+    } finally {
+      await check.end();
+    }
+    const position = new Map(rows.map((row, i) => [row.store_path.split("/").at(-1), i]));
+    for (const path of closure) {
+      const own = path.split("/").at(-1);
+      const row = rows[position.get(own)];
+      for (const reference of JSON.parse(row.references_json)) {
+        if (reference !== own) assert.ok(position.get(reference) < position.get(own), `${reference} before ${own}`);
+      }
+    }
   } finally {
     if (server) await server.close();
     await rm(home, { recursive: true, force: true });

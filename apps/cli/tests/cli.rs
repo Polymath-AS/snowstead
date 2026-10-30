@@ -45,33 +45,51 @@ fn manual_login(home: &std::path::Path, name: &str, url: &str, token: &str) -> O
 }
 
 #[test]
-fn closure_accepts_a_flake_installable_without_a_local_file() {
+fn push_reads_stdin_and_includes_each_paths_closure() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let bin = home.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
+    // Any real top-level store path satisfies the local check; nix itself is mocked.
+    let root = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .find_map(|dir| {
+            let dir = dir.to_str()?.strip_prefix("/nix/store/")?.to_owned();
+            Some(format!("/nix/store/{}", dir.split('/').next()?))
+        })
+        .expect("run inside nix develop so PATH contains store paths");
+    let dependency = format!("/nix/store/{}-dependency", "a".repeat(32));
     let nix = bin.join("nix");
-    let hash = "a".repeat(32);
-    std::fs::write(&nix, format!("#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = '.#app' ]; then echo /nix/store/{hash}-app; exit 0; fi\ndone\nexit 1\n")).unwrap();
+    std::fs::write(
+        &nix,
+        format!("#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = -r ]; then printf '%s\\n' {root} {dependency}; exit 0; fi\ndone\nexit 1\n"),
+    )
+    .unwrap();
     std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (url, request) = mock(200, json!({"missing": []}));
     login(home.path(), &url);
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowstead"))
         .env("HOME", home.path())
         .env("PATH", std::env::join_paths(paths).unwrap())
-        .args(["push", "main", "--closure", ".#app"])
-        .output()
+        .args(["push", "main"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{root}").unwrap();
+    let result = child.wait_with_output().unwrap();
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let mut hashes = vec![root[11..43].to_owned(), "a".repeat(32)];
+    hashes.sort();
     assert_eq!(
         request.join().unwrap().1,
-        json!({"cache":"main", "storePathHashes":[hash]})
+        json!({"cache":"main", "storePathHashes":hashes})
     );
 }
 
@@ -177,6 +195,12 @@ fn invalid_commands_fail_before_credentials_or_http() {
         vec!["push", "main", "/anything", "--jobs", "0"],
         vec!["push", "main", "/anything", "--compression-level", "20"],
         vec!["push", "main"],
+        vec!["push", "main", ".#app"],
+        vec![
+            "push",
+            "main",
+            "/nix/store/00000000000000000000000000000000-app.drv",
+        ],
         vec!["token", "create", "ci", "--expires", "0"],
     ] {
         let result = run(home.path(), &args);
@@ -316,6 +340,7 @@ fn already_present_store_path_does_not_need_local_materialization() {
             "push",
             "main",
             "/nix/store/00000000000000000000000000000000-snowstead-missing-local-fixture",
+            "--no-deps",
         ],
     );
     assert!(
@@ -443,7 +468,7 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
         .env("TMPDIR", home.path().join("no-spooling-here"))
         .env("SNOWSTEAD_URL", url)
         .env("SNOWSTEAD_TOKEN", TOKEN)
-        .args(["push", "main", path, "--jobs", "1"])
+        .args(["push", "main", path, "--no-deps", "--jobs", "1"])
         .output()
         .unwrap();
     assert!(!result.status.success());
