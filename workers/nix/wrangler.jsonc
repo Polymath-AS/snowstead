@@ -36,6 +36,9 @@
 	"keep_names": false,
 	"workers_dev": false,
 	"preview_urls": false,
+	"durable_objects": {
+		"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-control" }]
+	},
 	"vars": {
 		"SIGNING_KEY_NAME": "snowstead-1",
 		// Hosted caches must never fall back to the service's shared key.
@@ -94,6 +97,9 @@
 		// Bindings are intentionally explicit: Wrangler does not inherit them.
 		"production": {
 			"name": "snowstead-nix",
+			"durable_objects": {
+				"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-control" }]
+			},
 			"vars": {
 				"SIGNING_KEY_NAME": "snowstead-1",
 				"REQUIRE_CACHE_SIGNING_KEYS": "true",
@@ -123,6 +129,9 @@
 			"workers_dev": false,
 			"preview_urls": false,
 			"routes": [],
+			"durable_objects": {
+				"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-staging-control" }]
+			},
 			"vars": {
 				"SIGNING_KEY_NAME": "snowstead-staging-1",
 				"REQUIRE_CACHE_SIGNING_KEYS": "true",

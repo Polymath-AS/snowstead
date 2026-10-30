@@ -1,12 +1,43 @@
 import { and, eq, gt, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { WorkerConfig } from "./config.js";
 import type { Cache } from "./db/types.js";
+import type { Db } from "./db/connection.js";
 import { caches as cacheRows, goEntries } from "./db/schema.js";
-import { findCache } from "./db/repository.js";
+import { findCache, findOrg, lockOrgStorageLimit, checkOrgStorageLimit } from "./db/repository.js";
 import { errorResponse, jsonResponse } from "./responses.js";
+import { PRIVATE_CACHES_REFUSED } from "./visibility.js";
 
 export function activeGoEntries(cache: Pick<Cache, "id" | "goGeneration">, now = new Date()) {
 	return and(eq(goEntries.cacheId, cache.id), eq(goEntries.generation, cache.goGeneration), gt(goEntries.expiresAt, now));
+}
+
+/** Reserve quota and a cleanup record; never read the request body or touch R2. */
+export async function reserveGoUpload(db: Db, cache: Cache, action: string, output: string, size: number) {
+	return db.transaction(async (tx) => {
+		const initialOrg = await findOrg(tx, cache.orgId);
+		if (!initialOrg) return errorResponse("Not Found", 404);
+		const org = await lockOrgStorageLimit(tx, initialOrg);
+		if (!org) return errorResponse("Not Found", 404);
+		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
+		if (!current || current.goGeneration !== cache.goGeneration) return errorResponse("Cache changed; retry", 409);
+		if (!current.isPublic && !org.privateCaches) return errorResponse(PRIVATE_CACHES_REFUSED, 403);
+		const now = new Date();
+		// Expired entries lose their action slot, not their cleanup record/key.
+		await tx.update(goEntries).set({ cacheId: null }).where(and(eq(goEntries.cacheId, cache.id),
+			eq(goEntries.generation, cache.goGeneration), eq(goEntries.action, action), lt(goEntries.expiresAt, now)));
+		const [existing] = await tx.select().from(goEntries).where(and(activeGoEntries(cache, now), eq(goEntries.action, action)));
+		if (existing) return existing;
+		if (await checkOrgStorageLimit(tx, org, size)) return errorResponse("Not enough storage", 413);
+		const id = crypto.randomUUID();
+		const [entry] = await tx.insert(goEntries).values({ id, cacheId: cache.id, generation: cache.goGeneration, action,
+			r2Key: `go/${cache.id}/${cache.goGeneration}/${action}/${id}`, output, size,
+			expiresAt: new Date(now.getTime() + 3600_000),
+		}).onConflictDoNothing({ target: [goEntries.cacheId, goEntries.generation, goEntries.action] }).returning();
+		if (entry) return entry;
+		// The unique action index also fences writers from an older deployment.
+		const [winner] = await tx.select().from(goEntries).where(and(activeGoEntries(cache), eq(goEntries.action, action)));
+		return winner ?? errorResponse("Action changed; retry", 409);
+	});
 }
 
 /** Exact live, completed Go totals; pending transfers are never dashboard entries. */

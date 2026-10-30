@@ -5,7 +5,6 @@ import { hasCacheAccess, isOrgsToken } from "@snowstead/cache-core/jwt";
 import {
 	findCache,
 	findCacheById,
-	createUploadSessionsWithinLimit,
 	findUploadSession,
 	findUploadSessions,
 	transitionSessionStatus,
@@ -228,12 +227,13 @@ async function createSessions(
 			expiresAt,
 		};
 	}));
-	const refused = await createUploadSessionsWithinLimit(config.db, cache.orgId, rows);
+	const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" })
+		.reserveNix(cache.orgId, rows);
 	if (refused) {
 		await Promise.allSettled(rows.flatMap((r) =>
 			r.r2UploadId ? [config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()] : [],
 		));
-		return storageFullResponse(refused);
+		return refused instanceof Response ? refused : storageFullResponse(refused);
 	}
 
 	return Promise.all(rows.map(async (row): Promise<SessionResponse> => {

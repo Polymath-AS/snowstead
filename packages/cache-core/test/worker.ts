@@ -3,6 +3,8 @@ import nix from "../../../workers/nix/src/index.js";
 import control from "../../../workers/control/src/index.js";
 import go from "../../../workers/go/src/index.js";
 
+export { UploadCoordinator } from "../src/upload-coordinator.js";
+
 // In-process composition lets fixtures override secrets and outbound fetch.
 // integration/worker-split.mjs additionally exercises real service bindings.
 export default {

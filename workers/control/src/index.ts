@@ -6,6 +6,8 @@ import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
 import { retryCdnPurges } from "@snowstead/cache-core/cdn";
 
+export { UploadCoordinator } from "@snowstead/cache-core/upload-coordinator";
+
 export default {
 	fetch(request, env, ctx): Promise<Response> {
 		return serve(request, env, ctx, handleRequest);

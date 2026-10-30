@@ -2,6 +2,7 @@ import { connect } from "./db/connection.js";
 import type { Connection, Db } from "./db/connection.js";
 import type { CdnConfig } from "./cdn.js";
 import type { RateLimiters } from "./rate-limit.js";
+import type { UploadCoordinator } from "./upload-coordinator.js";
 
 export interface WorkerConfig {
 	/** Private caches, and everything the Worker alone reads. */
@@ -11,6 +12,7 @@ export interface WorkerConfig {
 	/** Authorization state read per request: token revocations. */
 	readonly authKv: KVNamespace;
 	readonly db: Db;
+	readonly uploadCoordinator: DurableObjectNamespace<UploadCoordinator>;
 	/** Database work that may outlive the response. */
 	readonly defer: (task: Promise<unknown>) => void;
 	/** Waits for deferred work, then releases the request's connection; nothing to wait for if it never opened one. */
@@ -89,6 +91,7 @@ function readSettings(env: Env): Settings {
 		bucket: env.CACHE_BUCKET,
 		publicBucket: env.PUBLIC_BUCKET,
 		authKv: env.AUTH_KV,
+		uploadCoordinator: env.UPLOAD_COORDINATOR,
 		signingKeyName: env.SIGNING_KEY_NAME || "snowstead-1",
 		signingPrivateKey: env.SIGNING_PRIVATE_KEY || "",
 		signingMasterKey,

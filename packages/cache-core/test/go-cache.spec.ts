@@ -101,6 +101,40 @@ describe("named Go caches", () => {
 		}
 	});
 
+	it("bounds hot-org database waiters, rejects stale queued work, and leaves other orgs usable", async () => {
+		const hot = await setup();
+		const cold = await setup();
+		await api(hot.org, "", "PUT", { storageLimit: 1000 });
+		const writer = await token(hot, ["push", "go:write"]);
+		const coldWriter = await token(cold);
+		const reserve = () => SELF.fetch(`http://example.com/_api/v1/caches/${hot.name}/upload-sessions/batch`, {
+			method: "POST", headers: { authorization: `Bearer ${writer}`, "content-type": "application/json" },
+			body: JSON.stringify({ paths: [{ storePath: `/nix/store/${"1".repeat(32)}-queued`, storePathHash: "1".repeat(32),
+				narHash: `sha256:${"1".repeat(52)}`, narSize: 1, fileHash: "b".repeat(64), fileSize: 1, compression: "zstd" }] }),
+		});
+		const pending: Promise<Response>[] = [];
+		const responses: Response[] = [];
+		try {
+			await db.transaction(async tx => {
+				await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + hot.org}, 0))`);
+				const waiting = async () => Number((await tx.execute(sql`select count(*) as n from pg_locks where locktype = 'advisory' and not granted`)).rows[0].n);
+				pending.push(reserve().then(response => { responses.push(response); return response; }));
+				await expect.poll(waiting).toBe(1);
+				for (let i = 0; i < 95; i++) pending.push(reserve().then(response => { responses.push(response); return response; }));
+				await expect.poll(() => responses.some(response => response.status === 429)).toBe(true);
+				expect(await waiting()).toBe(1);
+				expect((await transfer(cold, coldWriter, "unblocked")).status).toBe(201);
+				await new Promise(resolve => setTimeout(resolve, 2100));
+			});
+		} finally { await Promise.allSettled(pending); }
+		expect(responses.every(response => [201, 429].includes(response.status))).toBe(true);
+		expect(responses.filter(response => response.status === 201)).toHaveLength(1);
+		expect(responses.filter(response => response.status === 429).every(response => response.headers.get("retry-after") === "1")).toBe(true);
+		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 0, pending: 1 });
+		expect((await reserve()).status).toBe(201);
+		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 0, pending: 2 });
+	});
+
 	it("completes a distinct upload while an earlier upload body is paused", async () => {
 		const target = await setup();
 		const writer = await token(target);
