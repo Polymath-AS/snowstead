@@ -24,6 +24,7 @@ struct Entry {
     deriver: Option<String>,
 }
 
+#[cfg_attr(snowstead_hotpath, hotpath::measure)]
 async fn query(args: &[&str], paths: &[String]) -> Result<Vec<u8>> {
     let output = Command::new("nix")
         .args(["--extra-experimental-features", "nix-command flakes"])
@@ -44,6 +45,7 @@ async fn query(args: &[&str], paths: &[String]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+#[cfg_attr(snowstead_hotpath, hotpath::measure)]
 pub async fn closure(path: &str) -> Result<Vec<String>> {
     // Nix resolves filesystem aliases and flake installables without building
     // them, just as the existing --closure command does.

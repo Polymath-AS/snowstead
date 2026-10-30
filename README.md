@@ -172,9 +172,25 @@ Compression defaults to zstd level 3; use `--compression-level <1-19>` to change
 it. Independent paths use a bounded native worker pool. NARs of at least
 64 MiB use up to four additional zstd workers; the producer and codec workers
 share one CPU budget, rather than multiplying workers by `--jobs`.
-The existing v1 upload protocol still requires the compressed hash and size
-before creating a session, so compressed NARs are spooled to temporary files
-and removed after upload. This also allows retries without recompression.
+The Rust CLI streams compressed NARs directly into multipart uploads: no NAR
+temporary files, whole-NAR buffering, or compression pass just to learn the
+size. Upload buffers share a global budget of 64 MiB, or one negotiated part
+if a very large NAR needs larger parts. Codec memory is additional. Slow
+uploads pause compression; queued and retrying parts keep their buffer
+reservation, so retries reuse the same bytes without recompression.
+
+The server reserves quota before granting each exact-size part upload, then
+checks the final size, compressed hash, and receipts before publishing. Each
+session uploads private staging bytes, even when the hash is already stored.
+Existing v1 clients remain supported. Deploy the database migration and new
+Workers before the streaming CLI; it does not fall back to disk spooling on
+older servers. Config and credential writes still use atomic temporary files.
+
+Large canonical installations keep a durable source/destination pin. An
+ambiguous storage completion stays blocked rather than reopening on a timeout;
+an operator must reconcile its R2 upload before clearing that pin. Drain
+pre-upgrade canonical multipart sessions before rollout. Staged session bytes
+are retained for retries and removed by garbage collection after expiry.
 
 For local CLI development, run `cargo build -p snowstead-cli` and
 `cargo test -p snowstead-cli` inside `nix develop`. `pnpm check` includes the
@@ -185,11 +201,38 @@ For development-only function and thread profiling, use
 Hotpath annotations; Hotpath is a Cargo dev-dependency, not linked into the
 normal CLI. Set `HOTPATH_OUTPUT_FORMAT=json` and `HOTPATH_OUTPUT_PATH=report.json`
 to save a report instead of printing it. Reports include metadata queries,
-NAR preparation, spool writes, batch waits, transfers, completion, and commits.
+NAR encoding, buffer backpressure, batch waits, transfers, and finalization.
 Async durations include waiting, and concurrent/nested durations overlap;
 do not add them together or treat them as CPU time. `poop` is available in the
 Linux development shell for separate CPU-counter comparisons. Profiling adds
 overhead, so use the normal binary for throughput benchmarks.
+
+To isolate local work from HTTP, profile existing store paths with
+`nix run .#hotpath -- local --closure /nix/store/… --rounds 1`.
+This development-only command resolves the closure, queries metadata, and
+prepares NARs sequentially, without loading credentials or uploading anything.
+It validates each NAR against the Nix database and discards encoded output
+directly into a sink. Hotpath separates Nix queries and encoding; the Zig
+call includes filesystem reads, hashing, and compression.
+It is elapsed-time instrumentation, not a CPU sample inside Zig or libzstd.
+
+For throughput without profiler overhead, build the same development target:
+
+```bash
+RUSTFLAGS="--cfg snowstead_local" cargo build --release -p snowstead-cli --example snowstead
+target/release/examples/snowstead local /nix/store/… --rounds 5
+target/release/examples/snowstead local /nix/store/… --rounds 5 --upstream
+```
+
+Run inside `nix develop`. `--upstream` replaces the native walker with
+`nix-store --dump`, keeping the same Zig hashing, zstd settings, and sink
+output. Use `--compression-level 0` for raw NAR encoding plus hashing,
+or the default level 3 for upload preparation; `--threads 4` enables four
+additional zstd workers. Use the same Nix on `PATH` for both runs. JSON lines
+report metadata timings and input MB/s (decimal), not compressed-output MB/s.
+One warm-up pass is omitted from throughput rows but included in Hotpath.
+Results describe warm-cache, sequential local preparation, not parallel upload
+speed, durable disk throughput, or a pure in-process libnix comparison.
 
 See [docs.md](docs.md) for token management and parallelism options.
 

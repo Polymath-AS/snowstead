@@ -1,17 +1,18 @@
 use crate::{
-    api::{self, Client, CommitResult, Session, SessionParams},
+    api::{self, Client, SessionParams},
     batch::Batcher,
     nar, nix,
 };
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, TryStreamExt};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
+    io::{self, Write},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::Instrument;
 
 pub struct Summary {
@@ -128,8 +129,7 @@ pub async fn push(
                 .with_context(|| format!("missing path info for {path}"))?,
         );
     }
-    // Fill the upload pipeline with short preparations before a large NAR
-    // reserves the compression budget for its producer and codec workers.
+    // Short paths fill the pipeline while larger paths use codec workers.
     ordered.sort_unstable_by_key(|i| i.nar_size);
     let cpu = std::thread::available_parallelism().map_or(1, usize::from);
     // Independent paths already use blocking workers. Large NARs get codec
@@ -138,135 +138,151 @@ pub async fn push(
     let large_threads = cpu.saturating_sub(1).min(4) as i32;
     let compression = Arc::new(Semaphore::new(cpu));
     let parts = Arc::new(Semaphore::new(16));
-    let object_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let session_client = client.clone();
-    let cache_owned = cache.to_owned();
-    let sessions: Batcher<SessionParams, Session> =
-        Batcher::new(100, Duration::from_millis(50), move |specs| {
-            let client = session_client.clone();
-            let cache = cache_owned.clone();
-            async move { client.create_sessions(&cache, &specs).await }
-        });
-    let commit_client = client.clone();
-    let commits: Batcher<String, CommitResult> =
-        Batcher::new(100, Duration::from_millis(50), move |ids| {
-            let client = commit_client.clone();
-            async move { client.commit(&ids, None).await }
-        });
-    // Multipart commits assemble and verify whole NARs. Keep them out of
-    // small-path batches and bound the server's concurrent promotions.
+    // Negotiate first so one global byte semaphore can enforce the exact
+    // max(64 MiB, largest part) budget even with mixed-size sessions.
+    let mut sessions = Vec::with_capacity(ordered.len());
+    let mut largest = 64 * 1024 * 1024;
+    for chunk in ordered.chunks(100) {
+        let specs: Vec<_> = chunk
+            .iter()
+            .map(|info| SessionParams {
+                store_path: info.store_path.clone(),
+                store_path_hash: info.store_path_hash.clone(),
+                nar_hash: info.nar_hash.clone(),
+                nar_size: info.nar_size,
+                compression: "zstd".into(),
+                references: info.references.clone(),
+                deriver: info.deriver.clone(),
+            })
+            .collect();
+        let rows = client.create_sessions(cache, &specs).await?;
+        let count = rows.len();
+        for session in rows {
+            let guard = AbortGuard::new(client.clone(), session.session_id.clone());
+            sessions.push((session, guard));
+        }
+        if count != chunk.len() {
+            bail!("API batch response length differs from request");
+        }
+    }
+    for (session, _) in &sessions {
+        if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
+            bail!("invalid multipart part size");
+        }
+        largest = largest.max(session.part_size as usize);
+    }
+    let buffers = Arc::new(Semaphore::new(largest));
+    let session_ids: Vec<_> = sessions
+        .iter()
+        .map(|(session, _)| session.session_id.clone())
+        .collect();
     let multipart_client = client.clone();
     let multipart_commits = Batcher::new(
         jobs.min(8),
         Duration::from_millis(10),
-        move |uploads: Vec<(String, Vec<api::UploadedPart>)>| {
+        move |uploads: Vec<api::Finalize>| {
             let client = multipart_client.clone();
-            async move {
-                let ids: Vec<_> = uploads.iter().map(|(id, _)| id.clone()).collect();
-                let parts = uploads.into_iter().collect();
-                client.commit(&ids, Some(&parts)).await
-            }
+            async move { client.finalize(&uploads).await }
         },
     );
-    let mut work = futures_util::stream::iter(ordered.into_iter().map(|info| {
-        let compression = compression.clone();
-        let parts = parts.clone();
-        let sessions = sessions.clone();
-        let commits = commits.clone();
-        let multipart_commits = multipart_commits.clone();
-        let locks = object_locks.clone();
-        let span = tracing::debug_span!("push_path",path=%info.store_path);
-        async move {
-            let path = info.store_path.clone();
-            let start = Instant::now();
-            let result = async {
-                let threads = if info.nar_size >= LARGE_NAR {
-                    large_threads
-                } else {
-                    0
-                };
-                let permit = compression.acquire_many_owned(threads as u32 + 1).await?;
-                let file_path = path.clone();
-                let expected = info.nar_hash.clone();
-                let size = info.nar_size;
-                let encoded = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    nar::prepare(Path::new(&file_path), size, &expected, level, threads)
-                })
-                .await??;
-                tracing::debug!(
-                    elapsed_ms = start.elapsed().as_millis(),
-                    nar_bytes = size,
-                    compressed_bytes = encoded.digest.file_size,
-                    compression_threads = threads,
-                    "compressed NAR"
-                );
-                let session = sessions
-                    .request(SessionParams {
-                        store_path: info.store_path,
-                        store_path_hash: info.store_path_hash,
-                        nar_hash: info.nar_hash,
-                        nar_size: info.nar_size,
-                        file_hash: hex::encode(encoded.digest.file_hash),
-                        file_size: encoded.digest.file_size,
-                        compression: "zstd".into(),
-                        references: info.references,
-                        deriver: info.deriver,
-                    })
-                    .await?;
-                let lock = {
-                    let mut locks = locks.lock().await;
-                    locks
-                        .entry(session.r2_key.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                };
-                let _guard = lock.lock().await;
-                let published = match session.upload_method.as_str() {
-                    "presigned-parts" => {
-                        let uploaded = client
-                            .upload_presigned_parts(&session, &encoded.path, parts)
-                            .await?;
-                        multipart_commits
-                            .request((session.session_id.clone(), uploaded))
-                            .await?
-                    }
-                    "direct" if encoded.digest.file_size > api::MULTIPART_THRESHOLD => {
-                        client
-                            .upload_multipart(&session.session_id, &encoded.path, parts)
-                            .await?;
-                        client.complete(&session.session_id).await?;
-                        commits.request(session.session_id.clone()).await?
-                    }
-                    "direct" | "presigned" => {
-                        match client.upload_single(&session, &encoded.path, parts).await? {
-                            Some(result) => result,
-                            None => commits.request(session.session_id.clone()).await?,
+    let mut work = futures_util::stream::iter(ordered.into_iter().zip(sessions).map(
+        |(info, (session, mut guard))| {
+            let compression = compression.clone();
+            let parts = parts.clone();
+            let buffers = buffers.clone();
+            let multipart_commits = multipart_commits.clone();
+            let span = tracing::debug_span!("push_path",path=%info.store_path);
+            async move {
+                let path = info.store_path.clone();
+                let start = Instant::now();
+                let result = async {
+                    let threads = if info.nar_size >= LARGE_NAR {
+                        large_threads
+                    } else {
+                        0
+                    };
+                    let permit = compression.acquire_many_owned(threads as u32 + 1).await?;
+                    let file_path = path.clone();
+                    let expected = info.nar_hash.clone();
+                    let size = info.nar_size;
+                    let (sender, receiver) = mpsc::channel(1);
+                    let mut writer = Bridge::new(session.part_size as usize, buffers, sender);
+                    let producer = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let digest =
+                            nar::dump(Path::new(&file_path), size, level, threads, &mut writer)?;
+                        if digest.nar_size != size
+                            || Some(digest.nar_hash) != nar::parse_hash(&expected)
+                        {
+                            bail!("NAR hash or size differs from the Nix database for {file_path}");
                         }
+                        writer.finish()?;
+                        Ok::<_, anyhow::Error>(digest)
+                    });
+                    let uploaded = upload_parts(client, &session.session_id, receiver, parts).await;
+                    // upload_parts drops its receiver on error, waking a blocked
+                    // producer before we join it. Cancellation does the same.
+                    let digest = producer.await?;
+                    let uploaded = uploaded?;
+                    let digest = digest?;
+                    let published = multipart_commits
+                        .request(api::Finalize {
+                            session_id: session.session_id.clone(),
+                            nar_hash: info.nar_hash,
+                            nar_size: digest.nar_size,
+                            file_hash: hex::encode(digest.file_hash),
+                            file_size: digest.file_size,
+                            parts: uploaded,
+                        })
+                        .await?;
+                    if published.session_id != session.session_id || !published.published {
+                        tracing::debug!(
+                            has_error = published.error.is_some(),
+                            "publication rejected"
+                        );
+                        bail!(
+                            "publication failed (status {})",
+                            published.status.unwrap_or(500)
+                        )
                     }
-                    _ => bail!("unsupported upload method"),
-                };
-                if !published.published {
-                    bail!(
-                        "publication failed (status {})",
-                        published.status.unwrap_or(500)
-                    )
+                    guard.disarm();
+                    tracing::debug!(
+                        elapsed_ms = start.elapsed().as_millis(),
+                        compressed_bytes = digest.file_size,
+                        "published store path"
+                    );
+                    Ok::<_, anyhow::Error>(())
                 }
-                tracing::debug!(
-                    elapsed_ms = start.elapsed().as_millis(),
-                    compressed_bytes = encoded.digest.file_size,
-                    "published store path"
-                );
-                Ok::<_, anyhow::Error>(())
+                .await;
+                if result.is_err() {
+                    guard.abort().await;
+                }
+                (path, result)
             }
-            .await;
-            (path, result)
-        }
-        .instrument(span)
-    }))
+            .instrument(span)
+        },
+    ))
     .buffer_unordered(jobs);
-    while let Some((path, result)) = work.next().await {
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    loop {
+        let next = tokio::select! {
+            next = work.next() => next,
+            _ = &mut interrupt => {
+                // Closing receivers wakes both channel-blocked and byte-budget-
+                // blocked native workers. Give abort requests a bounded grace
+                // period before the CLI tears down its runtime. Guard drops may
+                // also abort: the endpoint is deliberately idempotent.
+                drop(work);
+                let cleanup = futures_util::stream::iter(session_ids.iter().map(|id| client.abort(id)))
+                    .buffer_unordered(16).collect::<Vec<_>>();
+                let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
+                bail!("upload cancelled");
+            }
+        };
+        let Some((path, result)) = next else {
+            break;
+        };
         match result {
             Ok(()) => summary.pushed += 1,
             Err(error) => {
@@ -276,4 +292,268 @@ pub async fn push(
         }
     }
     Ok(summary)
+}
+
+// The permit belongs to the bytes, including any clones retained by HTTP
+// transports after a future is cancelled. No replay allocation escapes accounting.
+struct Buffer {
+    bytes: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+impl AsRef<[u8]> for Buffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+struct Bridge {
+    size: usize,
+    budget: Arc<Semaphore>,
+    sender: mpsc::Sender<(u32, bytes::Bytes)>,
+    current: Option<Buffer>,
+    number: u32,
+    runtime: tokio::runtime::Handle,
+}
+impl Bridge {
+    fn new(size: usize, budget: Arc<Semaphore>, sender: mpsc::Sender<(u32, bytes::Bytes)>) -> Self {
+        Self {
+            size,
+            budget,
+            sender,
+            current: None,
+            number: 1,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+    fn finish(&mut self) -> io::Result<()> {
+        if let Some(buffer) = self.current.take() {
+            self.sender
+                .blocking_send((self.number, bytes::Bytes::from_owner(buffer)))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped"))?;
+            self.number += 1;
+        }
+        Ok(())
+    }
+}
+impl Write for Bridge {
+    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let len = bytes.len();
+        while !bytes.is_empty() {
+            if self.sender.is_closed() {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped"));
+            }
+            if self.current.is_none() {
+                if self.number > 10_000 {
+                    return Err(io::Error::other("too many upload parts"));
+                }
+                let permit = self.runtime.block_on(async {
+                    tokio::select! {
+                        permit = self.budget.clone().acquire_many_owned(self.size as u32) => permit.map_err(|_| io::Error::other("upload budget closed")),
+                        _ = self.sender.closed() => Err(io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped")),
+                    }
+                })?;
+                self.current = Some(Buffer {
+                    bytes: Vec::with_capacity(self.size),
+                    _permit: permit,
+                });
+            }
+            let current = self.current.as_mut().unwrap();
+            let count = bytes.len().min(self.size - current.bytes.len());
+            current.bytes.extend_from_slice(&bytes[..count]);
+            bytes = &bytes[count..];
+            if current.bytes.len() == self.size {
+                self.finish()?;
+            }
+        }
+        Ok(len)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+async fn upload_parts(
+    client: &Client,
+    id: &str,
+    receiver: mpsc::Receiver<(u32, bytes::Bytes)>,
+    limit: Arc<Semaphore>,
+) -> anyhow::Result<Vec<api::UploadedPart>> {
+    let mut parts: Vec<_> = futures_util::stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|part| (part, receiver))
+    })
+    .map(|(number, bytes)| {
+        let limit = limit.clone();
+        async move {
+            let _permit = limit.acquire().await?;
+            client.upload_part(id, number, bytes).await
+        }
+    })
+    .buffer_unordered(4)
+    .try_collect()
+    .await?;
+    parts.sort_by_key(|part| part.part_number);
+    Ok(parts)
+}
+struct AbortGuard {
+    client: Client,
+    id: Option<String>,
+}
+impl AbortGuard {
+    fn new(client: Client, id: String) -> Self {
+        Self {
+            client,
+            id: Some(id),
+        }
+    }
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+    async fn abort(&mut self) {
+        if let Some(id) = &self.id {
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.client.abort(id)).await;
+        }
+        self.disarm();
+    }
+}
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), client.abort(&id)).await;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::tests::{client, read, reply};
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, sync::Notify};
+
+    #[tokio::test]
+    async fn native_stream_starts_before_completion_bounds_all_producers_and_cleans_up() {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("data");
+            // Incompressible input ensures many parts, without a second NAR pass.
+            let data: Vec<u8> = (0..128 * 1024).map(|_| rand::random::<u8>()).collect();
+            std::fs::write(&path, data).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let received = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let aborted = Arc::new(Notify::new());
+            let server = tokio::spawn({
+                let received = received.clone();
+                let release = release.clone();
+                let aborted = aborted.clone();
+                let origin = url.clone();
+                async move {
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let origin = origin.clone();
+                        let received = received.clone();
+                        let release = release.clone();
+                        let aborted = aborted.clone();
+                        tokio::spawn(async move {
+                            let (headers, body) = read(&mut socket).await;
+                            if headers.starts_with("POST /_api/v1/uploads/s1/parts ") {
+                                let body: Value = serde_json::from_slice(&body).unwrap();
+                                assert_eq!(body["parts"][0]["size"], 1024);
+                                let number = &body["parts"][0]["partNumber"];
+                                reply(&mut socket, 200, &json!({"parts":[{"partNumber":number,"url":format!("{origin}/part"),"headers":{}}]}).to_string(), "").await;
+                            } else if headers.starts_with("PUT /part ") {
+                                assert_eq!(body.len(), 1024);
+                                received.notify_one();
+                                release.notified().await;
+                                if !cancel {
+                                    reply(&mut socket, 403, "denied", "").await;
+                                }
+                            } else {
+                                assert!(headers.starts_with("POST /_api/v1/uploads/s1/abort "));
+                                reply(&mut socket, 200, "{}", "").await;
+                                aborted.notify_one();
+                            }
+                        });
+                    }
+                }
+            });
+            // Scale the byte budget down to two parts. The same semaphore is
+            // shared by two native producers, not recreated for each path.
+            let budget = Arc::new(Semaphore::new(2048));
+            let mut producers = Vec::new();
+            let mut receivers = Vec::new();
+            for _ in 0..2 {
+                let (sender, receiver) = mpsc::channel(1);
+                let mut writer = Bridge::new(1024, budget.clone(), sender);
+                let path = path.clone();
+                producers.push(tokio::task::spawn_blocking(move || {
+                    nar::dump(&path, 0, 3, 0, &mut writer)?;
+                    writer.finish()?;
+                    Ok::<_, anyhow::Error>(())
+                }));
+                receivers.push(receiver);
+            }
+            let client = client(&url);
+            let consumer = tokio::spawn(async move {
+                let mut guard = AbortGuard::new(client.clone(), "s1".into());
+                let limit = Arc::new(Semaphore::new(1));
+                let tasks = receivers
+                    .into_iter()
+                    .map(|receiver| upload_parts(&client, "s1", receiver, limit.clone()));
+                let result = futures_util::future::try_join_all(tasks).await;
+                assert!(result.is_err());
+                guard.abort().await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), received.notified())
+                .await
+                .unwrap();
+            assert!(
+                producers.iter().all(|producer| !producer.is_finished()),
+                "HTTP must start before either encoder finishes"
+            );
+            assert_eq!(budget.available_permits(), 0);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                producers.iter().all(|producer| !producer.is_finished()),
+                "slow HTTP must backpressure both encoders"
+            );
+            if cancel {
+                consumer.abort();
+            }
+            release.notify_waiters();
+            if cancel {
+                assert!(consumer.await.unwrap_err().is_cancelled());
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), consumer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            for producer in producers {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(5), producer)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), aborted.notified())
+                .await
+                .unwrap();
+            // The HTTP transport can briefly retain an owned body after cancellation.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while budget.available_permits() != 2048 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            server.abort();
+        }
+    }
 }
