@@ -46,6 +46,18 @@ struct Authorized {
     expires_at: Option<String>,
 }
 
+pub fn status(profile: Option<&str>) -> Result<()> {
+    let (name, _) = config::local_server(profile)?;
+    println!("Local profile '{name}' is configured. Remote credentials have not been verified.");
+    Ok(())
+}
+
+pub fn logout(profile: Option<&str>) -> Result<()> {
+    let name = config::logout(profile)?;
+    println!("Removed local profile '{name}' (remote token not revoked)");
+    Ok(())
+}
+
 pub async fn login(options: &Login) -> Result<()> {
     if options
         .name

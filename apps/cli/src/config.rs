@@ -100,11 +100,16 @@ pub fn server(name: Option<&str>) -> Result<Server> {
     Ok(local_server(name)?.1)
 }
 
+impl Config {
+    fn profile_name<'a>(&'a self, name: Option<&'a str>) -> Result<&'a str> {
+        name.or(self.default_server.as_deref())
+            .context("No server specified and no default configured. Run: snowstead login")
+    }
+}
+
 pub fn local_server(name: Option<&str>) -> Result<(String, Server)> {
     let config = load()?;
-    let key = name
-        .or(config.default_server.as_deref())
-        .context("No server specified and no default configured. Run: snowstead login")?;
+    let key = config.profile_name(name)?;
     let server = config
         .servers
         .get(key)
@@ -113,14 +118,16 @@ pub fn local_server(name: Option<&str>) -> Result<(String, Server)> {
     Ok((key.into(), server))
 }
 
-pub fn logout(name: Option<&str>) -> Result<()> {
-    let (key, _) = local_server(name)?;
+pub fn logout(name: Option<&str>) -> Result<String> {
     let mut config = load()?;
-    config.servers.remove(&key);
+    let key = config.profile_name(name)?.to_owned();
+    config
+        .servers
+        .remove(&key)
+        .context("Server not found in config. Run: snowstead login")?;
     if config.default_server.as_deref() == Some(&key) {
         config.default_server = config.servers.keys().next().cloned();
     }
     save(&config)?;
-    println!("Removed local profile '{key}' (remote token not revoked)");
-    Ok(())
+    Ok(key)
 }

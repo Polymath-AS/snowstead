@@ -229,16 +229,10 @@ async fn run(cli: Cli) -> Result<()> {
     }
     match &cli.command {
         Command::Login(options) => return auth::login(options).await,
-        Command::Logout => return config::logout(cli.server.as_deref()),
+        Command::Logout => return auth::logout(cli.server.as_deref()),
         Command::Auth {
             command: AuthCommand::Status,
-        } => {
-            let (name, _) = config::local_server(cli.server.as_deref())?;
-            println!(
-                "Local profile '{name}' is configured. Remote credentials have not been verified."
-            );
-            return Ok(());
-        }
+        } => return auth::status(cli.server.as_deref()),
         _ => (),
     }
     let server = config::server(cli.server.as_deref())?;
