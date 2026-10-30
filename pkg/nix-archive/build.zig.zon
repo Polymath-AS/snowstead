@@ -1,0 +1,9 @@
+.{
+    .name = .nix_archive,
+    .version = "0.1.0",
+    .fingerprint = 0xcb3a212dbdaff4ec,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

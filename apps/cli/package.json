@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "bin": {
-    "snowstead": "./dist/main.js"
+    "snowstead": "../../target/release/snowstead"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "pnpm build && node --test test/*.test.mjs",
-    "check": "pnpm test"
+    "build": "cargo build --release --manifest-path Cargo.toml",
+    "test": "cargo test --manifest-path Cargo.toml",
+    "check": "cargo fmt --manifest-path Cargo.toml -- --check && cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path Cargo.toml"
   },
   "dependencies": {
     "@snowstead/cache-domain": "workspace:*"
