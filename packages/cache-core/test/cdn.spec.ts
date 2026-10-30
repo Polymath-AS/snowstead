@@ -105,7 +105,7 @@ describe("CDN purges", () => {
 
 	it("queues a failed publish purge, recovers, and purges re-publishes and deletions", async () => {
 		const connection = resolveConfig(env);
-		const local = { ...connection, cdn: config.cdn, upstreams: [], r2AccessKeyId: "", r2SecretAccessKey: "" };
+		const local: WorkerConfig = Object.assign(Object.create(connection), { cdn: config.cdn, upstreams: [], r2AccessKeyId: "", r2SecretAccessKey: "" });
 		const name = `purge-flow-${crypto.randomUUID().slice(0, 8)}`;
 		const hash = "3".repeat(32);
 		const bytes = new Uint8Array([83, 14, 251]);

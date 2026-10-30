@@ -169,7 +169,7 @@ describe("orgs", () => {
 });
 
 describe("storage limit", () => {
-	it("recovers a canonical collision without reserving more quota", async () => {
+	it("stages duplicate NARs independently without reserving more quota on multipart retry", async () => {
 		const bytes = crypto.getRandomValues(new Uint8Array(16));
 		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
 		const { org, cache, token } = await orgWithCache(32);
@@ -187,21 +187,27 @@ describe("storage limit", () => {
 		const second = await create("2");
 		expect(first.status).toBe(201);
 		expect(second.status).toBe(201);
-		const a = await first.json<{ sessionId: string }>();
-		const b = await second.json<{ sessionId: string }>();
+		const a = await first.json<{ sessionId: string; r2Key: string }>();
+		const b = await second.json<{ sessionId: string; r2Key: string }>();
+		for (const s of [a, b]) expect(s.r2Key).toBe(`staging/${s.sessionId}`);
 		const put = (id: string, suffix: string) => SELF.fetch(`http://example.com/_api/v1/uploads/${id}/${suffix}`, {
 			method: "PUT", headers: { authorization: `Bearer ${token}` }, body: bytes,
 		});
 		expect((await put(a.sessionId, "blob")).status).toBe(200);
-		expect((await put(b.sessionId, "blob")).status).toBe(412);
+		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
 		expect((await create("3")).status).toBe(507);
-		expect((await post(`/uploads/${b.sessionId}/multipart`, {})).status).toBe(200);
+		const start = await post(`/uploads/${b.sessionId}/multipart`, {});
+		expect(start.status).toBe(200);
+		const instructions = await start.json();
+		expect(await (await post(`/uploads/${b.sessionId}/multipart`, {})).json()).toEqual(instructions);
 		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 32, used: 0 });
 		expect((await put(b.sessionId, "part/1")).status).toBe(200);
 		expect((await post(`/uploads/${b.sessionId}/complete`, {})).status).toBe(200);
 		for (const sessionId of [b.sessionId, a.sessionId]) {
 			expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
 		}
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 0, used: 32 });
+		for (const s of [a, b]) expect(await env.CACHE_BUCKET.head(s.r2Key)).not.toBeNull();
 	});
 
 	it("accepts pushes that fit and refuses one that doesn't", async () => {

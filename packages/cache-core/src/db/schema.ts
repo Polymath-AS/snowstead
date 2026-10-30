@@ -122,8 +122,11 @@ export const uploadSessions = pgTable("upload_sessions", {
 	storePath: text("store_path").notNull(),
 	narHash: text("nar_hash").notNull(),
 	narSize: bytes("nar_size").notNull(),
-	fileHash: text("file_hash").notNull(),
+	/** Streaming sessions learn the compressed hash only at finalization. */
+	fileHash: text("file_hash"),
+	/** Reserved compressed bytes while streaming; exact size after finalization. */
 	fileSize: bytes("file_size").notNull(),
+	partSize: integer("part_size"),
 	compression: text("compression").notNull(),
 	referencesJson: text("references_json").notNull().default("[]"),
 	deriver: text("deriver"),
@@ -141,11 +144,26 @@ export const uploadParts = pgTable("upload_parts", {
 	id: id(),
 	sessionId: text("session_id").notNull().references(() => uploadSessions.id),
 	partNumber: integer("part_number").notNull(),
-	etag: text("etag").notNull(),
+	/** Null reserves a part before its upload URL is issued. */
+	etag: text("etag"),
 	size: bytes("size").notNull(),
 }, (table) => [
 	uniqueIndex("upload_parts_session_part_unique").on(table.sessionId, table.partNumber),
 ]);
+
+/** Non-expiring pins: an ambiguous R2 completion must never admit a stale writer. */
+export const narInstallations = pgTable("nar_installations", {
+	key: text("key").primaryKey(),
+	operationId: text("operation_id").notNull(),
+	sourceKey: text("source_key").notNull(),
+	uploadId: text("upload_id"),
+	fileHash: text("file_hash").notNull(),
+	compression: text("compression").notNull(),
+	isPrivate: boolean("is_private").notNull(),
+	fileSize: bytes("file_size").notNull(),
+	phase: text("phase").notNull().default("preparing"),
+	createdAt: createdAt("created_at"),
+});
 
 export const gcMarks = pgTable("gc_marks", {
 	id: id(),

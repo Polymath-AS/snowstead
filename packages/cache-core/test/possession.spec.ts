@@ -1,7 +1,7 @@
 import { env, SELF, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { testDb } from "./db.js";
-import { createCache, findUploadSession } from "../src/db/repository.js";
+import { createCache, createUploadSessions, findCache, findUploadSession } from "../src/db/repository.js";
 import { narKey } from "../src/layout.js";
 import { eq } from "drizzle-orm";
 import { uploadSessions } from "../src/db/schema.js";
@@ -145,18 +145,18 @@ describe("proof of possession", () => {
 	it("won't complete a session on an upload another session made", async () => {
 		const { bytes, fileHash } = await nar();
 		const [first, second] = [await freshCache(), await freshCache()];
-		// Both before the NAR is stored, so both upload to its own key.
+		// Even before a NAR exists, each session must prove its own upload.
 		const a = await session(first, fileHash);
 		const b = await session(second, fileHash);
-		expect(b.r2Key).not.toMatch(/^staging\//);
+		expect(a.r2Key).toBe(`staging/${a.sessionId}`);
+		expect(b.r2Key).toBe(`staging/${b.sessionId}`);
 
 		expect((await put(`/_api/v1/uploads/${a.sessionId}/blob`, bytes)).status).toBe(200);
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await commit(b.sessionId)).toMatchObject({ status: 400, error: "Upload incomplete" });
 		expect(await narinfoStatus(second, b.hash)).toBe(404);
 
-		// The abandoned session names the same canonical key as the published
-		// path. Expiring it must not withdraw somebody else's bytes.
+		// Expiring an abandoned staging reservation must not withdraw a NAR.
 		await db.update(uploadSessions).set({ expiresAt: new Date(0) }).where(eq(uploadSessions.id, b.sessionId));
 		const config = resolveConfig(env);
 		try {
@@ -190,6 +190,22 @@ describe("canonical and staged upload interleaving", () => {
 		return response.json<{ sessionId: string; r2Key: string }>();
 	}
 
+	/** A persisted pre-upgrade reservation, not a newly created API session. */
+	async function legacyPamSession(cacheName: string, index: number) {
+		const cache = await findCache(db, "default", cacheName);
+		const sessionId = crypto.randomUUID();
+		await createUploadSessions(db, [{
+			id: sessionId, cacheId: cache!.id,
+			storePath: `/nix/store/${paths[index]}`, storePathHash: paths[index].slice(0, 32),
+			narHash: "sha256-0CszDDh/wN3/LZKd90rIIRYLmGc0kOKYCTxZcQcq0Fk=", narSize: 1152,
+			fileHash, fileSize: bytes.length, compression: "zstd",
+			referencesJson: JSON.stringify(["9qqk0zxph7qihzs9hjy1hfgacb6ndmj1-linux-pam-1.7.2"]),
+			deriver: null, system: null, status: "pending", r2UploadKey: canonical,
+			expiresAt: new Date(Date.now() + 3600_000),
+		}]);
+		return { sessionId, r2Key: canonical };
+	}
+
 	async function upload(s: { sessionId: string; r2Key: string }, method: string) {
 		if (method === "presigned") {
 			// The S3 transport leaves the session pending. Supply the object R2
@@ -205,7 +221,7 @@ describe("canonical and staged upload interleaving", () => {
 		}
 	}
 
-	it("returns signed create-only instructions only for canonical single PUTs", async () => {
+	it("signs session-scoped private staging PUTs even before the NAR exists", async () => {
 		await env.PUBLIC_BUCKET.delete(canonical);
 		const cache = await freshCache();
 		for (const index of [0, 1]) {
@@ -225,20 +241,54 @@ describe("canonical and staged upload interleaving", () => {
 			expect(response.status).toBe(201);
 			const s = await response.json<{ sessionId: string; r2Key: string; uploadMethod: string; uploadUrl: string; uploadHeaders: Record<string, string> }>();
 			expect(s.uploadMethod).toBe("presigned");
-			expect(s.uploadHeaders["if-none-match"]).toBe(index === 0 ? "*" : undefined);
-			expect(new URL(s.uploadUrl).searchParams.get("X-Amz-SignedHeaders")?.split(";").includes("if-none-match")).toBe(index === 0);
+			expect(s.r2Key).toBe(`staging/${s.sessionId}`);
+			expect(s.uploadHeaders["if-none-match"]).toBeUndefined();
+			expect(new URL(s.uploadUrl).searchParams.get("X-Amz-SignedHeaders")?.split(";").includes("if-none-match")).toBe(false);
 			expect(s.uploadHeaders["x-amz-meta-session"]).toBe(s.sessionId);
 			if (index === 0) await upload(s, "presigned");
+			expect(await env.PUBLIC_BUCKET.head(canonical)).toBeNull();
 		}
+	});
+
+	it.each(["direct", "presigned", "multipart"])("publishes simultaneous new %s sessions without canonical upload collisions", async method => {
+		await env.PUBLIC_BUCKET.delete(canonical);
+		const [first, second] = [await freshCache(), await freshCache()];
+		const a = await pamSession(first, 0);
+		const b = await pamSession(second, 1);
+		for (const s of [a, b]) {
+			expect(s.r2Key).toBe(`staging/${s.sessionId}`);
+			await upload(s, method);
+		}
+		expect(await env.PUBLIC_BUCKET.head(canonical)).toBeNull();
+		if (method === "multipart") {
+			expect((await post(`/_api/v1/uploads/${b.sessionId}/complete`, {})).status).toBe(200);
+			expect((await post(`/_api/v1/uploads/${a.sessionId}/complete`, {})).status).toBe(200);
+		}
+		expect(await commit(b.sessionId)).toMatchObject({ published: true });
+		const installed = await env.PUBLIC_BUCKET.head(canonical);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		for (const [s, cache, index] of [[a, first, 0], [b, second, 1]] as const) {
+			const source = await env.CACHE_BUCKET.head(s.r2Key);
+			expect(source?.customMetadata).toEqual({ session: s.sessionId });
+			const receipt = await findUploadSession(db, s.sessionId);
+			expect((await put(`/_api/v1/uploads/${s.sessionId}/blob`, bytes)).status).toBe(409);
+			expect((await post(`/_api/v1/uploads/${s.sessionId}/multipart`, {})).status).toBe(409);
+			expect(await commit(s.sessionId)).toMatchObject({ published: true });
+			expect(await findUploadSession(db, s.sessionId)).toEqual(receipt);
+			expect((await env.CACHE_BUCKET.head(s.r2Key))?.version).toBe(source?.version);
+			expect(await narinfoStatus(cache, paths[index].slice(0, 32))).toBe(200);
+		}
+		expect((await env.PUBLIC_BUCKET.head(canonical))?.version).toBe(installed?.version);
+		expect(await storedBytes(fileHash)).toEqual(bytes);
 	});
 
 	it.each([
 		["direct", false], ["direct", true], ["presigned", false], ["presigned", true],
-	] as const)("recovers initial canonical %s collisions with the same reservation (bad parts %s)", async (method, badParts) => {
+	] as const)("recovers pre-upgrade canonical %s collisions with the same reservation (bad parts %s)", async (method, badParts) => {
 		await env.PUBLIC_BUCKET.delete(canonical);
 		const cache = await freshCache();
-		const a = await pamSession(cache, 0);
-		const b = await pamSession(cache, 1);
+		const a = await legacyPamSession(cache, 0);
+		const b = await legacyPamSession(cache, 1);
 		expect(a.r2Key).toBe(canonical);
 		expect(b.r2Key).toBe(canonical);
 		const before = await findUploadSession(db, b.sessionId);
@@ -276,7 +326,7 @@ describe("canonical and staged upload interleaving", () => {
 
 	it("recognizes its own canonical upload after a lost response without overwriting it", async () => {
 		await env.PUBLIC_BUCKET.delete(canonical);
-		const a = await pamSession(await freshCache(), 0);
+		const a = await legacyPamSession(await freshCache(), 0);
 		await upload(a, "direct");
 		const winner = await env.PUBLIC_BUCKET.head(canonical);
 		expect((await put(`/_api/v1/uploads/${a.sessionId}/blob`, bytes)).status).toBe(412);
@@ -288,7 +338,7 @@ describe("canonical and staged upload interleaving", () => {
 		["complete", "direct"], ["commit", "direct"], ["complete", "presigned"], ["commit", "presigned"],
 	])("fences a stale %s after %s multipart retarget", async (endpoint, method) => {
 		await env.PUBLIC_BUCKET.delete(canonical);
-		const a = await pamSession(await freshCache(), 0);
+		const a = await legacyPamSession(await freshCache(), 0);
 		await upload(a, method);
 		let retargeted = false;
 		const bucket = new Proxy(env.PUBLIC_BUCKET, {
@@ -370,7 +420,7 @@ describe("canonical and staged upload interleaving", () => {
 	])("keeps canonical %s proof when staged %s completes first", async (firstMethod, secondMethod) => {
 		await env.PUBLIC_BUCKET.delete(canonical);
 		const [first, second] = [await freshCache(), await freshCache()];
-		const a = await pamSession(first, 0);
+		const a = await legacyPamSession(first, 0);
 		expect(a.r2Key).toBe(canonical);
 		await upload(a, firstMethod);
 		const before = await env.PUBLIC_BUCKET.head(canonical);
@@ -389,7 +439,7 @@ describe("canonical and staged upload interleaving", () => {
 		const after = await env.PUBLIC_BUCKET.head(canonical);
 		expect(after?.version).toBe(before?.version);
 		expect(after?.customMetadata).toEqual({ session: a.sessionId });
-		expect(await env.CACHE_BUCKET.head(b.r2Key)).toBeNull();
+		expect((await env.CACHE_BUCKET.head(b.r2Key))?.customMetadata).toEqual({ session: b.sessionId });
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await commit(b.sessionId)).toMatchObject({ published: true });
@@ -402,9 +452,9 @@ describe("canonical and staged upload interleaving", () => {
 	it.each([false, true])("doesn't clobber a canonical PUT arriving during promotion (bad parts: %s)", async badParts => {
 		await env.PUBLIC_BUCKET.delete(canonical);
 		const [first, second] = [await freshCache(), await freshCache()];
-		const a = await pamSession(first, 0);
+		const a = await legacyPamSession(first, 0);
 		const b = await pamSession(second, 1);
-		// Both were created before the NAR exists; multipart B moves to staging.
+		// A predates the upgrade; new B never receives a canonical write URL.
 		expect((await post(`/_api/v1/uploads/${b.sessionId}/multipart`, {})).status).toBe(200);
 		const body = badParts ? new Uint8Array(bytes.length).fill(1) : bytes;
 		const uploaded = await put(`/_api/v1/uploads/${b.sessionId}/part/1`, body);
@@ -440,7 +490,13 @@ describe("canonical and staged upload interleaving", () => {
 		expect(await response.json()).toMatchObject({ results: [badParts
 			? { error: "File hash mismatch", status: 400 }
 			: { published: true }] });
-		expect(interleaved).toBe(true);
+		// Invalid staging is rejected before even inspecting the destination.
+		expect(interleaved).toBe(!badParts);
+		if (badParts) {
+			expect(await env.PUBLIC_BUCKET.head(canonical)).toBeNull();
+			expect(await env.CACHE_BUCKET.head(b.r2Key)).not.toBeNull();
+			await upload(a, "direct");
+		}
 		expect((await env.PUBLIC_BUCKET.head(canonical))?.customMetadata).toEqual({ session: a.sessionId });
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await storedBytes(fileHash)).toEqual(bytes);
@@ -493,7 +549,10 @@ describe("canonical and staged upload interleaving", () => {
 			const response = await request("/uploads/commit", "POST", { sessionIds: [s.sessionId] }, owner.token);
 			expect(await response.json()).toMatchObject({ results: [{ published: true }] });
 		}
-		expect((await env.CACHE_BUCKET.head(key))?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await env.CACHE_BUCKET.head(key)).not.toBeNull();
+		for (const s of [a, b]) {
+			expect((await env.CACHE_BUCKET.head(s.r2Key))?.customMetadata).toEqual({ session: s.sessionId });
+		}
 		expect(await env.PUBLIC_BUCKET.head(canonical)).toBeNull();
 	});
 
@@ -502,12 +561,15 @@ describe("canonical and staged upload interleaving", () => {
 		const [first, second] = [await freshCache(), await freshCache()];
 		const a = await session(first, fileHash);
 		expect((await put(`/_api/v1/uploads/${a.sessionId}/blob`, bytes)).status).toBe(200);
+		expect(await commit(a.sessionId)).toMatchObject({ published: true });
+		const canonical = narKey(fileHash, "zstd", false);
+		const before = await env.PUBLIC_BUCKET.head(canonical);
 		const b = await session(second, fileHash);
 		// Fault injection bypasses PUT's checksum to exercise completion itself.
-		await env.CACHE_BUCKET.put(b.r2Key, mismatch === "size" ? bytes.slice(1) : new Uint8Array(SIZE));
+		await env.CACHE_BUCKET.put(b.r2Key, mismatch === "size" ? bytes.slice(1) : new Uint8Array(SIZE), { customMetadata: { session: b.sessionId } });
 		expect(await commit(b.sessionId)).toMatchObject({ status: 400, error: mismatch === "size" ? "File size mismatch" : "File hash mismatch" });
-		expect(await env.CACHE_BUCKET.head(b.r2Key)).toBeNull();
-		expect((await env.PUBLIC_BUCKET.head(a.r2Key))?.customMetadata).toEqual({ session: a.sessionId });
+		expect(await env.CACHE_BUCKET.head(b.r2Key)).not.toBeNull();
+		expect((await env.PUBLIC_BUCKET.head(canonical))?.version).toBe(before?.version);
 		expect(await commit(a.sessionId)).toMatchObject({ published: true });
 		expect(await narinfoStatus(second, b.hash)).toBe(404);
 	});

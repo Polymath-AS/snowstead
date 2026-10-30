@@ -78,14 +78,15 @@ export async function createPresignedPartPut(
 	uploadId: string,
 	partNumber: number,
 	expiresIn: number,
+	size?: number,
 ): Promise<string> {
 	const client = getClient(accessKeyId, secretAccessKey);
 	const url = new URL(`/${bucket}/${key}`, endpoint);
 	url.searchParams.set("partNumber", String(partNumber));
 	url.searchParams.set("uploadId", uploadId);
 	url.searchParams.set("X-Amz-Expires", String(expiresIn));
-	const signed = await client.sign(new Request(url, { method: "PUT" }), {
-		aws: { signQuery: true },
+	const signed = await client.sign(new Request(url, { method: "PUT", headers: size === undefined ? {} : { "content-length": String(size) } }), {
+		aws: { signQuery: true, allHeaders: size !== undefined },
 	});
 	return signed.url;
 }

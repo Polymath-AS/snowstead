@@ -153,13 +153,15 @@ describe("signing public key", () => {
 describe("admin narinfo backfill", () => {
 	it("stores the narinfo of paths published straight to the database", async () => {
 		const cache = await createCache(db, `backfill-${crypto.randomUUID().slice(0, 8)}`);
+		const body = new Uint8Array(10);
+		const fileHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", body)), byte => byte.toString(16).padStart(2, "0")).join("");
 		const blob = await createBlobObject(db, {
-			fileHash: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
-			fileSize: 10,
+			fileHash,
+			fileSize: body.byteLength,
 			compression: "zstd",
 			r2Key: `nars/${crypto.randomUUID()}`,
 		});
-		await env.CACHE_BUCKET.put(blob.r2Key, new Uint8Array(10));
+		await env.CACHE_BUCKET.put(blob.r2Key, body);
 		const hash = "1".repeat(32);
 		await createPublishedPath(db, {
 			cacheId: cache.id,

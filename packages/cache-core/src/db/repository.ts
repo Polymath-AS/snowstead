@@ -12,6 +12,7 @@ import {
 	publishedPaths,
 	uploadSessions,
 	uploadParts,
+	narInstallations,
 	gcMarks,
 	apiTokens,
 	tokenCaches,
@@ -298,8 +299,8 @@ export async function globalOverview(db: Db, now: Date) {
 		paths: sql`(select coalesce(sum(${caches.pathCount}), 0) from ${caches})`.mapWith(Number),
 		storedBytes: sql`(select coalesce(sum(${caches.size}), 0) from ${caches})`.mapWith(Number),
 		physicalStoredBytes: sql`(select coalesce(sum(${blobObjects.fileSize}), 0) from ${blobObjects})`.mapWith(Number),
-		pendingBytes: sql`(select coalesce(sum(${uploadSessions.fileSize}), 0) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
-		uploadsPending: sql`(select count(*) from ${uploadSessions} where ${uploadSessions.status} in ('pending', 'uploading') and ${uploadSessions.expiresAt} > ${now})`.mapWith(Number),
+		pendingBytes: sql`(select coalesce(sum(${uploadSessions.fileSize}), 0) from ${uploadSessions} where ${uploadSessions.status} = 'finalizing' or (${uploadSessions.status} in ('pending', 'uploading', 'streaming') and ${uploadSessions.expiresAt} > ${now}))`.mapWith(Number),
+		uploadsPending: sql`(select count(*) from ${uploadSessions} where ${uploadSessions.status} = 'finalizing' or (${uploadSessions.status} in ('pending', 'uploading', 'streaming') and ${uploadSessions.expiresAt} > ${now}))`.mapWith(Number),
 		privateServedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.bytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
 		activeTokens: sql`(select count(*) from ${apiTokens} where ${apiTokens.revokedAt} is null and (${apiTokens.expiresAt} is null or ${apiTokens.expiresAt} > ${now}))`.mapWith(Number),
 		apiKeys: sql`(select count(*) from ${orgApiKeys} where ${orgApiKeys.revokedAt} is null)`.mapWith(Number),
@@ -320,8 +321,7 @@ export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsa
 				.innerJoin(caches, eq(uploadSessions.cacheId, caches.id))
 				.where(and(
 					eq(caches.orgId, orgId),
-					sql`${uploadSessions.status} in ('pending', 'uploading')`,
-					gt(uploadSessions.expiresAt, now),
+					or(eq(uploadSessions.status, "finalizing"), and(inArray(uploadSessions.status, ["pending", "uploading", "streaming"]), gt(uploadSessions.expiresAt, now))),
 				)),
 		),
 		first(db.select({
@@ -596,8 +596,9 @@ export async function createUploadSession(
 		readonly storePath: string;
 		readonly narHash: string;
 		readonly narSize: number;
-		readonly fileHash: string;
+		readonly fileHash: string | null;
 		readonly fileSize: number;
+		readonly partSize?: number;
 		readonly compression: string;
 		readonly referencesJson: string;
 		readonly deriver: string | null;
@@ -693,6 +694,135 @@ export async function findUploadParts(
 		.orderBy(uploadParts.partNumber);
 }
 
+type StreamError = { readonly error: string; readonly status: number };
+
+/** Reserve immutable part lengths before handing out upload authority. */
+export async function reserveStreamParts(
+	db: Db,
+	orgId: string,
+	sessionId: string,
+	parts: readonly { partNumber: number; size: number }[],
+): Promise<StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
+	return db.transaction(async tx => {
+		const org = await findOrg(tx, orgId);
+		if (!org) return { error: "Not found", status: 404 };
+		const currentOrg = await lockOrgStorageLimit(tx, org);
+		const session = await first(tx.select().from(uploadSessions).where(eq(uploadSessions.id, sessionId)).for("update"));
+		const cache = session && await findCacheById(tx, session.cacheId);
+		if (!session || cache?.orgId !== orgId || session.expiresAt <= new Date()) return { error: "Not found", status: 404 };
+		if (session.status !== "streaming" || !session.partSize) return { error: "Conflict", status: 409 };
+		if (parts.length === 0 || parts.length > 100 || new Set(parts.map(p => p.partNumber)).size !== parts.length
+			|| parts.some(p => !Number.isSafeInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || !Number.isSafeInteger(p.size) || p.size < 1 || p.size > (session.partSize ?? 0))) {
+			return { error: "Invalid part reservations", status: 400 };
+		}
+		const existing = new Map((await findUploadParts(tx, sessionId)).map(p => [p.partNumber, p]));
+		if (parts.some(p => existing.has(p.partNumber) && existing.get(p.partNumber)?.size !== p.size)) return { error: "Part size cannot change", status: 409 };
+		const fresh = parts.filter(p => !existing.has(p.partNumber));
+		const requested = fresh.reduce((n, p) => n + p.size, 0);
+		if (session.fileSize + requested > 5 * 1024 ** 4) return { error: "NAR exceeds the multipart object limit", status: 400 };
+		const refused = currentOrg && await checkOrgStorageLimit(tx, currentOrg, requested);
+		if (refused) return refused;
+		if (fresh.length > 0) {
+			await tx.insert(uploadParts).values(fresh.map(p => ({ ...p, sessionId })));
+			await tx.update(uploadSessions).set({ fileSize: session.fileSize + requested }).where(eq(uploadSessions.id, sessionId));
+		}
+		return undefined;
+	});
+}
+
+/** Freeze the exact stream and receipts. Replays cannot change sealed content. */
+export async function sealUploadStream(
+	db: Db,
+	sessionId: string,
+	input: { narHash: string; narSize: number; fileHash: string; fileSize: number; parts: readonly { partNumber: number; etag: string }[] },
+): Promise<UploadSession | StreamError> {
+	return db.transaction(async tx => {
+		const session = await first(tx.select().from(uploadSessions).where(eq(uploadSessions.id, sessionId)).for("update"));
+		if (!session || session.expiresAt <= new Date()) return { error: "Not found", status: 404 };
+		if (!session.partSize || !["streaming", "finalizing", "completed"].includes(session.status)) return { error: "Conflict", status: 409 };
+		const reserved = await findUploadParts(tx, sessionId);
+		const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
+		if (input.narHash !== session.narHash || input.narSize !== session.narSize || input.fileSize !== session.fileSize
+			|| reserved.length === 0 || parts.length !== reserved.length
+			|| reserved.some((p, i) => p.partNumber !== i + 1 || parts[i]?.partNumber !== p.partNumber || !parts[i]?.etag
+				|| (i < reserved.length - 1 && p.size !== session.partSize))) return { error: "Stream metadata or parts do not match reservations", status: 400 };
+		if (session.status !== "streaming") {
+			if (session.fileHash !== input.fileHash || reserved.some((p, i) => p.etag !== parts[i]?.etag)) return { error: "Sealed stream cannot change", status: 409 };
+			return session;
+		}
+		await tx.execute(sql`update ${uploadParts} set etag = receipts.etag
+			from jsonb_to_recordset(${JSON.stringify(parts)}::jsonb) as receipts("partNumber" integer, etag text)
+			where ${uploadParts.sessionId} = ${sessionId} and ${uploadParts.partNumber} = receipts."partNumber"`);
+		return returned(tx.update(uploadSessions).set({ fileHash: input.fileHash, status: "finalizing" }).where(eq(uploadSessions.id, sessionId)).returning());
+	});
+}
+
+/** Abort may release only an unsealed stream, never a concurrent finalization. */
+export async function abortUploadStream(db: Db, sessionId: string): Promise<UploadSession | undefined> {
+	return first(db.update(uploadSessions).set({ status: "aborted" })
+		.where(and(eq(uploadSessions.id, sessionId), isNotNull(uploadSessions.partSize), inArray(uploadSessions.status, ["streaming", "aborted"]))).returning());
+}
+
+/** Old canonical multipart completions cannot be fenced by an expiring SQL lease. */
+export async function hasCanonicalUploadReservations(db: Db, key: string): Promise<boolean> {
+	return (await first(db.select({ id: uploadSessions.id }).from(uploadSessions).where(and(
+		eq(uploadSessions.r2UploadKey, key),
+		notInArray(uploadSessions.status, ["completed"]),
+		or(isNotNull(uploadSessions.r2UploadId), gt(uploadSessions.expiresAt, new Date())),
+	)).limit(1))) !== undefined;
+}
+
+/** Pins both source and destination outside long-running storage transfers. */
+export async function acquireNarInstallation(db: Db, params: typeof narInstallations.$inferInsert): Promise<boolean> {
+	return withUploadSessionLock(db, async tx => {
+		if (params.sourceKey.startsWith("staging/")) {
+			const source = await findUploadSession(tx, params.sourceKey.slice("staging/".length));
+			if (!source || source.expiresAt <= new Date() || source.fileHash !== params.fileHash || source.fileSize !== params.fileSize) return false;
+		}
+		await ensureBlobObjects(tx, [{ fileHash: params.fileHash, fileSize: params.fileSize, compression: params.compression, r2Key: params.key }]);
+		return (await tx.insert(narInstallations).values(params).onConflictDoNothing().returning()).length > 0;
+	});
+}
+
+export async function setNarInstallationUpload(db: Db, key: string, operationId: string, uploadId: string): Promise<boolean> {
+	return (await db.update(narInstallations).set({ uploadId, phase: "copying" })
+		.where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId), isNull(narInstallations.uploadId))).returning()).length > 0;
+}
+
+export async function installationOwns(db: Db, key: string, operationId: string): Promise<boolean> {
+	return (await first(db.select().from(narInstallations).where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId))))) !== undefined;
+}
+
+export async function finishNarInstallation(
+	db: Db, key: string, operationId: string, removeSource: (key: string) => Promise<void>,
+): Promise<void> {
+	await withUploadSessionLock(db, async tx => {
+		const installation = await first(tx.select().from(narInstallations)
+			.where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId))));
+		if (!installation) return;
+		// Cache deletion can remove a pinned stage's session, but not its bytes.
+		// Serialize with deletion so either it owns cleanup or we do. A failed
+		// storage delete rolls back, preserving the durable pin for recovery.
+		if (installation.sourceKey.startsWith("staging/") &&
+			!await findUploadSession(tx, installation.sourceKey.slice("staging/".length))) {
+			await removeSource(installation.sourceKey);
+		}
+		await tx.delete(narInstallations).where(and(eq(narInstallations.key, key), eq(narInstallations.operationId, operationId)));
+	});
+}
+
+export async function narSourcePinned(db: Db, key: string): Promise<boolean> {
+	return (await first(db.select().from(narInstallations).where(eq(narInstallations.sourceKey, key)).limit(1))) !== undefined;
+}
+
+/** Fence new source pins while a short staged-object cleanup runs. */
+export async function withUploadSourceCleanup<T>(db: Db, run: (tx: Db) => Promise<T>): Promise<T> {
+	return db.transaction(async tx => {
+		await tx.execute(sql`lock table upload_sessions in share row exclusive mode`);
+		return run(tx);
+	});
+}
+
 /** Uploads may run together, but not across a canonical NAR deletion. */
 export async function withUploadSessionLock<T>(db: Db, run: (db: Db) => Promise<T>): Promise<T> {
 	return db.transaction(async (tx) => {
@@ -720,6 +850,7 @@ export async function deleteUnreferencedBlobObjects(
 			.where(and(
 				sql`not exists (select 1 from ${publishedPaths} where ${publishedPaths.blobObjectId} = ${blobObjects.id})`,
 				sql`not exists (select 1 from ${uploadSessions} where ${uploadSessions.fileHash} = ${blobObjects.fileHash} and ${uploadSessions.compression} = ${blobObjects.compression} and ${uploadSessions.expiresAt} > ${now.toISOString()}::timestamptz)`,
+				sql`not exists (select 1 from ${narInstallations} where ${narInstallations.fileHash} = ${blobObjects.fileHash} and ${narInstallations.compression} = ${blobObjects.compression})`,
 			))
 			.limit(limit);
 		const blobs = await tx.delete(blobObjects).where(inArray(blobObjects.id, unreferenced)).returning();
@@ -1022,7 +1153,7 @@ export async function completeUploadSessions(
 					WHERE verified.id = ${uploadSessions.id} AND verified.status = ${uploadSessions.status}
 					AND verified."r2UploadKey" IS NOT DISTINCT FROM ${uploadSessions.r2UploadKey}
 					AND verified."r2UploadId" IS NOT DISTINCT FROM ${uploadSessions.r2UploadId})`,
-				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
+				sql`${uploadSessions.status} IN ('pending', 'uploading', 'finalizing')`,
 			),
 		)
 		.returning({ id: uploadSessions.id });
@@ -1132,12 +1263,21 @@ export async function cacheHasNar(db: Db, cacheId: number, fileHash: string, com
  */
 export async function deleteEmptyCache(db: Db, cacheId: number): Promise<{ deleted: boolean; staged: string[] }> {
 	return db.transaction(async (tx) => {
+		await tx.execute(sql`lock table upload_sessions in share row exclusive mode`);
 		await tx.execute(sql`select id from ${caches} where ${caches.id} = ${cacheId} for update`);
 		const [published] = await tx.select({ id: publishedPaths.id }).from(publishedPaths).where(eq(publishedPaths.cacheId, cacheId)).limit(1);
 		if (published) return { deleted: false, staged: [] };
 
 		const sessions = await tx.select().from(uploadSessions).where(eq(uploadSessions.cacheId, cacheId));
-		const canonical = sessions.filter((s) => s.r2UploadKey !== null && !s.r2UploadKey.startsWith("staging/"));
+		const canonical = sessions.filter((s): s is UploadSession & { fileHash: string } => s.fileHash !== null && s.r2UploadKey !== null && !s.r2UploadKey.startsWith("staging/"));
+		// Deleting a cache must not erase the only record of an old canonical
+		// MPU whose completion may still arrive. Keep a fail-closed tombstone.
+		const unresolved = canonical.filter(s => s.r2UploadId && s.status !== "completed");
+		if (unresolved.length > 0) await tx.insert(narInstallations).values(unresolved.map(s => ({
+			key: s.r2UploadKey ?? "", operationId: s.id, sourceKey: s.r2UploadKey ?? "", uploadId: s.r2UploadId,
+			fileHash: s.fileHash, compression: s.compression, isPrivate: !s.r2UploadKey?.startsWith("nar/"),
+			fileSize: s.fileSize, phase: "legacy-unresolved",
+		}))).onConflictDoNothing();
 		if (canonical.length > 0) {
 			await tx.insert(blobObjects).values(canonical.map((s) => ({
 				fileHash: s.fileHash, fileSize: s.fileSize, compression: s.compression, r2Key: s.r2UploadKey ?? "",
@@ -1148,6 +1288,7 @@ export async function deleteEmptyCache(db: Db, cacheId: number): Promise<{ delet
 			await tx.delete(uploadSessions).where(eq(uploadSessions.cacheId, cacheId));
 		}
 		await tx.delete(caches).where(eq(caches.id, cacheId));
-		return { deleted: true, staged: sessions.flatMap((s) => (s.r2UploadKey?.startsWith("staging/") ? [s.r2UploadKey] : [])) };
+		const pins = new Set((await tx.select({ sourceKey: narInstallations.sourceKey }).from(narInstallations)).map(p => p.sourceKey));
+		return { deleted: true, staged: sessions.flatMap((s) => (s.r2UploadKey?.startsWith("staging/") && !pins.has(s.r2UploadKey) ? [s.r2UploadKey] : [])) };
 	});
 }

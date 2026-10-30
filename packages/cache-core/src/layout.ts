@@ -1,5 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import { pathDepth } from "./cache-path.js";
+import { installNar } from "./nar-install.js";
 
 /**
  * Where a cache's objects live. Public caches are laid out in the public
@@ -85,13 +86,12 @@ export async function placeNar(
 	isPrivate: boolean,
 ): Promise<void> {
 	const target = narKey(fileHash, compression, isPrivate);
-	const targetBucket = bucketFor(config, isPrivate);
-	if (target === fromKey || (await targetBucket.head(target))) return;
-	const source = await bucketForKey(config, fromKey).get(fromKey);
+	// This is publication of already-proven content, not a possession check.
+	if (target === fromKey || await bucketFor(config, isPrivate).head(target)) return;
+	const source = await bucketForKey(config, fromKey).head(fromKey);
 	if (!source) throw new Error(`NAR ${fromKey} is missing`);
-	await targetBucket.put(target, source.body, {
-		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
-	});
+	const error = await installNar(config, fromKey, fileHash, compression, isPrivate, source.size);
+	if (error) throw new Error(error);
 }
 
 /** The S3 bucket name an upload's key belongs to, for presigning. */

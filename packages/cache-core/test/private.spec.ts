@@ -8,10 +8,12 @@ const PRIVATE = "private-test";
 const OTHER = "private-other";
 const PUBLIC = "public-test";
 const HASH = "2".repeat(32);
-const FILE_HASH = "b".repeat(64);
 const NAR = new Uint8Array([5, 6, 7, 8]);
-// Each cache's NAR has a file hash of its own.
-const fileHash = (cache: string) => `${cache === PRIVATE ? "c0" : "d0"}${FILE_HASH.slice(2)}`;
+const PUBLIC_NAR = new Uint8Array([5, 6, 7, 9]);
+// SHA-256 of each cache's distinct NAR bytes, independently computed with sha256sum.
+const fileHash = (cache: string) => cache === PRIVATE
+	? "55e5509f8052998294266ee5b50cb592938191fb5d67f73cac2e60b0276b1bdd"
+	: "d94651b3956271de8ffa244919929c2238d5fee455cf0f5101188e1e1d4feb4c";
 
 function admin(path: string, body?: unknown): Promise<Response> {
 	return SELF.fetch(`http://example.com/_api/v1/admin${path}`, {
@@ -60,7 +62,7 @@ beforeAll(async () => {
 			system: null,
 			signaturesJson: "[]",
 		});
-		await env.CACHE_BUCKET.put(blob.r2Key, NAR);
+		await env.CACHE_BUCKET.put(blob.r2Key, name === PRIVATE ? NAR : PUBLIC_NAR);
 	}
 	expect((await admin("/narinfo/backfill", { limit: 1000 })).status).toBe(200);
 
@@ -231,10 +233,11 @@ describe("private NARs", () => {
 	it("stop being served once their path is deleted, though cached", async () => {
 		const name = "private-deleted";
 		const hash = "4".repeat(32);
-		const file = `e0${FILE_HASH.slice(2)}`;
+		const body = new Uint8Array([5, 6, 7, 10]);
+		const file = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", body)), byte => byte.toString(16).padStart(2, "0")).join("");
 		expect((await admin("/caches", { name, private: true, protocols: ["nix"] })).status).toBe(201);
 		const cache = await findCache(db, "default", name);
-		const blob = await createBlobObject(db, { fileHash: file, fileSize: NAR.byteLength, compression: "zstd", r2Key: `nars/sha256/${file}/zstd.nar` });
+		const blob = await createBlobObject(db, { fileHash: file, fileSize: body.byteLength, compression: "zstd", r2Key: `nars/sha256/${file}/zstd.nar` });
 		await createPublishedPath(db, {
 			cacheId: cache!.id,
 			storePathHash: hash,
@@ -247,7 +250,7 @@ describe("private NARs", () => {
 			system: null,
 			signaturesJson: "[]",
 		});
-		await env.CACHE_BUCKET.put(blob.r2Key, NAR);
+		await env.CACHE_BUCKET.put(blob.r2Key, body);
 		expect((await admin("/narinfo/backfill", { limit: 1000 })).status).toBe(200);
 		const auth = `Bearer ${(await token([name], ["pull"])).token}`;
 

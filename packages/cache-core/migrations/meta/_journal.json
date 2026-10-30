@@ -50,6 +50,13 @@
       "when": 1793227522456,
       "tag": "0006_cache_protocols",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793399383324,
+      "tag": "0007_wealthy_stingray",
+      "breakpoints": true
     }
   ]
 }
