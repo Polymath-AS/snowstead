@@ -78,9 +78,24 @@ Nix, Go, and control share the existing database, buckets, and authorization sta
 Hosted reads enter through the web gateway, which uses the existing R2/CDN
 origin for public objects. Production cache Worker routes remain API-only.
 
+Control owns the SQLite-backed `UploadCoordinator` Durable Object namespace;
+Nix and Go bind to it for shared per-organization upload coordination. Deploy
+control first to create the namespace and apply its Durable Object migration,
+then Nix and Go, and the gateway last. Staging uses its own control namespace.
+The coordinator has no public route and does not require a separate Worker.
+
+Only reservation SQL enters the queue, after authorization and input validation.
+Each org admits one reservation at a time, with at most 64 active/queued calls
+and a two-second queue deadline. Overload returns 429 with `Retry-After: 1`
+without opening a reservation connection. Postgres quota checks and transaction
+locks remain authoritative, including during rolling deployments. Nix batches
+reserve their sessions in one call; payloads, signing, and publication stay
+outside the coordinator. Go's separate transfer transaction still fences cache
+reset and garbage collection. Reservation traces include protocol and queue wait.
+
 ```bash
-# With resources and service secrets provisioned: migrate, deploy Nix, Go, and
-# control, then switch the existing public Worker to the gateway.
+# With resources and service secrets provisioned: migrate, deploy control,
+# then Nix and Go, then switch the existing public Worker to the gateway.
 DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
 ```
 
