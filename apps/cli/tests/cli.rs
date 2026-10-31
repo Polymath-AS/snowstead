@@ -481,6 +481,15 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
 
 #[test]
 fn push_uploads_before_delayed_session_creation_finishes() {
+    streamed_session_creation(false);
+}
+
+#[test]
+fn late_session_negotiation_failure_clears_live_sessions_after_completed_work() {
+    streamed_session_creation(true);
+}
+
+fn streamed_session_creation(late_failure: bool) {
     use sha2::{Digest, Sha256};
     use std::{
         os::unix::fs::PermissionsExt,
@@ -545,13 +554,17 @@ fn push_uploads_before_delayed_session_creation_finishes() {
     let uploaded = Arc::new((Mutex::new(0usize), Condvar::new()));
     let batches = Arc::new(Mutex::new(Vec::new()));
     let published = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let live = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let stalled = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let missing: Vec<_> = paths.iter().map(|p| p[11..43].to_owned()).collect();
     let server = thread::spawn({
-        let (stop, uploaded, batches, published, url) = (
+        let (stop, uploaded, batches, published, live, stalled, url) = (
             stop.clone(),
             uploaded.clone(),
             batches.clone(),
             published.clone(),
+            live.clone(),
+            stalled.clone(),
             url.clone(),
         );
         move || {
@@ -565,10 +578,12 @@ fn push_uploads_before_delayed_session_creation_finishes() {
                     }
                     Err(error) => panic!("{error}"),
                 };
-                let (uploaded, batches, published, url, missing) = (
+                let (uploaded, batches, published, live, stalled, url, missing) = (
                     uploaded.clone(),
                     batches.clone(),
                     published.clone(),
+                    live.clone(),
+                    stalled.clone(),
                     url.clone(),
                     missing.clone(),
                 );
@@ -587,6 +602,7 @@ fn push_uploads_before_delayed_session_creation_finishes() {
                     }).unwrap();
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).unwrap();
+                    let mut status = 200;
                     let response = if headers.starts_with("PUT /part ") {
                         assert!(!headers.contains(TOKEN), "signed PUT must not carry API credentials");
                         assert!(!body.is_empty());
@@ -613,8 +629,12 @@ fn push_uploads_before_delayed_session_creation_finishes() {
                                 assert!(!timeout.timed_out() && *count > 0,
                                     "all-session creation blocked the first upload");
                             }
-                            json!({"sessions": body["paths"].as_array().unwrap().iter().map(|p|
-                                json!({"sessionId":p["storePathHash"], "partSize":8388608})
+                            json!({"sessions": body["paths"].as_array().unwrap().iter().map(|p| {
+                                live.lock().unwrap().insert(p["storePathHash"].as_str().unwrap().to_owned());
+                                // Reject the later response only after earlier work has
+                                // finished. Even invalid responses own real sessions.
+                                json!({"sessionId":p["storePathHash"], "partSize":if late_failure && index == 2 {0} else {8388608}})
+                            }
                             ).collect::<Vec<_>>()})
                         } else if headers.starts_with("POST /_api/v1/uploads/parts ") {
                             json!({"results":body["uploads"].as_array().unwrap().iter().map(|u|
@@ -623,17 +643,45 @@ fn push_uploads_before_delayed_session_creation_finishes() {
                                 ).collect::<Vec<_>>()})
                             ).collect::<Vec<_>>()})
                         } else if headers.lines().next().unwrap().ends_with("/abort HTTP/1.1") {
+                            let id = headers.split_whitespace().nth(1).unwrap()
+                                .strip_prefix("/_api/v1/uploads/").unwrap()
+                                .strip_suffix("/abort").unwrap();
+                            if late_failure {
+                                let active = live.lock().unwrap().contains(id);
+                                // Already-terminal requests are slow, while the first
+                                // abort of the final live session loses its response.
+                                // A bounded cleanup must spend its slots on live work,
+                                // not replay the entire history of completed sessions.
+                                let first_live_abort = active && id == format!("{:032}", 99)
+                                    && stalled.lock().unwrap().insert(id.to_owned());
+                                if !active || first_live_abort {
+                                    thread::sleep(Duration::from_secs(6));
+                                }
+                                if first_live_abort {
+                                    status = 503;
+                                } else {
+                                    live.lock().unwrap().remove(id);
+                                }
+                            } else {
+                                live.lock().unwrap().remove(id);
+                            }
                             json!({})
                         } else {
                             assert!(headers.starts_with("POST /_api/v1/uploads/finalize "));
                             json!({"results":body["uploads"].as_array().unwrap().iter().map(|u| {
                                 assert!(published.lock().unwrap().insert(u["sessionId"].as_str().unwrap().to_owned()));
+                                live.lock().unwrap().remove(u["sessionId"].as_str().unwrap());
                                 json!({"sessionId":u["sessionId"], "published":true})
                             }).collect::<Vec<_>>()})
                         }
                     };
                     let body = response.to_string();
-                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    // A timed-out cleanup can close the connection before our
+                    // deliberately stalled response is ready.
+                    let sent = write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nETag: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    if !late_failure {
+                        sent.unwrap();
+                    }
                 }));
             }
             for handler in handlers {
@@ -648,7 +696,13 @@ fn push_uploads_before_delayed_session_creation_finishes() {
         .env("PATH", std::env::join_paths(executable_paths).unwrap())
         .env("SNOWSTEAD_URL", url)
         .env("SNOWSTEAD_TOKEN", TOKEN)
-        .args(["push", "main", "--no-deps", "--jobs", "32"])
+        .args([
+            "push",
+            "main",
+            "--no-deps",
+            "--jobs",
+            if late_failure { "1" } else { "32" },
+        ])
         .args(&paths)
         .output()
         .unwrap();
@@ -658,13 +712,21 @@ fn push_uploads_before_delayed_session_creation_finishes() {
         !result.status.success(),
         "the absent fixtures must fail encoding"
     );
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(
-        stdout.contains("1 pushed") && stdout.contains("100 failed"),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    if late_failure {
+        assert!(String::from_utf8_lossy(&result.stderr).contains("invalid multipart part size"));
+    } else {
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            stdout.contains("1 pushed") && stdout.contains("100 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     assert_eq!(*batches.lock().unwrap(), [100, 1]);
     assert!(*uploaded.0.lock().unwrap() > 0);
     assert_eq!(published.lock().unwrap().len(), 1);
+    assert!(
+        live.lock().unwrap().is_empty(),
+        "CLI exit left live upload reservations"
+    );
 }

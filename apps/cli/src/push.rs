@@ -153,7 +153,9 @@ pub async fn push(
     // byte budget only when a larger part is negotiated preserves the global
     // max(64 MiB, largest part) bound without delaying all transfers first.
     let buffers = Arc::new(Semaphore::new(64 * 1024 * 1024));
-    let session_ids = std::sync::Mutex::new(Vec::new());
+    // Completed paths must not consume the bounded cleanup's time or slots.
+    // Guards retain ownership through cancellation and unsuccessful aborts.
+    let session_ids = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let pending = ordered.into_iter().zip(outcomes);
     let sessions = futures_util::stream::try_unfold(
         (pending, 64 * 1024 * 1024usize),
@@ -182,8 +184,11 @@ pub async fn push(
                 let rows: Vec<_> = rows
                     .into_iter()
                     .map(|session| {
-                        let guard = AbortGuard::new(client.clone(), session.session_id.clone());
-                        session_ids.lock().unwrap().push(session.session_id.clone());
+                        let guard = AbortGuard::new(
+                            client.clone(),
+                            session.session_id.clone(),
+                            session_ids.clone(),
+                        );
                         (session, guard)
                     })
                     .collect();
@@ -527,30 +532,45 @@ async fn upload_parts(
 struct AbortGuard {
     client: Client,
     id: Option<String>,
+    live: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 impl AbortGuard {
-    fn new(client: Client, id: String) -> Self {
+    fn new(client: Client, id: String, live: Arc<std::sync::Mutex<HashSet<String>>>) -> Self {
+        live.lock().unwrap().insert(id.clone());
         Self {
             client,
             id: Some(id),
+            live,
         }
     }
     fn disarm(&mut self) {
-        self.id = None;
+        if let Some(id) = self.id.take() {
+            self.live.lock().unwrap().remove(&id);
+        }
     }
     async fn abort(&mut self) {
-        if let Some(id) = &self.id {
-            let _ = tokio::time::timeout(Duration::from_secs(5), self.client.abort(id)).await;
+        if let Some(id) = &self.id
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(5), self.client.abort(id)).await,
+                Ok(Ok(()))
+            )
+        {
+            self.disarm();
         }
-        self.disarm();
     }
 }
 impl Drop for AbortGuard {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
             let client = self.client.clone();
+            let live = self.live.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(5), client.abort(&id)).await;
+                if matches!(
+                    tokio::time::timeout(Duration::from_secs(5), client.abort(&id)).await,
+                    Ok(Ok(()))
+                ) {
+                    live.lock().unwrap().remove(&id);
+                }
             });
         }
     }
@@ -659,8 +679,10 @@ mod tests {
                 receivers.push(receiver);
             }
             let client = client(&url);
+            let live = Arc::new(std::sync::Mutex::new(HashSet::new()));
+            let owned = live.clone();
             let consumer = tokio::spawn(async move {
-                let mut guard = AbortGuard::new(client.clone(), "s1".into());
+                let mut guard = AbortGuard::new(client.clone(), "s1".into(), owned);
                 let limit = Arc::new(Semaphore::new(1));
                 let reserve_client = client.clone();
                 let reservations = Batcher::new(1, Duration::ZERO, move |requests| {
@@ -713,7 +735,7 @@ mod tests {
                 .unwrap();
             // The HTTP transport can briefly retain an owned body after cancellation.
             tokio::time::timeout(Duration::from_secs(5), async {
-                while budget.available_permits() != 2048 {
+                while budget.available_permits() != 2048 || !live.lock().unwrap().is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
