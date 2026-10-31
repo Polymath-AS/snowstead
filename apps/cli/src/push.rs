@@ -149,64 +149,87 @@ pub async fn push(
     let large_threads = cpu.saturating_sub(1).min(4) as i32;
     let compression = Arc::new(Semaphore::new(cpu));
     let parts = Arc::new(Semaphore::new(16));
-    // Negotiate at most one batch ahead of the active jobs. Growing the shared
+    // Prefetch one session batch while the current batch uploads. Growing the shared
     // byte budget only when a larger part is negotiated preserves the global
     // max(64 MiB, largest part) bound without delaying all transfers first.
     let buffers = Arc::new(Semaphore::new(64 * 1024 * 1024));
     // Completed paths must not consume the bounded cleanup's time or slots.
     // Guards retain ownership through cancellation and unsuccessful aborts.
     let session_ids = Arc::new(std::sync::Mutex::new(HashSet::new()));
-    let pending = ordered.into_iter().zip(outcomes);
+    let negotiate = |chunk: Vec<(nix::PathInfo, watch::Sender<Option<bool>>)>,
+                     mut largest: usize| {
+        let client = client.clone();
+        let cache = cache.to_owned();
+        let buffers = buffers.clone();
+        let session_ids = session_ids.clone();
+        async move {
+            let specs: Vec<_> = chunk
+                .iter()
+                .map(|(info, _)| SessionParams {
+                    store_path: info.store_path.clone(),
+                    store_path_hash: info.store_path_hash.clone(),
+                    nar_hash: info.nar_hash.clone(),
+                    nar_size: info.nar_size,
+                    compression: "zstd".into(),
+                    references: info.references.clone(),
+                    deriver: info.deriver.clone(),
+                    inline: inline_capacity(info.nar_size).map(|_| true),
+                })
+                .collect();
+            let rows = client.create_sessions(&cache, &specs).await?;
+            // Guard every returned session before validating the response.
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|session| {
+                    let guard = AbortGuard::new(
+                        client.clone(),
+                        session.session_id.clone(),
+                        session_ids.clone(),
+                    );
+                    (session, guard)
+                })
+                .collect();
+            if rows.len() != chunk.len() {
+                bail!("API batch response length differs from request");
+            }
+            for ((session, _), spec) in rows.iter().zip(&specs) {
+                if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
+                    bail!("invalid multipart part size");
+                }
+                if session.inline
+                    && (spec.inline != Some(true) || session.part_size != INLINE_LIMIT)
+                {
+                    bail!("invalid inline session");
+                }
+                let next = largest.max(session.part_size as usize);
+                buffers.add_permits(next - largest);
+                largest = next;
+            }
+            Ok::<_, anyhow::Error>((chunk.into_iter().zip(rows).collect::<Vec<_>>(), largest))
+        }
+    };
+    let mut pending = ordered.into_iter().zip(outcomes);
+    let mut negotiations = tokio::task::JoinSet::new();
+    negotiations.spawn(negotiate(
+        pending.by_ref().take(100).collect(),
+        64 * 1024 * 1024usize,
+    ));
     let sessions = futures_util::stream::try_unfold(
-        (pending, 64 * 1024 * 1024usize),
-        |(mut pending, mut largest)| {
-            let buffers = &buffers;
-            let session_ids = &session_ids;
+        (pending, &mut negotiations),
+        |(mut pending, negotiations)| {
+            let negotiate = &negotiate;
             async move {
-                let chunk: Vec<_> = pending.by_ref().take(100).collect();
-                if chunk.is_empty() {
+                let Some(result) = negotiations.join_next().await else {
                     return Ok::<_, anyhow::Error>(None);
+                };
+                let (batch, largest) = result??;
+                let next: Vec<_> = pending.by_ref().take(100).collect();
+                if !next.is_empty() {
+                    negotiations.spawn(negotiate(next, largest));
                 }
-                let specs: Vec<_> = chunk
-                    .iter()
-                    .map(|(info, _)| SessionParams {
-                        store_path: info.store_path.clone(),
-                        store_path_hash: info.store_path_hash.clone(),
-                        nar_hash: info.nar_hash.clone(),
-                        nar_size: info.nar_size,
-                        compression: "zstd".into(),
-                        references: info.references.clone(),
-                        deriver: info.deriver.clone(),
-                    })
-                    .collect();
-                let rows = client.create_sessions(cache, &specs).await?;
-                // Guard every returned session before validating the response.
-                let rows: Vec<_> = rows
-                    .into_iter()
-                    .map(|session| {
-                        let guard = AbortGuard::new(
-                            client.clone(),
-                            session.session_id.clone(),
-                            session_ids.clone(),
-                        );
-                        (session, guard)
-                    })
-                    .collect();
-                if rows.len() != chunk.len() {
-                    bail!("API batch response length differs from request");
-                }
-                for (session, _) in &rows {
-                    if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
-                        bail!("invalid multipart part size");
-                    }
-                    let next = largest.max(session.part_size as usize);
-                    buffers.add_permits(next - largest);
-                    largest = next;
-                }
-                let batch = futures_util::stream::iter(
-                    chunk.into_iter().zip(rows).map(Ok::<_, anyhow::Error>),
-                );
-                Ok(Some((batch, (pending, largest))))
+                let batch =
+                    futures_util::stream::iter(batch.into_iter().map(Ok::<_, anyhow::Error>));
+                Ok(Some((batch, (pending, negotiations))))
             }
         },
     )
@@ -214,6 +237,7 @@ pub async fn push(
     let reserve_client = client.clone();
     let reservations = Batcher::new(
         jobs.min(16),
+        1,
         Duration::from_millis(2),
         move |requests: Vec<api::PartReservation>| {
             let client = reserve_client.clone();
@@ -221,26 +245,43 @@ pub async fn push(
         },
     );
     let multipart_client = client.clone();
-    let multipart_commits = Batcher::new(
+    let finalize = move |uploads: Vec<api::Finalize>| {
+        let client = multipart_client.clone();
+        async move { client.finalize(&uploads).await }
+    };
+    // Keep small metadata-heavy paths out of large-object completion batches.
+    // Three small batches plus one large batch bound total finalize pressure,
+    // without changing the large-object transfer or completion concurrency.
+    const SMALL_UPLOAD: u64 = 1024 * 1024;
+    let small_commits = Batcher::new(
         jobs.min(8),
+        jobs.min(3),
         Duration::from_millis(10),
-        move |uploads: Vec<api::Finalize>| {
-            let client = multipart_client.clone();
-            async move { client.finalize(&uploads).await }
-        },
+        finalize.clone(),
     );
+    let large_commits = Batcher::new(jobs.min(8), 1, Duration::from_millis(10), finalize);
     let work = sessions
         .map_ok(|((info, outcome), (session, mut guard))| {
             let compression = compression.clone();
             let parts = parts.clone();
             let buffers = buffers.clone();
             let reservations = reservations.clone();
-            let multipart_commits = multipart_commits.clone();
+            let small_commits = small_commits.clone();
+            let large_commits = large_commits.clone();
             let span = tracing::debug_span!("push_path",path=%info.store_path);
             async move {
                 let path = info.store_path.clone();
                 let start = Instant::now();
                 let result = async {
+                    // Inline bytes stay live through publication. Wait before
+                    // taking any permits so dependents cannot exhaust the byte
+                    // budget needed by an earlier streaming dependency.
+                    let mut dependency_wait_ms = 0;
+                    if session.inline {
+                        let started = Instant::now();
+                        wait_dependencies(&info, published).await?;
+                        dependency_wait_ms = started.elapsed().as_millis();
+                    }
                     let threads = if info.nar_size >= LARGE_NAR {
                         large_threads
                     } else {
@@ -254,10 +295,15 @@ pub async fn push(
                     // A small NAR needs only one final part, not a whole 8 MiB
                     // allocation. This is zstd's compress bound with its maximum
                     // small-input margin; large NARs keep the negotiated size.
-                    let capacity = session.part_size.min(size + size / 256 + 64) as usize;
+                    let capacity = if session.inline {
+                        inline_capacity(size).context("invalid inline NAR size")?
+                    } else {
+                        session.part_size.min(size + size / 256 + 64) as usize
+                    };
                     // Wait for output capacity before allocating a codec. A slow
                     // upload must not park every producer with live zstd state.
-                    let mut writer = Bridge::new(capacity, buffers, sender).await?;
+                    let part_limit = if session.inline { 1 } else { 10_000 };
+                    let mut writer = Bridge::new(capacity, part_limit, buffers, sender).await?;
                     let producer = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let digest =
@@ -270,34 +316,51 @@ pub async fn push(
                         writer.finish()?;
                         Ok::<_, anyhow::Error>(digest)
                     });
-                    let uploaded =
+                    // Drain the channel before joining the producer. Even a
+                    // single bounded frame must not strand its blocking sender.
+                    let mut inline_bytes = None;
+                    let uploaded = if session.inline {
+                        receive_inline(receiver).await.map(|bytes| {
+                            inline_bytes = Some(bytes);
+                            Vec::new()
+                        })
+                    } else {
                         upload_parts(client, &session.session_id, receiver, parts, &reservations)
-                            .await;
+                            .await
+                    };
                     // upload_parts drops its receiver on error, waking a blocked
                     // producer before we join it. Cancellation does the same.
                     let digest = producer.await?;
                     let uploaded = uploaded?;
                     let digest = digest?;
-                    let own = basename(&info);
-                    for reference in info.references.iter().filter(|r| *r != own) {
-                        let Some(mut done) = published.get(reference).cloned() else {
-                            continue;
-                        };
-                        let ok = done.wait_for(Option::is_some).await;
-                        if !matches!(ok.as_deref(), Ok(Some(true))) {
-                            bail!("dependency {reference} was not published");
-                        }
+                    let upload_elapsed_ms = start.elapsed().as_millis();
+                    if !session.inline {
+                        let started = Instant::now();
+                        wait_dependencies(&info, published).await?;
+                        dependency_wait_ms = started.elapsed().as_millis();
                     }
-                    let published = multipart_commits
-                        .request(api::Finalize {
-                            session_id: session.session_id.clone(),
-                            nar_hash: info.nar_hash,
-                            nar_size: digest.nar_size,
-                            file_hash: hex::encode(digest.file_hash),
-                            file_size: digest.file_size,
-                            parts: uploaded,
-                        })
-                        .await?;
+                    let finalization_started = Instant::now();
+                    let commits = if digest.file_size <= SMALL_UPLOAD {
+                        &small_commits
+                    } else {
+                        &large_commits
+                    };
+                    let published = if let Some(bytes) = inline_bytes {
+                        client
+                            .inline(&session.session_id, &hex::encode(digest.file_hash), bytes)
+                            .await?
+                    } else {
+                        commits
+                            .request(api::Finalize {
+                                session_id: session.session_id.clone(),
+                                nar_hash: info.nar_hash,
+                                nar_size: digest.nar_size,
+                                file_hash: hex::encode(digest.file_hash),
+                                file_size: digest.file_size,
+                                parts: uploaded,
+                            })
+                            .await?
+                    };
                     if published.session_id != session.session_id || !published.published {
                         tracing::debug!(
                             has_error = published.error.is_some(),
@@ -312,6 +375,9 @@ pub async fn push(
                     tracing::debug!(
                         elapsed_ms = start.elapsed().as_millis(),
                         compressed_bytes = digest.file_size,
+                        upload_elapsed_ms,
+                        dependency_wait_ms,
+                        finalization_elapsed_ms = finalization_started.elapsed().as_millis(),
                         "published store path"
                     );
                     Ok::<_, anyhow::Error>(())
@@ -343,11 +409,17 @@ pub async fn push(
                 // Give abort requests a bounded grace period before runtime
                 // teardown. Guard drops also abort; the endpoint is idempotent.
                 drop(work);
-                let session_ids = session_ids.lock().unwrap().clone();
-                let cleanup =
+                let cleanup = async {
+                    // Join cancellation before taking the IDs: a prefetched response
+                    // can finish registering guards concurrently with the interrupt.
+                    negotiations.abort_all();
+                    while negotiations.join_next().await.is_some() {}
+                    let session_ids = session_ids.lock().unwrap().clone();
                     futures_util::stream::iter(session_ids.iter().map(|id| client.abort(id)))
                         .buffer_unordered(16)
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>()
+                        .await;
+                };
                 let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
                 return Err(error);
             }
@@ -361,6 +433,57 @@ pub async fn push(
         }
     }
     Ok(summary)
+}
+
+const INLINE_LIMIT: u64 = 1024 * 1024;
+
+async fn wait_dependencies(
+    info: &nix::PathInfo,
+    published: &HashMap<String, watch::Receiver<Option<bool>>>,
+) -> anyhow::Result<()> {
+    for reference in info.references.iter().filter(|r| *r != basename(info)) {
+        let Some(mut done) = published.get(reference).cloned() else {
+            continue;
+        };
+        let ok = done.wait_for(Option::is_some).await;
+        if !matches!(ok.as_deref(), Ok(Some(true))) {
+            bail!("dependency {reference} was not published");
+        }
+    }
+    Ok(())
+}
+
+// ZSTD_COMPRESSBOUND, including the small-input margin. Charge this whole
+// allocation to the existing byte budget, not just the final compressed size.
+fn inline_capacity(size: u64) -> Option<usize> {
+    if size > INLINE_LIMIT {
+        return None;
+    }
+    let bound = size
+        + (size >> 8)
+        + if size < 128 * 1024 {
+            (128 * 1024 - size) >> 11
+        } else {
+            0
+        };
+    (bound <= INLINE_LIMIT).then_some(bound as usize)
+}
+
+async fn receive_inline(
+    mut receiver: mpsc::Receiver<(u32, bytes::Bytes)>,
+) -> anyhow::Result<bytes::Bytes> {
+    let (number, bytes) = receiver
+        .recv()
+        .await
+        .context("inline encoder produced no bytes")?;
+    if number != 1
+        || bytes.is_empty()
+        || bytes.len() > INLINE_LIMIT as usize
+        || receiver.recv().await.is_some()
+    {
+        bail!("inline encoder exceeded its bounded frame");
+    }
+    Ok(bytes)
 }
 
 fn basename(info: &nix::PathInfo) -> &str {
@@ -420,6 +543,7 @@ impl AsRef<[u8]> for Buffer {
 }
 struct Bridge {
     size: usize,
+    part_limit: u32,
     budget: Arc<Semaphore>,
     sender: mpsc::Sender<(u32, bytes::Bytes)>,
     current: Option<Buffer>,
@@ -430,6 +554,7 @@ impl Bridge {
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
     async fn new(
         size: usize,
+        part_limit: u32,
         budget: Arc<Semaphore>,
         sender: mpsc::Sender<(u32, bytes::Bytes)>,
     ) -> io::Result<Self> {
@@ -440,6 +565,7 @@ impl Bridge {
             .map_err(|_| io::Error::other("upload budget closed"))?;
         Ok(Self {
             size,
+            part_limit,
             budget,
             sender,
             current: Some(Buffer {
@@ -469,7 +595,7 @@ impl Write for Bridge {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped"));
             }
             if self.current.is_none() {
-                if self.number > 10_000 {
+                if self.number > self.part_limit {
                     return Err(io::Error::other("too many upload parts"));
                 }
                 let permit = self.runtime.block_on(async {
@@ -584,6 +710,79 @@ mod tests {
     use tokio::{net::TcpListener, sync::Notify};
 
     #[test]
+    fn inline_selection_obeys_zstd_bound_at_every_size() {
+        for size in 0..=INLINE_LIMIT + 1 {
+            let bound = zstd::zstd_safe::compress_bound(size as usize);
+            assert_eq!(
+                inline_capacity(size),
+                (size <= INLINE_LIMIT && bound <= INLINE_LIMIT as usize).then_some(bound)
+            );
+        }
+        assert!(inline_capacity(INLINE_LIMIT).is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_native_frame_retains_budget_and_never_blocks_the_producer() {
+        use sha2::{Digest, Sha256};
+        for size in [0, 1, 128 * 1024, 1040000] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("data");
+            std::fs::write(
+                &path,
+                (0..size).map(|_| rand::random::<u8>()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let raw = std::process::Command::new("nix-store")
+                .arg("--dump")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(raw.status.success());
+            let size = raw.stdout.len() as u64;
+            let capacity = inline_capacity(size).unwrap();
+            let budget = Arc::new(Semaphore::new(capacity));
+            let (sender, receiver) = mpsc::channel(1);
+            let mut bridge = Bridge::new(capacity, 1, budget.clone(), sender)
+                .await
+                .unwrap();
+            let producer = tokio::task::spawn_blocking(move || {
+                let digest = nar::dump(&path, size, 3, 0, &mut bridge).unwrap();
+                bridge.finish().unwrap();
+                digest
+            });
+            let bytes = tokio::time::timeout(Duration::from_secs(5), receive_inline(receiver))
+                .await
+                .unwrap()
+                .unwrap();
+            let digest = producer.await.unwrap();
+            assert_eq!(zstd::stream::decode_all(&bytes[..]).unwrap(), raw.stdout);
+            assert_eq!(digest.file_hash, <[u8; 32]>::from(Sha256::digest(&bytes)));
+            assert_eq!(budget.available_permits(), 0);
+            let replay = bytes.clone();
+            drop(bytes);
+            assert_eq!(budget.available_permits(), 0);
+            drop(replay);
+            assert_eq!(budget.available_permits(), capacity);
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_overflow_fails_without_waiting_for_a_second_buffer() {
+        let budget = Arc::new(Semaphore::new(64));
+        let (sender, receiver) = mpsc::channel(1);
+        let mut bridge = Bridge::new(64, 1, budget.clone(), sender).await.unwrap();
+        let producer = tokio::task::spawn_blocking(move || bridge.write_all(&[1; 65]));
+        let bytes = tokio::time::timeout(Duration::from_secs(2), receive_inline(receiver))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(producer.await.unwrap().is_err());
+        assert_eq!(budget.available_permits(), 0);
+        drop(bytes);
+        assert_eq!(budget.available_permits(), 64);
+    }
+
+    #[test]
     fn publish_order_puts_references_first_even_when_larger() {
         let info = |name: &str, size: u64, references: &[&str]| nix::PathInfo {
             store_path: format!("/nix/store/{name}"),
@@ -669,7 +868,9 @@ mod tests {
             let mut receivers = Vec::new();
             for _ in 0..2 {
                 let (sender, receiver) = mpsc::channel(1);
-                let mut writer = Bridge::new(1024, budget.clone(), sender).await.unwrap();
+                let mut writer = Bridge::new(1024, 10_000, budget.clone(), sender)
+                    .await
+                    .unwrap();
                 let path = path.clone();
                 producers.push(tokio::task::spawn_blocking(move || {
                     nar::dump(&path, 0, 3, 0, &mut writer)?;
@@ -685,7 +886,7 @@ mod tests {
                 let mut guard = AbortGuard::new(client.clone(), "s1".into(), owned);
                 let limit = Arc::new(Semaphore::new(1));
                 let reserve_client = client.clone();
-                let reservations = Batcher::new(1, Duration::ZERO, move |requests| {
+                let reservations = Batcher::new(1, 1, Duration::ZERO, move |requests| {
                     let client = reserve_client.clone();
                     async move { client.reserve_parts(&requests).await }
                 });

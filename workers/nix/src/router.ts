@@ -20,6 +20,7 @@ import {
 	handleReserveUploadParts,
 	handleReserveUploadPartsBatch,
 	handleFinalizeUploadStreams,
+	handleInlineUpload,
 	handleAbortUploadStream,
 } from "./uploads.js";
 
@@ -27,6 +28,7 @@ import {
 const RE_STREAM_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-streams\/batch$/;
 const RE_STREAM_PARTS = /^\/_api\/v1\/uploads\/([^/]+)\/parts$/;
 const RE_STREAM_ABORT = /^\/_api\/v1\/uploads\/([^/]+)\/abort$/;
+const RE_INLINE_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/inline$/;
 const RE_PART_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/;
 
 export async function handleRequest(
@@ -420,6 +422,12 @@ async function handleWriteApi(
 		readonly method?: string;
 		readonly handle: (match: RegExpMatchArray, config: WorkerConfig) => Promise<Response>;
 	}> = [
+		{
+			pattern: RE_INLINE_UPLOAD,
+			endpoint: "inline-upload",
+			method: "POST",
+			handle: (m, c) => handleInlineUpload(request, c, m[1], identity),
+		},
 		{
 			pattern: RE_STREAM_PARTS,
 			endpoint: "reserve-upload-parts",

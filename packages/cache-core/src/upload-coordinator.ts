@@ -53,6 +53,10 @@ export class UploadCoordinator extends DurableObject<Env> {
 		return this.streams.seal(inputs);
 	}
 
+	sealInlineStreams(inputs: readonly StreamReceipt[]) {
+		return this.streams.sealInline(inputs);
+	}
+
 	abortStream(id: string) {
 		return this.streams.abort(id);
 	}

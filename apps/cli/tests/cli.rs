@@ -425,7 +425,7 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
             ),
             (
                 "/_api/v1/caches/main/upload-streams/batch",
-                json!({"sessions":[{"sessionId":"s1","partSize":8388608}]}),
+                json!({"sessions":[{"sessionId":"s1","partSize":8388608,"inline":false}]}),
             ),
             ("/_api/v1/uploads/s1/abort", json!({})),
         ] {
@@ -480,7 +480,172 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
 }
 
 #[test]
-fn push_uploads_before_delayed_session_creation_finishes() {
+fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    // Existing small file outputs work in a read-only Nix build sandbox too:
+    // no store mutation or fixture registration is needed.
+    let files: Vec<_> = std::fs::read_dir("/nix/store")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| !path.to_string_lossy().ends_with(".drv"))
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() < 4096))
+        .take(2)
+        .collect();
+    assert_eq!(files.len(), 2, "Nix shell must contain small file outputs");
+    let paths: Vec<_> = files
+        .iter()
+        .map(|p| p.to_str().unwrap().to_owned())
+        .collect();
+    let raws: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let output = Command::new("nix-store")
+                .args(["--dump", path])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        })
+        .collect();
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let mut metadata = serde_json::Map::new();
+    for (index, path) in paths.iter().enumerate() {
+        metadata.insert(
+            path.clone(),
+            json!({
+                "narHash":format!("sha256:{}", hex::encode(Sha256::digest(&raws[index]))),
+                "narSize":raws[index].len(),
+                "references":if index == 1 {vec![paths[0].clone()]} else {vec![]},
+                "deriver":format!("/nix/store/{}-fixture.drv", "0".repeat(32))
+            }),
+        );
+    }
+    let nix = bin.join("nix");
+    std::fs::write(
+        &nix,
+        format!(
+            "#!/bin/sh\ncat <<'METADATA'\n{}\nMETADATA\n",
+            Value::Object(metadata.clone())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server_paths = paths.clone();
+    let server = thread::spawn(move || {
+        let mut first_bytes = None;
+        for step in 0..5 {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            let response = if step == 0 {
+                assert!(headers.starts_with("POST /_api/v1/get-missing-paths "));
+                json!({"missing":server_paths.iter().map(|p| &p[11..43]).collect::<Vec<_>>()})
+            } else if step == 1 {
+                assert!(headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch "));
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let specs = body["paths"].as_array().unwrap();
+                assert_eq!(specs.len(), 2);
+                for spec in specs {
+                    let path = spec["storePath"].as_str().unwrap();
+                    assert_eq!(spec["inline"], true);
+                    assert_eq!(spec["storePathHash"], &path[11..43]);
+                    assert_eq!(spec["narHash"], metadata[path]["narHash"]);
+                    assert_eq!(spec["narSize"], metadata[path]["narSize"]);
+                    assert_eq!(spec["compression"], "zstd");
+                    assert_eq!(spec["deriver"], metadata[path]["deriver"]);
+                    let expected_refs: Vec<_> = metadata[path]["references"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| &p.as_str().unwrap()[11..])
+                        .collect();
+                    assert_eq!(spec["references"], json!(expected_refs));
+                    assert!(spec.get("fileHash").is_none() && spec.get("fileSize").is_none());
+                }
+                json!({"sessions":specs.iter().map(|spec| json!({"sessionId":spec["storePathHash"],"partSize":1048576,"inline":true})).collect::<Vec<_>>()})
+            } else {
+                let index = usize::from(step == 4);
+                let id = &server_paths[index][11..43];
+                let hash = hex::encode(Sha256::digest(&body));
+                assert!(
+                    headers.starts_with(&format!(
+                        "POST /_api/v1/uploads/{id}/inline?fileHash={hash} "
+                    )),
+                    "inline must publish its dependency first; no parts/finalize calls"
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/octet-stream")
+                );
+                assert_eq!(zstd::stream::decode_all(&body[..]).unwrap(), raws[index]);
+                if step == 2 {
+                    first_bytes = Some(body);
+                    continue; // Published, acknowledgement lost.
+                }
+                if step == 3 {
+                    assert_eq!(Some(body), first_bytes);
+                }
+                json!({"sessionId":id,"published":true})
+            };
+            let response = response.to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+        }
+    });
+    let mut search = vec![bin];
+    search.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+        .env("HOME", home.path())
+        .env("PATH", std::env::join_paths(search).unwrap())
+        .env("SNOWSTEAD_URL", &url)
+        .env("SNOWSTEAD_TOKEN", TOKEN)
+        .args([
+            "push",
+            "main",
+            &paths[1],
+            &paths[0],
+            "--no-deps",
+            "--jobs",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("2 pushed"));
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(TOKEN));
+    server.join().unwrap();
+}
+
+#[test]
+fn push_prefetches_next_sessions_before_current_upload_finishes() {
     streamed_session_creation(false);
 }
 
@@ -606,6 +771,15 @@ fn streamed_session_creation(late_failure: bool) {
                     let response = if headers.starts_with("PUT /part ") {
                         assert!(!headers.contains(TOKEN), "signed PUT must not carry API credentials");
                         assert!(!body.is_empty());
+                        // With jobs=1, waiting until the current 100 sessions are
+                        // consumed cannot start the second negotiation here.
+                        // Only an independently polled, one-batch prefetch can.
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while batches.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        assert_eq!(batches.lock().unwrap().len(), 2,
+                            "next session batch was not prefetched while an upload was active");
                         *uploaded.0.lock().unwrap() += 1;
                         uploaded.1.notify_all();
                         json!({})
@@ -615,6 +789,10 @@ fn streamed_session_creation(late_failure: bool) {
                             json!({"missing": missing})
                         } else if headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch ") {
                             let count = body["paths"].as_array().unwrap().len();
+                            for spec in body["paths"].as_array().unwrap() {
+                                assert!(spec["narSize"].as_u64().unwrap() > 1048576);
+                                assert!(spec.get("inline").is_none(), "large NARs must stay multipart");
+                            }
                             let index = {
                                 let mut batches = batches.lock().unwrap();
                                 batches.push(count);
@@ -633,7 +811,7 @@ fn streamed_session_creation(late_failure: bool) {
                                 live.lock().unwrap().insert(p["storePathHash"].as_str().unwrap().to_owned());
                                 // Reject the later response only after earlier work has
                                 // finished. Even invalid responses own real sessions.
-                                json!({"sessionId":p["storePathHash"], "partSize":if late_failure && index == 2 {0} else {8388608}})
+                                json!({"sessionId":p["storePathHash"], "partSize":if late_failure && index == 2 {0} else {8388608}, "inline":false})
                             }
                             ).collect::<Vec<_>>()})
                         } else if headers.starts_with("POST /_api/v1/uploads/parts ") {

@@ -18,13 +18,13 @@ function post(path: string, body: unknown, token = AUTH): Promise<Response> {
 	});
 }
 
-async function stream(cache: string, token = AUTH) {
+async function stream(cache: string, token = AUTH, inline = false, size = narSize) {
 	const hash = crypto.randomUUID().replaceAll("-", "").replace(/[eotu]/g, "a");
 	const response = await post(`/_api/v1/caches/${cache}/upload-streams/batch`, {
-		paths: [{ storePath: `/nix/store/${hash}-stream`, storePathHash: hash, narHash, narSize, compression: "zstd", references: [] }],
+		paths: [{ storePath: `/nix/store/${hash}-stream`, storePathHash: hash, narHash, narSize: size, compression: "zstd", references: [], inline }],
 	}, token);
 	expect(response.status).toBe(201);
-	const { sessions } = await response.json<{ sessions: { sessionId: string; partSize: number }[] }>();
+	const { sessions } = await response.json<{ sessions: { sessionId: string; partSize: number; inline: boolean }[] }>();
 	return { ...sessions[0], hash };
 }
 
@@ -45,6 +45,127 @@ async function digest(bytes: Uint8Array) {
 }
 
 describe("streaming upload contract", () => {
+	it.each([false, true])("publishes and replays inline bytes without a staged object (private: %s)", async isPrivate => {
+		const name = `inline-${crypto.randomUUID().slice(0, 8)}`;
+		expect((await SELF.fetch("http://example.com/_api/v1/orgs/default/caches", {
+			method: "POST", headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" },
+			body: JSON.stringify({ name, protocols: ["nix"], private: isPrivate }),
+		})).status).toBe(201);
+		const token = await signJwt({ jti: crypto.randomUUID(), sub: "inline-test", iss: TOKEN_ISSUER, aud: TOKEN_AUDIENCE,
+			caches: [name], perms: ["push", "pull"], org: "default", iat: Math.floor(Date.now() / 1000) }, env.JWT_SECRET);
+		const s = await stream(name, token, true);
+		expect(s).toMatchObject({ inline: true, partSize: 1024 ** 2 });
+		const session = (await findUploadSession(db, s.sessionId))!;
+		expect(session.r2UploadId).toBeNull();
+		const bytes = new Uint8Array([19, 238, 7, 61, isPrivate ? 5 : 4]);
+		const hash = await digest(bytes);
+		const send = () => SELF.fetch(`http://example.com/_api/v1/uploads/${s.sessionId}/inline?fileHash=${hash}`, {
+			method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/octet-stream", "content-length": String(bytes.length) }, body: bytes.slice(),
+		});
+		const usage = await orgUsage(db, "default", new Date());
+		for (let replay = 0; replay < 2; replay++) {
+			expect(await (await send()).json()).toMatchObject({ sessionId: s.sessionId, published: true });
+			expect((await findUploadSession(db, s.sessionId))?.status).toBe("completed");
+			expect(await env.CACHE_BUCKET.head(session.r2UploadKey!)).toBeNull();
+		}
+		expect(await orgUsage(db, "default", new Date())).toEqual({ used: usage.used + bytes.length, pending: usage.pending });
+		const key = isPrivate ? `nars/sha256/${hash}/zstd.nar` : `nar/${hash}/zstd.nar`;
+		const bucket = isPrivate ? env.CACHE_BUCKET : env.PUBLIC_BUCKET;
+		expect(new Uint8Array(await (await bucket.get(key))!.arrayBuffer())).toEqual(bytes);
+		if (isPrivate) expect(await env.PUBLIC_BUCKET.head(`nar/${hash}/zstd.nar`)).toBeNull();
+		const info = await SELF.fetch(`http://example.com/${name}/${s.hash}.narinfo`, { headers: { authorization: `Bearer ${token}` } });
+		expect(info.status).toBe(200);
+		expect(await info.text()).toContain(`FileHash: sha256:${hash}`);
+	});
+
+	it("requires inline possession, binds retries to the same bytes, and refuses multipart bypasses", async () => {
+		const cache = await createCache(db, `inline-proof-${crypto.randomUUID().slice(0, 8)}`);
+		const s = await stream(cache.name, AUTH, true);
+		const bytes = new Uint8Array([29, 201, 4]);
+		const hash = await digest(bytes);
+		const key = `nar/${hash}/zstd.nar`;
+		await env.PUBLIC_BUCKET.put(key, bytes, { sha256: hash });
+		const before = await env.PUBLIC_BUCKET.head(key);
+		const send = (body: Uint8Array, fileHash = hash) => SELF.fetch(`http://example.com/_api/v1/uploads/${s.sessionId}/inline?fileHash=${fileHash}`, {
+			method: "POST", headers: { authorization: `Bearer ${AUTH}`, "content-length": String(body.length) }, body: body.slice(),
+		});
+		expect((await send(new Uint8Array([29, 201, 5]))).status).toBe(400);
+		expect((await findUploadSession(db, s.sessionId))?.status).toBe("streaming");
+		expect((await SELF.fetch(`http://example.com/${cache.name}/${s.hash}.narinfo`)).status).toBe(404);
+		expect((await post(`/_api/v1/uploads/${s.sessionId}/parts`, { parts: [{ partNumber: 1, size: bytes.length }] })).status).toBe(409);
+		const item = { sessionId: s.sessionId, narHash, narSize, fileHash: hash, fileSize: bytes.length, parts: [{ partNumber: 1, etag: hash }] };
+		expect(await (await post("/_api/v1/uploads/finalize", { uploads: [item] })).json()).toMatchObject({ results: [{ status: 409 }] });
+		expect(await (await send(bytes)).json()).toMatchObject({ published: true });
+		const changed = new Uint8Array([30, 201, 4]);
+		expect(await (await send(changed, await digest(changed))).json()).toMatchObject({ published: false, status: 409 });
+		expect((await env.PUBLIC_BUCKET.head(key))?.version).toBe(before?.version);
+		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(key))!.arrayBuffer())).toEqual(bytes);
+	});
+
+	it("bounds inline bytes at 1 MiB, checks actual lengths, and rejects multipart sessions", async () => {
+		const cache = await createCache(db, `inline-bound-${crypto.randomUUID().slice(0, 8)}`);
+		const s = await stream(cache.name, AUTH, true, 1024 ** 2);
+		const bytes = new Uint8Array(1024 ** 2);
+		bytes[0] = 3; bytes[bytes.length - 1] = 201;
+		const fileHash = await digest(bytes);
+		const request = (id: string, body: Uint8Array, size: number | undefined) => new Request(`http://example.com/_api/v1/uploads/${id}/inline?fileHash=${fileHash}`, {
+			method: "POST", headers: { authorization: `Bearer ${AUTH}`, ...(size === undefined ? {} : { "content-length": String(size) }) }, body: body.slice(),
+		});
+		for (const [size, expected] of [[bytes.length + 1, 413], [4, 400], [6, 400]] as const) {
+			const ctx = createExecutionContext();
+			const response = await nix.fetch(request(s.sessionId, new Uint8Array(5), size), env, ctx);
+			expect(response.status).toBe(expected);
+			await waitOnExecutionContext(ctx);
+		}
+		expect(await (await SELF.fetch(request(s.sessionId, bytes, bytes.length))).json()).toMatchObject({ published: true });
+		const multipart = await stream(cache.name);
+		expect((await SELF.fetch(request(multipart.sessionId, bytes, bytes.length))).status).toBe(409);
+		const hash = "3".repeat(32);
+		expect((await post(`/_api/v1/caches/${cache.name}/upload-streams/batch`, { paths: [{
+			storePath: `/nix/store/${hash}-large`, storePathHash: hash, narHash, narSize: bytes.length + 1, compression: "zstd", inline: true,
+		}] })).status).toBe(400);
+	});
+
+	it("recovers inline sealing after SQL failure and a coordinator restart", async () => {
+		const cache = await createCache(db, `inline-retry-${crypto.randomUUID().slice(0, 8)}`);
+		const s = await stream(cache.name, AUTH, true);
+		const bytes = new Uint8Array([11, 37, 204, 6]);
+		const hash = await digest(bytes);
+		const request = () => new Request(`http://example.com/_api/v1/uploads/${s.sessionId}/inline?fileHash=${hash}`, {
+			method: "POST", headers: { authorization: `Bearer ${AUTH}`, "content-length": String(bytes.length) }, body: bytes.slice(),
+		});
+		const ctx = createExecutionContext();
+		const response = await nix.fetch(request(), { ...env, HYPERDRIVE: { ...env.HYPERDRIVE, connectionString: "postgres://postgres:postgres@127.0.0.1:1/unavailable" } }, ctx);
+		expect(await response.json()).toMatchObject({ published: false, status: 500 });
+		await waitOnExecutionContext(ctx);
+		expect((await post(`/_api/v1/uploads/${s.sessionId}/abort`, {})).status).toBe(409);
+		await abortAllDurableObjects();
+		expect(await (await SELF.fetch(request())).json()).toMatchObject({ published: true });
+		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(`nar/${hash}/zstd.nar`))!.arrayBuffer())).toEqual(bytes);
+	});
+
+	it("enforces inline authorization and capacity before storing or publishing bytes", async () => {
+		const org = `inline-quota-${crypto.randomUUID().slice(0, 8)}`;
+		await putOrg(db, org, org, { storageLimit: 4 });
+		const { cache } = await ensureCache(db, "main", true, org);
+		const token = await signJwt({ jti: crypto.randomUUID(), sub: "inline-quota", iss: TOKEN_ISSUER, aud: TOKEN_AUDIENCE,
+			caches: ["main"], perms: ["push"], org, iat: Math.floor(Date.now() / 1000) }, env.JWT_SECRET);
+		const s = await stream(cache.name, token, true);
+		const bytes = new Uint8Array([21, 7, 199, 3, 61]);
+		const hash = await digest(bytes);
+		const send = (credential: string, body = bytes) => SELF.fetch(`http://example.com/_api/v1/uploads/${s.sessionId}/inline?fileHash=${hash}`, {
+			method: "POST", headers: { authorization: `Bearer ${credential}`, "content-length": String(body.length) }, body: body.slice(),
+		});
+		const denied = await signJwt({ jti: crypto.randomUUID(), sub: "inline-denied", iss: TOKEN_ISSUER, aud: TOKEN_AUDIENCE,
+			caches: ["other"], perms: ["push"], org, iat: Math.floor(Date.now() / 1000) }, env.JWT_SECRET);
+		expect((await send(denied)).status).toBe(403);
+		expect(await (await send(token)).json()).toMatchObject({ published: false, status: 413 });
+		expect((await findUploadSession(db, s.sessionId))?.status).toBe("streaming");
+		expect(await env.PUBLIC_BUCKET.head(`nar/${hash}/zstd.nar`)).toBeNull();
+		expect(await env.PUBLIC_BUCKET.head(`${org}/main/${s.hash}.narinfo`)).toBeNull();
+		expect(await orgUsage(db, org, new Date())).toEqual({ used: 0, pending: 0 });
+	});
+
 	it("rejects full staging without SQL orphans and admits a retry after an existing upload aborts", async () => {
 		const org = `stream-full-${crypto.randomUUID().slice(0, 8)}`;
 		await putOrg(db, org, org, {});
@@ -75,12 +196,17 @@ describe("streaming upload contract", () => {
 		expect((await findUploadSession(db, sessions[0].sessionId))?.status).toBe("streaming");
 	});
 
-	it("publishes verified bytes, replays finalization, and refuses mutations or legacy bypasses", async () => {
+	it.each([false, true])("publishes verified bytes, replays finalization, and refuses mutations or legacy bypasses (already assembled: %s)", async assembled => {
 		const cache = await createCache(db, `stream-${crypto.randomUUID().slice(0, 8)}`);
 		const s = await stream(cache.name);
 		expect(s.partSize).toBe(8 * 1024 ** 2);
 		const bytes = new Uint8Array([31, 7, 219, 84, 2]);
 		const receipt = await upload(s.sessionId, bytes);
+		if (assembled) {
+			// An interrupted finalizer can leave complete bytes with no publication.
+			const session = (await findUploadSession(db, s.sessionId))!;
+			await env.CACHE_BUCKET.resumeMultipartUpload(session.r2UploadKey!, session.r2UploadId!).complete([receipt]);
+		}
 		for (const endpoint of ["multipart", "complete", "publish"]) {
 			expect((await post(`/_api/v1/uploads/${s.sessionId}/${endpoint}`, {})).status).toBe(404);
 		}

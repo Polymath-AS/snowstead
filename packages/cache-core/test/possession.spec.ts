@@ -79,15 +79,14 @@ describe("proof of possession", () => {
 		let version: string | undefined;
 		const bucket = new Proxy(env.PUBLIC_BUCKET, {
 			get(target, property) {
-				if (property === "head") return async (requested: string) => {
-					const observed = await target.head(requested);
+				if (property === "put") return async (requested: string, value: Parameters<R2Bucket["put"]>[1], options?: R2PutOptions) => {
 					if (requested === key && !interleaved) {
 						interleaved = true;
 						// A signed URL issued before cutover may still write directly to R2.
 						await target.put(key, body, { sha256: owner.fileHash, customMetadata: { session: "outstanding-grant" }, onlyIf: { etagDoesNotMatch: "*" } });
 						version = (await target.head(key))?.version;
 					}
-					return observed;
+					return target.put(requested, value, options);
 				};
 				const value = Reflect.get(target, property, target);
 				return typeof value === "function" ? value.bind(target) : value;

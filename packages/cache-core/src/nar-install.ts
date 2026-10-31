@@ -25,7 +25,7 @@ const installations = new WeakMap<WorkerConfig, Promise<void>>();
 /** One SQL admission/cleanup phase around bounded, connection-free transfers. */
 export async function installStagedNars(
 	config: WorkerConfig,
-	sessions: readonly (UploadSession & { fileHash: string })[],
+	sessions: readonly (UploadSession & { fileHash: string; inlineBytes?: ArrayBuffer })[],
 ): Promise<Map<string, string | undefined>> {
 	return serializeInstallations(config, async () => {
 		const results = new Map<string, string | undefined>();
@@ -44,6 +44,7 @@ export async function installStagedNars(
 					key: narKey(session.fileHash, session.compression, isPrivate), operationId: crypto.randomUUID(),
 					sourceKey: session.r2UploadKey, fileHash: session.fileHash, compression: session.compression,
 					isPrivate, fileSize: session.fileSize, sessionId: session.id,
+					inlineBytes: session.inlineBytes,
 					terminal: false,
 				});
 			}
@@ -96,6 +97,8 @@ type Installation = {
 	isPrivate: boolean;
 	fileSize: number;
 	sessionId?: string;
+	/** Bounded request-owned bytes need no staging object or storage read. */
+	inlineBytes?: ArrayBuffer;
 	/** Only a known terminal storage outcome allows the durable gate to go. */
 	terminal: boolean;
 };
@@ -162,13 +165,31 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 	let writeStarted = false;
 	let success = false;
 	try {
-		const source = await sourceBucket.head(sourceKey);
-		if (!source) return "Upload incomplete";
-		if (sessionId !== undefined && source.customMetadata?.session !== sessionId) return "Upload incomplete";
-		if (source.size !== fileSize) return "File size mismatch";
-		if (!(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
+		if (job.inlineBytes && fileSize > MIB) return "File size mismatch";
+		const sourceBody = job.inlineBytes === undefined && fileSize <= MIB ? await sourceBucket.get(sourceKey) : undefined;
+		const source = job.inlineBytes !== undefined ? undefined : fileSize <= MIB ? sourceBody : await sourceBucket.head(sourceKey);
+		if (job.inlineBytes === undefined && !source) return "Upload incomplete";
+		// One GET binds small-object metadata and bytes to the same version.
+		// Four transfer lanes cap these buffers at 4 MiB per installation wave;
+		// large objects retain the connection-free streaming/copy path.
+		let verifiedBytes = job.inlineBytes;
+		try {
+			if (source && sessionId !== undefined && source.customMetadata?.session !== sessionId) return "Upload incomplete";
+			if (source && source.size !== fileSize) return "File size mismatch";
+			if (sourceBody) verifiedBytes = await sourceBody.arrayBuffer();
+			if (verifiedBytes) {
+				if (verifiedBytes.byteLength !== fileSize) return "File size mismatch";
+				const digest = await crypto.subtle.digest("SHA-256", verifiedBytes);
+				const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+				if (hex !== fileHash) return "File hash mismatch";
+			} else if (!source || !(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
+		} finally {
+			if (sourceBody && !sourceBody.bodyUsed) await sourceBody.body.cancel();
+		}
 
-		const existing = await destination.head(key);
+		// Small verified buffers can go straight to the checksum-checked,
+		// create-only PUT. A losing PUT still verifies the existing winner below.
+		const existing = verifiedBytes === undefined ? await destination.head(key) : null;
 		if (existing) {
 			if (existing.size !== fileSize) return "File size mismatch";
 			if (!(await verifies(destination, existing, fileHash))) return "File hash mismatch";
@@ -177,16 +198,17 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 		}
 
 		if (fileSize <= SINGLE_PUT_MAX) {
-			const body = await readSource(sourceBucket, source);
+			const object = verifiedBytes === undefined ? await readSource(sourceBucket, source!) : undefined;
+			const body = verifiedBytes ?? object?.body;
 			if (!body) return "Upload incomplete";
 			writeStarted = true;
-			const stored = await destination.put(key, body.body, {
+			const stored = await destination.put(key, body, {
 				sha256: fileHash,
 				httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
 				onlyIf: { etagDoesNotMatch: "*" },
 			});
 			writeStarted = false;
-			if (!body.bodyUsed) await body.body.cancel();
+			if (object && !object.bodyUsed) await object.body.cancel();
 			if (!stored) {
 				const winner = await destination.head(key);
 				if (!winner || winner.size !== fileSize || !(await verifies(destination, winner, fileHash))) {
@@ -208,10 +230,10 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 		const registered = await setNarInstallationUpload(config.db, key, operationId, multipart.uploadId);
 		await config.releaseDb();
 		if (!registered) return INSTALLATION_BUSY;
-		const parts = await copyParts(config, sourceBucket, source, multipart);
+		const parts = await copyParts(config, sourceBucket, source!, multipart);
 		// UploadPartCopy cannot condition its source. Only frozen sources are
 		// allowed; detecting replacement also prevents completing mixed parts.
-		if ((await sourceBucket.head(sourceKey))?.version !== source.version) return "Upload incomplete: source changed";
+		if ((await sourceBucket.head(sourceKey))?.version !== source!.version) return "Upload incomplete: source changed";
 		const owns = await installationOwns(config.db, key, operationId);
 		await config.releaseDb();
 		if (!owns) return INSTALLATION_BUSY;

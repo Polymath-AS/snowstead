@@ -170,6 +170,25 @@ export class StreamState {
 		});
 	}
 
+	/** Inline bytes use the same admission and immutable receipt as streamed parts. */
+	sealInline(inputs: readonly StreamReceipt[]): Map<string, { session: UploadSession; parts: StreamPart[] } | StreamError> {
+		const results = new Map<string, { session: UploadSession; parts: StreamPart[] } | StreamError>();
+		for (const input of inputs) {
+			const session = this.get([input.sessionId])[0];
+			if (!session || session.r2UploadId !== null || session.partSize !== 1024 ** 2 || session.narSize > 1024 ** 2
+				|| input.fileSize < 1 || input.fileSize > 1024 ** 2) {
+				results.set(input.sessionId, { error: "Not an inline upload", status: 409 });
+				continue;
+			}
+			if (session.status === "streaming") {
+				const error = this.reserve([{ sessionId: session.id, parts: [{ partNumber: 1, size: input.fileSize }] }]).get(session.id);
+				if (error) { results.set(session.id, error); continue; }
+			}
+			for (const [id, result] of this.seal([input])) results.set(id, result);
+		}
+		return results;
+	}
+
 	abort(id: string): UploadSession | undefined {
 		return this.storage.transactionSync(() => {
 			const session = this.get([id])[0];

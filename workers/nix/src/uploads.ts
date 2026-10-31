@@ -28,11 +28,11 @@ import { createPresignedPartPut } from "@snowstead/cache-core/presign";
 import { PRIVATE_CACHES_REFUSED, isPrivateCache, privateCache } from "@snowstead/cache-core/visibility";
 import { checkUpstream, knownUpstream } from "@snowstead/cache-core/upstream";
 import { jsonResponse, errorResponse, messageOf } from "@snowstead/cache-core/responses";
-import { FileHash, NarHash, StorePathBasename, StorePathHash, parseBody } from "@snowstead/cache-core/schemas";
+import { FileHash, NarHash, StorePathBasename, StorePathHash, parseBody, valueOf } from "@snowstead/cache-core/schemas";
 import type { Db } from "@snowstead/cache-core/db/connection";
 import { errorForLog } from "@snowstead/cache-core/logging";
 import { bridgeUploadStreams, streamSessionId, streamSessionOrg } from "@snowstead/cache-core/upload-stream";
-import type { StreamPart } from "@snowstead/cache-core/upload-stream";
+import type { StreamPart, StreamReceipt } from "@snowstead/cache-core/upload-stream";
 import { CapacityError, withOrgCapacity } from "@snowstead/cache-core/capacity";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
@@ -325,11 +325,12 @@ type Part = v.InferOutput<typeof PartList>[number];
 /** Keep the assembled proof at staging until GC so interrupted installs retry. */
 async function assembleStaged(config: WorkerConfig, session: HashedSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
-	if (session.r2UploadId && !(await config.bucket.head(key))) {
+	if (session.r2UploadId) {
 		try {
 			await config.bucket.resumeMultipartUpload(key, session.r2UploadId).complete([...parts]);
 		} catch (err) {
-			// Another finalizer may have completed this MPU concurrently.
+			// Probe only on recovery: a prior attempt or concurrent finalizer
+			// may have completed this MPU before publication finished.
 			if (!(await config.bucket.head(key))) return `Upload incomplete: ${messageOf(err)}`;
 		}
 	}
@@ -412,9 +413,11 @@ const StreamPath = v.pipe(v.object({
 	compression: v.literal("zstd"),
 	references: v.nullish(v.array(StorePathBasename), []),
 	deriver: NarinfoWord("deriver"),
+	inline: v.optional(v.boolean(), false),
 }), v.check(({ storePath, storePathHash }) =>
 	storePath.startsWith(`/nix/store/${storePathHash}-`) && v.is(StorePathBasename, storePath.slice(11)),
-"storePath must be /nix/store/<storePathHash>-<name>"));
+"storePath must be /nix/store/<storePathHash>-<name>"),
+v.check(path => !path.inline || path.narSize <= MIB, "Inline NAR exceeds 1 MiB"));
 const StreamBatch = v.object({
 	paths: v.pipe(v.array(StreamPath), v.minLength(1), v.maxLength(MAX_BATCH)),
 });
@@ -457,7 +460,7 @@ export async function handleCreateUploadStreams(
 	if (await isPrivateCache(config, cache.path) && (await findOrg(config.db, cache.orgId))?.privateCaches === false) {
 		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 	}
-	const rows: (UploadSession & { partSize: number; r2UploadKey: string; r2UploadId: string; status: "streaming" })[] = [];
+	const rows: (UploadSession & { partSize: number; r2UploadKey: string; status: "streaming" })[] = [];
 	let reservationStarted = false;
 	try {
 		const paths = body.paths.entries();
@@ -465,13 +468,13 @@ export async function handleCreateUploadStreams(
 			for (const [index, path] of paths) {
 				const id = streamSessionId(cache.orgId);
 				const r2UploadKey = `${STAGING_PREFIX}${id}`;
-				const multipart = await config.bucket.createMultipartUpload(r2UploadKey, {
+				const multipart = path.inline ? undefined : await config.bucket.createMultipartUpload(r2UploadKey, {
 					customMetadata: { [SESSION_METADATA]: id },
 				});
 				rows[index] = {
 					...path, id, cacheId: cache.id, fileHash: null, fileSize: 0,
-					partSize: streamPartSize(path.narSize), referencesJson: JSON.stringify(path.references),
-					system: null, status: "streaming" as const, r2UploadKey, r2UploadId: multipart.uploadId,
+					partSize: path.inline ? MIB : streamPartSize(path.narSize), referencesJson: JSON.stringify(path.references),
+					system: null, status: "streaming" as const, r2UploadKey, r2UploadId: multipart?.uploadId ?? null,
 					createdAt: new Date(),
 					expiresAt: new Date(Date.now() + SESSION_TTL_SECONDS * 1000),
 				};
@@ -481,14 +484,14 @@ export async function handleCreateUploadStreams(
 		if (failed?.status === "rejected") throw failed.reason;
 		reservationStarted = true;
 		const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" }).createStreams(cache.orgId, rows);
-		if (!refused) return jsonResponse({ sessions: rows.map((r) => ({ sessionId: r.id, partSize: r.partSize })) }, 201);
-		await Promise.allSettled(rows.map((r) => config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()));
+		if (!refused) return jsonResponse({ sessions: rows.map((r) => ({ sessionId: r.id, partSize: r.partSize, inline: r.r2UploadId === null })) }, 201);
+		await Promise.allSettled(rows.filter(r => r.r2UploadId !== null).map((r) => config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId!).abort()));
 		return refused;
 	} catch (error) {
 		// A failed reservation can have committed. Leave uncertain rows and MPUs
 		// to GC rather than aborting a session the caller could still retry.
 		if (!reservationStarted) {
-			await Promise.allSettled(rows.map((r) => config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()));
+			await Promise.allSettled(rows.filter(r => r.r2UploadId !== null).map((r) => config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId!).abort()));
 		}
 		console.error("Failed to create upload streams", errorForLog(error));
 		return errorResponse("Internal error", 500);
@@ -534,6 +537,10 @@ async function reserveUploadParts(
 		const denied = await sessionAccessError(config, session, identity);
 		if (denied || !session) {
 			results.set(input.sessionId, errorResponse(denied?.error ?? "Not found", denied?.status ?? 404));
+			continue;
+		}
+		if (session.r2UploadId === null) {
+			results.set(input.sessionId, errorResponse("Not a multipart upload", 409));
 			continue;
 		}
 		const parsed = v.safeParse(StreamParts, { parts: input.parts });
@@ -626,10 +633,57 @@ export async function handleFinalizeUploadStreams(
 ): Promise<Response> {
 	const body = await parseBody(request, StreamFinalize);
 	if (body instanceof Response) return body;
+	const loaded = await loadUploadSessions(config, body.uploads.map(upload => upload.sessionId));
+	return finalizeUploadStreams(config, identity, origin, body, loaded);
+}
+
+/** One bounded binary request replaces reserve, part PUT, and finalize for tiny NARs. */
+export async function handleInlineUpload(
+	request: Request, config: WorkerConfig, sessionId: string, identity: AuthIdentity,
+): Promise<Response> {
+	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
+	if (result.error) return result.error;
+	const session = result.session;
+	if (session.r2UploadId !== null || session.partSize !== MIB || session.narSize > MIB) return errorResponse("Not an inline upload", 409);
+	const fileHash = valueOf(FileHash, new URL(request.url).searchParams.get("fileHash"));
+	if (!fileHash) return errorResponse("Invalid file hash", 400);
+	const length = request.headers.get("content-length");
+	if (length === null) return errorResponse("Content-Length required", 411);
+	const size = Number(length);
+	if (!Number.isSafeInteger(size) || size < 1) return errorResponse("Invalid Content-Length", 400);
+	if (size > MIB) return errorResponse("Inline upload exceeds 1 MiB", 413);
+	if (!request.body) return errorResponse("Upload body required", 400);
+	// Do not trust Content-Length to bound a buffered read. Cancel immediately
+	// on excess bytes, and never allocate more than the admitted object size.
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	try {
+		await request.body.pipeTo(new WritableStream<Uint8Array>({
+			write(chunk) {
+				if (offset + chunk.byteLength > size) throw new Error("File size mismatch");
+				bytes.set(chunk, offset);
+				offset += chunk.byteLength;
+			},
+		}));
+	} catch { return errorResponse("File size mismatch", 400); }
+	if (offset !== size) return errorResponse("File size mismatch", 400);
+	const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+	if (hash !== fileHash) return errorResponse("File hash mismatch", 400);
+	const response = await finalizeUploadStreams(config, identity, new URL(request.url).origin, { uploads: [{
+		sessionId, narHash: session.narHash, narSize: session.narSize, fileHash, fileSize: size,
+		parts: [{ partNumber: 1, etag: fileHash }],
+	}] }, new Map([[sessionId, session]]), bytes.buffer);
+	const { results } = await response.json<{ results: PublishResult[] }>();
+	return jsonResponse(results[0]);
+}
+
+async function finalizeUploadStreams(
+	config: WorkerConfig, identity: AuthIdentity, origin: string,
+	body: { uploads: StreamReceipt[] }, loaded: Map<string, UploadSession>, inlineBytes?: ArrayBuffer,
+): Promise<Response> {
 	const results = new Map<string, PublishResult | { sessionId: string; published: false; error: string; status: number }>();
 	const usable: HashedSession[] = [];
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, published: false, error, status });
-	const loaded = await loadUploadSessions(config, body.uploads.map(upload => upload.sessionId));
 	const authorized: typeof body.uploads = [];
 	for (const upload of body.uploads) {
 		const sessionId = upload.sessionId;
@@ -640,7 +694,7 @@ export async function handleFinalizeUploadStreams(
 				fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
 				continue;
 			}
-			if (session.partSize === null) {
+			if (session.partSize === null || (session.r2UploadId === null) !== (inlineBytes !== undefined)) {
 				fail(sessionId, "Conflict", 409);
 				continue;
 			}
@@ -657,7 +711,8 @@ export async function handleFinalizeUploadStreams(
 		const orgs = new Set(authorized.map(u => streamSessionOrg(u.sessionId)).filter(org => org !== undefined));
 		for (const org of orgs) {
 			const batch = authorized.filter(u => streamSessionOrg(u.sessionId) === org);
-			const local = await config.uploadCoordinator.getByName(org, { locationHint: "weur" }).sealStreams(batch);
+			const coordinator = config.uploadCoordinator.getByName(org, { locationHint: "weur" });
+			const local = inlineBytes === undefined ? await coordinator.sealStreams(batch) : await coordinator.sealInlineStreams(batch);
 			const ready: { session: UploadSession; parts: StreamPart[] }[] = [];
 			for (const [id, result] of local) {
 				if ("error" in result) sealed.set(id, result);
@@ -667,7 +722,7 @@ export async function handleFinalizeUploadStreams(
 			for (const [id, session] of await bridgeUploadStreams(config.db, ready)) sealed.set(id, session);
 		}
 		await config.releaseDb();
-		const pending: HashedSession[] = [];
+		const pending: (HashedSession & { inlineBytes?: ArrayBuffer })[] = [];
 		const uploads = authorized.values();
 		await Promise.all(Array.from({ length: Math.min(4, authorized.length) }, async () => {
 			for (const upload of uploads) {
@@ -679,6 +734,10 @@ export async function handleFinalizeUploadStreams(
 				if (!hasFileHash(session)) throw new Error("Sealed stream has no file hash");
 				if (session.status === "completed") {
 					usable.push(session);
+					continue;
+				}
+				if (inlineBytes !== undefined) {
+					pending.push({ ...session, inlineBytes });
 					continue;
 				}
 				try {

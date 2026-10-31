@@ -3,7 +3,10 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::{Method, Response, Url, header, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone)]
 pub struct Client {
@@ -29,6 +32,7 @@ pub struct Missing {
 pub struct Session {
     pub session_id: String,
     pub part_size: u64,
+    pub inline: bool,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +45,8 @@ pub struct SessionParams {
     pub references: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deriver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline: Option<bool>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +149,7 @@ impl Client {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        let started = Instant::now();
         let response = request
             .send()
             .await
@@ -150,6 +157,7 @@ impl Client {
         tracing::debug!(
             operation,
             status = response.status().as_u16(),
+            response_headers_ms = started.elapsed().as_millis(),
             "API response"
         );
         Ok(response)
@@ -262,6 +270,65 @@ impl Client {
             }
             if attempt == 4 {
                 bail!("finalize: transient HTTP failure after 4 attempts");
+            }
+            backoff(attempt).await;
+        }
+        unreachable!()
+    }
+    /// Replays retain the same globally budgeted allocation, including after a
+    /// lost publication acknowledgement. HTTP and item failures share a budget.
+    pub async fn inline(
+        &self,
+        id: &str,
+        file_hash: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<CommitResult> {
+        if bytes.is_empty()
+            || bytes.len() > 1024 * 1024
+            || file_hash.len() != 64
+            || !file_hash
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            bail!("inline upload: invalid bytes or hash");
+        }
+        let path = format!(
+            "/_api/v1/uploads/{}/inline?fileHash={file_hash}",
+            segment(id)?
+        );
+        for attempt in 1..=4 {
+            let response = self
+                .http
+                .post(format!("{}{path}", self.server))
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(bytes.clone())
+                .send()
+                .await;
+            let row = match response {
+                Err(_) => None,
+                Ok(response) if transient(response.status().as_u16()) => None,
+                Ok(response) => {
+                    match status_ok("inline upload", response)?
+                        .json::<CommitResult>()
+                        .await
+                    {
+                        Ok(row) => Some(row),
+                        Err(error) if error.is_body() || error.is_timeout() => None,
+                        Err(_) => bail!("inline upload: invalid response"),
+                    }
+                }
+            };
+            if let Some(row) = row {
+                if row.session_id != id {
+                    bail!("inline upload: response session differs from request");
+                }
+                if row.published || !row.status.is_some_and(transient) || attempt == 4 {
+                    return Ok(row);
+                }
+            } else if attempt == 4 {
+                bail!("inline upload: transient HTTP failure after 4 attempts");
             }
             backoff(attempt).await;
         }
@@ -568,6 +635,75 @@ pub(crate) mod tests {
         client.upload_part(part, bytes).await
     }
     #[tokio::test]
+    async fn inline_retries_share_four_attempts_and_reject_wrong_identity_and_permanent_errors() {
+        let scenarios = vec![
+            vec![
+                (0, Value::Null),
+                (503, Value::Null),
+                (200, json!({"sessionId":"s1","status":503})),
+                (200, json!({"sessionId":"s1","published":true})),
+            ],
+            vec![(429, Value::Null); 4],
+            vec![(200, json!({"sessionId":"s1","status":503})); 4],
+            vec![(200, json!({"sessionId":"other","published":true}))],
+            vec![(403, json!({"error":"private secret-token"}))],
+            vec![(
+                200,
+                json!({"sessionId":"s1","status":400,"error":"private secret-token"}),
+            )],
+        ];
+        futures_util::future::join_all(scenarios.into_iter().enumerate().map(
+            |(index, responses)| async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    for (status, response) in responses {
+                        let (mut socket, _) =
+                            tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        let (headers, body) = read(&mut socket).await;
+                        assert!(headers.starts_with(&format!(
+                            "POST /_api/v1/uploads/s1/inline?fileHash={} ",
+                            "a".repeat(64)
+                        )));
+                        assert!(
+                            headers
+                                .to_ascii_lowercase()
+                                .contains("content-type: application/octet-stream")
+                        );
+                        assert!(headers.to_ascii_lowercase().contains("content-length: 6"));
+                        assert_eq!(body, b"abcdef");
+                        if status != 0 {
+                            reply(&mut socket, status, &response.to_string(), "").await;
+                        }
+                    }
+                });
+                let result = client(&url)
+                    .inline("s1", &"a".repeat(64), bytes::Bytes::from_static(b"abcdef"))
+                    .await;
+                match index {
+                    0 => assert!(result.unwrap().published),
+                    2 | 5 => assert!(!result.unwrap().published),
+                    _ => {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            !error.contains("private")
+                                && !error.contains("secret-token")
+                                && !error.contains(&url)
+                        );
+                        if index == 1 {
+                            assert!(error.contains("4 attempts"));
+                        }
+                    }
+                }
+                server.await.unwrap();
+            },
+        ))
+        .await;
+    }
+    #[tokio::test]
     async fn stream_wire_contract_retries_exact_bytes_and_only_supplied_headers() {
         for supplied_auth in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -587,7 +723,7 @@ pub(crate) mod tests {
                         reply(
                             &mut socket,
                             200,
-                            r#"{"sessions":[{"sessionId":"s1","partSize":8388608}]}"#,
+                            r#"{"sessions":[{"sessionId":"s1","partSize":8388608,"inline":false}]}"#,
                             "",
                         )
                         .await;
@@ -657,6 +793,7 @@ pub(crate) mod tests {
                         compression: "zstd".into(),
                         references: vec![],
                         deriver: None,
+                        inline: None,
                     }],
                 )
                 .await

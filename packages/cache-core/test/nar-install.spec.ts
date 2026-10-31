@@ -33,10 +33,11 @@ function bucket(base: R2Bucket, overrides: Partial<R2Bucket>): R2Bucket {
 	});
 }
 
-async function fixture() {
+async function fixture(size = 16) {
 	const cache = await createCache(db, `install-${crypto.randomUUID()}`);
 	const id = crypto.randomUUID();
-	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	const bytes = new Uint8Array(size);
+	for (let offset = 0; offset < size; offset += 65536) crypto.getRandomValues(bytes.subarray(offset, offset + 65536));
 	const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
 		.map(byte => byte.toString(16).padStart(2, "0")).join("");
 	const sourceKey = `staging/${id}`;
@@ -81,8 +82,8 @@ describe("verified canonical NAR installation", () => {
 		}
 	});
 
-	it("pins before reading, releases SQL before hashing, and retains its own stage", async () => {
-		const f = await fixture();
+	it.each([16, 1024 ** 2, 1024 ** 2 + 1])("pins before reading, releases SQL before hashing, and retains its own stage (%s bytes)", async size => {
+		const f = await fixture(size);
 		const base = config();
 		let released = false;
 		const privateBucket = bucket(env.CACHE_BUCKET, {
@@ -102,9 +103,12 @@ describe("verified canonical NAR installation", () => {
 		expect(await gate(f.key)).toBeUndefined();
 	});
 
-	it.each(["owner", "size", "hash"])("rejects bad staged %s even if canonical bytes already exist", async fault => {
+	it.each([
+		["owner", false], ["size", false], ["hash", false],
+		["owner", true], ["size", true], ["hash", true],
+	])("rejects bad staged %s (canonical exists: %s)", async (fault, exists) => {
 		const f = await fixture();
-		await env.PUBLIC_BUCKET.put(f.key, f.bytes, { customMetadata: { session: "canonical-owner" } });
+		if (exists) await env.PUBLIC_BUCKET.put(f.key, f.bytes, { customMetadata: { session: "canonical-owner" } });
 		const before = await env.PUBLIC_BUCKET.head(f.key);
 		await env.CACHE_BUCKET.put(f.sourceKey,
 			fault === "size" ? new Uint8Array(1) : fault === "hash" ? new Uint8Array(16) : f.bytes,
@@ -114,6 +118,41 @@ describe("verified canonical NAR installation", () => {
 		);
 		expect((await env.PUBLIC_BUCKET.head(f.key))?.version).toBe(before?.version);
 		expect(await env.CACHE_BUCKET.head(f.sourceKey)).not.toBeNull();
+		expect(await gate(f.key)).toBeUndefined();
+	});
+
+	it.each(["owner", "size"])("cancels the small source body rejected for %s", async fault => {
+		const f = await fixture();
+		await env.CACHE_BUCKET.put(f.sourceKey, fault === "size" ? new Uint8Array(1) : f.bytes,
+			{ customMetadata: { session: fault === "owner" ? "someone-else" : f.session.id } });
+		const object = (await env.CACHE_BUCKET.get(f.sourceKey))!;
+		const cancel = vi.spyOn(object.body, "cancel");
+		const privateBucket = bucket(env.CACHE_BUCKET, { get: async () => object });
+		expect((await installStagedNars(config({ bucket: privateBucket }), [f.session])).get(f.session.id)).toBe(
+			fault === "owner" ? "Upload incomplete" : "File size mismatch",
+		);
+		expect(cancel).toHaveBeenCalledOnce();
+		expect(object.bodyUsed).toBe(true);
+		expect(await env.PUBLIC_BUCKET.head(f.key)).toBeNull();
+		expect(await gate(f.key)).toBeUndefined();
+	});
+
+	it("rejects a small source whose body length disagrees with its metadata", async () => {
+		const f = await fixture();
+		await env.CACHE_BUCKET.put(f.sourceKey, new Uint8Array(1), { customMetadata: { session: f.session.id } });
+		const privateBucket = bucket(env.CACHE_BUCKET, {
+			get: async key => {
+				const object = await env.CACHE_BUCKET.get(key);
+				return object ? new Proxy(object, {
+					get: (target, property) => {
+						const value = Reflect.get(target, property, target);
+						return property === "size" ? f.bytes.length : typeof value === "function" ? value.bind(target) : value;
+					},
+				}) : null;
+			},
+		});
+		expect((await installStagedNars(config({ bucket: privateBucket }), [f.session])).get(f.session.id)).toBe("File size mismatch");
+		expect(await env.PUBLIC_BUCKET.head(f.key)).toBeNull();
 		expect(await gate(f.key)).toBeUndefined();
 	});
 
@@ -143,22 +182,41 @@ describe("verified canonical NAR installation", () => {
 		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: before.version, customMetadata: { session: "old-owner" } });
 	});
 
-	it("preserves a create-only canonical PUT arriving after the absent HEAD", async () => {
+	it.each(["valid", "size", "hash"])("verifies and preserves a concurrent create-only canonical winner (%s)", async fault => {
 		const f = await fixture();
-		let arrived = false;
+		let winner: R2Object | undefined;
 		const publicBucket = bucket(env.PUBLIC_BUCKET, {
-			head: async key => {
-				const observed = await env.PUBLIC_BUCKET.head(key);
-				if (!arrived) {
-					arrived = true;
-					await env.PUBLIC_BUCKET.put(key, f.bytes, { customMetadata: { session: "old-owner" }, onlyIf: { etagDoesNotMatch: "*" } });
-				}
-				return observed;
+			put: async (key, value, options) => {
+				winner = (await env.PUBLIC_BUCKET.put(key,
+					fault === "size" ? new Uint8Array(1) : fault === "hash" ? new Uint8Array(f.bytes.length) : f.bytes,
+					{ customMetadata: { session: "old-owner" }, onlyIf: { etagDoesNotMatch: "*" } }))!;
+				return env.PUBLIC_BUCKET.put(key, value, options);
 			},
 		});
-		expect((await installStagedNars(config({ publicBucket }), [f.session])).get(f.session.id)).toBeUndefined();
-		expect((await env.PUBLIC_BUCKET.head(f.key))?.customMetadata).toEqual({ session: "old-owner" });
+		expect((await installStagedNars(config({ publicBucket }), [f.session])).get(f.session.id)).toBe(
+			fault === "valid" ? undefined : "File hash mismatch",
+		);
+		expect(winner).toBeDefined();
+		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: winner!.version, customMetadata: { session: "old-owner" } });
 		expect(await gate(f.key)).toBeUndefined();
+	});
+
+	it.each([false, true])("retains the durable gate after an ambiguous small canonical PUT (inline: %s)", async inline => {
+		const f = await fixture();
+		const session = { ...f.session, inlineBytes: inline ? f.bytes.slice().buffer : undefined };
+		if (inline) await env.CACHE_BUCKET.delete(f.sourceKey);
+		const publicBucket = bucket(env.PUBLIC_BUCKET, {
+			put: async (key, value, options) => {
+				await env.PUBLIC_BUCKET.put(key, value, options);
+				throw new Error("PUT response lost");
+			},
+		});
+		const cfg = config({ publicBucket });
+		expect((await installStagedNars(cfg, [session])).get(f.session.id)).toContain("retry");
+		expect(await gate(f.key)).toMatchObject({ sourceKey: f.sourceKey });
+		expect(Boolean(await env.CACHE_BUCKET.head(f.sourceKey))).toBe(!inline);
+		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
+		expect((await installStagedNars(cfg, [session])).get(f.session.id)).toBe(INSTALLATION_BUSY);
 	});
 
 	it("does not read an unpinned source when another installer owns the key", async () => {
