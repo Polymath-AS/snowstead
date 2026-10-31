@@ -24,6 +24,7 @@ import {
 	handleCommit,
 	handleCreateUploadStreams,
 	handleReserveUploadParts,
+	handleReserveUploadPartsBatch,
 	handleFinalizeUploadStreams,
 	handleAbortUploadStream,
 } from "./uploads.js";
@@ -407,6 +408,12 @@ async function handleWriteApi(
 		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
 		const response = await handleCreateUploadStreams(request, config, streamBatch[1], identity);
 		writeAuditLog(config, identity, "push", streamBatch[1], response.status, '{"endpoint":"create-upload-streams"}', ip);
+		return response;
+	}
+	if (pathname === "/_api/v1/uploads/parts") {
+		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+		const response = await handleReserveUploadPartsBatch(request, config, identity);
+		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"reserve-upload-parts-batch"}', ip);
 		return response;
 	}
 	if (pathname === "/_api/v1/uploads/finalize") {

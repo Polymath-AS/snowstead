@@ -187,6 +187,15 @@ pub async fn push(
         .iter()
         .map(|(session, _)| session.session_id.clone())
         .collect();
+    let reserve_client = client.clone();
+    let reservations = Batcher::new(
+        jobs.min(16),
+        Duration::from_millis(2),
+        move |requests: Vec<api::PartReservation>| {
+            let client = reserve_client.clone();
+            async move { client.reserve_parts(&requests).await }
+        },
+    );
     let multipart_client = client.clone();
     let multipart_commits = Batcher::new(
         jobs.min(8),
@@ -201,6 +210,7 @@ pub async fn push(
             let compression = compression.clone();
             let parts = parts.clone();
             let buffers = buffers.clone();
+            let reservations = reservations.clone();
             let multipart_commits = multipart_commits.clone();
             let span = tracing::debug_span!("push_path",path=%info.store_path);
             async move {
@@ -217,7 +227,13 @@ pub async fn push(
                     let expected = info.nar_hash.clone();
                     let size = info.nar_size;
                     let (sender, receiver) = mpsc::channel(1);
-                    let mut writer = Bridge::new(session.part_size as usize, buffers, sender);
+                    // A small NAR needs only one final part, not a whole 8 MiB
+                    // allocation. This is zstd's compress bound with its maximum
+                    // small-input margin; large NARs keep the negotiated size.
+                    let capacity = session.part_size.min(size + size / 256 + 64) as usize;
+                    // Wait for output capacity before allocating a codec. A slow
+                    // upload must not park every producer with live zstd state.
+                    let mut writer = Bridge::new(capacity, buffers, sender).await?;
                     let producer = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let digest =
@@ -230,7 +246,9 @@ pub async fn push(
                         writer.finish()?;
                         Ok::<_, anyhow::Error>(digest)
                     });
-                    let uploaded = upload_parts(client, &session.session_id, receiver, parts).await;
+                    let uploaded =
+                        upload_parts(client, &session.session_id, receiver, parts, &reservations)
+                            .await;
                     // upload_parts drops its receiver on error, waking a blocked
                     // producer before we join it. Cancellation does the same.
                     let digest = producer.await?;
@@ -380,15 +398,28 @@ struct Bridge {
     runtime: tokio::runtime::Handle,
 }
 impl Bridge {
-    fn new(size: usize, budget: Arc<Semaphore>, sender: mpsc::Sender<(u32, bytes::Bytes)>) -> Self {
-        Self {
+    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    async fn new(
+        size: usize,
+        budget: Arc<Semaphore>,
+        sender: mpsc::Sender<(u32, bytes::Bytes)>,
+    ) -> io::Result<Self> {
+        let permit = budget
+            .clone()
+            .acquire_many_owned(size as u32)
+            .await
+            .map_err(|_| io::Error::other("upload budget closed"))?;
+        Ok(Self {
             size,
             budget,
             sender,
-            current: None,
+            current: Some(Buffer {
+                bytes: Vec::with_capacity(size),
+                _permit: permit,
+            }),
             number: 1,
             runtime: tokio::runtime::Handle::current(),
-        }
+        })
     }
     fn finish(&mut self) -> io::Result<()> {
         if let Some(buffer) = self.current.take() {
@@ -443,6 +474,7 @@ async fn upload_parts(
     id: &str,
     receiver: mpsc::Receiver<(u32, bytes::Bytes)>,
     limit: Arc<Semaphore>,
+    reservations: &Batcher<api::PartReservation, Result<api::Part, String>>,
 ) -> anyhow::Result<Vec<api::UploadedPart>> {
     let mut parts: Vec<_> = futures_util::stream::unfold(receiver, |mut receiver| async {
         receiver.recv().await.map(|part| (part, receiver))
@@ -451,7 +483,15 @@ async fn upload_parts(
         let limit = limit.clone();
         async move {
             let _permit = limit.acquire().await?;
-            client.upload_part(id, number, bytes).await
+            let part = reservations
+                .request(api::PartReservation {
+                    session_id: id.to_owned(),
+                    part_number: number,
+                    size: bytes.len(),
+                })
+                .await?
+                .map_err(anyhow::Error::msg)?;
+            client.upload_part(part, bytes).await
         }
     })
     .buffer_unordered(4)
@@ -557,11 +597,11 @@ mod tests {
                         let aborted = aborted.clone();
                         tokio::spawn(async move {
                             let (headers, body) = read(&mut socket).await;
-                            if headers.starts_with("POST /_api/v1/uploads/s1/parts ") {
+                            if headers.starts_with("POST /_api/v1/uploads/parts ") {
                                 let body: Value = serde_json::from_slice(&body).unwrap();
-                                assert_eq!(body["parts"][0]["size"], 1024);
-                                let number = &body["parts"][0]["partNumber"];
-                                reply(&mut socket, 200, &json!({"parts":[{"partNumber":number,"url":format!("{origin}/part"),"headers":{}}]}).to_string(), "").await;
+                                assert_eq!(body["uploads"][0]["parts"][0]["size"], 1024);
+                                let number = &body["uploads"][0]["parts"][0]["partNumber"];
+                                reply(&mut socket, 200, &json!({"results":[{"sessionId":"s1","parts":[{"partNumber":number,"url":format!("{origin}/part"),"headers":{}}]}]}).to_string(), "").await;
                             } else if headers.starts_with("PUT /part ") {
                                 assert_eq!(body.len(), 1024);
                                 received.notify_one();
@@ -585,7 +625,7 @@ mod tests {
             let mut receivers = Vec::new();
             for _ in 0..2 {
                 let (sender, receiver) = mpsc::channel(1);
-                let mut writer = Bridge::new(1024, budget.clone(), sender);
+                let mut writer = Bridge::new(1024, budget.clone(), sender).await.unwrap();
                 let path = path.clone();
                 producers.push(tokio::task::spawn_blocking(move || {
                     nar::dump(&path, 0, 3, 0, &mut writer)?;
@@ -598,9 +638,14 @@ mod tests {
             let consumer = tokio::spawn(async move {
                 let mut guard = AbortGuard::new(client.clone(), "s1".into());
                 let limit = Arc::new(Semaphore::new(1));
-                let tasks = receivers
-                    .into_iter()
-                    .map(|receiver| upload_parts(&client, "s1", receiver, limit.clone()));
+                let reserve_client = client.clone();
+                let reservations = Batcher::new(1, Duration::ZERO, move |requests| {
+                    let client = reserve_client.clone();
+                    async move { client.reserve_parts(&requests).await }
+                });
+                let tasks = receivers.into_iter().map(|receiver| {
+                    upload_parts(&client, "s1", receiver, limit.clone(), &reservations)
+                });
                 let result = futures_util::future::try_join_all(tasks).await;
                 assert!(result.is_err());
                 guard.abort().await;
