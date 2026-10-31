@@ -260,6 +260,9 @@ pub async fn push(
         finalize.clone(),
     );
     let large_commits = Batcher::new(jobs.min(8), 1, Duration::from_millis(10), finalize);
+    // Each inline request owns a publication transaction. Match the three
+    // small-finalize lanes rather than opening one SQL connection per job.
+    let inline_commits = Arc::new(Semaphore::new(jobs.min(3)));
     let work = sessions
         .map_ok(|((info, outcome), (session, mut guard))| {
             let compression = compression.clone();
@@ -268,6 +271,7 @@ pub async fn push(
             let reservations = reservations.clone();
             let small_commits = small_commits.clone();
             let large_commits = large_commits.clone();
+            let inline_commits = inline_commits.clone();
             let span = tracing::debug_span!("push_path",path=%info.store_path);
             async move {
                 let path = info.store_path.clone();
@@ -346,6 +350,7 @@ pub async fn push(
                         &large_commits
                     };
                     let published = if let Some(bytes) = inline_bytes {
+                        let _permit = inline_commits.acquire().await?;
                         client
                             .inline(&session.session_id, &hex::encode(digest.file_hash), bytes)
                             .await?
