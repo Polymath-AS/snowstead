@@ -86,6 +86,28 @@ pub struct PartReservation {
     pub part_number: u32,
     pub size: usize,
 }
+pub struct InlineUpload {
+    pub session_id: String,
+    pub file_hash: String,
+    pub bytes: bytes::Bytes,
+}
+
+// Only the small manifest is allocated afresh. Payload frames clone the
+// permit-owned Bytes, retaining the global memory charge throughout a replay.
+fn inline_frames(uploads: &[&InlineUpload]) -> Result<Vec<bytes::Bytes>> {
+    let manifest = serde_json::to_vec(&json!({"uploads": uploads.iter().map(|upload| {
+        json!({"sessionId":upload.session_id,"fileHash":upload.file_hash,"fileSize":upload.bytes.len()})
+    }).collect::<Vec<_>>()}))?;
+    if manifest.len() > 16 * 1024 {
+        bail!("inline upload: manifest exceeds limit");
+    }
+    let mut header = Vec::with_capacity(4 + manifest.len());
+    header.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+    header.extend_from_slice(&manifest);
+    Ok(std::iter::once(bytes::Bytes::from(header))
+        .chain(uploads.iter().map(|upload| upload.bytes.clone()))
+        .collect())
+}
 fn status_ok(operation: &str, response: Response) -> Result<Response> {
     if response.status().is_success() {
         Ok(response)
@@ -277,41 +299,54 @@ impl Client {
     }
     /// Replays retain the same globally budgeted allocation, including after a
     /// lost publication acknowledgement. HTTP and item failures share a budget.
-    pub async fn inline(
-        &self,
-        id: &str,
-        file_hash: &str,
-        bytes: bytes::Bytes,
-    ) -> Result<CommitResult> {
-        if bytes.is_empty()
-            || bytes.len() > 1024 * 1024
-            || file_hash.len() != 64
-            || !file_hash
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            bail!("inline upload: invalid bytes or hash");
+    pub async fn inline_batch(&self, uploads: &[InlineUpload]) -> Result<Vec<CommitResult>> {
+        #[derive(Deserialize)]
+        struct Results {
+            results: Vec<CommitResult>,
         }
-        let path = format!(
-            "/_api/v1/uploads/{}/inline?fileHash={file_hash}",
-            segment(id)?
-        );
+        if uploads.is_empty() || uploads.len() > 8 {
+            bail!("inline upload: invalid batch size");
+        }
+        for (index, upload) in uploads.iter().enumerate() {
+            segment(&upload.session_id)?;
+            if upload.bytes.is_empty()
+                || upload.bytes.len() > 1024 * 1024
+                || upload.file_hash.len() != 64
+                || !upload
+                    .file_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                || uploads[..index]
+                    .iter()
+                    .any(|other| other.session_id == upload.session_id)
+            {
+                bail!("inline upload: invalid bytes, hash, or duplicate session");
+            }
+        }
+        let mut pending: Vec<_> = uploads.iter().enumerate().collect();
+        let mut results = vec![None; uploads.len()];
         for attempt in 1..=4 {
+            let paths: Vec<_> = pending.iter().map(|(_, upload)| *upload).collect();
+            let frames = inline_frames(&paths)?;
+            let length: usize = frames.iter().map(bytes::Bytes::len).sum();
+            let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+                frames.into_iter().map(Ok::<_, std::io::Error>),
+            ));
             let response = self
                 .http
-                .post(format!("{}{path}", self.server))
+                .post(format!("{}/_api/v1/uploads/inline/batch", self.server))
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, bytes.len())
-                .body(bytes.clone())
+                .header(header::CONTENT_LENGTH, length)
+                .body(body)
                 .send()
                 .await;
-            let row = match response {
+            let data = match response {
                 Err(_) => None,
                 Ok(response) if transient(response.status().as_u16()) => None,
                 Ok(response) => {
                     match status_ok("inline upload", response)?
-                        .json::<CommitResult>()
+                        .json::<Results>()
                         .await
                     {
                         Ok(row) => Some(row),
@@ -320,12 +355,30 @@ impl Client {
                     }
                 }
             };
-            if let Some(row) = row {
-                if row.session_id != id {
-                    bail!("inline upload: response session differs from request");
+            if let Some(data) = data {
+                if data.results.len() != pending.len()
+                    || data
+                        .results
+                        .iter()
+                        .zip(&pending)
+                        .any(|(row, (_, upload))| row.session_id != upload.session_id)
+                {
+                    bail!("inline upload: response count or order differs from request");
                 }
-                if row.published || !row.status.is_some_and(transient) || attempt == 4 {
-                    return Ok(row);
+                let mut retry = Vec::new();
+                for ((index, upload), row) in pending.into_iter().zip(data.results) {
+                    if attempt < 4 && !row.published && row.status.is_some_and(transient) {
+                        retry.push((index, upload));
+                    } else {
+                        results[index] = Some(row);
+                    }
+                }
+                pending = retry;
+                if pending.is_empty() {
+                    return results
+                        .into_iter()
+                        .map(|row| row.ok_or_else(|| anyhow!("inline upload: missing result")))
+                        .collect();
                 }
             } else if attempt == 4 {
                 bail!("inline upload: transient HTTP failure after 4 attempts");
@@ -664,28 +717,36 @@ pub(crate) mod tests {
                                 .unwrap()
                                 .unwrap();
                         let (headers, body) = read(&mut socket).await;
-                        assert!(headers.starts_with(&format!(
-                            "POST /_api/v1/uploads/s1/inline?fileHash={} ",
-                            "a".repeat(64)
-                        )));
+                        assert!(headers.starts_with("POST /_api/v1/uploads/inline/batch "));
                         assert!(
                             headers
                                 .to_ascii_lowercase()
                                 .contains("content-type: application/octet-stream")
                         );
-                        assert!(headers.to_ascii_lowercase().contains("content-length: 6"));
-                        assert_eq!(body, b"abcdef");
+                        let frames = inline_frames(&[&inline_upload("s1", b"abcdef")]).unwrap();
+                        assert_eq!(body, frames.concat());
+                        assert!(
+                            headers
+                                .to_ascii_lowercase()
+                                .contains(&format!("content-length: {}", body.len()))
+                        );
                         if status != 0 {
-                            reply(&mut socket, status, &response.to_string(), "").await;
+                            reply(
+                                &mut socket,
+                                status,
+                                &json!({"results":[response]}).to_string(),
+                                "",
+                            )
+                            .await;
                         }
                     }
                 });
                 let result = client(&url)
-                    .inline("s1", &"a".repeat(64), bytes::Bytes::from_static(b"abcdef"))
+                    .inline_batch(&[inline_upload("s1", b"abcdef")])
                     .await;
                 match index {
-                    0 => assert!(result.unwrap().published),
-                    2 | 5 => assert!(!result.unwrap().published),
+                    0 => assert!(result.unwrap()[0].published),
+                    2 | 5 => assert!(!result.unwrap()[0].published),
                     _ => {
                         let error = result.unwrap_err().to_string();
                         assert!(
@@ -702,6 +763,229 @@ pub(crate) mod tests {
             },
         ))
         .await;
+    }
+    fn inline_upload(id: &str, bytes: &'static [u8]) -> InlineUpload {
+        InlineUpload {
+            session_id: id.into(),
+            file_hash: "a".repeat(64),
+            bytes: bytes::Bytes::from_static(bytes),
+        }
+    }
+    #[tokio::test]
+    async fn inline_frames_preserve_allocations_and_budget_until_last_frame_drops() {
+        struct Owner(Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                let _ = &self.1;
+                &self.0
+            }
+        }
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+        let mut upload = inline_upload("s1", b"unused");
+        upload.bytes = bytes::Bytes::from_owner(Owner(
+            b"abcdef".to_vec(),
+            budget.clone().acquire_many_owned(6).await.unwrap(),
+        ));
+        let frames = inline_frames(&[&upload]).unwrap();
+        let replay = inline_frames(&[&upload]).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].as_ptr(), upload.bytes.as_ptr());
+        assert_eq!(replay[1].as_ptr(), upload.bytes.as_ptr());
+        let manifest_len = u32::from_be_bytes(frames[0][..4].try_into().unwrap()) as usize;
+        assert_eq!(manifest_len, frames[0].len() - 4);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frames[0][4..]).unwrap(),
+            json!({"uploads":[{"sessionId":"s1","fileHash":"a".repeat(64),"fileSize":6}]})
+        );
+        drop(upload);
+        drop(frames);
+        assert_eq!(budget.available_permits(), 0);
+        drop(replay);
+        assert_eq!(budget.available_permits(), 6);
+    }
+    #[tokio::test]
+    async fn inline_batch_replays_lost_ack_then_only_transient_items_in_original_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for step in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, body) = read(&mut socket).await;
+                assert!(headers.starts_with("POST /_api/v1/uploads/inline/batch "));
+                bodies.push(body);
+                match step {
+                    0 => (), // All published bytes may have arrived; acknowledgement lost.
+                    1 => {
+                        reply(
+                            &mut socket,
+                            200,
+                            &json!({"results":[
+                                {"sessionId":"ok","published":true},
+                                {"sessionId":"busy","status":503},
+                                {"sessionId":"bad","status":400},
+                                {"sessionId":"denied","status":403},
+                                {"sessionId":"full","status":507}
+                            ]})
+                            .to_string(),
+                            "",
+                        )
+                        .await
+                    }
+                    2 => reply(&mut socket, 503, "private", "").await,
+                    _ => {
+                        reply(
+                            &mut socket,
+                            200,
+                            r#"{"results":[{"sessionId":"busy","published":true}]}"#,
+                            "",
+                        )
+                        .await
+                    }
+                }
+            }
+            bodies
+        });
+        let uploads: Vec<_> = ["ok", "busy", "bad", "denied", "full"]
+            .into_iter()
+            .map(|id| inline_upload(id, b"abcdef"))
+            .collect();
+        let results = client.inline_batch(&uploads).await.unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ok", "busy", "bad", "denied", "full"]
+        );
+        assert!(results[0].published && results[1].published);
+        assert_eq!(
+            results[2..]
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>(),
+            [Some(400), Some(403), Some(507)]
+        );
+        let bodies = server.await.unwrap();
+        assert_eq!(
+            bodies[0],
+            inline_frames(&uploads.iter().collect::<Vec<_>>())
+                .unwrap()
+                .concat()
+        );
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[2], inline_frames(&[&uploads[1]]).unwrap().concat());
+        assert_eq!(bodies[2], bodies[3]);
+    }
+    #[tokio::test]
+    async fn inline_batch_rejects_missing_extra_reordered_and_mismatched_results() {
+        for ids in [
+            vec!["s1"],
+            vec!["s1", "s2", "s3"],
+            vec!["s2", "s1"],
+            vec!["s1", "wrong"],
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = client(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read(&mut socket).await;
+                reply(&mut socket, 200, &json!({"results": ids.into_iter().map(|id| json!({"sessionId":id,"published":true})).collect::<Vec<_>>()} ).to_string(), "").await;
+            });
+            let error = client
+                .inline_batch(&[inline_upload("s1", b"a"), inline_upload("s2", b"bc")])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("response count or order"));
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn inline_batch_validates_bounds_before_sending() {
+        let client = client("http://127.0.0.1:1");
+        for uploads in [
+            vec![],
+            (0..9)
+                .map(|id| inline_upload(&format!("s{id}"), b"a"))
+                .collect(),
+            vec![inline_upload("s1", b"")],
+            vec![inline_upload("s1", b"a"), inline_upload("s1", b"b")],
+        ] {
+            assert!(
+                client
+                    .inline_batch(&uploads)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid")
+            );
+        }
+        let mut upload = inline_upload("s1", b"a");
+        upload.bytes = bytes::Bytes::from(vec![0; 1024 * 1024 + 1]);
+        assert!(
+            client
+                .inline_batch(&[upload])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+        let upload = inline_upload(&"s".repeat(16 * 1024), b"a");
+        assert!(
+            client
+                .inline_batch(&[upload])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("manifest exceeds")
+        );
+    }
+    #[tokio::test]
+    async fn inline_batcher_sends_full_batches_and_flushes_the_tail() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut sizes = Vec::new();
+            let mut received = 0;
+            while received < 19 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, body) = read(&mut socket).await;
+                assert!(headers.starts_with("POST /_api/v1/uploads/inline/batch "));
+                assert!(!headers.to_ascii_lowercase().contains("transfer-encoding"));
+                let length = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+                let manifest: Value = serde_json::from_slice(&body[4..4 + length]).unwrap();
+                let uploads = manifest["uploads"].as_array().unwrap();
+                sizes.push(uploads.len());
+                received += uploads.len();
+                let mut offset = 4 + length;
+                for upload in uploads {
+                    let size = upload["fileSize"].as_u64().unwrap() as usize;
+                    assert_eq!(&body[offset..offset + size], b"abcdef");
+                    offset += size;
+                }
+                assert_eq!(offset, body.len());
+                reply(&mut socket, 200, &json!({"results":uploads.iter().map(|upload| json!({"sessionId":upload["sessionId"],"published":true})).collect::<Vec<_>>()} ).to_string(), "").await;
+            }
+            sizes
+        });
+        let batch = crate::batch::Batcher::new(8, 3, Duration::from_millis(10), move |uploads| {
+            let client = client.clone();
+            async move { client.inline_batch(&uploads).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let results = futures_util::future::join_all(
+                (0..19).map(|index| batch.request(inline_upload(&format!("s{index}"), b"abcdef"))),
+            )
+            .await;
+            for (index, row) in results.into_iter().enumerate() {
+                let row = row.unwrap();
+                assert_eq!(row.session_id, format!("s{index}"));
+                assert!(row.published);
+            }
+            assert_eq!(server.await.unwrap(), [8, 8, 3]);
+        })
+        .await
+        .expect("full batches and an independent tail must make progress");
     }
     #[tokio::test]
     async fn stream_wire_contract_retries_exact_bytes_and_only_supplied_headers() {

@@ -71,6 +71,7 @@ function apiTemplate(pathname: string): string | undefined {
 	if (/^\/_api\/v1\/go\/[^/]+\/[^/]+\/v1\/actions\/[a-f0-9]{64}$/.test(pathname)) {
 		return API + "go/:org/:cache/v1/actions/:action";
 	}
+	if (pathname === API + "uploads/inline/batch") return pathname;
 	if (pathname === API + "uploads/parts" || pathname === API + "uploads/finalize") return pathname;
 	const segments = pathname.slice(API.length).split("/");
 	const template = segments

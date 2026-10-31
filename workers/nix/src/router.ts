@@ -1,10 +1,12 @@
 import type { WorkerConfig } from "@snowstead/cache-core/config";
-import { cacheHasNar, findCacheByPath, recordBandwidth } from "@snowstead/cache-core/db/repository";
+import { cacheHasNar, findCacheByPath, findPublishedPathWithBlob, recordBandwidth } from "@snowstead/cache-core/db/repository";
+import type { CacheAt } from "@snowstead/cache-core/db/repository";
+import { signingKeyFor } from "@snowstead/cache-core/cache-keys";
 import { OrgSlug, cachePath, splitReadPath, DEFAULT_ORG_SLUG } from "@snowstead/cache-core/cache-path";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
 import { errorForLog } from "@snowstead/cache-core/logging";
-import { narinfoCacheKey, privateCacheBase } from "@snowstead/cache-core/narinfo";
+import { narinfoCacheKey, privateCacheBase, signedNarinfo } from "@snowstead/cache-core/narinfo";
 import { bucketFor, narKey, narinfoKey, NARINFO_CACHE_CONTROL } from "@snowstead/cache-core/layout";
 import { actorId, authenticateWrite, authorizeRead } from "@snowstead/cache-core/auth";
 import { privateCache } from "@snowstead/cache-core/visibility";
@@ -21,6 +23,7 @@ import {
 	handleReserveUploadPartsBatch,
 	handleFinalizeUploadStreams,
 	handleInlineUpload,
+	handleInlineUploadBatch,
 	handleAbortUploadStream,
 } from "./uploads.js";
 
@@ -128,7 +131,7 @@ export async function handleRequest(
 
 	if (rest[0]?.endsWith(".narinfo") && rest.length === 1) {
 		const hashStr = rest[0].slice(0, -".narinfo".length);
-		const response = await handleNarinfo(config, path, hashStr, method, request, scope?.gen);
+		const response = await handleNarinfo(config, cache, hashStr, method, request, scope?.gen);
 		if (response.status === 200 || response.status === 204) recordNixAccess(config, cache.id, hashStr);
 		return response;
 	}
@@ -198,13 +201,14 @@ function narinfoForClient(response: Response, isPrivate: boolean, request: Reque
 
 async function handleNarinfo(
 	config: WorkerConfig,
-	cachePath: string,
+	cacheAt: CacheAt,
 	hashStr: string,
 	method: string,
 	request: Request,
 	privateGen: number | string | undefined,
 ): Promise<Response> {
 	const isPrivate = privateGen !== undefined;
+	const cachePath = cacheAt.path;
 	const storePathHash = valueOf(StorePathHash, hashStr);
 	if (storePathHash === undefined) {
 		return new Response("Not Found", { status: 404 });
@@ -222,14 +226,37 @@ async function handleNarinfo(
 		return narinfoForClient(cached, isPrivate, request);
 	}
 
-	// The narinfo was rendered and signed at publish. An unknown cache and an
-	// unpublished path are both a missing object: a (negatively cached) 404.
-	const bucket = bucketFor(config, isPrivate);
-	const key = narinfoKey(cachePath, storePathHash, isPrivate);
-	// A cold HEAD needs only metadata. Do not download, decode, and cache a
-	// body merely to throw it away (nor populate the GET cache with no body).
-	const object = await (method === "HEAD" ? bucket.head(key) : bucket.get(key));
-	if (!object) {
+	let response: Response | undefined;
+	if (isPrivate) {
+		// Publication is the SQL commit, not a second R2 metadata write. Old
+		// stored private narinfo is deliberately ignored, including orphans.
+		const published = await findPublishedPathWithBlob(config.db, cacheAt.id, storePathHash);
+		if (published) {
+			const body = await signedNarinfo(await signingKeyFor(config, cacheAt), published.path, published.blob, true, cachePath);
+			const bytes = new TextEncoder().encode(body);
+			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+			const etag = [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+			response = new Response(body, { headers: {
+				"content-type": "text/x-nix-narinfo", "content-length": String(bytes.length),
+				"cache-control": NARINFO_CACHE_CONTROL, "etag": `"${etag}"`,
+				// No Last-Modified: a signing-key change can alter this representation
+				// without changing the published path's creation timestamp.
+			} });
+		}
+	} else {
+		const key = narinfoKey(cachePath, storePathHash, false);
+		// Public HEAD still reads only R2 metadata and never populates a GET
+		// cache entry with an empty body.
+		const object = await (method === "HEAD" ? config.publicBucket.head(key) : config.publicBucket.get(key));
+		if (object) response = new Response(method === "HEAD" ? null : (object as R2ObjectBody).body, {
+			headers: {
+				"content-type": "text/x-nix-narinfo", "content-length": String(object.size),
+				"cache-control": NARINFO_CACHE_CONTROL, "etag": object.httpEtag,
+				"last-modified": object.uploaded.toUTCString(),
+			},
+		});
+	}
+	if (!response) {
 		const notFound = () =>
 			new Response("Not Found", { status: 404, headers: { "cache-control": `public, max-age=${NARINFO_NEGATIVE_TTL_SECONDS}` } });
 		if (config.ctx) {
@@ -240,16 +267,7 @@ async function handleNarinfo(
 		return forClient(notFound(), isPrivate, method);
 	}
 
-	const response = new Response(method === "HEAD" ? null : (object as R2ObjectBody).body, {
-		headers: {
-			"content-type": "text/x-nix-narinfo",
-			"content-length": String(object.size),
-			"cache-control": NARINFO_CACHE_CONTROL,
-			"etag": object.httpEtag,
-			"last-modified": object.uploaded.toUTCString(),
-		},
-	});
-	if (config.ctx && method !== "HEAD") {
+	if (config.ctx && (isPrivate || method !== "HEAD")) {
 		config.ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	}
 	return narinfoForClient(response, isPrivate, request);
@@ -412,6 +430,12 @@ async function handleWriteApi(
 		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
 		const response = await handleFinalizeUploadStreams(request, config, identity, new URL(request.url).origin);
 		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"finalize-upload-streams"}', ip);
+		return response;
+	}
+	if (pathname === "/_api/v1/uploads/inline/batch") {
+		if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: { allow: "POST" } });
+		const response = await handleInlineUploadBatch(request, config, identity);
+		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"inline-upload-batch"}', ip);
 		return response;
 	}
 

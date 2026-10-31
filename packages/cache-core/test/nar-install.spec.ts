@@ -104,14 +104,16 @@ describe("verified canonical NAR installation", () => {
 	});
 
 	it.each([
-		["owner", false], ["size", false], ["hash", false],
-		["owner", true], ["size", true], ["hash", true],
-	])("rejects bad staged %s (canonical exists: %s)", async (fault, exists) => {
-		const f = await fixture();
+		["owner", false, 16], ["size", false, 16], ["hash", false, 16],
+		["owner", true, 16], ["size", true, 16], ["hash", true, 16],
+		["owner", false, 1024 ** 2 + 1], ["size", false, 1024 ** 2 + 1], ["hash", false, 1024 ** 2 + 1],
+		["owner", true, 1024 ** 2 + 1], ["size", true, 1024 ** 2 + 1], ["hash", true, 1024 ** 2 + 1],
+	] as const)("rejects bad staged %s (canonical exists: %s, bytes: %s)", async (fault, exists, size) => {
+		const f = await fixture(size);
 		if (exists) await env.PUBLIC_BUCKET.put(f.key, f.bytes, { customMetadata: { session: "canonical-owner" } });
 		const before = await env.PUBLIC_BUCKET.head(f.key);
 		await env.CACHE_BUCKET.put(f.sourceKey,
-			fault === "size" ? new Uint8Array(1) : fault === "hash" ? new Uint8Array(16) : f.bytes,
+			fault === "size" ? new Uint8Array(1) : fault === "hash" ? new Uint8Array(size) : f.bytes,
 			{ customMetadata: { session: fault === "owner" ? "someone-else" : f.session.id } });
 		expect((await installStagedNars(config(), [f.session])).get(f.session.id)).toBe(
 			fault === "owner" ? "Upload incomplete" : fault === "size" ? "File size mismatch" : "File hash mismatch",
@@ -182,8 +184,11 @@ describe("verified canonical NAR installation", () => {
 		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: before.version, customMetadata: { session: "old-owner" } });
 	});
 
-	it.each(["valid", "size", "hash"])("verifies and preserves a concurrent create-only canonical winner (%s)", async fault => {
-		const f = await fixture();
+	it.each([
+		["valid", 16], ["size", 16], ["hash", 16],
+		["valid", 1024 ** 2 + 1], ["size", 1024 ** 2 + 1], ["hash", 1024 ** 2 + 1],
+	] as const)("verifies and preserves a concurrent create-only canonical winner (%s, %s bytes)", async (fault, size) => {
+		const f = await fixture(size);
 		let winner: R2Object | undefined;
 		const publicBucket = bucket(env.PUBLIC_BUCKET, {
 			put: async (key, value, options) => {
@@ -199,6 +204,45 @@ describe("verified canonical NAR installation", () => {
 		expect(winner).toBeDefined();
 		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: winner!.version, customMetadata: { session: "old-owner" } });
 		expect(await gate(f.key)).toBeUndefined();
+	});
+
+	it("requires its own streamed proof even when a conditional PUT loses to a valid winner", async () => {
+		const f = await fixture(1024 ** 2 + 1);
+		await env.CACHE_BUCKET.put(f.sourceKey, new Uint8Array(f.bytes.length), { customMetadata: { session: f.session.id } });
+		const publicBucket = bucket(env.PUBLIC_BUCKET, {
+			put: async key => {
+				await env.PUBLIC_BUCKET.put(key, f.bytes, { customMetadata: { session: "winner" } });
+				return null;
+			},
+		});
+		expect((await installStagedNars(config({ publicBucket }), [f.session])).get(f.session.id)).toBe("File hash mismatch");
+		expect(await gate(f.key)).toBeUndefined();
+		expect((await env.PUBLIC_BUCKET.head(f.key))?.customMetadata).toEqual({ session: "winner" });
+	});
+
+	it.each(["retained", "replaced", "missing", "unreadable"])("retains a lost-ack streaming write gate when its source is %s", async source => {
+		const f = await fixture(1024 ** 2 + 1);
+		let failed = false;
+		const privateBucket = bucket(env.CACHE_BUCKET, {
+			get: async (key, options) => {
+				if (failed && source === "unreadable") throw new Error("Source read unavailable");
+				return env.CACHE_BUCKET.get(key, options);
+			},
+		});
+		const publicBucket = bucket(env.PUBLIC_BUCKET, {
+			put: async (key, value, options) => {
+				await env.PUBLIC_BUCKET.put(key, value, options);
+				if (source === "replaced") await env.CACHE_BUCKET.put(f.sourceKey, new Uint8Array(f.bytes.length), {
+					customMetadata: { session: f.session.id },
+				});
+				if (source === "missing") await env.CACHE_BUCKET.delete(f.sourceKey);
+				failed = true;
+				throw new Error("PUT acknowledgement lost");
+			},
+		});
+		expect((await installStagedNars(config({ bucket: privateBucket, publicBucket }), [f.session])).get(f.session.id)).toContain("retry");
+		expect(await gate(f.key)).toMatchObject({ sourceKey: f.sourceKey });
+		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
 	});
 
 	it.each([false, true])("recovers verified bytes after an ambiguous PUT without releasing its gate (inline: %s)", async inline => {

@@ -44,7 +44,108 @@ async function digest(bytes: Uint8Array) {
 	return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(n => n.toString(16).padStart(2, "0")).join("");
 }
 
+function inlineRequest(items: { sessionId: string; fileHash: string; bytes: Uint8Array; fileSize?: number }[], token = AUTH): Request {
+	const manifest = new TextEncoder().encode(JSON.stringify({ uploads: items.map(item => ({
+		sessionId: item.sessionId, fileHash: item.fileHash, fileSize: item.fileSize ?? item.bytes.length,
+	})) }));
+	const frame = new Uint8Array(4 + manifest.length + items.reduce((sum, item) => sum + item.bytes.length, 0));
+	new DataView(frame.buffer).setUint32(0, manifest.length);
+	frame.set(manifest, 4);
+	let offset = 4 + manifest.length;
+	for (const item of items) { frame.set(item.bytes, offset); offset += item.bytes.length; }
+	return new Request("http://example.com/_api/v1/uploads/inline/batch", {
+		method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/octet-stream", "content-length": String(frame.length) }, body: frame,
+	});
+}
+
 describe("streaming upload contract", () => {
+	it("publishes and replays eight distinct inline payloads in order without staging", async () => {
+		const cache = await createCache(db, `inline-batch-${crypto.randomUUID().slice(0, 8)}`);
+		const items = [];
+		for (let i = 0; i < 8; i++) {
+			const session = await stream(cache.name, AUTH, true, 1024 ** 2);
+			const bytes = new Uint8Array(1024 ** 2);
+			bytes[0] = i + 1; bytes[bytes.length - 1] = 193 - i;
+			items.push({ ...session, bytes, fileHash: await digest(bytes) });
+		}
+		const usage = await orgUsage(db, "default", new Date());
+		for (let replay = 0; replay < 2; replay++) {
+			const response = await SELF.fetch(inlineRequest(items));
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ results: items.map(item => ({ sessionId: item.sessionId, published: true })) });
+		}
+		for (const item of items) {
+			const session = (await findUploadSession(db, item.sessionId))!;
+			expect(session.status).toBe("completed");
+			expect(await env.CACHE_BUCKET.head(session.r2UploadKey!)).toBeNull();
+			const stored = (await env.PUBLIC_BUCKET.get(`nar/${item.fileHash}/zstd.nar`))!;
+			expect(stored.size).toBe(item.bytes.length);
+			expect(await digest(new Uint8Array(await stored.arrayBuffer()))).toBe(item.fileHash);
+			expect((await SELF.fetch(`http://example.com/${cache.name}/${item.hash}.narinfo`)).status).toBe(200);
+		}
+		expect(await orgUsage(db, "default", new Date())).toEqual({ used: usage.used + 8 * 1024 ** 2, pending: usage.pending });
+	});
+
+	it("rejects malformed batches and a bad final payload before sealing earlier items", async () => {
+		const cache = await createCache(db, `inline-frame-${crypto.randomUUID().slice(0, 8)}`);
+		const a = await stream(cache.name, AUTH, true);
+		const b = await stream(cache.name, AUTH, true);
+		const bytes = new Uint8Array([197, 14, 6]);
+		const fileHash = await digest(bytes);
+		const first = { sessionId: a.sessionId, fileHash, bytes };
+		const second = { sessionId: b.sessionId, fileHash, bytes: new Uint8Array([197, 14, 7]) };
+		for (const items of [
+			[], [first, first], Array.from({ length: 9 }, (_, i) => ({ ...first, sessionId: String(i) })),
+			[{ ...first, fileSize: 0 }], [{ ...first, fileSize: 1024 ** 2 + 1 }],
+			[{ ...first, fileSize: bytes.length + 1 }], [{ ...first, fileHash: "not-a-hash" }], [first, second],
+		]) expect((await SELF.fetch(inlineRequest(items))).status).toBe(400);
+		const valid = inlineRequest([first]);
+		const frame = new Uint8Array(await valid.arrayBuffer());
+		for (const [declared, prefix, expected] of [
+			[frame.length - 1, undefined, 400], [frame.length + 1, undefined, 400],
+			[8 * 1024 ** 2 + 16 * 1024 + 5, undefined, 413],
+			[frame.length, 0, 400], [frame.length, 16 * 1024 + 1, 400], [frame.length, 1, 400],
+		] as const) {
+			const body = frame.slice();
+			if (prefix !== undefined) new DataView(body.buffer).setUint32(0, prefix);
+			const headers = new Headers(valid.headers);
+			headers.set("content-length", String(declared));
+			const ctx = createExecutionContext();
+			expect((await nix.fetch(new Request(valid.url, { method: "POST", headers, body }), env, ctx)).status).toBe(expected);
+			await waitOnExecutionContext(ctx);
+		}
+		for (const session of [a, b]) {
+			expect((await findUploadSession(db, session.sessionId))?.status).toBe("streaming");
+			expect((await SELF.fetch(`http://example.com/${cache.name}/${session.hash}.narinfo`)).status).toBe(404);
+		}
+		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
+		expect(await (await SELF.fetch(inlineRequest([first]))).json()).toMatchObject({ results: [{ sessionId: a.sessionId, published: true }] });
+	});
+
+	it("returns ordered per-item authorization, missing-session, and multipart errors without blocking valid inline publication", async () => {
+		const cache = await createCache(db, `inline-allow-${crypto.randomUUID().slice(0, 8)}`);
+		const other = await createCache(db, `inline-deny-${crypto.randomUUID().slice(0, 8)}`);
+		const allowed = await stream(cache.name, AUTH, true);
+		const denied = await stream(other.name, AUTH, true);
+		const multipart = await stream(cache.name);
+		const token = await signJwt({ jti: crypto.randomUUID(), sub: "batch-auth", iss: TOKEN_ISSUER, aud: TOKEN_AUDIENCE,
+			caches: [cache.name], perms: ["push"], org: "default", iat: Math.floor(Date.now() / 1000) }, env.JWT_SECRET);
+		const items = await Promise.all([denied.sessionId, allowed.sessionId, "missing", multipart.sessionId].map(async (sessionId, i) => {
+			const bytes = new Uint8Array([201, i, 71]);
+			return { sessionId, bytes, fileHash: await digest(bytes) };
+		}));
+		expect(await (await SELF.fetch(inlineRequest(items, token))).json()).toMatchObject({ results: [
+			{ sessionId: denied.sessionId, published: false, status: 403 },
+			{ sessionId: allowed.sessionId, published: true },
+			{ sessionId: "missing", published: false, status: 404 },
+			{ sessionId: multipart.sessionId, published: false, status: 409 },
+		] });
+		for (const i of [0, 3]) {
+			expect((await findUploadSession(db, items[i].sessionId))?.status).toBe("streaming");
+			expect(await env.PUBLIC_BUCKET.head(`nar/${items[i].fileHash}/zstd.nar`)).toBeNull();
+		}
+	});
+
 	it.each([false, true])("publishes and replays inline bytes without a staged object (private: %s)", async isPrivate => {
 		const name = `inline-${crypto.randomUUID().slice(0, 8)}`;
 		expect((await SELF.fetch("http://example.com/_api/v1/orgs/default/caches", {

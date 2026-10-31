@@ -12,6 +12,7 @@ import {
 import { bucketFor, bucketForKey, bucketNameForKey, IMMUTABLE, narKey } from "./layout.js";
 import { isPrivateCache } from "./visibility.js";
 import { errorForLog } from "./logging.js";
+import { UploadTiming } from "./upload-timing.js";
 
 const SINGLE_PUT_MAX = 5 * 1024 ** 3 - 1024 ** 2;
 const OBJECT_MAX = 5 * 1024 ** 4;
@@ -26,6 +27,7 @@ const installations = new WeakMap<WorkerConfig, Promise<void>>();
 export async function installStagedNars(
 	config: WorkerConfig,
 	sessions: readonly (UploadSession & { fileHash: string; inlineBytes?: ArrayBuffer })[],
+	timing = new UploadTiming(),
 ): Promise<Map<string, string | undefined>> {
 	return serializeInstallations(config, async () => {
 		const results = new Map<string, string | undefined>();
@@ -49,7 +51,7 @@ export async function installStagedNars(
 				});
 			}
 		}
-		const installed = await installNars(config, jobs, true);
+		const installed = await installNars(config, jobs, true, timing);
 		for (const job of jobs) results.set(job.sessionId!, installed.get(job.operationId));
 		return results;
 	});
@@ -103,7 +105,7 @@ type Installation = {
 	terminal: boolean;
 };
 
-async function installNars(config: WorkerConfig, jobs: readonly Installation[], recoverExisting = false): Promise<Map<string, string | undefined>> {
+async function installNars(config: WorkerConfig, jobs: readonly Installation[], recoverExisting = false, timing = new UploadTiming()): Promise<Map<string, string | undefined>> {
 	const results = new Map<string, string | undefined>();
 	let pending = jobs.filter(job => {
 		if (Number.isSafeInteger(job.fileSize) && job.fileSize > 0 && job.fileSize <= OBJECT_MAX) return true;
@@ -120,10 +122,10 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[], 
 			else wave.set(job.key, job);
 		}
 		pending = next;
-		const admitted = new Set(await acquireNarInstallations(config.db, [...wave.values()].map(
+		const admitted = new Set(await timing.run("install_admit", () => acquireNarInstallations(config.db, [...wave.values()].map(
 			({ key, operationId, sourceKey, fileHash, compression, isPrivate, fileSize }) =>
 				({ key, operationId, sourceKey, fileHash, compression, isPrivate, fileSize }),
-		)));
+		))));
 		const ready: Installation[] = [];
 		try {
 			for (const job of wave.values()) {
@@ -133,30 +135,30 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[], 
 					results.set(job.operationId, INSTALLATION_BUSY);
 				} else ready.push(job);
 			}
-			await config.releaseDb();
+			await timing.run("install_release", () => config.releaseDb());
 			// At most four held source streams leave room for destination writes
 			// under the six-connection limit. Small transfers do not access SQL.
 			const small = ready.filter(job => job.fileSize <= SINGLE_PUT_MAX);
 			await Promise.all(Array.from({ length: Math.min(4, small.length) }, async () => {
 				for (let job = small.shift(); job; job = small.shift()) {
-					results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job) : recoverNar(config, job)));
+					results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job, timing) : recoverNar(config, job)));
 				}
 			}));
 			// Large copies register/fence their destination MPU in SQL. Run
 			// those phases only after all connection-free transfers settle.
 			for (const job of ready.filter(job => job.fileSize > SINGLE_PUT_MAX)) {
-				results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job) : recoverNar(config, job)));
+				results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job, timing) : recoverNar(config, job)));
 			}
 		} finally {
-			await finishNarInstallations(config.db, [...wave.values()].filter(job => admitted.has(job.operationId) && job.terminal),
-				source => bucketForKey(config, source).delete(source));
-			await config.releaseDb();
+			await timing.run("install_finish", () => finishNarInstallations(config.db, [...wave.values()].filter(job => admitted.has(job.operationId) && job.terminal),
+				source => bucketForKey(config, source).delete(source)));
+			await timing.run("install_finish_release", () => config.releaseDb());
 		}
 	}
 	return results;
 }
 
-async function transferNar(config: WorkerConfig, job: Installation): Promise<string | undefined> {
+async function transferNar(config: WorkerConfig, job: Installation, timing: UploadTiming): Promise<string | undefined> {
 	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate } = job;
 
 	const sourceBucket = bucketForKey(config, sourceKey);
@@ -164,15 +166,23 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 	let multipart: R2MultipartUpload | undefined;
 	let writeStarted = false;
 	let success = false;
+	let streamedSource: R2Object | undefined;
 	try {
-		const proof = await verifySource(config, job);
+		// A single PUT validates SHA-256 before committing. Keep the source
+		// version/owner/size checks, but avoid hashing then reading it again.
+		const checksumOnPut = fileSize > MIB && fileSize <= SINGLE_PUT_MAX;
+		const proof = await timing.run("source_verify", () => verifySource(config, job, !checksumOnPut));
 		if (typeof proof === "string") return proof;
 		const { source, verifiedBytes } = proof;
+		if (checksumOnPut && source) streamedSource = source;
 
 		// Small verified buffers can go straight to the checksum-checked,
 		// create-only PUT. A losing PUT still verifies the existing winner below.
 		const existing = verifiedBytes === undefined ? await destination.head(key) : null;
 		if (existing) {
+			// Reuse does not issue a checksum-validated write: the caller must
+			// still prove possession of its own complete staged version.
+			if (streamedSource && !(await verifies(sourceBucket, streamedSource, fileHash))) return "File hash mismatch";
 			if (existing.size !== fileSize) return "File size mismatch";
 			if (!(await verifies(destination, existing, fileHash))) return "File hash mismatch";
 			success = true;
@@ -180,18 +190,20 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 		}
 
 		if (fileSize <= SINGLE_PUT_MAX) {
-			const object = verifiedBytes === undefined ? await readSource(sourceBucket, source!) : undefined;
+			const object = verifiedBytes === undefined ? await timing.run("source_reopen", () => readSource(sourceBucket, source!)) : undefined;
 			const body = verifiedBytes ?? object?.body;
 			if (!body) return "Upload incomplete";
 			writeStarted = true;
-			const stored = await destination.put(key, body, {
+			const stored = await timing.run("canonical_put", () => destination.put(key, body, {
 				sha256: fileHash,
 				httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
 				onlyIf: { etagDoesNotMatch: "*" },
-			});
+			}).finally(async () => {
+				if (object && !object.bodyUsed) await object.body.cancel();
+			}));
 			writeStarted = false;
-			if (object && !object.bodyUsed) await object.body.cancel();
 			if (!stored) {
+				if (streamedSource && !(await verifies(sourceBucket, streamedSource, fileHash))) return "File hash mismatch";
 				const winner = await destination.head(key);
 				if (!winner || winner.size !== fileSize || !(await verifies(destination, winner, fileHash))) {
 					return "File hash mismatch";
@@ -225,6 +237,17 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 		return undefined;
 	} catch (error) {
 		console.error("NAR installation failed", { key, operationId }, errorForLog(error));
+		if (writeStarted && streamedSource) {
+			try {
+				const actual = await digestOf(sourceBucket, streamedSource);
+				if (actual !== undefined && actual !== fileHash) {
+					// This exact source version cannot pass the PUT's checksum.
+					// It cannot leave a late successful write, so release its gate.
+					writeStarted = false;
+					return "File hash mismatch";
+				}
+			} catch { /* An unreadable proof leaves the write ambiguous and pinned. */ }
+		}
 		return INSTALLATION_INCOMPLETE;
 	} finally {
 		// An ambiguous PUT/complete may still be running. Keep its durable
@@ -258,7 +281,7 @@ async function recoverNar(config: WorkerConfig, job: Installation): Promise<stri
 	}
 }
 
-async function verifySource(config: WorkerConfig, job: Installation): Promise<{
+async function verifySource(config: WorkerConfig, job: Installation, verifyHash = true): Promise<{
 	source: R2Object | null | undefined;
 	verifiedBytes: ArrayBuffer | undefined;
 } | string> {
@@ -280,7 +303,7 @@ async function verifySource(config: WorkerConfig, job: Installation): Promise<{
 			const digest = await crypto.subtle.digest("SHA-256", verifiedBytes);
 			const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 			if (hex !== fileHash) return "File hash mismatch";
-		} else if (!source || !(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
+		} else if (verifyHash && (!source || !(await verifies(sourceBucket, source, fileHash)))) return "File hash mismatch";
 		return { source, verifiedBytes };
 	} finally {
 		if (sourceBody && !sourceBody.bodyUsed) await sourceBody.body.cancel();
@@ -297,12 +320,16 @@ async function readSource(bucket: R2Bucket, source: R2Object): Promise<R2ObjectB
 
 /** Hash the entire object, not multipart/composite SHA-256 or its ETag. */
 async function verifies(bucket: R2Bucket, source: R2Object, fileHash: string): Promise<boolean> {
+	return await digestOf(bucket, source) === fileHash;
+}
+
+/** Undefined is an unavailable/replaced version, never proof of corrupt bytes. */
+async function digestOf(bucket: R2Bucket, source: R2Object): Promise<string | undefined> {
 	const object = await readSource(bucket, source);
-	if (!object) return false;
+	if (!object) return undefined;
 	const digest = new crypto.DigestStream("SHA-256");
 	await object.body.pipeTo(digest);
-	const hex = [...new Uint8Array(await digest.digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-	return hex === fileHash;
+	return [...new Uint8Array(await digest.digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function copyParts(

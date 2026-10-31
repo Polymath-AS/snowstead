@@ -510,6 +510,17 @@ export async function findPublishedPath(
 	);
 }
 
+/** A cache-scoped published representation, read in one statement. */
+export async function findPublishedPathWithBlob(
+	db: Db,
+	cacheId: number,
+	storePathHash: string,
+): Promise<{ path: PublishedPath; blob: BlobObject } | undefined> {
+	return first(db.select({ path: publishedPaths, blob: blobObjects }).from(publishedPaths)
+		.innerJoin(blobObjects, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.where(and(eq(publishedPaths.cacheId, cacheId), eq(publishedPaths.storePathHash, storePathHash))).limit(1));
+}
+
 export async function createPublishedPath(
 	db: Db,
 	params: {

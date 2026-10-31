@@ -21,7 +21,7 @@ import { installStagedNars, INSTALLATION_BUSY, INSTALLATION_INCOMPLETE } from "@
 import type { BlobObject, PublishedPath, UploadSession } from "@snowstead/cache-core/db/types";
 import type { CacheAt } from "@snowstead/cache-core/db/repository";
 import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
-import { storeNarinfo, narinfoCacheKey } from "@snowstead/cache-core/narinfo";
+import { storePublicNarinfo, narinfoCacheKey } from "@snowstead/cache-core/narinfo";
 import { scheduleNarinfoPurge } from "@snowstead/cache-core/cdn";
 import { bucketFor, narKey } from "@snowstead/cache-core/layout";
 import { createPresignedPartPut } from "@snowstead/cache-core/presign";
@@ -34,6 +34,7 @@ import { errorForLog } from "@snowstead/cache-core/logging";
 import { bridgeUploadStreams, streamSessionId, streamSessionOrg } from "@snowstead/cache-core/upload-stream";
 import type { StreamPart, StreamReceipt } from "@snowstead/cache-core/upload-stream";
 import { CapacityError, withOrgCapacity } from "@snowstead/cache-core/capacity";
+import { UploadTiming } from "@snowstead/cache-core/upload-timing";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
 // visibility don't change once it has paths. Its path does when its org's
@@ -265,6 +266,9 @@ async function publishSessions(
 					blobObjectId: current.find((b) => b.fileHash === session.fileHash && b.compression === session.compression)?.id ?? row.blobObjectId,
 				})));
 			}, { origin, afterAdmission: async () => {
+				// Private metadata becomes readable with the SQL commit. There is
+				// no external narinfo write to hold its org lock open for.
+				if (isPrivate) return;
 				// Admit before exposing narinfo, holding the org lock through its
 				// write so concurrent eviction cannot recreate a withdrawn path.
 				// Retries repair failed external writes from the published row.
@@ -275,7 +279,7 @@ async function publishSessions(
 					const path = known ?? rows.find(row => row.session.id === session.id);
 					const blob = known ? existingBlobs.find(blob => blob.id === known.blobObjectId) : blobFor(session.fileHash, session.compression);
 					if (!path || !blob) return;
-					try { await storeNarinfo(config, cache, path, blob, isPrivate); }
+					try { await storePublicNarinfo(config, cache, path, blob); }
 					catch (error) {
 						console.error("Failed to store narinfo", { sessionId: session.id }, errorForLog(error));
 						results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
@@ -403,6 +407,15 @@ export async function handleGetMissingPaths(
 }
 
 const MIB = 1024 ** 2;
+const MAX_INLINE_BATCH = 8;
+const MAX_INLINE_MANIFEST = 16 * 1024;
+const MAX_INLINE_FRAME = 4 + MAX_INLINE_MANIFEST + MAX_INLINE_BATCH * MIB;
+const InlineBatch = v.object({ uploads: v.pipe(v.array(v.object({
+	sessionId: v.pipe(v.string(), v.nonEmpty()),
+	fileHash: FileHash,
+	fileSize: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(MIB)),
+})), v.minLength(1), v.maxLength(MAX_INLINE_BATCH),
+v.check(uploads => new Set(uploads.map(u => u.sessionId)).size === uploads.length, "Duplicate sessions")) });
 const MAX_OBJECT_BYTES = 5 * 1024 ** 4;
 const StreamSize = v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(MAX_OBJECT_BYTES));
 const StreamPath = v.pipe(v.object({
@@ -672,15 +685,73 @@ export async function handleInlineUpload(
 	const response = await finalizeUploadStreams(config, identity, new URL(request.url).origin, { uploads: [{
 		sessionId, narHash: session.narHash, narSize: session.narSize, fileHash, fileSize: size,
 		parts: [{ partNumber: 1, etag: fileHash }],
-	}] }, new Map([[sessionId, session]]), bytes.buffer);
+	}] }, new Map([[sessionId, session]]), new Map([[sessionId, bytes.buffer]]));
 	const { results } = await response.json<{ results: PublishResult[] }>();
-	return jsonResponse(results[0]);
+	return jsonResponse(results[0], 200, { "server-timing": response.headers.get("server-timing") ?? "" });
+}
+
+/** A length-prefixed manifest followed by at most eight independent tiny NARs. */
+export async function handleInlineUploadBatch(
+	request: Request, config: WorkerConfig, identity: AuthIdentity,
+): Promise<Response> {
+	if (request.headers.get("content-type") !== "application/octet-stream") return errorResponse("Expected application/octet-stream", 415);
+	const length = request.headers.get("content-length");
+	if (length === null) return errorResponse("Content-Length required", 411);
+	const size = Number(length);
+	if (!Number.isSafeInteger(size) || size < 5) return errorResponse("Invalid Content-Length", 400);
+	if (size > MAX_INLINE_FRAME) return errorResponse("Inline batch too large", 413);
+	if (!request.body) return errorResponse("Upload body required", 400);
+	// Bound the actual stream too: a declared length is not a memory limit.
+	const frame = new Uint8Array(size);
+	let offset = 0;
+	try {
+		await request.body.pipeTo(new WritableStream<Uint8Array>({
+			write(chunk) {
+				if (offset + chunk.byteLength > size) throw new Error("Frame size mismatch");
+				frame.set(chunk, offset);
+				offset += chunk.byteLength;
+			},
+		}));
+	} catch { return errorResponse("Frame size mismatch", 400); }
+	if (offset !== size) return errorResponse("Frame size mismatch", 400);
+	const manifestSize = new DataView(frame.buffer).getUint32(0);
+	if (manifestSize < 1 || manifestSize > MAX_INLINE_MANIFEST || 4 + manifestSize >= size) return errorResponse("Invalid inline manifest length", 400);
+	let manifest: unknown;
+	try {
+		manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(frame.subarray(4, 4 + manifestSize)));
+	} catch { return errorResponse("Invalid inline manifest", 400); }
+	const parsed = v.safeParse(InlineBatch, manifest);
+	if (!parsed.success) return errorResponse("Invalid inline manifest", 400);
+	const inputs = parsed.output.uploads;
+	if (4 + manifestSize + inputs.reduce((sum, input) => sum + input.fileSize, 0) !== size) return errorResponse("Frame size mismatch", 400);
+	// Validate every payload before sealing any receipt or writing any object.
+	// The frame and these per-item buffers together are bounded to about 16 MiB.
+	const inlineBytes = new Map<string, ArrayBuffer>();
+	offset = 4 + manifestSize;
+	for (const input of inputs) {
+		const bytes = frame.slice(offset, offset + input.fileSize);
+		offset += input.fileSize;
+		const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+		if (hash !== input.fileHash) return errorResponse("File hash mismatch", 400);
+		inlineBytes.set(input.sessionId, bytes.buffer);
+	}
+	const loaded = await loadUploadSessions(config, inputs.map(input => input.sessionId));
+	const uploads = inputs.flatMap(input => {
+		const session = loaded.get(input.sessionId);
+		return session ? [{ ...input, narHash: session.narHash, narSize: session.narSize, parts: [{ partNumber: 1, etag: input.fileHash }] }] : [];
+	});
+	const response = await finalizeUploadStreams(config, identity, new URL(request.url).origin, { uploads }, loaded, inlineBytes);
+	const { results } = await response.json<{ results: PublishResult[] }>();
+	const byId = new Map(results.map(result => [result.sessionId, result]));
+	return jsonResponse({ results: inputs.map(({ sessionId }) => byId.get(sessionId) ?? { sessionId, published: false, error: "Not found", status: 404 }) }, 200,
+		{ "server-timing": response.headers.get("server-timing") ?? "" });
 }
 
 async function finalizeUploadStreams(
 	config: WorkerConfig, identity: AuthIdentity, origin: string,
-	body: { uploads: StreamReceipt[] }, loaded: Map<string, UploadSession>, inlineBytes?: ArrayBuffer,
+	body: { uploads: StreamReceipt[] }, loaded: Map<string, UploadSession>, inlineBytes?: ReadonlyMap<string, ArrayBuffer>,
 ): Promise<Response> {
+	const timing = new UploadTiming();
 	const results = new Map<string, PublishResult | { sessionId: string; published: false; error: string; status: number }>();
 	const usable: HashedSession[] = [];
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, published: false, error, status });
@@ -694,7 +765,8 @@ async function finalizeUploadStreams(
 				fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
 				continue;
 			}
-			if (session.partSize === null || (session.r2UploadId === null) !== (inlineBytes !== undefined)) {
+			const inline = inlineBytes?.has(sessionId) ?? false;
+			if (session.partSize === null || (session.r2UploadId === null) !== inline || (inline && (session.partSize !== MIB || session.narSize > MIB))) {
 				fail(sessionId, "Conflict", 409);
 				continue;
 			}
@@ -712,16 +784,16 @@ async function finalizeUploadStreams(
 		for (const org of orgs) {
 			const batch = authorized.filter(u => streamSessionOrg(u.sessionId) === org);
 			const coordinator = config.uploadCoordinator.getByName(org, { locationHint: "weur" });
-			const local = inlineBytes === undefined ? await coordinator.sealStreams(batch) : await coordinator.sealInlineStreams(batch);
+			const local = await timing.run("seal", () => inlineBytes === undefined ? coordinator.sealStreams(batch) : coordinator.sealInlineStreams(batch));
 			const ready: { session: UploadSession; parts: StreamPart[] }[] = [];
 			for (const [id, result] of local) {
 				if ("error" in result) sealed.set(id, result);
 				else { ready.push(result); sealed.set(id, result.session); }
 			}
 			// SQL may already have committed publication before the DO saw its ack.
-			for (const [id, session] of await bridgeUploadStreams(config.db, ready)) sealed.set(id, session);
+			for (const [id, session] of await timing.run("bridge", () => bridgeUploadStreams(config.db, ready))) sealed.set(id, session);
 		}
-		await config.releaseDb();
+		await timing.run("bridge_release", () => config.releaseDb());
 		const pending: (HashedSession & { inlineBytes?: ArrayBuffer })[] = [];
 		const uploads = authorized.values();
 		await Promise.all(Array.from({ length: Math.min(4, authorized.length) }, async () => {
@@ -736,12 +808,13 @@ async function finalizeUploadStreams(
 					usable.push(session);
 					continue;
 				}
-				if (inlineBytes !== undefined) {
-					pending.push({ ...session, inlineBytes });
+				const bytes = inlineBytes?.get(session.id);
+				if (bytes !== undefined) {
+					pending.push({ ...session, inlineBytes: bytes });
 					continue;
 				}
 				try {
-					const error = await assembleStaged(config, session, upload.parts);
+					const error = await timing.run("assemble", () => assembleStaged(config, session, upload.parts));
 					if (error) fail(session.id, error, 400);
 					else pending.push(session);
 				} catch (error) {
@@ -750,7 +823,7 @@ async function finalizeUploadStreams(
 				}
 			}
 		}));
-		const installed = await installStagedNars(config, pending);
+		const installed = await timing.run("install", () => installStagedNars(config, pending, timing));
 		for (const session of pending) {
 			const error = installed.get(session.id);
 			if (error) fail(session.id, error, error === INSTALLATION_BUSY || error === INSTALLATION_INCOMPLETE ? 503 : 400);
@@ -766,27 +839,27 @@ async function finalizeUploadStreams(
 		try {
 			// Publish together before releasing reservations, retaining the
 			// batched protocol's database savings for small store paths.
-			const published = await publishSessions(config, cacheId, sessions, origin);
+			const published = await timing.run("publish", () => publishSessions(config, cacheId, sessions, origin));
 			for (const result of published) results.set(result.sessionId, result);
 			const publishedSessions = sessions.filter(s => {
 				const result = results.get(s.id);
 				return result && !("error" in result);
 			});
 			const successful = publishedSessions.filter(s => s.status !== "completed");
-			const completed = new Set(await completeUploadSessions(config.db, successful));
+			const completed = new Set(await timing.run("sql_complete", () => completeUploadSessions(config.db, successful)));
 			// Another retry may have completed the same sealed session meanwhile.
 			const raced = successful.filter(s => !completed.has(s.id));
 			const current = new Map((await findUploadSessions(config.db, raced.map(s => s.id))).map(s => [s.id, s]));
 			for (const session of raced) if (current.get(session.id)?.status !== "completed") fail(session.id, "Conflict", 409);
 			const org = sessions.map(s => streamSessionOrg(s.id)).find(org => org !== undefined);
-			if (org) await config.uploadCoordinator.getByName(org, { locationHint: "weur" })
-				.completeStreams(publishedSessions.filter(s => streamSessionOrg(s.id) === org && !("error" in results.get(s.id)!)).map(s => s.id));
+			if (org) await timing.run("coordinator_complete", () => config.uploadCoordinator.getByName(org, { locationHint: "weur" })
+				.completeStreams(publishedSessions.filter(s => streamSessionOrg(s.id) === org && !("error" in results.get(s.id)!)).map(s => s.id)));
 		} catch (error) {
 			console.error("Failed to publish upload streams", { cacheId }, errorForLog(error));
 			for (const session of sessions) fail(session.id, "Internal error", 500);
 		}
 	}
-	return jsonResponse({ results: body.uploads.map(u => results.get(u.sessionId)) });
+	return jsonResponse({ results: body.uploads.map(u => results.get(u.sessionId)) }, 200, { "server-timing": timing.header() });
 }
 
 export async function handleAbortUploadStream(
