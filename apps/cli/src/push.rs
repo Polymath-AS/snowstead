@@ -149,44 +149,63 @@ pub async fn push(
     let large_threads = cpu.saturating_sub(1).min(4) as i32;
     let compression = Arc::new(Semaphore::new(cpu));
     let parts = Arc::new(Semaphore::new(16));
-    // Negotiate first so one global byte semaphore can enforce the exact
-    // max(64 MiB, largest part) budget even with mixed-size sessions.
-    let mut sessions = Vec::with_capacity(ordered.len());
-    let mut largest = 64 * 1024 * 1024;
-    for chunk in ordered.chunks(100) {
-        let specs: Vec<_> = chunk
-            .iter()
-            .map(|info| SessionParams {
-                store_path: info.store_path.clone(),
-                store_path_hash: info.store_path_hash.clone(),
-                nar_hash: info.nar_hash.clone(),
-                nar_size: info.nar_size,
-                compression: "zstd".into(),
-                references: info.references.clone(),
-                deriver: info.deriver.clone(),
-            })
-            .collect();
-        let rows = client.create_sessions(cache, &specs).await?;
-        let count = rows.len();
-        for session in rows {
-            let guard = AbortGuard::new(client.clone(), session.session_id.clone());
-            sessions.push((session, guard));
-        }
-        if count != chunk.len() {
-            bail!("API batch response length differs from request");
-        }
-    }
-    for (session, _) in &sessions {
-        if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
-            bail!("invalid multipart part size");
-        }
-        largest = largest.max(session.part_size as usize);
-    }
-    let buffers = Arc::new(Semaphore::new(largest));
-    let session_ids: Vec<_> = sessions
-        .iter()
-        .map(|(session, _)| session.session_id.clone())
-        .collect();
+    // Negotiate at most one batch ahead of the active jobs. Growing the shared
+    // byte budget only when a larger part is negotiated preserves the global
+    // max(64 MiB, largest part) bound without delaying all transfers first.
+    let buffers = Arc::new(Semaphore::new(64 * 1024 * 1024));
+    let session_ids = std::sync::Mutex::new(Vec::new());
+    let pending = ordered.into_iter().zip(outcomes);
+    let sessions = futures_util::stream::try_unfold(
+        (pending, 64 * 1024 * 1024usize),
+        |(mut pending, mut largest)| {
+            let buffers = &buffers;
+            let session_ids = &session_ids;
+            async move {
+                let chunk: Vec<_> = pending.by_ref().take(100).collect();
+                if chunk.is_empty() {
+                    return Ok::<_, anyhow::Error>(None);
+                }
+                let specs: Vec<_> = chunk
+                    .iter()
+                    .map(|(info, _)| SessionParams {
+                        store_path: info.store_path.clone(),
+                        store_path_hash: info.store_path_hash.clone(),
+                        nar_hash: info.nar_hash.clone(),
+                        nar_size: info.nar_size,
+                        compression: "zstd".into(),
+                        references: info.references.clone(),
+                        deriver: info.deriver.clone(),
+                    })
+                    .collect();
+                let rows = client.create_sessions(cache, &specs).await?;
+                // Guard every returned session before validating the response.
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|session| {
+                        let guard = AbortGuard::new(client.clone(), session.session_id.clone());
+                        session_ids.lock().unwrap().push(session.session_id.clone());
+                        (session, guard)
+                    })
+                    .collect();
+                if rows.len() != chunk.len() {
+                    bail!("API batch response length differs from request");
+                }
+                for (session, _) in &rows {
+                    if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
+                        bail!("invalid multipart part size");
+                    }
+                    let next = largest.max(session.part_size as usize);
+                    buffers.add_permits(next - largest);
+                    largest = next;
+                }
+                let batch = futures_util::stream::iter(
+                    chunk.into_iter().zip(rows).map(Ok::<_, anyhow::Error>),
+                );
+                Ok(Some((batch, (pending, largest))))
+            }
+        },
+    )
+    .try_flatten();
     let reserve_client = client.clone();
     let reservations = Batcher::new(
         jobs.min(16),
@@ -205,8 +224,8 @@ pub async fn push(
             async move { client.finalize(&uploads).await }
         },
     );
-    let mut work = futures_util::stream::iter(ordered.into_iter().zip(sessions).zip(outcomes).map(
-        |((info, (session, mut guard)), outcome)| {
+    let work = sessions
+        .map_ok(|((info, outcome), (session, mut guard))| {
             let compression = compression.clone();
             let parts = parts.clone();
             let buffers = buffers.clone();
@@ -297,31 +316,36 @@ pub async fn push(
                 if result.is_err() {
                     guard.abort().await;
                 }
-                (path, result)
+                Ok((path, result))
             }
             .instrument(span)
-        },
-    ))
-    .buffer_unordered(jobs);
+        })
+        .try_buffer_unordered(jobs);
+    let mut work = Box::pin(work);
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     loop {
         let next = tokio::select! {
             next = work.next() => next,
-            _ = &mut interrupt => {
-                // Closing receivers wakes both channel-blocked and byte-budget-
-                // blocked native workers. Give abort requests a bounded grace
-                // period before the CLI tears down its runtime. Guard drops may
-                // also abort: the endpoint is deliberately idempotent.
-                drop(work);
-                let cleanup = futures_util::stream::iter(session_ids.iter().map(|id| client.abort(id)))
-                    .buffer_unordered(16).collect::<Vec<_>>();
-                let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
-                bail!("upload cancelled");
-            }
+            _ = &mut interrupt => Some(Err(anyhow::anyhow!("upload cancelled"))),
         };
-        let Some((path, result)) = next else {
-            break;
+        let (path, result) = match next {
+            None => break,
+            Some(Ok(result)) => result,
+            Some(Err(error)) => {
+                // Closing receivers wakes both channel-blocked and byte-budget-
+                // blocked native workers on cancellation or negotiation failure.
+                // Give abort requests a bounded grace period before runtime
+                // teardown. Guard drops also abort; the endpoint is idempotent.
+                drop(work);
+                let session_ids = session_ids.lock().unwrap().clone();
+                let cleanup =
+                    futures_util::stream::iter(session_ids.iter().map(|id| client.abort(id)))
+                        .buffer_unordered(16)
+                        .collect::<Vec<_>>();
+                let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
+                return Err(error);
+            }
         };
         match result {
             Ok(()) => summary.pushed += 1,

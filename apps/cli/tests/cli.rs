@@ -478,3 +478,193 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
     server.join().unwrap();
     assert!(!home.path().join("no-spooling-here").exists());
 }
+
+#[test]
+fn push_uploads_before_delayed_session_creation_finishes() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Resolve a real shell executable, rather than guessing from PATH's store
+    // basenames: dev shells can include derivations and stale entries there.
+    // This also works in Nix's read-only build sandbox without store writes.
+    let root = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .flat_map(|dir| [dir.join("bash"), dir.join("sh")])
+        .filter_map(|shell| std::fs::canonicalize(shell).ok())
+        .filter(|shell| shell.is_file())
+        .find_map(|shell| {
+            let shell = shell.to_str()?.strip_prefix("/nix/store/")?;
+            let basename = shell.split('/').next()?;
+            let root = format!("/nix/store/{basename}");
+            (!basename.ends_with(".drv") && std::path::Path::new(&root).is_dir()).then_some(root)
+        })
+        .expect("run inside nix develop so PATH contains a shell in a real store output");
+    let nar = Command::new("nix-store")
+        .args(["--dump", &root])
+        .output()
+        .unwrap();
+    assert!(nar.status.success());
+    let mut paths = vec![root.clone()];
+    paths.extend((0..100).map(|i| format!("/nix/store/{i:032}-snowstead-absent-session-fixture")));
+    let nar_hash = format!("sha256:{}", hex::encode(Sha256::digest(&nar.stdout)));
+    let mut metadata = serde_json::Map::new();
+    for (i, path) in paths.iter().enumerate() {
+        metadata.insert(
+            path.clone(),
+            json!({
+                "narHash": nar_hash,
+                // Ensure the real output sorts first, regardless of its size.
+                "narSize": nar.stdout.len() + usize::from(i != 0), "references": []
+            }),
+        );
+    }
+    let nix = bin.join("nix");
+    std::fs::write(
+        &nix,
+        format!(
+            "#!/bin/sh\ncat <<'METADATA'\n{}\nMETADATA\n",
+            Value::Object(metadata)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let uploaded = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let missing: Vec<_> = paths.iter().map(|p| p[11..43].to_owned()).collect();
+    let server = thread::spawn({
+        let (stop, uploaded, batches, published, url) = (
+            stop.clone(),
+            uploaded.clone(),
+            batches.clone(),
+            published.clone(),
+            url.clone(),
+        );
+        move || {
+            let mut handlers = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                let (uploaded, batches, published, url, missing) = (
+                    uploaded.clone(),
+                    batches.clone(),
+                    published.clone(),
+                    url.clone(),
+                    missing.clone(),
+                );
+                handlers.push(thread::spawn(move || {
+                    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length: usize = headers.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).unwrap();
+                    let response = if headers.starts_with("PUT /part ") {
+                        assert!(!headers.contains(TOKEN), "signed PUT must not carry API credentials");
+                        assert!(!body.is_empty());
+                        *uploaded.0.lock().unwrap() += 1;
+                        uploaded.1.notify_all();
+                        json!({})
+                    } else {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        if headers.starts_with("POST /_api/v1/get-missing-paths ") {
+                            json!({"missing": missing})
+                        } else if headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch ") {
+                            let count = body["paths"].as_array().unwrap().len();
+                            let index = {
+                                let mut batches = batches.lock().unwrap();
+                                batches.push(count);
+                                batches.len()
+                            };
+                            if index == 2 {
+                                // Do not finish creation until a real upload arrives.
+                                // The old all-sessions-first pipeline hits this timeout.
+                                let (count, timeout) = uploaded.1.wait_timeout_while(
+                                    uploaded.0.lock().unwrap(), Duration::from_secs(5), |n| *n == 0,
+                                ).unwrap();
+                                assert!(!timeout.timed_out() && *count > 0,
+                                    "all-session creation blocked the first upload");
+                            }
+                            json!({"sessions": body["paths"].as_array().unwrap().iter().map(|p|
+                                json!({"sessionId":p["storePathHash"], "partSize":8388608})
+                            ).collect::<Vec<_>>()})
+                        } else if headers.starts_with("POST /_api/v1/uploads/parts ") {
+                            json!({"results":body["uploads"].as_array().unwrap().iter().map(|u|
+                                json!({"sessionId":u["sessionId"], "parts":u["parts"].as_array().unwrap().iter().map(|p|
+                                    json!({"partNumber":p["partNumber"], "url":format!("{url}/part"), "headers":{}})
+                                ).collect::<Vec<_>>()})
+                            ).collect::<Vec<_>>()})
+                        } else if headers.lines().next().unwrap().ends_with("/abort HTTP/1.1") {
+                            json!({})
+                        } else {
+                            assert!(headers.starts_with("POST /_api/v1/uploads/finalize "));
+                            json!({"results":body["uploads"].as_array().unwrap().iter().map(|u| {
+                                assert!(published.lock().unwrap().insert(u["sessionId"].as_str().unwrap().to_owned()));
+                                json!({"sessionId":u["sessionId"], "published":true})
+                            }).collect::<Vec<_>>()})
+                        }
+                    };
+                    let body = response.to_string();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        }
+    });
+    let mut executable_paths = vec![bin];
+    executable_paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+        .env("HOME", home.path())
+        .env("PATH", std::env::join_paths(executable_paths).unwrap())
+        .env("SNOWSTEAD_URL", url)
+        .env("SNOWSTEAD_TOKEN", TOKEN)
+        .args(["push", "main", "--no-deps", "--jobs", "32"])
+        .args(&paths)
+        .output()
+        .unwrap();
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    assert!(
+        !result.status.success(),
+        "the absent fixtures must fail encoding"
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("1 pushed") && stdout.contains("100 failed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(*batches.lock().unwrap(), [100, 1]);
+    assert!(*uploaded.0.lock().unwrap() > 0);
+    assert_eq!(published.lock().unwrap().len(), 1);
+}
