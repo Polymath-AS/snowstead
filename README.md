@@ -30,6 +30,12 @@ reads and writes belong to the private Go Worker.
 The isolated [Go prototype](workers/go-cache/README.md) and its Terraform build
 gate remain disposable local benchmarks, not the hosted named-cache API.
 
+The [control-plane API](docs.md#cache-policy-api) exposes token last-use times,
+cross-product eviction candidates and 30-day history, named Nix closure pins,
+and a whole-cache eviction that keeps settings and credentials. Apply migration
+`0010` after the compiler-cache migration `0009` before deploying these endpoints.
+These features are API-only; they do not add dashboard or CLI commands.
+
 ## Workspace
 
 ```

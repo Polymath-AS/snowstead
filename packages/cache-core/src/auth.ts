@@ -5,6 +5,16 @@ import { privateCache } from "./visibility.js";
 import { isRevoked } from "./revocations.js";
 import { findOrgApiKey } from "./db/repository.js";
 import { errorResponse } from "./responses.js";
+import { and, eq, isNull, lt, or } from "drizzle-orm";
+import { apiTokens, DEFAULT_ORG_ID } from "./db/schema.js";
+
+function recordTokenUse(config: WorkerConfig, claims: TokenClaims): void {
+	const now = new Date();
+	config.afterResponse(db => db.update(apiTokens).set({ lastUsedAt: now }).where(and(
+		eq(apiTokens.jti, claims.jti), eq(apiTokens.orgId, claims.org ?? DEFAULT_ORG_ID),
+		or(isNull(apiTokens.lastUsedAt), lt(apiTokens.lastUsedAt, new Date(now.getTime() - 5 * 60_000))),
+	)).then(() => {}));
+}
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
 function authError(message: string, status: number): Response {
@@ -91,7 +101,7 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 	}
 	const result = await verifyJwt(token, config.jwtSecret);
 	// The signature vouches for the claims; only revocation needs looking up,
-	// and that is in KV, so private reads never touch the database.
+	// and that is in KV. Token usage is recorded after the foreground request.
 	if (result.kind !== "ok" || (await isRevoked(config, result.claims.jti))) {
 		return readAuthError("Unauthorized", 401);
 	}
@@ -105,6 +115,7 @@ export async function authorizeRead(request: Request, config: WorkerConfig, cach
 	if (cache.isPrivate && cache.org !== undefined && !isOrgsToken(result.claims, cache.org)) {
 		return readAuthError("Forbidden", 403);
 	}
+	recordTokenUse(config, result.claims);
 	return undefined;
 }
 
@@ -147,6 +158,7 @@ export async function authenticateWrite(
 			if (await isRevoked(config, result.claims.jti)) {
 				return { kind: "error", response: authError("Unauthorized", 401) };
 			}
+			recordTokenUse(config, result.claims);
 			return { kind: "ok", identity: { kind: "jwt", claims: result.claims } };
 		}
 		if (!config.authToken) {

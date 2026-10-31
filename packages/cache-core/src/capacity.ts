@@ -5,6 +5,8 @@ import { goEntries, orgs, publishedPaths, sccacheEntries } from "./db/schema.js"
 import { orgUsage } from "./db/repository.js";
 import { deleteCachePaths } from "./path-deletion.js";
 import { cachePath } from "./cache-path.js";
+import { evictionCandidates } from "./eviction.js";
+import type { Protection, Victim } from "./eviction.js";
 
 export class CapacityError extends Error {
 	constructor(message: string, readonly status: 413 | 503) { super(message); }
@@ -13,8 +15,6 @@ export class CapacityError extends Error {
 
 const VICTIM_BUDGET = 256;
 const ACCESS_INTERVAL_MS = 5 * 60_000;
-type Protection = { cacheId: number; storePathHash: string };
-type Victim = { kind: "nix" | "go" | "sccache"; id: string; cacheId: number; hash: string; size: string; name: string; isPublic: boolean };
 
 /**
  * Lock order: org, then publication's cache/session/entry locks. The callback
@@ -59,46 +59,14 @@ export async function withOrgCapacity<T>(config: WorkerConfig, orgId: string, pr
 		// path is not a victim. Bound candidates AND external deletion work.
 		// A global top-256 cannot need more than 256 from one cache/protocol.
 		// Keep exclusions as set filters so each LRU scan can stop early.
-		const candidates = await tx.execute(sql`
-			with active as materialized (
-				select u.cache_id, u.store_path_hash from upload_sessions u join caches c on c.id=u.cache_id
-				where c.org_id=${orgId} and (u.status='finalizing' or (u.status in ('pending','uploading','streaming') and u.expires_at>${now}))
-			)
-			select * from (
-				select 'nix' as kind, e.id, c.id as "cacheId", e.hash, e.size, c.name, c.is_public as "isPublic", e.used
-				from caches c cross join lateral (
-					select e.id::text, e.store_path_hash as hash, b.file_size::text as size, greatest(e.last_pushed_at,e.last_accessed_at) as used
-					from published_paths e join blob_objects b on b.id=e.blob_object_id
-					where e.cache_id=c.id
-					and e.store_path_hash <> all(array(select p."storePathHash" from ${protectedRows}
-						where p."cacheId"=c.id and p."storePathHash" is not null))
-					and e.store_path_hash <> all(array(select u.store_path_hash from active u where u.cache_id=c.id))
-					and (b.file_hash,b.compression) not in (select i.file_hash,i.compression from nar_installations i)
-					order by greatest(e.last_pushed_at,e.last_accessed_at), e.id::text limit ${VICTIM_BUDGET}
-				) e where c.org_id=${orgId}
-				union all
-				select 'go', e.id, c.id, 'go:' || e.id, e.size::text, c.name, c.is_public, greatest(e.uploaded_at,e.last_accessed_at)
-				from caches c cross join lateral (
-					select e.* from go_entries e where e.cache_id=c.id and e.generation=c.go_generation and e.uploaded_at is not null and e.expires_at>${now}
-					and 'go:' || e.id <> all(array(select p."storePathHash" from ${protectedRows}
-						where p."cacheId"=c.id and p."storePathHash" is not null))
-					order by greatest(e.uploaded_at,e.last_accessed_at), e.id limit ${VICTIM_BUDGET}
-				) e where c.org_id=${orgId}
-				union all
-				select 'sccache', e.id, c.id, 'sccache:' || e.id, e.size::text, c.name, c.is_public, greatest(e.uploaded_at,e.last_accessed_at)
-				from caches c cross join lateral (
-					select e.* from sccache_entries e where e.cache_id=c.id and e.generation=c.sccache_generation and e.uploaded_at is not null and e.expires_at>${now}
-					and 'sccache:' || e.id <> all(array(select p."storePathHash" from ${protectedRows}
-						where p."cacheId"=c.id and p."storePathHash" is not null))
-					order by greatest(e.uploaded_at,e.last_accessed_at), e.id limit ${VICTIM_BUDGET}
-				) e where c.org_id=${orgId}
-			) victims order by used, kind, id limit ${VICTIM_BUDGET}`);
+		const candidates = await evictionCandidates(tx, orgId, now, protect, VICTIM_BUDGET);
 		const victims: Victim[] = [];
 		let freed = 0;
-		for (const candidate of candidates.rows as unknown as Victim[]) {
+		for (const candidate of candidates) {
 			const table = candidate.kind === "nix" ? sql`published_paths` : candidate.kind === "go" ? sql`go_entries` : sql`sccache_entries`;
 			const id = candidate.kind === "nix" ? sql`${candidate.id}::bigint` : sql`${candidate.id}`;
 			const eligible = candidate.kind === "nix" ? sql`
+				not nix_path_pinned(e.cache_id,e.store_path_hash,${now}) and
 				not exists (select 1 from upload_sessions u where u.cache_id=e.cache_id and u.store_path_hash=e.store_path_hash
 					and (u.status='finalizing' or (u.status in ('pending','uploading','streaming') and u.expires_at>${now})))
 				and not exists (select 1 from nar_installations i join blob_objects b on b.id=e.blob_object_id
@@ -112,6 +80,7 @@ export async function withOrgCapacity<T>(config: WorkerConfig, orgId: string, pr
 			if (usage.used - freed <= org.storageLimit) break;
 		}
 		if (usage.used - freed > org.storageLimit) throw new CapacityError("Capacity victims are busy or exceed the eviction budget; retry", 503);
+		await tx.execute(sql`select set_config('snowstead.eviction_reason','capacity',true)`);
 		// No external deletions before the complete plan has been proven to fit.
 		for (const victim of victims) {
 			if (victim.kind !== "nix") {

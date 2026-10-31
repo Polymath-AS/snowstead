@@ -27,8 +27,8 @@ export async function deleteCachePaths(
 	const bucket = bucketFor(config, isPrivate);
 	const named = "storePathHashes" in which ? which.storePathHashes : [];
 
-	const deleted = await deletePublishedPaths(config.db, cache.id, which, async (hashes) => {
-		const keys = [...new Set([...named, ...hashes])].map((h) => narinfoKey(cache.path, h, isPrivate));
+	const deleted = await deletePublishedPaths(config.db, cache.id, which, async (hashes, protectedHashes) => {
+		const keys = [...new Set([...named.filter(hash => !protectedHashes.has(hash)), ...hashes])].map((h) => narinfoKey(cache.path, h, isPrivate));
 		if (keys.length > 0) await bucket.delete(keys);
 	});
 

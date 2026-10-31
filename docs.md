@@ -404,6 +404,143 @@ writes each private cache's org into KV, where pulls check it. This existing
 visibility index is unrelated to org limits; changing limits requires
 no KV synchronization.
 
+### Cache policy API
+
+Apply migration `0010_needy_risque.sql` after `0009` before deploying. All
+endpoints below use `/_api/v1/orgs/:org` (the org ID, not its mutable slug),
+return JSON with `Cache-Control: no-store`, and require `ADMIN_SECRET` or that
+org's management API key unless stated otherwise. Dates are ISO strings; sizes
+are integer bytes. Errors use `{ "error": "message" }`.
+
+#### Token last use
+
+| Method and suffix | Body | Response |
+| --- | --- | --- |
+| `GET /tokens` | none | `{ tokens: Token[] }` |
+| `GET /tokens/:jti` | none | `{ token: Token }`; 404 for missing or another org's token |
+
+`Token` is `{ jti, subject, caches: string[], perms: string[], org, createdAt,
+lastUsedAt, expiresAt, createdBy, revokedAt, revokedBy, revocationReason }`.
+`lastUsedAt` is an ISO string or null; it is the only addition to the existing
+org token-list shape. The operator-wide admin token list is unchanged.
+`expiresAt`, `revokedAt`, `revokedBy`, and `revocationReason` can be null.
+
+Successful JWT authentication for Nix, Go, and sccache schedules a conditional
+SQL update after foreground transactions and upload admission finish, using a
+separate connection under `waitUntil`. A token's timestamp changes at most once
+per five minutes, including concurrent calls. It records authentication, not
+successful artifact delivery. Anonymous public/CDN reads cannot identify a
+token. This is best-effort activity telemetry, not a security audit or exact
+request counter; failed background writes can leave it stale.
+
+#### Eviction visibility
+
+`GET /eviction?limit=50&nextCursor=...&recentCursor=...` has no body. `limit`
+defaults to 50, must be 1–200, and applies separately to each list. Cursors are
+opaque strings; URL-encode them and pass each list's cursor independently.
+Null means the end of that list. The JSON response is:
+
+```ts
+{
+  next: { items: Candidate[], cursor: string | null, bytesToFree: number },
+  recent: { items: Eviction[], cursor: string | null }
+}
+// Candidate:
+{ product: "nix" | "go" | "sccache", cache: string, cacheId: number,
+  key: string, size: number, lastAccessedAt: string | null }
+// Eviction: Candidate plus
+{ id: number, evictedAt: string,
+  reason: "capacity" | "retention" | "clear" | "evict" }
+```
+
+For Nix, `key` is the full store path; for Go/sccache it is the action key.
+`next` uses capacity's shared selection query, ordered by the later of last
+publication and access, then product and entry ID. It excludes pinned closures,
+active Nix uploads/installations, and expired/obsolete action entries. It is
+an advisory preview, not a reservation: row locks, accesses, and uploads can
+change what admission actually removes. Each response uses a consistent DB
+snapshot; subsequent pages are live views, not a frozen multi-request snapshot.
+`bytesToFree` is `max(used - storageLimit, 0)`, or zero for unlimited storage;
+it excludes pending transfers and hypothetical future uploads. Candidates are
+still available when this number is zero.
+
+`recent` is newest-first by log ID. Set-based SQL triggers record logical
+removal transactionally: capacity (`capacity`), expired-data GC (`retention`),
+product resets, explicit path deletion and cache deletion (`clear`), or the
+whole-cache endpoint below (`evict`). Later physical cleanup does not duplicate
+events. Logs retain the cache's ID and name even after deletion/name reuse.
+Only the last 30 days are returned; control's scheduled GC sweeps older rows.
+
+#### Named Nix pins
+
+| Method and suffix | Body | Response |
+| --- | --- | --- |
+| `GET /caches/:name/pins` | none | `{ pins: Pin[] }`, ordered by name |
+| `POST /caches/:name/pins` | `{ name, storePath, keep }` | `{ pin: Pin }`; 201 created, 200 updated |
+| `DELETE /caches/:name/pins/:pin` | none | `{ deleted: true, name: string }`, including an already absent pin |
+
+```ts
+type Keep = "forever" | { days: number } | { revisions: number };
+type Pin = {
+  name: string; keep: Keep; currentRevision: number;
+  history: { revision: number; storePath: string; createdAt: string;
+    supersededAt: string | null; pinned: boolean }[];
+};
+```
+
+Pin names match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`; `storePath` is a full
+`/nix/store/<hash>-<name>` path; days/revisions are integers 1–10000. Unknown
+request fields and invalid policies return 400. POST and DELETE also accept a
+JWT with Nix `push` permission for this exact cache and org. GET remains
+management-only. Writes audit `pin.create`, `pin.update`, or `pin.delete`.
+
+Re-pinning a name to a different path adds a monotonically numbered revision;
+retrying the current path does not add another. History is newest-first.
+The current revision always remains pinned. `forever` keeps every revision;
+`revisions: N` keeps the newest N including current; `days: N` keeps an old
+revision for N days after it was superseded. Old history remains visible after
+protection expires, until the pin is deleted. Extending keep returns 409 if it
+would reactivate a revision with missing paths.
+
+Closure handling is **cache-local and transitive**: a recursive SQL query
+deduplicates cycles/shared dependencies, then inserts indexed membership rows
+in one batch per revision. The root and every referenced dependency must
+already be published in this cache (409 otherwise); upstream-only dependencies
+are not fetched or silently assumed protected. More than 10000 distinct paths
+returns 413. Creation cost and stored membership scale with closure size;
+history storage scales with revisions and their closures. Candidate scans use
+indexed membership checks, not recursive traversal. Pin mutations serialize
+with publication and deletion under the existing org-then-cache transaction
+locks. Pinned roots and dependencies cannot be removed by capacity, retention,
+or the existing individual-path deletion endpoint. Whole-cache eviction and
+cache deletion explicitly override pins.
+
+#### Empty a cache without deleting it
+
+`POST /caches/:name/evict` takes **no body** and returns:
+
+```ts
+{ evicted: true, name: string,
+  removed: { nix: number, go: number, sccache: number }, pinsDeleted: number }
+```
+
+This management-only operation audits `cache.evict`, removes all Nix paths and
+Go/sccache rows (including staged/obsolete rows still attached to the cache),
+and deletes all its pins. It preserves the cache ID, slug, protocols/settings,
+tokens, and signing keys. It invalidates old action generations and aborts Nix
+sessions, so pre-eviction uploads cannot publish later. A fresh upload after
+the operation can repopulate the cache.
+
+The operation follows org → upload-session fence → cache → entry lock order;
+SQL changes and eviction logs commit together after idempotent external deletes.
+Partial external failure leaves durable SQL retry records; retry the request.
+An already empty cache returns zero counts. External deletes cannot roll back,
+so some objects may already be unavailable after a failed attempt. NAR blobs
+remain for reference-aware GC so other caches sharing them are not damaged.
+Detached Go/sccache objects from earlier capacity eviction remain owned by GC.
+Large evictions use batches internally but hold transaction locks until the
+request finishes; they can delay uploads and should run outside peak CI load.
+
 ### Cache signing key lifecycle
 
 Run database migrations before deploying. Signing management uses the org

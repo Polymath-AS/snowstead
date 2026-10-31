@@ -71,6 +71,13 @@
       "when": 1793461186845,
       "tag": "0009_parallel_starhawk",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1793478384143,
+      "tag": "0010_needy_risque",
+      "breakpoints": true
     }
   ]
 }

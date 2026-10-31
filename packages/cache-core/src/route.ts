@@ -23,6 +23,7 @@ const VALUE_AFTER: Readonly<Record<string, string>> = {
 	keys: ":key",
 	"signing-keys": ":key",
 	part: ":part",
+	pins: ":pin",
 };
 
 const API_ROUTES = new Set([
@@ -53,12 +54,17 @@ const API_ROUTES = new Set([
 	"orgs/:org/caches/:cache/purge",
 	"orgs/:org/caches/:cache/paths",
 	"orgs/:org/caches/:cache/delete",
+	"orgs/:org/caches/:cache/evict",
+	"orgs/:org/caches/:cache/pins",
+	"orgs/:org/caches/:cache/pins/:pin",
 	"orgs/:org/caches/:cache/signing-keys",
 	"orgs/:org/caches/:cache/signing-keys/:key/activate",
 	"orgs/:org/caches/:cache/paths/delete",
 	"orgs/:org/tokens",
+	"orgs/:org/tokens/:jti",
 	"orgs/:org/tokens/:jti/revoke",
 	"orgs/:org/audit",
+	"orgs/:org/eviction",
 ]);
 
 function apiTemplate(pathname: string): string | undefined {

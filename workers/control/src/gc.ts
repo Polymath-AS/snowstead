@@ -19,6 +19,8 @@ import {
 import { deleteCachePaths } from "@snowstead/cache-core/path-deletion";
 import { messageOf } from "@snowstead/cache-core/responses";
 import type { BlobObject, UploadSessionStatus } from "@snowstead/cache-core/db/types";
+import { lt } from "drizzle-orm";
+import { evictionLogs } from "@snowstead/cache-core/db/schema";
 
 const VALID_TRANSITION_STATUSES = new Set<string>(["pending", "uploading", "streaming", "finalizing", "aborted"]);
 
@@ -60,6 +62,11 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	let expiredAuditLogs = 0;
 
 	const now = new Date();
+	try {
+		await config.db.delete(evictionLogs).where(lt(evictionLogs.evictedAt, new Date(now.getTime() - 30 * DAY_MS)));
+	} catch (error) {
+		errors.push(`eviction log sweep: ${messageOf(error)}`);
+	}
 	try {
 		await sweepSccacheEntries(config);
 	} catch (error) {

@@ -2,6 +2,7 @@ import * as v from "valibot";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import { actorId, authenticateOrg, generateOrgApiKey } from "@snowstead/cache-core/auth";
 import { handleSigningApi } from "./signing-api.js";
+import { handleEvictionInfo, handleEvictCache, handlePins } from "./cache-policy-api.js";
 import { handleGoManagement } from "@snowstead/cache-core/go-cache";
 import { handleSccacheManagement } from "@snowstead/cache-core/sccache";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
@@ -56,6 +57,11 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		return errorResponse("Not Found", 404);
 	}
 
+	if (rest[0] === "caches" && rest[2] === "pins" && (
+		(rest.length === 3 && (request.method === "GET" || request.method === "POST")) ||
+		(rest.length === 4 && request.method === "DELETE")
+	)) return handlePins(request, config, org, decodeURIComponent(rest[1]), rest[3] === undefined ? undefined : decodeURIComponent(rest[3]));
+
 	const auth = await authenticateOrg(request, config, org);
 	if (auth.kind === "error") {
 		return auth.response;
@@ -82,6 +88,7 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 
 	if (route === "" && method === "GET") return handleGetOrg(config, org);
+	if (route === "eviction" && method === "GET") return handleEvictionInfo(config, org, url);
 	if (route === "" && method === "PUT") {
 		if (!isOperator) return errorResponse("Forbidden", 403);
 		const old = await findOrg(config.db, org);
@@ -135,6 +142,9 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 		return audit("cache.create", response, cache.name ?? null, { private: cache.private, protocols: cache.protocols, retentionDays: cache.retentionDays });
 	}
 	if (rest.length === 2 && rest[0] === "caches" && method === "GET") return handleGetCache(config, value(1), org);
+	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "evict" && method === "POST") {
+		return audit("cache.evict", await handleEvictCache(config, org, value(1), url.origin), value(1));
+	}
 	if (rest.length === 3 && rest[0] === "caches" && rest[2] === "purge" && method === "POST") {
 		return audit("cache.purge", await handlePurgeCache(request, config, value(1), org), value(1));
 	}
@@ -151,6 +161,7 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	}
 
 	if (route === "tokens" && method === "GET") return handleListTokens(config, url, org);
+	if (rest.length === 2 && rest[0] === "tokens" && method === "GET") return handleListTokens(config, url, org, value(1));
 	if (route === "tokens" && method === "POST") {
 		const response = await handleCreateToken(request, config, actorId(identity), org);
 		const token = await answered<{ jti: string; subject: string }>(response);

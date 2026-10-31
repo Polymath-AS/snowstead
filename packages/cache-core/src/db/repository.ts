@@ -778,9 +778,16 @@ export async function deletePublishedPaths(
 	db: Db,
 	cacheId: number,
 	which: PathSelection,
-	withdraw: (storePathHashes: readonly string[]) => Promise<void>,
+	withdraw: (storePathHashes: readonly string[], protectedHashes: ReadonlySet<string>) => Promise<void>,
 ): Promise<string[]> {
 	return db.transaction(async (tx) => {
+		const [cache] = await tx.select({ org: caches.orgId }).from(caches).where(eq(caches.id, cacheId));
+		if (!cache) return [];
+		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + cache.org}, 0))`);
+		if ("lastPushedBefore" in which) await tx.execute(sql`select set_config('snowstead.eviction_reason','retention',true)`);
+		const unpinned = sql`not nix_path_pinned(${publishedPaths.cacheId},${publishedPaths.storePathHash},now())`;
+		const protectedHashes = new Set("storePathHashes" in which ? (await tx.select({ hash: publishedPaths.storePathHash }).from(publishedPaths)
+			.where(and(eq(publishedPaths.cacheId, cacheId), anyOf(publishedPaths.storePathHash, which.storePathHashes), sql`not (${unpinned})`))).map(row => row.hash) : []);
 		const column = "lastPushedBefore" in which ? publishedPaths.lastPushedAt : publishedPaths.createdAt;
 		const before = "lastPushedBefore" in which ? which.lastPushedBefore : "before" in which ? which.before : undefined;
 		const match = "storePathHashes" in which
@@ -789,16 +796,16 @@ export async function deletePublishedPaths(
 				publishedPaths.id,
 				tx.select({ id: publishedPaths.id })
 					.from(publishedPaths)
-					.where(and(eq(publishedPaths.cacheId, cacheId), lt(column, before ?? new Date(0))))
+					.where(and(eq(publishedPaths.cacheId, cacheId), lt(column, before ?? new Date(0)), unpinned))
 					.orderBy(column, publishedPaths.id)
 					.limit(which.limit),
 			);
 		const rows = await tx
 			.delete(publishedPaths)
-			.where(and(eq(publishedPaths.cacheId, cacheId), match))
+			.where(and(eq(publishedPaths.cacheId, cacheId), match, unpinned))
 			.returning({ storePathHash: publishedPaths.storePathHash });
 		const deleted = rows.map((r) => r.storePathHash);
-		await withdraw(deleted);
+		await withdraw(deleted, protectedHashes);
 		return deleted;
 	});
 }
@@ -921,8 +928,9 @@ export async function findApiToken(
 export async function listApiTokens(
 	db: Db,
 	orgId?: string,
+	jti?: string,
 ): Promise<ApiTokenWithCaches[]> {
-	const tokens = await db.select().from(apiTokens).where(orgId === undefined ? undefined : eq(apiTokens.orgId, orgId));
+	const tokens = await db.select().from(apiTokens).where(and(orgId === undefined ? undefined : eq(apiTokens.orgId, orgId), jti === undefined ? undefined : eq(apiTokens.jti, jti)));
 	const entries = await cacheEntriesOf(db, tokens.map((t) => t.jti));
 	return tokens.map((t) => ({ ...t, caches: entries.get(t.jti) ?? [] }));
 }

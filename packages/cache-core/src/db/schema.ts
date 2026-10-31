@@ -187,6 +187,7 @@ export const apiTokens = pgTable("api_tokens", {
 	cachesJson: text("caches_json").notNull().default("[]"),
 	permsJson: text("perms_json").notNull(),
 	createdAt: createdAt("created_at"),
+	lastUsedAt: timestamptz("last_used_at"),
 	expiresAt: timestamptz("expires_at"),
 	createdBy: text("created_by").notNull(),
 	revokedAt: timestamptz("revoked_at"),
@@ -318,3 +319,41 @@ export const sccacheUsage = pgTable("sccache_usage", {
 	used: bytes("used").notNull(),
 	pending: bytes("pending").notNull(),
 }, (table) => [primaryKey({ columns: [table.cacheId, table.generation, table.expiresMinute] })]);
+
+/** Historical identity survives cache deletion and name reuse. */
+export const evictionLogs = pgTable("eviction_logs", {
+	id: id(),
+	orgId: text("org_id").notNull(),
+	cacheId: integer("cache_id").notNull(),
+	cache: text("cache").notNull(),
+	product: text("product").$type<"nix" | "go" | "sccache">().notNull(),
+	key: text("key").notNull(),
+	size: bytes("size").notNull(),
+	lastAccessedAt: timestamptz("last_accessed_at"),
+	evictedAt: createdAt("evicted_at"),
+	reason: text("reason").$type<"capacity" | "retention" | "clear" | "evict">().notNull(),
+}, table => [index("eviction_logs_org_page").on(table.orgId, table.id), index("eviction_logs_expiry").on(table.evictedAt)]);
+
+export const pins = pgTable("pins", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
+	name: text("name").notNull(),
+	keepKind: text("keep_kind").$type<"forever" | "days" | "revisions">().notNull(),
+	keepValue: integer("keep_value"),
+	currentRevision: integer("current_revision").notNull(),
+}, table => [uniqueIndex("pins_cache_name").on(table.cacheId, table.name)]);
+
+export const pinRevisions = pgTable("pin_revisions", {
+	id: text("id").primaryKey(),
+	pinId: text("pin_id").notNull().references(() => pins.id, { onDelete: "cascade" }),
+	revision: integer("revision").notNull(),
+	storePath: text("store_path").notNull(),
+	createdAt: createdAt("created_at"),
+	supersededAt: timestamptz("superseded_at"),
+}, table => [uniqueIndex("pin_revisions_number").on(table.pinId, table.revision)]);
+
+export const pinPaths = pgTable("pin_paths", {
+	revisionId: text("revision_id").notNull().references(() => pinRevisions.id, { onDelete: "cascade" }),
+	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
+	storePathHash: text("store_path_hash").notNull(),
+}, table => [primaryKey({ columns: [table.revisionId, table.storePathHash] }), index("pin_paths_lookup").on(table.cacheId, table.storePathHash)]);

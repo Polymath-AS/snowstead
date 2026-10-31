@@ -15,6 +15,8 @@ export interface WorkerConfig {
 	readonly uploadCoordinator: DurableObjectNamespace<UploadCoordinator>;
 	/** Database work that may outlive the response. */
 	readonly defer: (task: Promise<unknown>) => void;
+	/** Starts only on close, after foreground transactions and admission have ended. */
+	readonly afterResponse: (task: (db: Db) => Promise<unknown>) => void;
 	/** Waits for deferred work, then releases the request's connection; nothing to wait for if it never opened one. */
 	readonly close: () => Promise<void> | undefined;
 	/**
@@ -45,7 +47,7 @@ export interface WorkerConfig {
 	readonly ctx?: ExecutionContext;
 }
 
-type Settings = Omit<WorkerConfig, "db" | "defer" | "close" | "releaseDb" | "ctx">;
+type Settings = Omit<WorkerConfig, "db" | "defer" | "afterResponse" | "close" | "releaseDb" | "ctx">;
 
 /**
  * What a config takes from env, worked out once per env rather than per
@@ -60,6 +62,7 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 	// Built on first use: most requests (cache hits, nix-cache-info, NARs)
 	// never touch the database.
 	let connection: Connection | undefined;
+	const background: ((db: Db) => Promise<unknown>)[] = [];
 	const open = () => (connection ??= connect(env.HYPERDRIVE.connectionString));
 	const releasing = new Set<Promise<void>>();
 	const releaseDb = async () => {
@@ -85,8 +88,16 @@ export function resolveConfig(env: Env, ctx?: ExecutionContext): WorkerConfig {
 			return open().db;
 		},
 		defer: (task) => open().defer(task),
+		afterResponse: task => { background.push(task); },
 		releaseDb,
-		close: releaseDb,
+		close: async () => {
+			await releaseDb();
+			if (!background.length) return;
+			const pending = background.splice(0);
+			const connection = connect(env.HYPERDRIVE.connectionString);
+			try { await Promise.allSettled(pending.map(task => task(connection.db))); }
+			finally { await connection.close(); }
+		},
 		ctx,
 	};
 }

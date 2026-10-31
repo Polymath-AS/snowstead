@@ -6,7 +6,8 @@ import { signingPublicKey } from "@snowstead/cache-core/signing";
 import { newCacheKey } from "@snowstead/cache-core/cache-keys";
 import { deleteCachePaths } from "@snowstead/cache-core/path-deletion";
 import { purgeCache, purgeNarinfo, scheduleNarinfoPurge } from "@snowstead/cache-core/cdn";
-import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
+import { DEFAULT_ORG_ID, pins } from "@snowstead/cache-core/db/schema";
+import { eq, sql } from "drizzle-orm";
 import { OrgSlug, cachePath } from "@snowstead/cache-core/cache-path";
 import {
 	createApiToken,
@@ -166,10 +167,11 @@ export async function handleListTokens(
 	config: WorkerConfig,
 	url: URL,
 	scope?: string,
+	jti?: string,
 ): Promise<Response> {
 	const filter = scope ?? orgFilter(url);
 	if (filter instanceof Response) return filter;
-	const [tokens, caches] = await Promise.all([listApiTokens(config.db, filter), listCaches(config.db, filter)]);
+	const [tokens, caches] = await Promise.all([listApiTokens(config.db, filter, jti), listCaches(config.db, filter)]);
 	// Shown by name: a token names caches by id, which nobody reads.
 	const names = new Map(caches.map((c) => [cacheIdEntry(c.id), c.name]));
 	const result = tokens.map((t) => ({
@@ -179,12 +181,14 @@ export async function handleListTokens(
 		perms: JSON.parse(t.permsJson),
 		org: t.orgId,
 		createdAt: t.createdAt,
+		...(scope === undefined ? {} : { lastUsedAt: t.lastUsedAt }),
 		expiresAt: t.expiresAt,
 		createdBy: t.createdBy,
 		revokedAt: t.revokedAt,
 		revokedBy: t.revokedBy,
 		revocationReason: t.revocationReason,
 	}));
+	if (jti !== undefined) return result.length ? jsonResponse({ token: result[0] }) : errorResponse("Token not found", 404);
 	return jsonResponse({ tokens: result });
 }
 
@@ -715,7 +719,15 @@ export async function handleDeleteCache(config: WorkerConfig, rawName: string, o
 	if (name instanceof Response) return name;
 	const cache = await cacheNamed(config, name, scope);
 	if (cache instanceof Response) return cache;
+	return config.db.transaction(async tx => {
+		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + cache.orgId}, 0))`);
+		await tx.delete(pins).where(eq(pins.cacheId, cache.id));
+		return deleteCacheAndObjects({ ...config, db: tx }, cache, origin);
+	});
+}
 
+async function deleteCacheAndObjects(config: WorkerConfig, cache: CacheAt, origin: string): Promise<Response> {
+	const name = cache.name;
 	let paths = 0;
 	for (let attempt = 1; ; attempt++) {
 		for (;;) {
