@@ -49,7 +49,7 @@ export async function installStagedNars(
 				});
 			}
 		}
-		const installed = await installNars(config, jobs);
+		const installed = await installNars(config, jobs, true);
 		for (const job of jobs) results.set(job.sessionId!, installed.get(job.operationId));
 		return results;
 	});
@@ -103,7 +103,7 @@ type Installation = {
 	terminal: boolean;
 };
 
-async function installNars(config: WorkerConfig, jobs: readonly Installation[]): Promise<Map<string, string | undefined>> {
+async function installNars(config: WorkerConfig, jobs: readonly Installation[], recoverExisting = false): Promise<Map<string, string | undefined>> {
 	const results = new Map<string, string | undefined>();
 	let pending = jobs.filter(job => {
 		if (Number.isSafeInteger(job.fileSize) && job.fileSize > 0 && job.fileSize <= OBJECT_MAX) return true;
@@ -127,7 +127,7 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[]):
 		const ready: Installation[] = [];
 		try {
 			for (const job of wave.values()) {
-				if (!admitted.has(job.operationId)) results.set(job.operationId, INSTALLATION_BUSY);
+				if (!admitted.has(job.operationId) && !recoverExisting) results.set(job.operationId, INSTALLATION_BUSY);
 				else if (!job.sourceKey.startsWith("staging/") && await hasCanonicalUploadReservations(config.db, job.sourceKey)) {
 					job.terminal = true;
 					results.set(job.operationId, INSTALLATION_BUSY);
@@ -139,13 +139,13 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[]):
 			const small = ready.filter(job => job.fileSize <= SINGLE_PUT_MAX);
 			await Promise.all(Array.from({ length: Math.min(4, small.length) }, async () => {
 				for (let job = small.shift(); job; job = small.shift()) {
-					results.set(job.operationId, await transferNar(config, job));
+					results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job) : recoverNar(config, job)));
 				}
 			}));
 			// Large copies register/fence their destination MPU in SQL. Run
 			// those phases only after all connection-free transfers settle.
 			for (const job of ready.filter(job => job.fileSize > SINGLE_PUT_MAX)) {
-				results.set(job.operationId, await transferNar(config, job));
+				results.set(job.operationId, await (admitted.has(job.operationId) ? transferNar(config, job) : recoverNar(config, job)));
 			}
 		} finally {
 			await finishNarInstallations(config.db, [...wave.values()].filter(job => admitted.has(job.operationId) && job.terminal),
@@ -157,7 +157,7 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[]):
 }
 
 async function transferNar(config: WorkerConfig, job: Installation): Promise<string | undefined> {
-	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate, sessionId } = job;
+	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate } = job;
 
 	const sourceBucket = bucketForKey(config, sourceKey);
 	const destination = bucketFor(config, isPrivate);
@@ -165,27 +165,9 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 	let writeStarted = false;
 	let success = false;
 	try {
-		if (job.inlineBytes && fileSize > MIB) return "File size mismatch";
-		const sourceBody = job.inlineBytes === undefined && fileSize <= MIB ? await sourceBucket.get(sourceKey) : undefined;
-		const source = job.inlineBytes !== undefined ? undefined : fileSize <= MIB ? sourceBody : await sourceBucket.head(sourceKey);
-		if (job.inlineBytes === undefined && !source) return "Upload incomplete";
-		// One GET binds small-object metadata and bytes to the same version.
-		// Four transfer lanes cap these buffers at 4 MiB per installation wave;
-		// large objects retain the connection-free streaming/copy path.
-		let verifiedBytes = job.inlineBytes;
-		try {
-			if (source && sessionId !== undefined && source.customMetadata?.session !== sessionId) return "Upload incomplete";
-			if (source && source.size !== fileSize) return "File size mismatch";
-			if (sourceBody) verifiedBytes = await sourceBody.arrayBuffer();
-			if (verifiedBytes) {
-				if (verifiedBytes.byteLength !== fileSize) return "File size mismatch";
-				const digest = await crypto.subtle.digest("SHA-256", verifiedBytes);
-				const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-				if (hex !== fileHash) return "File hash mismatch";
-			} else if (!source || !(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
-		} finally {
-			if (sourceBody && !sourceBody.bodyUsed) await sourceBody.body.cancel();
-		}
+		const proof = await verifySource(config, job);
+		if (typeof proof === "string") return proof;
+		const { source, verifiedBytes } = proof;
 
 		// Small verified buffers can go straight to the checksum-checked,
 		// create-only PUT. A losing PUT still verifies the existing winner below.
@@ -252,6 +234,56 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 			try { await multipart.abort(); } catch { terminal = false; }
 		}
 		job.terminal = terminal;
+	}
+}
+
+/**
+ * Sealed SQL upload sessions independently protect the canonical blob from GC.
+ * A lost admission may therefore reuse verified bytes, but cannot write storage
+ * or finish the old operation: its ambiguous write may still be in flight.
+ */
+async function recoverNar(config: WorkerConfig, job: Installation): Promise<string | undefined> {
+	try {
+		const destination = bucketFor(config, job.isPrivate);
+		const existing = await destination.head(job.key);
+		if (!existing) return INSTALLATION_BUSY;
+		const proof = await verifySource(config, job);
+		if (typeof proof === "string") return proof;
+		if (existing.size !== job.fileSize) return "File size mismatch";
+		if (!(await verifies(destination, existing, job.fileHash))) return "File hash mismatch";
+		return undefined;
+	} catch (error) {
+		console.error("NAR recovery failed", { key: job.key, operationId: job.operationId }, errorForLog(error));
+		return INSTALLATION_INCOMPLETE;
+	}
+}
+
+async function verifySource(config: WorkerConfig, job: Installation): Promise<{
+	source: R2Object | null | undefined;
+	verifiedBytes: ArrayBuffer | undefined;
+} | string> {
+	const { sourceKey, fileHash, fileSize, sessionId } = job;
+	const sourceBucket = bucketForKey(config, sourceKey);
+	if (job.inlineBytes && fileSize > MIB) return "File size mismatch";
+	const sourceBody = job.inlineBytes === undefined && fileSize <= MIB ? await sourceBucket.get(sourceKey) : undefined;
+	const source = job.inlineBytes !== undefined ? undefined : fileSize <= MIB ? sourceBody : await sourceBucket.head(sourceKey);
+	if (job.inlineBytes === undefined && !source) return "Upload incomplete";
+	// One GET binds small-object metadata and bytes to the same version.
+	// Four lanes cap these buffers at 4 MiB; large objects remain streamed.
+	let verifiedBytes = job.inlineBytes;
+	try {
+		if (source && sessionId !== undefined && source.customMetadata?.session !== sessionId) return "Upload incomplete";
+		if (source && source.size !== fileSize) return "File size mismatch";
+		if (sourceBody) verifiedBytes = await sourceBody.arrayBuffer();
+		if (verifiedBytes) {
+			if (verifiedBytes.byteLength !== fileSize) return "File size mismatch";
+			const digest = await crypto.subtle.digest("SHA-256", verifiedBytes);
+			const hex = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+			if (hex !== fileHash) return "File hash mismatch";
+		} else if (!source || !(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
+		return { source, verifiedBytes };
+	} finally {
+		if (sourceBody && !sourceBody.bodyUsed) await sourceBody.body.cancel();
 	}
 }
 

@@ -4,7 +4,7 @@ import { AwsClient } from "aws4fetch";
 import { eq } from "drizzle-orm";
 import { resolveConfig } from "../src/config.js";
 import type { WorkerConfig } from "../src/config.js";
-import { createCache, createUploadSession, acquireNarInstallations, deleteEmptyCache } from "../src/db/repository.js";
+import { createCache, createUploadSession, acquireNarInstallations, deleteEmptyCache, finishNarInstallations, deleteUnreferencedBlobObjects } from "../src/db/repository.js";
 import { narInstallations, uploadSessions } from "../src/db/schema.js";
 import { installStagedNars, installNar, INSTALLATION_BUSY } from "../src/nar-install.js";
 import { narKey, placeNar } from "../src/layout.js";
@@ -201,7 +201,7 @@ describe("verified canonical NAR installation", () => {
 		expect(await gate(f.key)).toBeUndefined();
 	});
 
-	it.each([false, true])("retains the durable gate after an ambiguous small canonical PUT (inline: %s)", async inline => {
+	it.each([false, true])("recovers verified bytes after an ambiguous PUT without releasing its gate (inline: %s)", async inline => {
 		const f = await fixture();
 		const session = { ...f.session, inlineBytes: inline ? f.bytes.slice().buffer : undefined };
 		if (inline) await env.CACHE_BUCKET.delete(f.sourceKey);
@@ -214,9 +214,102 @@ describe("verified canonical NAR installation", () => {
 		const cfg = config({ publicBucket });
 		expect((await installStagedNars(cfg, [session])).get(f.session.id)).toContain("retry");
 		expect(await gate(f.key)).toMatchObject({ sourceKey: f.sourceKey });
+		const retained = await gate(f.key);
+		const before = await env.PUBLIC_BUCKET.head(f.key);
 		expect(Boolean(await env.CACHE_BUCKET.head(f.sourceKey))).toBe(!inline);
 		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
-		expect((await installStagedNars(cfg, [session])).get(f.session.id)).toBe(INSTALLATION_BUSY);
+		expect((await installStagedNars(config({ publicBucket }), [session])).get(f.session.id)).toBeUndefined();
+		expect(await gate(f.key)).toEqual(retained);
+		expect((await env.PUBLIC_BUCKET.head(f.key))?.version).toBe(before?.version);
+	});
+
+	it.each([16, 1024 ** 2 + 1])("recovers a new session without taking over an interrupted install (%s bytes)", async size => {
+		const f = await fixture(size);
+		await acquireNarInstallations(db, [{
+			key: f.key, operationId: "interrupted-operation", sourceKey: f.sourceKey,
+			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
+		}]);
+		const retained = await gate(f.key);
+		const id = crypto.randomUUID();
+		const session = await createUploadSession(db, { ...f.session, id, r2UploadKey: `staging/${id}` });
+		await env.CACHE_BUCKET.put(session.r2UploadKey!, f.bytes, { customMetadata: { session: id } });
+		const before = await env.PUBLIC_BUCKET.put(f.key, f.bytes, { customMetadata: { session: "original-owner" } });
+		const mutation = vi.fn(() => { throw new Error("recovery must be read-only"); });
+		const cfg = config({
+			bucket: bucket(env.CACHE_BUCKET, { put: mutation, delete: mutation, createMultipartUpload: mutation, resumeMultipartUpload: mutation }),
+			publicBucket: bucket(env.PUBLIC_BUCKET, { put: mutation, delete: mutation, createMultipartUpload: mutation, resumeMultipartUpload: mutation }),
+		});
+		expect((await installStagedNars(cfg, [{ ...session, fileHash: f.fileHash }])).get(id)).toBeUndefined();
+		expect(mutation).not.toHaveBeenCalled();
+		expect(await gate(f.key)).toEqual(retained);
+		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: before.version, customMetadata: { session: "original-owner" } });
+		expect(await env.CACHE_BUCKET.head(f.sourceKey)).not.toBeNull();
+		expect(await env.CACHE_BUCKET.head(session.r2UploadKey!)).not.toBeNull();
+	});
+
+	it.each(["source-deleted", "source-replaced", "canonical-deleted", "canonical-replaced"])("fails closed when recovery bytes change after HEAD (%s)", async fault => {
+		const f = await fixture(1024 ** 2 + 1);
+		await acquireNarInstallations(db, [{
+			key: f.key, operationId: "interrupted-operation", sourceKey: f.sourceKey,
+			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
+		}]);
+		await env.PUBLIC_BUCKET.put(f.key, f.bytes);
+		const retained = await gate(f.key);
+		const changed = fault.startsWith("source") ? env.CACHE_BUCKET : env.PUBLIC_BUCKET;
+		const intercepted = bucket(changed, {
+			get: async (key, options) => {
+				if (fault.endsWith("deleted")) await changed.delete(key);
+				else await changed.put(key, f.bytes, { customMetadata: { session: f.session.id } });
+				return changed.get(key, options);
+			},
+		});
+		const cfg = config(fault.startsWith("source") ? { bucket: intercepted } : { publicBucket: intercepted });
+		expect((await installStagedNars(cfg, [f.session])).get(f.session.id)).toBe("File hash mismatch");
+		expect(await gate(f.key)).toEqual(retained);
+		if (fault.endsWith("deleted")) expect(await changed.head(fault.startsWith("source") ? f.sourceKey : f.key)).toBeNull();
+	});
+
+	it("retains canonical bytes through GC after the old owner releases its gate", async () => {
+		const f = await fixture();
+		await acquireNarInstallations(db, [{
+			key: f.key, operationId: "interrupted-operation", sourceKey: f.sourceKey,
+			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
+		}]);
+		await db.update(uploadSessions).set({ expiresAt: new Date(0) }).where(eq(uploadSessions.id, f.session.id));
+		const id = crypto.randomUUID();
+		const session = await createUploadSession(db, { ...f.session, id, status: "finalizing", r2UploadKey: `staging/${id}` });
+		await env.CACHE_BUCKET.put(session.r2UploadKey!, f.bytes, { customMetadata: { session: id } });
+		await env.PUBLIC_BUCKET.put(f.key, f.bytes);
+		const privateBucket = bucket(env.CACHE_BUCKET, {
+			get: async (key, options) => {
+				await finishNarInstallations(db, [{ key: f.key, operationId: "interrupted-operation" }], async () => {});
+				const removed = await deleteUnreferencedBlobObjects(db, 10_000, async () => {});
+				expect(removed.some(blob => blob.fileHash === f.fileHash)).toBe(false);
+				return env.CACHE_BUCKET.get(key, options);
+			},
+		});
+		expect((await installStagedNars(config({ bucket: privateBucket }), [{ ...session, fileHash: f.fileHash }])).get(id)).toBeUndefined();
+		expect(await gate(f.key)).toBeUndefined();
+		await db.update(uploadSessions).set({ expiresAt: new Date(0) }).where(eq(uploadSessions.id, id));
+		const removed = await deleteUnreferencedBlobObjects(db, 10_000, async () => {});
+		expect(removed.some(blob => blob.fileHash === f.fileHash)).toBe(true);
+	});
+
+	it.each(["source-owner", "source-hash", "canonical-hash"])("requires both possession and valid canonical bytes during recovery (%s)", async fault => {
+		const f = await fixture();
+		await acquireNarInstallations(db, [{
+			key: f.key, operationId: "interrupted-operation", sourceKey: f.sourceKey,
+			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
+		}]);
+		const retained = await gate(f.key);
+		await env.CACHE_BUCKET.put(f.sourceKey, fault === "source-hash" ? new Uint8Array(f.bytes.length) : f.bytes,
+			{ customMetadata: { session: fault === "source-owner" ? "another-owner" : f.session.id } });
+		const before = await env.PUBLIC_BUCKET.put(f.key, fault === "canonical-hash" ? new Uint8Array(f.bytes.length) : f.bytes);
+		expect((await installStagedNars(config(), [f.session])).get(f.session.id)).toBe(
+			fault === "source-owner" ? "Upload incomplete" : "File hash mismatch",
+		);
+		expect(await gate(f.key)).toEqual(retained);
+		expect((await env.PUBLIC_BUCKET.head(f.key))?.version).toBe(before.version);
 	});
 
 	it("does not read an unpinned source when another installer owns the key", async () => {
