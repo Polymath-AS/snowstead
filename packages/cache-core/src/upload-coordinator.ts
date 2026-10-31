@@ -20,6 +20,10 @@ export class UploadCoordinator extends DurableObject<Env> {
 			if (rows.some(row => streamSessionOrg(row.id) !== org)) return errorResponse("Invalid session locator", 400);
 			const policy = await findOrg(db, org);
 			if (!policy) return errorResponse("Not found", 404);
+			// run serializes creators. Grants, aborts, and completion can only free
+			// session slots while SQL is pending, never consume this admission.
+			const admission = this.streams.checkCreate(rows.length);
+			if (admission) return errorResponse(admission.error, admission.status, { "retry-after": "1" });
 			// Keep SQL cleanup/policy visibility, but no SQL part metadata until seal.
 			await createUploadSessions(db, rows);
 			const refused = this.streams.create(rows.map(row => ({ ...row, partSize: row.partSize ?? null,
@@ -69,15 +73,18 @@ export class UploadCoordinator extends DurableObject<Env> {
 	}
 
 	private async run<T>(protocol: string, operation: (db: Db) => Promise<T>): Promise<T | Response> {
-		const busy = () => errorResponse("Upload reservation queue is busy; retry", 429, { "retry-after": "1" });
-		if (this.pending >= 64) return busy();
+		const busy = (reason: "queue_full" | "queue_timeout", queueMs: number) => {
+			console.warn({ event: "upload_admission_rejected", reason, protocol, pending: this.pending, queue_ms: queueMs });
+			return errorResponse("Upload reservation queue is busy; retry", 429, { "retry-after": "1" });
+		};
+		if (this.pending >= 64) return busy("queue_full", 0);
 		const arrived = Date.now();
 		this.pending++;
 		const result = this.tail.then(async () => {
 			// Waiting consumes no database connection. Never time out an admitted
 			// transaction: its commit outcome must be known before releasing the slot.
 			const queueMs = Date.now() - arrived;
-			if (queueMs > 2000) return busy();
+			if (queueMs > 2000) return busy("queue_timeout", queueMs);
 			return tracing.enterSpan("upload_reservation", async span => {
 				if (span.isTraced) span.setAttributes({ "snowstead.protocol": protocol, "snowstead.queue_ms": queueMs });
 				const connection = connect(this.env.HYPERDRIVE.connectionString);

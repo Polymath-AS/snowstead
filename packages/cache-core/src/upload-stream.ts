@@ -92,10 +92,18 @@ export class StreamState {
 		).toArray();
 	}
 
+	/** Admission must precede SQL cleanup records; refusals do not own sessions. */
+	checkCreate(count: number): StreamError | undefined {
+		const active = this.storage.sql.exec<{ count: number }>("SELECT count(*) AS count FROM streams_v2 WHERE expires > ? AND status IN ('streaming', 'finalizing')", Date.now()).one().count;
+		if (active + count <= 8192) return;
+		console.warn({ event: "upload_admission_rejected", reason: "active_session_limit", active, requested: count, limit: 8192 });
+		return { error: "Too many active upload sessions; finish or abort existing uploads", status: 429 };
+	}
+
 	create(sessions: readonly UploadSession[], capacity: number | null): StreamError | undefined {
 		return this.storage.transactionSync(() => {
-			const active = this.storage.sql.exec<{ count: number }>("SELECT count(*) AS count FROM streams_v2 WHERE expires > ? AND status IN ('streaming', 'finalizing')", Date.now()).one().count;
-			if (active + sessions.length > 8192) return { error: "Upload staging is busy; retry", status: 429 };
+			const refused = this.checkCreate(sessions.length);
+			if (refused) return refused;
 			for (const session of sessions) this.storage.sql.exec(
 				"INSERT INTO streams_v2 (id, payload, status, expires, capacity) VALUES (?, ?, ?, ?, ?)",
 				session.id, JSON.stringify(session), session.status, session.expiresAt.getTime(), capacity,

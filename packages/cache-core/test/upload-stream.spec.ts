@@ -1,7 +1,9 @@
-import { abortAllDurableObjects, createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
+import { abortAllDurableObjects, createExecutionContext, env, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { testDb } from "./db.js";
-import { createCache, findUploadParts, findUploadSession, orgUsage } from "../src/db/repository.js";
+import { uploadSessions } from "../src/db/schema.js";
+import { createCache, ensureCache, findUploadParts, findUploadSession, orgUsage, putOrg } from "../src/db/repository.js";
 import { signJwt, TOKEN_ISSUER, TOKEN_AUDIENCE } from "../src/jwt.js";
 import nix from "../../../workers/nix/src/index.js";
 
@@ -43,6 +45,36 @@ async function digest(bytes: Uint8Array) {
 }
 
 describe("streaming upload contract", () => {
+	it("rejects full staging without SQL orphans and admits a retry after an existing upload aborts", async () => {
+		const org = `stream-full-${crypto.randomUUID().slice(0, 8)}`;
+		await putOrg(db, org, org, {});
+		const { cache } = await ensureCache(db, "main", true, org);
+		const token = await signJwt({ jti: crypto.randomUUID(), sub: "full-staging", iss: TOKEN_ISSUER, aud: TOKEN_AUDIENCE,
+			caches: ["*"], perms: ["push"], org, iat: Math.floor(Date.now() / 1000) }, env.JWT_SECRET);
+		const existing = await stream(cache.name, token);
+		const coordinator = env.UPLOAD_COORDINATOR.getByName(org);
+		// Fill the real SQLite admission table without creating 8,191 R2 MPUs.
+		await runInDurableObject(coordinator, async (_instance, state) => {
+			state.storage.sql.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8191)
+				INSERT INTO streams_v2 (id, payload, status, expires)
+				SELECT 'fixture-' || n.i, s.payload, 'streaming', s.expires FROM n CROSS JOIN streams_v2 s LIMIT 8191`);
+		});
+		const path = { storePath: `/nix/store/${"2".repeat(32)}-retry`, storePathHash: "2".repeat(32), narHash, narSize, compression: "zstd" };
+		const create = () => post(`/_api/v1/caches/${cache.name}/upload-streams/batch`, { paths: [path] }, token);
+		await abortAllDurableObjects();
+		for (let retry = 0; retry < 2; retry++) {
+			const rejected = await create();
+			expect(rejected.status).toBe(429);
+			expect(await db.select({ id: uploadSessions.id }).from(uploadSessions).where(eq(uploadSessions.cacheId, cache.id)))
+				.toEqual([{ id: existing.sessionId }]);
+		}
+		expect((await post(`/_api/v1/uploads/${existing.sessionId}/abort`, {}, token)).status).toBe(200);
+		const admitted = await create();
+		expect(admitted.status).toBe(201);
+		const { sessions } = await admitted.json<{ sessions: { sessionId: string }[] }>();
+		expect((await findUploadSession(db, sessions[0].sessionId))?.status).toBe("streaming");
+	});
+
 	it("publishes verified bytes, replays finalization, and refuses mutations or legacy bypasses", async () => {
 		const cache = await createCache(db, `stream-${crypto.randomUUID().slice(0, 8)}`);
 		const s = await stream(cache.name);
