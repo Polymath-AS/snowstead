@@ -17,6 +17,7 @@ pkgs.mkShell {
     pkgs.zstd
     # The GOCACHEPROG helper and real Terraform build gate.
     pkgs.go
+    pkgs.sccache
     pkgs.stdenv.cc
     pkgs.time
     # Tests run against a throwaway cluster (scripts/with-postgres.sh).

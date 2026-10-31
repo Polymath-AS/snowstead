@@ -4,10 +4,11 @@
 
 The root `wrangler.jsonc` is the public **gateway** (`snowstead`). It routes
 management APIs to `snowstead-control`, Nix reads/uploads to `snowstead-nix`,
-and `/_api/v1/go/` artifact requests to `snowstead-go`
+`/_api/v1/go/` artifact requests to `snowstead-go`, and `/_api/v1/sccache/`
+compiler artifacts to `snowstead-sccache`
 over HTTP service bindings, forwarding the original URL, headers, and body.
 It has no database, storage, signing, or authorization logic. The service
-configs are under `workers/control`, `workers/nix`, and `workers/go`.
+configs are under `workers/control`, `workers/nix`, `workers/go`, and `workers/sccache`.
 Only control runs garbage collection and CDN-purge retries. Hosted reads enter
 through snowstead-web's owner/cache gateway, which uses the existing R2/CDN
 origin for public objects. The production cache Worker exposes only `/_api/*`;
@@ -25,6 +26,11 @@ Give Go the same `JWT_SECRET` as control so it can verify scoped Go tokens;
 Go permissions are independent of Nix push/pull permissions. Go management and
 cleanup remain in control, not the protocol Worker.
 
+The [sccache backend](workers/sccache/README.md) requires migration `0009` and
+the same `JWT_SECRET` as control. Deploy control first, then the protocol
+Workers, then the gateway. sccache access requires explicit protocol selection
+and `sccache:read` / `sccache:write` permissions.
+
 ```bash
 wrangler r2 bucket create snowstead-private
 # Uploads land near the pusher and replicate to the bucket; reads stay
@@ -38,6 +44,7 @@ wrangler hyperdrive create snowstead --caching-disabled \
 # Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
 wrangler secret put JWT_SECRET --config workers/nix/wrangler.jsonc --env production
 wrangler secret put JWT_SECRET --config workers/go/wrangler.jsonc --env production
+wrangler secret put JWT_SECRET --config workers/sccache/wrangler.jsonc --env production
 wrangler secret put JWT_SECRET --config workers/control/wrangler.jsonc --env production
 wrangler secret put ADMIN_SECRET --config workers/control/wrangler.jsonc --env production
 # Generate 32 cryptographically random bytes, base64; keep a private backup
@@ -72,7 +79,7 @@ not account-level IAM. Terraform owns the store, never secret values.
 
 ### Existing-installation cutover
 
-Deploy Nix, Go, and control **before** replacing the existing `snowstead` Worker
+Deploy control, Nix, Go, and sccache **before** replacing the existing `snowstead` Worker
 with the gateway. Keep the original JWT secret, signing-master-key source,
 bucket names, KV namespace, and database; generating replacement secrets would
 invalidate tokens or make existing sealed keys unreadable. Give both services
@@ -84,7 +91,7 @@ For first deployment, private per-service JSON secret files can be supplied
 with Wrangler's `--secrets-file` option. Do not commit them. Test the private
 services through a local gateway before switching public traffic. Keep the
 old deployment available for rollback. `pnpm deploy` migrates the existing
-schema, deploys control, deploys Nix and Go, then updates the gateway last. The old
+schema, deploys control, then Nix, Go, and sccache, and updates the gateway last. The old
 Worker and control may briefly both run maintenance during this sequence;
 schedule the cutover between cron invocations rather than running concurrent GC.
 The gateway explicitly clears its former schedules. No bucket, database,
@@ -210,14 +217,14 @@ snowstead token create builders --caches team --perms pull
 ```
 
 New caches require an explicit protocol selection: `--protocols nix`,
-`--protocols go`, or `--protocols nix,go` (no default). API creation payloads
-likewise require `"protocols": ["nix"]`, `["go"]`, or `["nix", "go"]` on
+`--protocols go`, `--protocols sccache`, or a comma-separated combination (no default).
+API creation payloads likewise require a nonempty `protocols` array of these names on
 `POST /_api/v1/admin/caches` and `POST /_api/v1/orgs/:org/caches`.
 Existing caches keep their protocols when omitted on updates. To add Go to a
 Nix cache, use `snowstead cache set team --protocols nix,go`; updates must keep
 all enabled protocols and cannot remove them. Cache lists, details, and creation
-responses include the `protocols` array. Existing database caches migrate with
-both protocols enabled.
+responses include the `protocols` array. Existing database caches keep Nix and
+Go enabled; sccache requires explicit opt-in.
 
 On the machines that substitute from it:
 

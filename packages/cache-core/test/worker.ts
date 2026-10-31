@@ -2,6 +2,7 @@ import gateway from "../../../workers/gateway/src/index.js";
 import nix from "../../../workers/nix/src/index.js";
 import control from "../../../workers/control/src/index.js";
 import go from "../../../workers/go/src/index.js";
+import sccache from "../../../workers/sccache/src/index.js";
 
 export { UploadCoordinator } from "../src/upload-coordinator.js";
 
@@ -12,6 +13,7 @@ export default {
 		return gateway.fetch(request, {
 			NIX: { fetch: (request: Request) => nix.fetch(request, env, ctx) } as Fetcher,
 			GO: { fetch: (request: Request) => go.fetch(request, env, ctx) } as Fetcher,
+			SCCACHE: { fetch: (request: Request) => sccache.fetch(request, env, ctx) } as Fetcher,
 			CONTROL: { fetch: (request: Request) => control.fetch(request, env, ctx) } as Fetcher,
 		});
 	},

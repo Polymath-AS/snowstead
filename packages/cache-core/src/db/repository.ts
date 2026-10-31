@@ -20,6 +20,8 @@ import {
 	upstreamPaths,
 	bandwidthDaily,
 	goEntries,
+	sccacheEntries,
+	sccacheUsage,
 	DEFAULT_ORG_ID,
 } from "./schema.js";
 import { CACHE_ID_PREFIX, cacheIdEntry } from "../jwt.js";
@@ -171,10 +173,17 @@ export async function setCachePublic(db: Db, cacheId: number, isPublic: boolean)
 	return db.transaction(async tx => {
 		// Go reservation and publication take this row's lock as well.
 		const [cache] = await tx.select().from(caches).where(eq(caches.id, cacheId)).for("update");
-		if (!cache || (cache.isPublic !== isPublic && await cacheHasGoEntries(tx, cacheId))) return false;
+		if (!cache || (cache.isPublic !== isPublic && (await cacheHasGoEntries(tx, cacheId) || await cacheHasSccacheEntries(tx, cacheId)))) return false;
 		await tx.update(caches).set({ isPublic }).where(eq(caches.id, cacheId));
 		return true;
 	});
+}
+
+export async function cacheHasSccacheEntries(db: Db, cacheId: number): Promise<boolean> {
+	return (await first(db.select({ id: sccacheEntries.id }).from(sccacheEntries)
+		.innerJoin(caches, eq(sccacheEntries.cacheId, caches.id)).where(and(eq(caches.id, cacheId),
+			eq(sccacheEntries.generation, caches.sccacheGeneration), gt(sccacheEntries.expiresAt, new Date()),
+		)).limit(1))) !== undefined;
 }
 
 /** Every cache, or one org's. */
@@ -309,29 +318,39 @@ export async function globalOverview(db: Db, now: Date) {
 }
 
 export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsage> {
-	const [used, pending, go] = await Promise.all([
-		first(
-			db.select({ bytes: sql`coalesce(sum(${caches.size}), 0)`.mapWith(Number) })
-				.from(caches)
-				.where(eq(caches.orgId, orgId)),
-		),
-		first(
-			db.select({ bytes: sql`coalesce(sum(${uploadSessions.fileSize}), 0)`.mapWith(Number) })
-				.from(uploadSessions)
-				.innerJoin(caches, eq(uploadSessions.cacheId, caches.id))
-				.where(and(
-					eq(caches.orgId, orgId),
-					or(eq(uploadSessions.status, "finalizing"), and(inArray(uploadSessions.status, ["pending", "uploading", "streaming"]), gt(uploadSessions.expiresAt, now))),
-				)),
-		),
-		first(db.select({
-			used: sql`coalesce(sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is not null), 0)`.mapWith(Number),
-			pending: sql`coalesce(sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is null), 0)`.mapWith(Number),
-		}).from(goEntries).innerJoin(caches, eq(goEntries.cacheId, caches.id)).where(and(
-			eq(caches.orgId, orgId), eq(goEntries.generation, caches.goGeneration), gt(goEntries.expiresAt, now),
-		))),
-	]);
-	return { used: (used?.bytes ?? 0) + (go?.used ?? 0), pending: (pending?.bytes ?? 0) + (go?.pending ?? 0) };
+	const minute = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
+	const nextMinute = new Date(minute.getTime() + 60_000);
+	// Aggregate each source before combining: joining detail rows would multiply
+	// usage. Summary and boundary entries share the same MVCC snapshot, so a
+	// concurrent publication cannot be counted twice or missed across the two.
+	const [usage] = await db.select({
+		used: sql`coalesce(sum(usage.used), 0)`.mapWith(Number),
+		pending: sql`coalesce(sum(usage.pending), 0)`.mapWith(Number),
+	}).from(sql`(
+		select sum(${caches.size}) as used, 0 as pending from ${caches} where ${caches.orgId} = ${orgId}
+		union all
+		select 0, sum(${uploadSessions.fileSize}) from ${uploadSessions}
+		inner join ${caches} on ${uploadSessions.cacheId} = ${caches.id}
+		where ${caches.orgId} = ${orgId} and (${uploadSessions.status} = 'finalizing'
+			or (${uploadSessions.status} in ('pending', 'uploading', 'streaming') and ${uploadSessions.expiresAt} > ${now}))
+		union all
+		select sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is not null),
+			sum(${goEntries.size}) filter (where ${goEntries.uploadedAt} is null)
+		from ${goEntries} inner join ${caches} on ${goEntries.cacheId} = ${caches.id}
+		where ${caches.orgId} = ${orgId} and ${goEntries.generation} = ${caches.goGeneration} and ${goEntries.expiresAt} > ${now}
+		union all
+		select sum(${sccacheUsage.used}), sum(${sccacheUsage.pending})
+		from ${sccacheUsage} inner join ${caches} on ${sccacheUsage.cacheId} = ${caches.id}
+		where ${caches.orgId} = ${orgId} and ${sccacheUsage.generation} = ${caches.sccacheGeneration}
+			and ${sccacheUsage.expiresMinute} > ${minute}
+		union all
+		select sum(${sccacheEntries.size}) filter (where ${sccacheEntries.uploadedAt} is not null),
+			sum(${sccacheEntries.size}) filter (where ${sccacheEntries.uploadedAt} is null)
+		from ${sccacheEntries} inner join ${caches} on ${sccacheEntries.cacheId} = ${caches.id}
+		where ${caches.orgId} = ${orgId} and ${sccacheEntries.generation} = ${caches.sccacheGeneration} and ${sccacheEntries.expiresAt} > ${now}
+			and ${sccacheEntries.expiresAt} < ${nextMinute}
+	) as usage`);
+	return usage;
 }
 
 /** Adds bytes served for an org to its count for the UTC day of `now`. */

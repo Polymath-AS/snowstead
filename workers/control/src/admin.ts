@@ -29,6 +29,7 @@ import {
 	setCacheSigningKey,
 	cacheHasPaths,
 	cacheHasGoEntries,
+	cacheHasSccacheEntries,
 	listPublishedPathsAfter,
 	findOrg,
 	putOrg,
@@ -231,8 +232,8 @@ const CacheSettings = v.object({
 	),
 	private: v.optional(v.boolean("private must be a boolean")),
 	protocols: v.optional(v.pipe(
-		v.array(v.picklist(["nix", "go"])),
-		v.nonEmpty("Choose at least one protocol: nix or go"),
+		v.array(v.picklist(["nix", "go", "sccache"])),
+		v.nonEmpty("Choose at least one protocol: nix, go, or sccache"),
 		v.check((values) => new Set(values).size === values.length, "protocols must not contain duplicates"),
 	)),
 });
@@ -261,7 +262,7 @@ export async function handleCreateCache(
 	}
 	const existing = await findCache(config.db, org, name);
 	const protocols = body.protocols ?? existing?.protocols;
-	if (protocols === undefined) return errorResponse("Choose at least one protocol: nix or go", 400);
+	if (protocols === undefined) return errorResponse("Choose at least one protocol: nix, go, or sccache", 400);
 	if (existing?.protocols.some((protocol) => !protocols.includes(protocol))) {
 		return errorResponse("Enabled protocols cannot be removed", 409);
 	}
@@ -281,6 +282,9 @@ export async function handleCreateCache(
 	}
 	if (changing && existing && (await cacheHasGoEntries(config.db, existing.id))) {
 		return errorResponse("only a cache without Go entries or uploads can change visibility; reset Go data first", 409);
+	}
+	if (changing && existing && (await cacheHasSccacheEntries(config.db, existing.id))) {
+		return errorResponse("only a cache without sccache entries or uploads can change visibility; reset sccache data first", 409);
 	}
 
 	// The marker before the database when turning private, after it when

@@ -1,4 +1,5 @@
 import { DurableObject, tracing } from "cloudflare:workers";
+import type { RpcStub, RpcTarget } from "cloudflare:workers";
 import { connect } from "./db/connection.js";
 import type { Db } from "./db/connection.js";
 import type { Cache } from "./db/types.js";
@@ -6,6 +7,7 @@ import { createUploadSessions, findOrg } from "./db/repository.js";
 import { StreamState, streamSessionOrg } from "./upload-stream.js";
 import type { StreamReceipt } from "./upload-stream.js";
 import { reserveGoUpload } from "./go-cache.js";
+import { reserveSccacheUpload } from "./sccache.js";
 import { errorResponse } from "./responses.js";
 import { errorForLog } from "./logging.js";
 
@@ -14,6 +16,41 @@ export class UploadCoordinator extends DurableObject<Env> {
 	private tail: Promise<void> = Promise.resolve();
 	private pending = 0;
 	private readonly streams = new StreamState(this.ctx.storage);
+	private sccacheLanes = {
+		read: { active: 0, waiting: [] as ((admitted: boolean) => void)[] },
+		write: { active: 0, waiting: [] as ((admitted: boolean) => void)[] },
+	};
+
+	/** Admission only: callbacks and payloads stay in the protocol Worker. */
+	async admitSccache(laneName: "read" | "write", operation: RpcStub<RpcTarget & { run(): Promise<void> }>): Promise<boolean> {
+		const arrived = Date.now();
+		const lane = this.sccacheLanes[laneName];
+		if (lane.active >= 8) {
+			if (lane.waiting.length >= 64) return false;
+			const admitted = await new Promise<boolean>(resolve => {
+				const wake = (admitted: boolean) => { clearTimeout(timer); resolve(admitted); };
+				const timer = setTimeout(() => {
+					lane.waiting.splice(lane.waiting.indexOf(wake), 1);
+					resolve(false);
+				}, 2000);
+				lane.waiting.push(wake);
+			});
+			if (!admitted) return false;
+		} else {
+			lane.active++;
+		}
+		try {
+			await tracing.enterSpan("sccache_admission", async span => {
+				if (span.isTraced) span.setAttributes({ "snowstead.lane": laneName, "snowstead.queue_ms": Date.now() - arrived });
+				await operation.run();
+			});
+			return true;
+		} finally {
+			const next = lane.waiting.shift();
+			if (next) next(true);
+			else lane.active--;
+		}
+	}
 
 	createStreams(org: string, rows: Parameters<typeof createUploadSessions>[1]) {
 		return this.run("nix", async db => {
@@ -74,6 +111,10 @@ export class UploadCoordinator extends DurableObject<Env> {
 
 	reserveGo(cache: Cache, action: string, output: string, size: number) {
 		return this.run("go", db => reserveGoUpload(db, cache, action, output, size));
+	}
+
+	reserveSccache(cache: Cache, action: string, size: number) {
+		return this.run("sccache", db => reserveSccacheUpload(db, cache, action, size));
 	}
 
 	private async run<T>(protocol: string, operation: (db: Db) => Promise<T>): Promise<T | Response> {

@@ -1,0 +1,71 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "snowstead-sccache",
+	"account_id": "a5af70f803f5950f325622198dbd50a2",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-10",
+	// Required by pg through Hyperdrive, not by artifact streaming.
+	"compatibility_flags": ["nodejs_compat"],
+	"upload_source_maps": true,
+	"keep_names": false,
+	"workers_dev": false,
+	"preview_urls": false,
+	"observability": {
+		"enabled": true,
+		"logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true },
+		"traces": { "enabled": true, "head_sampling_rate": 0.1 },
+		"issues": { "enabled": true }
+	},
+	// Only the gateway is public; only control owns scheduled maintenance.
+	"routes": [],
+	"triggers": { "crons": [] },
+	"durable_objects": {
+		"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-control" }]
+	},
+	// PUBLIC_BUCKET is required by the shared config, but compiler artifacts
+	// always use CACHE_BUCKET. No signing secrets are needed by this service.
+	"r2_buckets": [
+		{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-private" },
+		{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-public" }
+	],
+	"kv_namespaces": [{ "binding": "AUTH_KV", "id": "5600f9fcae284ef6b92a0d809068d44d" }],
+	"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "9c99efdbc9964220995416b4ea44e111" }],
+	"ratelimits": [
+		{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+	],
+	"env": {
+		"production": {
+			"name": "snowstead-sccache",
+			"durable_objects": {
+				"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-control" }]
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "5600f9fcae284ef6b92a0d809068d44d" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "9c99efdbc9964220995416b4ea44e111" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
+			]
+		},
+		"staging": {
+			"name": "snowstead-staging-sccache",
+			"durable_objects": {
+				"bindings": [{ "name": "UPLOAD_COORDINATOR", "class_name": "UploadCoordinator", "script_name": "snowstead-staging-control" }]
+			},
+			"r2_buckets": [
+				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-staging-private" },
+				{ "binding": "PUBLIC_BUCKET", "bucket_name": "snowstead-staging-public" }
+			],
+			"kv_namespaces": [{ "binding": "AUTH_KV", "id": "896fb71e5f8f44dda6c6331227eb5a04" }],
+			"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "78a7b1b04a314a79ba614e11c5b0ede5" }],
+			"ratelimits": [
+				{ "name": "PUSH_LIMIT", "namespace_id": "2001", "simple": { "limit": 6000, "period": 60 } },
+				{ "name": "READ_LIMIT", "namespace_id": "2003", "simple": { "limit": 12000, "period": 60 } }
+			]
+		}
+	}
+}

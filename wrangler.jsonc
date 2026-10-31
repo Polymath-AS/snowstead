@@ -16,6 +16,7 @@
 	"services": [
 		{ "binding": "NIX", "service": "snowstead-nix" },
 		{ "binding": "GO", "service": "snowstead-go" },
+		{ "binding": "SCCACHE", "service": "snowstead-sccache" },
 		{ "binding": "CONTROL", "service": "snowstead-control" }
 	],
 	// Hosted reads go through snowstead-web's owner/cache gateway. The R2
@@ -33,6 +34,7 @@
 			"services": [
 				{ "binding": "NIX", "service": "snowstead-nix" },
 				{ "binding": "GO", "service": "snowstead-go" },
+				{ "binding": "SCCACHE", "service": "snowstead-sccache" },
 				{ "binding": "CONTROL", "service": "snowstead-control" }
 			]
 		},
@@ -48,6 +50,7 @@
 			"services": [
 				{ "binding": "NIX", "service": "snowstead-staging-nix" },
 				{ "binding": "GO", "service": "snowstead-staging-go" },
+				{ "binding": "SCCACHE", "service": "snowstead-staging-sccache" },
 				{ "binding": "CONTROL", "service": "snowstead-staging-control" }
 			]
 		}

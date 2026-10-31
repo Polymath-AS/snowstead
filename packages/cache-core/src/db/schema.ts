@@ -46,6 +46,7 @@ export const caches = pgTable("caches", {
 	retentionDays: integer("retention_days"),
 	/** Go resets change this namespace without touching Nix paths. */
 	goGeneration: text("go_generation").notNull().default("0"),
+	sccacheGeneration: text("sccache_generation").notNull().default("0"),
 	/**
 	 * Its published paths, and the bytes of the NARs they point at (a NAR
 	 * shared with another cache counts in both). Kept by triggers on
@@ -62,10 +63,10 @@ export const caches = pgTable("caches", {
 /** One row per enabled product, with room for product-specific configuration. */
 export const cacheProtocols = pgTable("cache_protocols", {
 	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
-	protocol: text("protocol").$type<"nix" | "go">().notNull(),
+	protocol: text("protocol").$type<"nix" | "go" | "sccache">().notNull(),
 }, (table) => [
 	primaryKey({ columns: [table.cacheId, table.protocol] }),
-	check("cache_protocols_protocol_valid", sql`${table.protocol} IN ('nix', 'go')`),
+	check("cache_protocols_protocol_valid", sql`${table.protocol} IN ('nix', 'go', 'sccache')`),
 ]);
 
 export const cacheSigningKeys = pgTable("cache_signing_keys", {
@@ -289,3 +290,31 @@ export const goEntries = pgTable("go_entries", {
 	uniqueIndex("go_entries_action").on(table.cacheId, table.generation, table.action),
 	index("go_entries_expiry").on(table.expiresAt),
 ]);
+
+/** Opaque sccache archives; action keys are compiler inputs, not body digests. */
+export const sccacheEntries = pgTable("sccache_entries", {
+	id: text("id").primaryKey(),
+	cacheId: integer("cache_id").references(() => caches.id, { onDelete: "set null" }),
+	generation: text("generation").notNull(),
+	action: text("action").notNull(),
+	r2Key: text("r2_key").notNull().unique(),
+	size: bytes("size").notNull(),
+	uploadedAt: timestamptz("uploaded_at"),
+	lastAccessedAt: timestamptz("last_accessed_at"),
+	expiresAt: timestamptz("expires_at").notNull(),
+}, (table) => [
+	index("sccache_entries_lru").on(table.cacheId, table.generation, sql`greatest(${table.uploadedAt}, ${table.lastAccessedAt})`, table.id).where(sql`${table.uploadedAt} is not null`),
+	index("sccache_entries_staging").on(table.cacheId, table.expiresAt).where(sql`${table.uploadedAt} is null`),
+	uniqueIndex("sccache_entries_action").on(table.cacheId, table.generation, table.action),
+	index("sccache_entries_expiry").on(table.expiresAt),
+	index("sccache_entries_quota_expiry").on(table.cacheId, table.generation, table.expiresAt),
+]);
+
+/** Trigger-maintained totals; only the current expiry minute needs an exact entry scan. */
+export const sccacheUsage = pgTable("sccache_usage", {
+	cacheId: integer("cache_id").notNull().references(() => caches.id, { onDelete: "cascade" }),
+	generation: text("generation").notNull(),
+	expiresMinute: timestamptz("expires_minute").notNull(),
+	used: bytes("used").notNull(),
+	pending: bytes("pending").notNull(),
+}, (table) => [primaryKey({ columns: [table.cacheId, table.generation, table.expiresMinute] })]);

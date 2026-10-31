@@ -138,13 +138,15 @@ fn nonempty_csv(value: &str) -> std::result::Result<String, String> {
 fn protocols(value: &str) -> std::result::Result<String, String> {
     let values: Vec<_> = value.split(',').map(str::trim).collect();
     if values.is_empty()
-        || values.iter().any(|p| !matches!(*p, "nix" | "go"))
+        || values
+            .iter()
+            .any(|p| !matches!(*p, "nix" | "go" | "sccache"))
         || values
             .iter()
             .enumerate()
             .any(|(i, p)| values[..i].contains(p))
     {
-        return Err("must be a unique comma-separated list of nix and/or go".into());
+        return Err("must be a unique comma-separated list of nix, go, or sccache".into());
     }
     Ok(values.join(","))
 }
@@ -251,7 +253,9 @@ async fn run(mut cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Cache {
             command: CacheCommand::Create { protocols, .. },
-        } if protocols.is_empty() => bail!("cache create requires --protocols nix|go|nix,go"),
+        } if protocols.is_empty() => {
+            bail!("cache create requires --protocols nix|go|sccache (comma-separated)")
+        }
         Command::Cache {
             command:
                 CacheCommand::Set {

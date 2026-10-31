@@ -1,6 +1,10 @@
 # Snowstead
 
-A Cloudflare-native cache for Nix paths and Go compiler outputs.
+A Cloudflare-native cache for Nix paths and Go, Rust, and C/C++ compiler outputs.
+
+The [sccache backend](workers/sccache/README.md) works with unmodified sccache
+clients over WebDAV. Enable `--protocols sccache` and use scoped
+`sccache:read,sccache:write` tokens for Rust and C/C++ CI builds.
 
 The [native Go helper](apps/go-cache/README.md) uses
 `https://cache.snowstead.com/_api/v1/go/<org-slug>/<cache-name>` as its base URL.
@@ -10,11 +14,12 @@ access only to protected CI jobs building reviewed code: hashes detect
 corruption, not malicious outputs from authorized writers.
 
 New caches require explicit protocols: `snowstead cache create main --protocols nix`
-for Nix, `--protocols go` for Go, or `--protocols nix,go` for both; there is no
+for Nix, `--protocols go` for Go, `--protocols sccache` for Rust/C/C++, or a
+comma-separated combination such as `--protocols nix,go,sccache`; there is no
 default. API creation requests require the corresponding `protocols` array.
 Existing-cache updates may omit it to preserve the selection, or add protocols
 but not remove them (for example, `snowstead cache set main --protocols nix,go`).
-Existing database caches migrate with both protocols enabled.
+Existing database caches keep Nix and Go enabled; sccache requires explicit opt-in.
 
 Go objects use the private bucket and internal Cache API, expire seven days
 after upload, and count toward organization storage limits. Resetting Go leaves
@@ -31,6 +36,7 @@ gate remain disposable local benchmarks, not the hosted named-cache API.
 workers/gateway/      Public URL routing through service bindings
 workers/nix/          Nix reads and upload protocol
 workers/go/           Hosted Go action-cache protocol
+workers/sccache/      Rust/C/C++ artifacts for sccache's WebDAV client
 workers/go-cache/     Isolated prototype for disposable benchmark harnesses
 workers/control/      Organizations, caches, tokens, signing management, and maintenance
 packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
@@ -55,7 +61,7 @@ pnpm check # type-check + tests across the workspace
 
 The worker's tests run against a throwaway Postgres that
 `scripts/with-postgres.sh` starts (or the server `SNOWSTEAD_TEST_DATABASE_URL`
-names). To run all four hosted Workers locally through the gateway on http://localhost:8787:
+names). To run all five hosted Workers locally through the gateway on http://localhost:8787:
 
 ```bash
 pnpm dev
@@ -74,14 +80,14 @@ After changing `packages/cache-core/src/db/schema.ts`, run
 
 See [docs.md](docs.md) for resource setup, secret provisioning, and the
 existing-installation cutover. The gateway has no storage or secrets;
-Nix, Go, and control share the existing database, buckets, and authorization state.
+Nix, Go, sccache, and control share the existing database, buckets, and authorization state.
 Hosted reads enter through the web gateway, which uses the existing R2/CDN
 origin for public objects. Production cache Worker routes remain API-only.
 
 Control owns the SQLite-backed `UploadCoordinator` Durable Object namespace;
-Nix and Go bind to it for shared per-organization upload coordination. Deploy
+Nix, Go, and sccache bind to it for shared per-organization upload coordination. Deploy
 control first to create the namespace and apply its Durable Object migration,
-then Nix and Go, and the gateway last. Staging uses its own control namespace.
+then Nix, Go, and sccache, and the gateway last. Staging uses its own control namespace.
 The coordinator has no public route and does not require a separate Worker.
 
 Each org keeps Nix part grants and sealed receipts in its coordinator's SQLite
@@ -183,7 +189,7 @@ reservation, so retries reuse the same bytes without recompression.
 
 The server grants exact-size parts from a separate, bounded staging budget,
 then checks the final size, compressed hash, and receipts before publishing.
-Publication evicts least-recently-used entries across the org's Nix and Go
+Publication evicts least-recently-used entries across the org's Nix, Go and compiler
 caches when retained capacity is full. Public CDN reads bypass the service,
 so their access times are not observed; pushes and service reads update use.
 Each session uploads private staging bytes, even when the hash is already

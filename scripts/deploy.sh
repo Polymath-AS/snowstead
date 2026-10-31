@@ -9,4 +9,5 @@ pnpm --dir "$ROOT" --filter @snowstead/cache-core db:migrate
 pnpm --dir "$ROOT" exec wrangler deploy --config "$ROOT/workers/control/wrangler.jsonc" --env "$ENV"
 pnpm --dir "$ROOT" exec wrangler deploy --config "$ROOT/workers/nix/wrangler.jsonc" --env "$ENV"
 pnpm --dir "$ROOT" exec wrangler deploy --config "$ROOT/workers/go/wrangler.jsonc" --env "$ENV"
+pnpm --dir "$ROOT" exec wrangler deploy --config "$ROOT/workers/sccache/wrangler.jsonc" --env "$ENV"
 pnpm --dir "$ROOT" exec wrangler deploy --config "$ROOT/wrangler.jsonc" --env "$ENV"

@@ -35,6 +35,6 @@ export type ApiToken = InferSelectModel<typeof apiTokens>;
 
 export type AuditLog = InferSelectModel<typeof auditLogs>;
 
-export type TokenPermission = "pull" | "push" | "go:read" | "go:write";
+export type TokenPermission = "pull" | "push" | "go:read" | "go:write" | "sccache:read" | "sccache:write";
 
 export type UploadSessionStatus = "pending" | "uploading" | "streaming" | "finalizing" | "aborted" | "completed" | "expired";

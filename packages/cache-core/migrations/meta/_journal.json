@@ -64,6 +64,13 @@
       "when": 1793409737316,
       "tag": "0008_retained_capacity",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793461186845,
+      "tag": "0009_parallel_starhawk",
+      "breakpoints": true
     }
   ]
 }

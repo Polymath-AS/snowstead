@@ -54,7 +54,7 @@ fi
 
 # Wrangler loads .dev.vars beside each service's config in multi-Worker mode.
 # Share the generated local source, preserving any service-local overrides.
-for worker in nix go control; do
+for worker in nix go sccache control; do
   if [ ! -e "$ROOT/workers/$worker/.dev.vars" ]; then
     ln -s ../../.dev.vars "$ROOT/workers/$worker/.dev.vars"
   fi
@@ -67,4 +67,5 @@ CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$DATABASE_URL" \
 pnpm exec wrangler dev --local --config "$ROOT/wrangler.jsonc" \
   --config "$ROOT/workers/nix/wrangler.jsonc" --config "$ROOT/workers/control/wrangler.jsonc" \
   --config "$ROOT/workers/go/wrangler.jsonc" \
+  --config "$ROOT/workers/sccache/wrangler.jsonc" \
   --env-file "$ROOT/.dev.vars" "$@"

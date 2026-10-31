@@ -46,7 +46,7 @@ test("Rust CLI uploads, publishes, and skips a real NAR through the hosted Worke
       root: new URL("../../../", import.meta.url).pathname,
       workers: [
         { configPath: "wrangler.jsonc" },
-        ...["nix", "control", "go"].map((worker) => ({ configPath: `workers/${worker}/wrangler.jsonc`, vars, secrets })),
+        ...["nix", "control", "go", "sccache"].map((worker) => ({ configPath: `workers/${worker}/wrangler.jsonc`, vars, secrets })),
       ],
     });
     const { url } = await server.listen();

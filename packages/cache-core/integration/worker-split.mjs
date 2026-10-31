@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { randomBytes, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { Client } from "pg";
@@ -39,6 +42,7 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 				{ configPath: "workers/nix/wrangler.jsonc", vars, secrets },
 				{ configPath: "workers/control/wrangler.jsonc", vars, secrets },
 				{ configPath: "workers/go/wrangler.jsonc", vars, secrets },
+				{ configPath: "workers/sccache/wrangler.jsonc", vars, secrets },
 			],
 		});
 		const { url } = await server.listen();
@@ -223,12 +227,54 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 				}
 			}
 		}
+		// Real clients, empty local caches and a fresh daemon on each pass: a
+		// warm hit must come from the hosted protocol, not process-local state.
+		await api("/admin/caches", { name: "compiler", private: true, protocols: ["sccache"] });
+		const { token: compilerToken } = await (await api("/admin/tokens", {
+			subject: "compiler-test", caches: ["compiler"], perms: ["sccache:read", "sccache:write"],
+		})).json();
+		const dir = await mkdtemp(join(tmpdir(), "snowstead-sccache-"));
+		const exec = promisify(execFile);
+		const clientEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("SCCACHE_")));
+		Object.assign(clientEnv, {
+			SCCACHE_SERVER_UDS: join(dir, "server.sock"), SCCACHE_CONF: join(dir, "config"),
+			SCCACHE_WEBDAV_ENDPOINT: new URL("/_api/v1/sccache/default/compiler/", url).href,
+			SCCACHE_WEBDAV_TOKEN: compilerToken,
+		});
+		const run = args => exec("sccache", args, { env: clientEnv, cwd: dir, timeout: 30_000 });
+		try {
+			await writeFile(join(dir, "config"), "");
+			await writeFile(join(dir, "input.cpp"), "int cached(int n) { return n * 7 + 3; }\n");
+			await writeFile(join(dir, "input.rs"), "pub fn cached(n: u64) -> u64 { n * 11 + 5 }\n");
+			let expected;
+			for (let pass = 0; pass < 2; pass++) {
+				clientEnv.SCCACHE_DIR = join(dir, `local-${pass}`);
+				await run(["--start-server"]);
+				const start = performance.now();
+				await run(["c++", "-c", "input.cpp", "-o", "cpp.o", "-O2"]);
+				await run(["rustc", "--crate-name", "fixture", "--crate-type", "rlib", "--emit=link", "input.rs", "--out-dir", ".", "-O"]);
+				const stats = JSON.parse((await run(["--show-stats", "--stats-format", "json"])).stdout).stats;
+				const sum = counts => Object.values(counts).reduce((a, b) => a + b, 0);
+				assert.equal(sum(stats[pass ? "cache_hits" : "cache_misses"].counts), 2, JSON.stringify(stats));
+				assert.equal(stats.cache_write_errors, 0);
+				const outputs = await Promise.all(["cpp.o", "libfixture.rlib"].map(name => readFile(join(dir, name))));
+				if (expected) assert.deepEqual(outputs, expected);
+				expected = outputs;
+				console.log(`sccache ${pass ? "warm" : "cold"} Rust+C++: ${(performance.now() - start).toFixed(1)} ms`);
+				await run(["--stop-server"]);
+				await Promise.all(["cpp.o", "libfixture.rlib"].map(name => rm(join(dir, name))));
+			}
+		} finally {
+			await run(["--stop-server"]).catch(() => {});
+			await rm(dir, { recursive: true, force: true });
+		}
 		// Each service rejects the other service's routes even when called directly.
 		assert.equal((await server.getWorker("snowstead-nix").fetch("http://test/_api/v1/admin/caches")).status, 404);
 		assert.equal((await server.getWorker("snowstead-control").fetch("http://test/open/nix-cache-info")).status, 404);
 		assert.equal((await server.getWorker("snowstead-go").fetch("http://test/_api/v1/admin/caches")).status, 404);
+		assert.equal((await server.getWorker("snowstead-sccache").fetch("http://test/_api/v1/admin/caches")).status, 404);
 	} catch (error) {
-		console.error(server?.getLogs());
+		console.error(JSON.stringify(server?.getLogs(), null, 2));
 		throw error;
 	} finally {
 		await server?.close();
