@@ -7,6 +7,7 @@ import { findCache, createBlobObject, createPublishedPath } from "../src/db/repo
 import { resolveConfig } from "../src/config.js";
 import { sweepGoEntries } from "../src/go-cache.js";
 import { handleRequest } from "../../../workers/go/src/router.js";
+import { createStream, postUpload } from "./upload.js";
 
 const db = testDb();
 const action = "a".repeat(64);
@@ -47,23 +48,19 @@ async function transfer(target: Target, credential?: string, body?: string, outp
 }
 
 describe("named Go caches", () => {
-	it("does not wait for another reservation's org quota lock when storage is unlimited", async () => {
+	it("applies a new retained capacity on the next publication after an unlimited policy", async () => {
 		const target = await setup();
-		const writer = await token(target);
-		let upload: Promise<Response> | undefined;
-		let completed = false;
-		try {
-			await db.transaction(async tx => {
-				await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + target.org}, 0))`);
-				upload = transfer(target, writer, "independent").then(response => { completed = true; return response; });
-				await expect.poll(() => completed, { timeout: 2000 }).toBe(true);
-			});
-		} finally {
-			// Release the held lock before draining, including on the old code.
-			await upload;
-		}
-		expect((await upload)!.status).toBe(201);
-		expect(await (await transfer(target)).text()).toBe("independent");
+		const writer = await token(target, ["go:read", "go:write"], ["*"]);
+		expect((await transfer(target, writer, "first")).status).toBe(201);
+		expect((await api(target.org, "", "PUT", { storageLimit: 3 })).status).toBe(200);
+		expect(await (await transfer(target)).text()).toBe("first");
+		expect(await (await api(target.org, "")).json()).toMatchObject({ used: 5 });
+		expect((await api(target.org, "/caches", "POST", { name: "second", protocols: ["go"] })).status).toBe(201);
+		const second = { ...target, name: "second" };
+		expect((await transfer(second, writer, "new")).status).toBe(201);
+		expect((await transfer(target)).status).toBe(404);
+		expect(await (await transfer(second)).text()).toBe("new");
+		expect(await (await api(target.org, "")).json()).toMatchObject({ used: 3, pending: 0 });
 	});
 
 	it.each([null, 5])("publishes one immutable output when same-action uploads race with storage limit %s", async storageLimit => {
@@ -81,7 +78,7 @@ describe("named Go caches", () => {
 		expect(await (await api(target.org, `/caches/${target.name}/go`)).json()).toMatchObject({ entries: 1, size: 5 });
 	});
 
-	it("shares finite storage reservations with concurrent Nix pushes across caches", async () => {
+	it("stages concurrent Nix work independently of retained Go capacity across caches", async () => {
 		for (let round = 0; round < 4; round++) {
 			const target = await setup();
 			await api(target.org, "", "PUT", { storageLimit: 100 });
@@ -89,15 +86,14 @@ describe("named Go caches", () => {
 			const writer = await token(target, ["push", "go:write"], [target.name, "nix"]);
 			const [go, nix] = await Promise.all([
 				transfer(target, writer, "g".repeat(60)),
-				SELF.fetch("http://example.com/_api/v1/caches/nix/upload-sessions/batch", {
-					method: "POST", headers: { authorization: `Bearer ${writer}`, "content-type": "application/json" },
-					body: JSON.stringify({ paths: [{ storePath: `/nix/store/${"1".repeat(32)}-quota`, storePathHash: "1".repeat(32),
-						narHash: `sha256:${"1".repeat(52)}`, narSize: 50, fileHash: "b".repeat(64), fileSize: 50, compression: "zstd" }] }),
-				}),
+				(async () => {
+					const stream = await createStream("nix", { storePath: `/nix/store/${"1".repeat(32)}-quota`, storePathHash: "1".repeat(32), narHash: `sha256:${"1".repeat(52)}`, narSize: 50, compression: "zstd" }, writer);
+					return postUpload(`/uploads/${stream.sessionId}/parts`, { parts: [{ partNumber: 1, size: 50 }] }, writer);
+				})(),
 			]);
-			expect([go.status, nix.status]).toEqual(go.status === 201 ? [201, 507] : [413, 201]);
-			expect(await (await api(target.org, "")).json()).toMatchObject(go.status === 201
-				? { used: 60, pending: 0 } : { used: 0, pending: 50 });
+			expect([go.status, nix.status]).toEqual([201, 200]);
+			expect(await (await transfer(target)).text()).toBe("g".repeat(60));
+			expect(await (await api(target.org, "")).json()).toMatchObject({ used: 60, pending: 50 });
 		}
 	});
 
@@ -107,10 +103,9 @@ describe("named Go caches", () => {
 		await api(hot.org, "", "PUT", { storageLimit: 1000 });
 		const writer = await token(hot, ["push", "go:write"]);
 		const coldWriter = await token(cold);
-		const reserve = () => SELF.fetch(`http://example.com/_api/v1/caches/${hot.name}/upload-sessions/batch`, {
-			method: "POST", headers: { authorization: `Bearer ${writer}`, "content-type": "application/json" },
-			body: JSON.stringify({ paths: [{ storePath: `/nix/store/${"1".repeat(32)}-queued`, storePathHash: "1".repeat(32),
-				narHash: `sha256:${"1".repeat(52)}`, narSize: 1, fileHash: "b".repeat(64), fileSize: 1, compression: "zstd" }] }),
+		const reserve = async () => SELF.fetch(`http://example.com/_api/v1/go/${hot.org}/${hot.name}/v1/actions/${crypto.randomUUID().replaceAll("-", "").padEnd(64, "0")}`, {
+			method: "PUT", headers: { authorization: `Bearer ${writer}`, "content-length": "1", "x-snowstead-output-id": await hash("x") },
+			body: "x",
 		});
 		const pending: Promise<Response>[] = [];
 		const responses: Response[] = [];
@@ -130,9 +125,9 @@ describe("named Go caches", () => {
 		expect(responses.every(response => [201, 429].includes(response.status))).toBe(true);
 		expect(responses.filter(response => response.status === 201)).toHaveLength(1);
 		expect(responses.filter(response => response.status === 429).every(response => response.headers.get("retry-after") === "1")).toBe(true);
-		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 0, pending: 1 });
+		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 1, pending: 0 });
 		expect((await reserve()).status).toBe(201);
-		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 0, pending: 2 });
+		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 2, pending: 0 });
 	});
 
 	it("completes a distinct upload while an earlier upload body is paused", async () => {

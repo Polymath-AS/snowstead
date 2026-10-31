@@ -6,7 +6,7 @@ import { resolveConfig } from "../src/config.js";
 import type { WorkerConfig } from "../src/config.js";
 import { createCache, createUploadSession, acquireNarInstallations, deleteEmptyCache } from "../src/db/repository.js";
 import { narInstallations, uploadSessions } from "../src/db/schema.js";
-import { installStagedNar, installNar, INSTALLATION_BUSY } from "../src/nar-install.js";
+import { installStagedNars, installNar, INSTALLATION_BUSY } from "../src/nar-install.js";
 import { narKey, placeNar } from "../src/layout.js";
 import { testDb } from "./db.js";
 
@@ -69,13 +69,13 @@ describe("verified canonical NAR installation", () => {
 				await env.CACHE_BUCKET.delete(key);
 			},
 		});
-		const result = installStagedNar(config({ bucket: privateBucket }), f.session);
+		const result = installStagedNars(config({ bucket: privateBucket }), [f.session]);
 		if (failDelete) {
 			await expect(result).rejects.toThrow("storage unavailable");
 			expect(await gate(f.key)).toMatchObject({ sourceKey: f.sourceKey });
 			expect(await env.CACHE_BUCKET.head(f.sourceKey)).not.toBeNull();
 		} else {
-			expect(await result).toBeUndefined();
+			expect((await result).get(f.session.id)).toBeUndefined();
 			expect(await gate(f.key)).toBeUndefined();
 			expect(await env.CACHE_BUCKET.head(f.sourceKey)).toBeNull();
 		}
@@ -96,7 +96,7 @@ describe("verified canonical NAR installation", () => {
 			bucket: privateBucket,
 			releaseDb: async () => { await base.releaseDb(); released = true; },
 		});
-		expect(await installStagedNar(cfg, f.session)).toBeUndefined();
+		expect((await installStagedNars(cfg, [f.session])).get(f.session.id)).toBeUndefined();
 		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
 		expect(await env.CACHE_BUCKET.head(f.sourceKey)).not.toBeNull();
 		expect(await gate(f.key)).toBeUndefined();
@@ -109,7 +109,7 @@ describe("verified canonical NAR installation", () => {
 		await env.CACHE_BUCKET.put(f.sourceKey,
 			fault === "size" ? new Uint8Array(1) : fault === "hash" ? new Uint8Array(16) : f.bytes,
 			{ customMetadata: { session: fault === "owner" ? "someone-else" : f.session.id } });
-		expect(await installStagedNar(config(), f.session)).toBe(
+		expect((await installStagedNars(config(), [f.session])).get(f.session.id)).toBe(
 			fault === "owner" ? "Upload incomplete" : fault === "size" ? "File size mismatch" : "File hash mismatch",
 		);
 		expect((await env.PUBLIC_BUCKET.head(f.key))?.version).toBe(before?.version);
@@ -117,11 +117,12 @@ describe("verified canonical NAR installation", () => {
 		expect(await gate(f.key)).toBeUndefined();
 	});
 
-	it.each([false, true])("only legacy multipart stages may omit session metadata (legacy: %s)", async legacy => {
+	it.each([null, 8 * 1024 ** 2])("requires stage ownership regardless of part size (%s)", async partSize => {
 		const f = await fixture();
 		await env.CACHE_BUCKET.put(f.sourceKey, f.bytes);
-		const session = { ...f.session, r2UploadId: "assembled", partSize: legacy ? null : 8 * 1024 ** 2 };
-		expect(await installStagedNar(config(), session)).toBe(legacy ? undefined : "Upload incomplete");
+		const session = { ...f.session, r2UploadId: "assembled", partSize };
+		expect((await installStagedNars(config(), [session])).get(session.id)).toBe("Upload incomplete");
+		expect(await env.PUBLIC_BUCKET.head(f.key)).toBeNull();
 		expect(await gate(f.key)).toBeUndefined();
 	});
 
@@ -129,7 +130,7 @@ describe("verified canonical NAR installation", () => {
 		const a = await fixture();
 		const b = await fixture();
 		const cfg = config();
-		expect(await Promise.all([installStagedNar(cfg, a.session), installStagedNar(cfg, b.session)])).toEqual([undefined, undefined]);
+		expect(await Promise.all([installStagedNars(cfg, [a.session]), installStagedNars(cfg, [b.session])])).toEqual([new Map([[a.session.id, undefined]]), new Map([[b.session.id, undefined]])]);
 		expect(await gate(a.key)).toBeUndefined();
 		expect(await gate(b.key)).toBeUndefined();
 	});
@@ -138,7 +139,7 @@ describe("verified canonical NAR installation", () => {
 		const f = await fixture();
 		await db.insert(uploadSessions).values({ ...f.session, id: crypto.randomUUID(), r2UploadKey: f.key });
 		const before = await env.PUBLIC_BUCKET.put(f.key, f.bytes, { customMetadata: { session: "old-owner" } });
-		expect(await installStagedNar(config(), f.session)).toBeUndefined();
+		expect((await installStagedNars(config(), [f.session])).get(f.session.id)).toBeUndefined();
 		expect(await env.PUBLIC_BUCKET.head(f.key)).toMatchObject({ version: before.version, customMetadata: { session: "old-owner" } });
 	});
 
@@ -155,7 +156,7 @@ describe("verified canonical NAR installation", () => {
 				return observed;
 			},
 		});
-		expect(await installStagedNar(config({ publicBucket }), f.session)).toBeUndefined();
+		expect((await installStagedNars(config({ publicBucket }), [f.session])).get(f.session.id)).toBeUndefined();
 		expect((await env.PUBLIC_BUCKET.head(f.key))?.customMetadata).toEqual({ session: "old-owner" });
 		expect(await gate(f.key)).toBeUndefined();
 	});
@@ -167,7 +168,7 @@ describe("verified canonical NAR installation", () => {
 			fileHash: f.fileHash, compression: "zstd", isPrivate: false, fileSize: f.bytes.length,
 		}])).toEqual(["another-operation"]);
 		const get = vi.fn(() => { throw new Error("must not hash"); });
-		expect(await installStagedNar(config({ bucket: bucket(env.CACHE_BUCKET, { get }) }), f.session)).toBe(INSTALLATION_BUSY);
+		expect((await installStagedNars(config({ bucket: bucket(env.CACHE_BUCKET, { get }) }), [f.session])).get(f.session.id)).toBe(INSTALLATION_BUSY);
 		expect(get).not.toHaveBeenCalled();
 		expect((await gate(f.key))?.operationId).toBe("another-operation");
 	});
@@ -179,8 +180,8 @@ describe("verified canonical NAR installation", () => {
 			r2UploadKey: f.key, r2UploadId: multipart ? "legacy-multipart" : null,
 			expiresAt: multipart ? new Date(0) : new Date(Date.now() + 60_000),
 		});
-		expect(await installStagedNar(config({ bucket: f.source, publicBucket: f.destination }),
-			{ ...f.session, fileSize: f.size })).toBe(INSTALLATION_BUSY);
+		expect((await installStagedNars(config({ bucket: f.source, publicBucket: f.destination }),
+			[{ ...f.session, fileSize: f.size }])).get(f.session.id)).toBe(INSTALLATION_BUSY);
 		expect(f.upload.uploadPart).not.toHaveBeenCalled();
 		expect(f.upload.complete).not.toHaveBeenCalled();
 		expect(await env.PUBLIC_BUCKET.head(f.key)).toBeNull();

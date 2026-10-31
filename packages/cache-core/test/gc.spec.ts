@@ -1,5 +1,7 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, afterAll } from "vitest";
+import { eq } from "drizzle-orm";
+import { narInstallations } from "../src/db/schema.js";
 import {
 	createCache,
 	createBlobObject,
@@ -94,6 +96,36 @@ describe("gc: expire abandoned sessions", () => {
 		expect((await findUploadSession(config.db, live.id))?.status).toBe("completed");
 		expect(await env.PUBLIC_BUCKET.head(unpublished.key)).toBeNull();
 		expect(await env.PUBLIC_BUCKET.head(published.key)).not.toBeNull();
+	});
+
+	it("keeps pinned completed stages while cleaning unpinned and null-key sessions", async () => {
+		const cache = await createCache(config.db, `gc-pinned-${crypto.randomUUID()}`);
+		const sessions = [];
+		for (const staged of [true, true, false]) {
+			const id = crypto.randomUUID();
+			const key = staged ? `staging/${id}` : null;
+			const session = await createUploadSession(config.db, makeSessionParams({ id, cacheId: cache.id, expiresAt: new Date(0), r2UploadKey: key }));
+			await transitionSessionStatus(config.db, id, "pending", "completed");
+			if (key) await env.CACHE_BUCKET.put(key, "stage");
+			sessions.push(session);
+		}
+		const [pinned, unpinned, noKey] = sessions;
+		// Multiple installations may protect the same source; none may be cleaned.
+		await config.db.insert(narInstallations).values(["a", "b"].map(suffix => ({
+			key: `nar/${crypto.randomUUID()}/${suffix}`, operationId: crypto.randomUUID(), sourceKey: pinned.r2UploadKey!,
+			fileHash: pinned.fileHash!, fileSize: pinned.fileSize, compression: pinned.compression, isPrivate: true,
+		})));
+		try {
+			const result = await runGarbageCollection(config);
+			expect(result.errors).toEqual([]);
+			expect((await findUploadSession(config.db, pinned.id))?.status).toBe("completed");
+			expect(await env.CACHE_BUCKET.head(pinned.r2UploadKey!)).not.toBeNull();
+			expect(await findUploadSession(config.db, unpinned.id)).toBeUndefined();
+			expect(await env.CACHE_BUCKET.head(unpinned.r2UploadKey!)).toBeNull();
+			expect(await findUploadSession(config.db, noKey.id)).toBeUndefined();
+		} finally {
+			await config.db.delete(narInstallations).where(eq(narInstallations.sourceKey, pinned.r2UploadKey!));
+		}
 	});
 
 	it("retries a partially failed NAR deletion on the next GC run", async () => {

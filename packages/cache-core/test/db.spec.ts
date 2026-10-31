@@ -12,8 +12,6 @@ import {
 	findUploadSession,
 	transitionSessionStatus,
 	findExpiredSessions,
-	upsertUploadPart,
-	findUploadParts,
 	createGcMark,
 	findGcMarks,
 	deleteGcMark,
@@ -300,38 +298,6 @@ describe("upload_sessions", () => {
 		expect(expiredIds).toContain(expiredId);
 		expect(expiredIds).not.toContain(freshId);
 		expect(expiredIds).not.toContain(sessionId);
-	});
-});
-
-describe("upload_parts", () => {
-	it("stores parts and reads them back in part-number order", async () => {
-		const cache = await createCache(getDb(), `up-create-${crypto.randomUUID()}`);
-		const sessionId = crypto.randomUUID();
-		await createUploadSession(getDb(), makeSessionParams({ id: sessionId, cacheId: cache.id }));
-
-		const row = await upsertUploadPart(getDb(), {
-			sessionId,
-			partNumber: 3,
-			etag: "etag-abc",
-			size: 1024,
-		});
-
-		expect(row.sessionId).toBe(sessionId);
-		expect(row.partNumber).toBe(3);
-		expect(row.etag).toBe("etag-abc");
-		expect(row.size).toBe(1024);
-		expect(typeof row.id).toBe("number");
-
-		await upsertUploadPart(getDb(), { sessionId, partNumber: 1, etag: "e1", size: 100 });
-		await upsertUploadPart(getDb(), { sessionId, partNumber: 2, etag: "e2", size: 200 });
-
-		const parts = await findUploadParts(getDb(), sessionId);
-
-		expect(parts).toEqual([
-			expect.objectContaining({ sessionId, partNumber: 1, etag: "e1", size: 100 }),
-			expect.objectContaining({ sessionId, partNumber: 2, etag: "e2", size: 200 }),
-			row,
-		]);
 	});
 });
 

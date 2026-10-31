@@ -111,12 +111,9 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	for (let batch = 0; batch < GC_BLOB_BATCHES; batch++) {
 		try {
 			const count = await withUploadSourceCleanup(config.db, async tx => {
-				const done = await findExpiredCompletedSessions(tx, now, GC_BLOB_BATCH);
-				const unpinned = [];
-				for (const session of done) {
-					if (session.r2UploadKey && await narSourcePinned(tx, session.r2UploadKey)) continue;
+				const unpinned = await findExpiredCompletedSessions(tx, now, GC_BLOB_BATCH);
+				for (const session of unpinned) {
 					if (session.r2UploadKey?.startsWith("staging/")) await config.bucket.delete(session.r2UploadKey);
-					unpinned.push(session);
 				}
 				await ensureBlobObjects(tx, unpinned.flatMap(s =>
 					s.fileHash && s.r2UploadKey && !s.r2UploadKey.startsWith("staging/")

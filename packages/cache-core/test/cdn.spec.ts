@@ -5,6 +5,7 @@ import { purgeCache, purgeNarinfo, scheduleNarinfoPurge, retryCdnPurges } from "
 import { handleRequest as handleNix } from "../../../workers/nix/src/router.js";
 import { handleRequest as handleControl } from "../../../workers/control/src/router.js";
 import type { WorkerConfig } from "../src/config.js";
+import { stageUpload, finalizeUploads } from "./upload.js";
 
 function handleRequest(request: Request, config: WorkerConfig): Promise<Response> {
 	const path = new URL(request.url).pathname;
@@ -109,8 +110,6 @@ describe("CDN purges", () => {
 		const name = `purge-flow-${crypto.randomUUID().slice(0, 8)}`;
 		const hash = "3".repeat(32);
 		const bytes = new Uint8Array([83, 14, 251]);
-		const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-		const fileHash = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
 		const post = (path: string, body: unknown, secret = "test-auth-token") => handleRequest(new Request(`http://example.com/_api/v1${path}`, {
 			method: "POST", headers: { authorization: `Bearer ${secret}` }, body: JSON.stringify(body),
 		}), local);
@@ -118,20 +117,17 @@ describe("CDN purges", () => {
 		const outbound = vi.spyOn(globalThis, "fetch").mockImplementation(failed.fetcher);
 		try {
 			expect((await post("/admin/caches", { name, protocols: ["nix"] }, "test-admin-secret")).status).toBe(201);
-			const session = await (await post(`/caches/${name}/upload-sessions`, {
+			const fetcher = (request: Request) => handleRequest(request, local);
+			const item = await stageUpload(name, {
 				storePathHash: hash, storePath: `/nix/store/${hash}-purged`, narHash: `sha256:${"1".repeat(52)}`,
-				narSize: bytes.length, fileHash, fileSize: bytes.length, compression: "zstd",
-			})).json<{ sessionId: string }>();
-			expect((await handleRequest(new Request(`http://example.com/_api/v1/uploads/${session.sessionId}/blob`, {
-				method: "PUT", headers: { authorization: "Bearer test-auth-token" }, body: bytes,
-			}), local)).status).toBe(200);
-			expect((await post(`/uploads/${session.sessionId}/complete`, {})).status).toBe(200);
-			expect((await post(`/uploads/${session.sessionId}/publish`, {})).status).toBe(200);
+				narSize: bytes.length, compression: "zstd",
+			}, bytes, "test-auth-token", fetcher);
+			expect(await finalizeUploads([item], "test-auth-token", fetcher)).toMatchObject([{ published: true }]);
 			expect((await env.CACHE_BUCKET.list({ prefix: "cdn-purges/" })).objects).toHaveLength(1);
 			const recovered = api();
 			outbound.mockImplementation(recovered.fetcher);
 			expect(await retryCdnPurges(local)).toBe(1);
-			expect((await post(`/uploads/${session.sessionId}/publish`, {})).status).toBe(200);
+			expect(await finalizeUploads([item], "test-auth-token", fetcher)).toMatchObject([{ published: true }]);
 			expect((await post(`/admin/caches/${name}/paths/delete`, { storePathHashes: [hash] }, "test-admin-secret")).status).toBe(200);
 			expect(recovered.calls.map((call) => call.body.files)).toEqual(Array.from({ length: 3 }, () => [`https://cache.example.com/${name}/${hash}.narinfo`]));
 			expect(await env.PUBLIC_BUCKET.head(`${name}/${hash}.narinfo`)).toBeNull();

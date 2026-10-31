@@ -1,6 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { signJwt, TOKEN_ISSUER, TOKEN_AUDIENCE } from "../src/jwt.js";
+import { createStream, finalizeUploads, postUpload, stageUpload, uploadPart } from "./upload.js";
 
 const unique = (prefix: string) => `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -37,7 +38,7 @@ async function sign(caches: string[], perms: ("push" | "pull")[], org?: string):
 	}, env.JWT_SECRET);
 }
 
-function createSessions(cache: string, sizes: number[], token: string): Promise<Response> {
+async function createSessions(cache: string, sizes: number[], token: string): Promise<Response> {
 	const paths = sizes.map((fileSize) => {
 		const hash = crypto.randomUUID().replaceAll("-", "").slice(0, 32).replace(/[eotu]/g, "a");
 		return {
@@ -45,16 +46,28 @@ function createSessions(cache: string, sizes: number[], token: string): Promise<
 			storePathHash: hash,
 			narHash: `sha256:${"1".repeat(52)}`,
 			narSize: fileSize,
-			fileHash: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
-			fileSize,
 			compression: "zstd",
 		};
 	});
-	return SELF.fetch(`http://example.com/_api/v1/caches/${cache}/upload-sessions/batch`, {
+	const created = await SELF.fetch(`http://example.com/_api/v1/caches/${cache}/upload-streams/batch`, {
 		method: "POST",
 		headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 		body: JSON.stringify({ paths }),
 	});
+	if (created.status !== 201) return created;
+	const body = await created.json<{ sessions: { sessionId: string; partSize: number }[] }>();
+	for (const [i, session] of body.sessions.entries()) {
+		// Reserve in protocol-sized batches without uploading synthetic large bodies.
+		const parts = Array.from({ length: Math.ceil(sizes[i] / session.partSize) }, (_, n) => ({ partNumber: n + 1, size: Math.min(session.partSize, sizes[i] - n * session.partSize) }));
+		for (let offset = 0; offset < parts.length; offset += 100) {
+			const response = await postUpload(`/uploads/${session.sessionId}/parts`, { parts: parts.slice(offset, offset + 100) }, token);
+			if (response.status !== 200) {
+				expect((await postUpload(`/uploads/${session.sessionId}/abort`, {}, token)).status).toBe(200);
+				return response;
+			}
+		}
+	}
+	return Response.json(body, { status: 201 });
 }
 
 /** An org with one cache, and a token that pushes to it. */
@@ -169,83 +182,108 @@ describe("orgs", () => {
 });
 
 describe("storage limit", () => {
-	it("stages duplicate NARs independently without reserving more quota on multipart retry", async () => {
+	async function streams(cache: string, token: string, count: number, narSize = 1) {
+		const sessions = [];
+		for (let i = 0; i < count; i++) {
+			const hash = crypto.randomUUID().replaceAll("-", "").replace(/[eotu]/g, "a");
+			sessions.push(await createStream(cache, { storePath: `/nix/store/${hash}-quota`, storePathHash: hash, narHash: `sha256:${"1".repeat(52)}`, narSize, compression: "zstd" }, token));
+		}
+		return sessions;
+	}
+
+	function reserve(token: string, uploads: { sessionId: string; parts: { partNumber: number; size: number }[] }[]) {
+		return SELF.fetch("http://example.com/_api/v1/uploads/parts", { method: "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ uploads }) });
+	}
+
+	it("stages duplicate NARs independently without double-reserving part retries", async () => {
 		const bytes = crypto.getRandomValues(new Uint8Array(16));
 		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
 		const { org, cache, token } = await orgWithCache(32);
-		const post = (path: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1${path}`, {
-			method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body),
-		});
-		const create = async (digit: string) => {
-			const hash = digit.repeat(32);
-			return post(`/caches/${cache}/upload-sessions`, {
-				storePath: `/nix/store/${hash}-quota`, storePathHash: hash,
-				narHash: `sha256:${"1".repeat(52)}`, narSize: 32, fileHash, fileSize: 16, compression: "zstd",
-			});
-		};
-		const first = await create("1");
-		const second = await create("2");
-		expect(first.status).toBe(201);
-		expect(second.status).toBe(201);
-		const a = await first.json<{ sessionId: string; r2Key: string }>();
-		const b = await second.json<{ sessionId: string; r2Key: string }>();
-		for (const s of [a, b]) expect(s.r2Key).toBe(`staging/${s.sessionId}`);
-		const put = (id: string, suffix: string) => SELF.fetch(`http://example.com/_api/v1/uploads/${id}/${suffix}`, {
-			method: "PUT", headers: { authorization: `Bearer ${token}` }, body: bytes,
-		});
-		expect((await put(a.sessionId, "blob")).status).toBe(200);
+		const sessions = await streams(cache, token, 3, 32);
+		const uploads = sessions.map(s => ({ sessionId: s.sessionId, parts: [{ partNumber: 1, size: bytes.length }] }));
+		for (let retry = 0; retry < 2; retry++) expect(await (await reserve(token, uploads)).json()).toMatchObject({ results: sessions.map(() => ({ parts: [{ partNumber: 1 }] })) });
+		const items = [];
+		for (const s of sessions.slice(0, 2)) items.push({ sessionId: s.sessionId, narHash: `sha256:${"1".repeat(52)}`, narSize: 32, fileHash, fileSize: bytes.length, parts: [await uploadPart(s.sessionId, bytes, token)] });
 		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
-		expect((await create("3")).status).toBe(507);
-		const start = await post(`/uploads/${b.sessionId}/multipart`, {});
-		expect(start.status).toBe(200);
-		const instructions = await start.json();
-		expect(await (await post(`/uploads/${b.sessionId}/multipart`, {})).json()).toEqual(instructions);
-		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 32, used: 0 });
-		expect((await put(b.sessionId, "part/1")).status).toBe(200);
-		expect((await post(`/uploads/${b.sessionId}/complete`, {})).status).toBe(200);
-		for (const sessionId of [b.sessionId, a.sessionId]) {
-			expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
-		}
-		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 0, used: 32 });
-		for (const s of [a, b]) expect(await env.CACHE_BUCKET.head(s.r2Key)).not.toBeNull();
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 48, used: 0 });
+		expect(await finalizeUploads(items.reverse(), token)).toMatchObject([{ published: true }, { published: true }]);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 16, used: 32 });
+		for (const s of sessions.slice(0, 2)) expect(await env.CACHE_BUCKET.head(`staging/${s.sessionId}`)).not.toBeNull();
 	});
 
-	it("accepts pushes that fit and refuses one that doesn't", async () => {
+	it("admits staging beyond retained capacity but rejects an individually oversized object", async () => {
 		const { org, cache, token } = await orgWithCache(1000);
 
 		expect((await createSessions(cache, [400, 400], token)).status).toBe(201);
-		// Uploads under way count, so a second push can't take the same space.
-		const refused = await createSessions(cache, [300], token);
-		expect(refused.status).toBe(507);
-		expect(await refused.json()).toEqual({
-			error: "Not enough storage: this push needs 300 bytes, and 200 bytes of your 1.0 KB is left.",
-		});
-
-		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ used: 0, pending: 800 });
+		expect((await createSessions(cache, [300], token)).status).toBe(201);
+		const refused = await createSessions(cache, [1001], token);
+		expect(refused.status).toBe(413);
+		expect(await refused.json()).toEqual({ error: "Object exceeds cache capacity" });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ used: 0, pending: 1100 });
 		expect((await createSessions(cache, [200], token)).status).toBe(201);
 	});
 
-	it("refuses a whole batch that doesn't fit", async () => {
+	it("stages a batch whose individual objects fit even when its sum exceeds retained capacity", async () => {
 		const { org, cache, token } = await orgWithCache(1000);
 
-		expect((await createSessions(cache, [600, 600], token)).status).toBe(507);
-		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 0 });
+		expect((await createSessions(cache, [600, 600], token)).status).toBe(201);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 1200 });
 	});
 
-	it("lets two pushes at once take no more than the limit", async () => {
-		const { cache, token } = await orgWithCache(1000);
+	it("admits concurrent pushes independently of retained capacity", async () => {
+		const { org, cache, token } = await orgWithCache(1000);
 
 		const results = await Promise.all(Array.from({ length: 4 }, () => createSessions(cache, [400], token)));
-		expect(results.map((r) => r.status).sort()).toEqual([201, 201, 507, 507]);
+		expect(results.map((r) => r.status)).toEqual([201, 201, 201, 201]);
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 1600, used: 0 });
 	});
 
-	it("doesn't limit an org without one, such as the default org", async () => {
+	it("bounds temporary bytes separately, including orgs without retained limits", async () => {
 		const { cache, token } = await orgWithCache(null);
-		expect((await createSessions(cache, [10 ** 12], token)).status).toBe(201);
+		expect((await createSessions(cache, [1024], token)).status).toBe(201);
+		const busy = await createSessions(cache, [10 ** 12], token);
+		expect(busy.status).toBe(429);
+		expect(await busy.json()).toEqual({ error: "Upload staging is busy; retry" });
 
 		const loose = unique("cache");
 		expect((await admin("/caches", "POST", { name: loose, protocols: ["nix"] })).status).toBe(201);
-		expect((await createSessions(loose, [10 ** 12], "test-auth-token")).status).toBe(201);
+		expect((await createSessions(loose, [1024], "test-auth-token")).status).toBe(201);
+		expect((await createSessions(loose, [10 ** 12], "test-auth-token")).status).toBe(429);
+	});
+
+	it("serializes competing staging reservations without reserving retained bytes", async () => {
+		const size = 256 * 1024 ** 2;
+		const { org, cache, token } = await orgWithCache(size);
+		const results = await Promise.all(Array.from({ length: 4 }, () => createSessions(cache, [size], token)));
+		expect(results.map(r => r.status).sort()).toEqual([201, 201, 429, 429]);
+		for (const response of results.filter(r => r.status === 429)) expect(await response.json()).toEqual({ error: "Upload staging is busy; retry" });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: size * 2, used: 0 });
+	});
+
+	it("grants stream parts beyond retained capacity with replay and per-object bounds", async () => {
+		const { org, cache, token } = await orgWithCache(10);
+		const sessions = await streams(cache, token, 2);
+		expect((await createSessions(cache, [9], token)).status).toBe(201);
+		const uploads = sessions.map(({ sessionId }, i) => ({ sessionId, parts: [{ partNumber: 1, size: 8 - i }] }));
+		for (let replay = 0; replay < 2; replay++) {
+			expect(await (await reserve(token, uploads)).json()).toMatchObject({ results: [{ parts: [{ partNumber: 1 }] }, { parts: [{ partNumber: 1 }] }] });
+			expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 24, used: 0 });
+		}
+		expect(await (await reserve(token, [{ sessionId: sessions[0].sessionId, parts: [{ partNumber: 2, size: 3 }] }])).json()).toMatchObject({ results: [{ status: 413 }] });
+		expect(await (await reserve(token, [{ sessionId: sessions[0].sessionId, parts: [{ partNumber: 1, size: 9 }] }])).json()).toMatchObject({ results: [{ status: 409 }] });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 24, used: 0 });
+	});
+
+	it("bounds aggregate durable stream staging while permitting existing grant replays", async () => {
+		const size = 256 * 1024 ** 2;
+		const { org, cache, token } = await orgWithCache(size);
+		const sessions = await streams(cache, token, 3, size);
+		const uploads = sessions.slice(0, 2).map(({ sessionId, partSize }) => ({ sessionId, parts: Array.from({ length: size / partSize }, (_, i) => ({ partNumber: i + 1, size: partSize })) }));
+		for (const upload of uploads) expect(await (await reserve(token, [upload])).json()).toMatchObject({ results: [{ parts: upload.parts.map(p => ({ partNumber: p.partNumber })) }] });
+		expect(await (await reserve(token, [{ sessionId: sessions[2].sessionId, parts: [{ partNumber: 1, size: 1 }] }])).json()).toMatchObject({ results: [{ status: 429 }] });
+		expect(await (await reserve(token, uploads)).json()).toMatchObject({ results: uploads.map(upload => ({ parts: upload.parts.map(p => ({ partNumber: p.partNumber })) })) });
+		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: size * 2, used: 0 });
 	});
 });
 
@@ -346,19 +384,11 @@ describe("public org caches", () => {
 		const body = crypto.getRandomValues(new Uint8Array(16));
 		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))].map((b) => b.toString(16).padStart(2, "0")).join("");
 		const hash = "r".repeat(32);
-		const post = (path: string, payload: unknown) => SELF.fetch(`http://example.com/_api/v1${path}`, {
-			method: "POST",
-			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-			body: JSON.stringify(payload),
-		});
-
-		const created = await post(`/caches/${cache}/upload-sessions`, {
+		const item = await stageUpload(cache, {
 			storePath: `/nix/store/${hash}-hello`, storePathHash: hash, narHash: `sha256:${"1".repeat(52)}`,
-			narSize: 32, fileHash, fileSize: 16, compression: "zstd",
-		});
-		const { sessionId } = await created.json<{ sessionId: string }>();
-		await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, { method: "PUT", headers: { authorization: `Bearer ${token}` }, body });
-		expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
+			narSize: 32, compression: "zstd",
+		}, body, token);
+		expect(await finalizeUploads([item], token)).toMatchObject([{ published: true }]);
 
 		const stored = await env.PUBLIC_BUCKET.get(`${org}/${cache}/${hash}.narinfo`);
 		const narinfo = (await stored?.text()) ?? "";
@@ -426,19 +456,11 @@ describe("slug changes", () => {
 	/** Publishes one path to the cache, as the client does. */
 	async function publish(cache: string, token: string, hash: string): Promise<void> {
 		const body = crypto.getRandomValues(new Uint8Array(16));
-		const fileHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))].map((b) => b.toString(16).padStart(2, "0")).join("");
-		const post = (path: string, payload: unknown) => SELF.fetch(`http://example.com/_api/v1${path}`, {
-			method: "POST",
-			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-			body: JSON.stringify(payload),
-		});
-		const created = await post(`/caches/${cache}/upload-sessions`, {
+		const item = await stageUpload(cache, {
 			storePath: `/nix/store/${hash}-hello`, storePathHash: hash, narHash: `sha256:${"1".repeat(52)}`,
-			narSize: 32, fileHash, fileSize: 16, compression: "zstd",
-		});
-		const { sessionId } = await created.json<{ sessionId: string }>();
-		await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, { method: "PUT", headers: { authorization: `Bearer ${token}` }, body });
-		expect(await (await post("/uploads/commit", { sessionIds: [sessionId] })).json()).toMatchObject({ results: [{ published: true }] });
+			narSize: 32, compression: "zstd",
+		}, body, token);
+		expect(await finalizeUploads([item], token)).toMatchObject([{ published: true }]);
 	}
 
 	/** Calls POST /move until it's done. */

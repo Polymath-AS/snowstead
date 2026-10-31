@@ -84,7 +84,7 @@ For first deployment, private per-service JSON secret files can be supplied
 with Wrangler's `--secrets-file` option. Do not commit them. Test the private
 services through a local gateway before switching public traffic. Keep the
 old deployment available for rollback. `pnpm deploy` migrates the existing
-schema, deploys Nix and Go, deploys control, then updates the gateway last. The old
+schema, deploys control, deploys Nix and Go, then updates the gateway last. The old
 Worker and control may briefly both run maintenance during this sequence;
 schedule the cutover between cron invocations rather than running concurrent GC.
 The gateway explicitly clears its former schedules. No bucket, database,

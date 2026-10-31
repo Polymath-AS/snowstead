@@ -7,6 +7,7 @@ import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
 import { errorResponse } from "@snowstead/cache-core/responses";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
+import { CapacityError, recordGoAccess, withOrgCapacity } from "@snowstead/cache-core/capacity";
 
 const RETENTION_MS = 7 * 86400_000;
 const MAX_BYTES = 64 * 1024 * 1024;
@@ -51,6 +52,7 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 	const cached = await edgeCache.match(key);
 	if (cached) {
 		if (head) await cached.body?.cancel();
+		recordGoAccess(config, entry.id);
 		return returned(cached, head, "HIT");
 	}
 	const result = head ? null : await config.bucket.get(entry.r2Key);
@@ -69,6 +71,7 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 		"cache-control": `public, max-age=${ttl}`,
 	} });
 	if (!head && ttl > 0 && config.ctx) config.ctx.waitUntil(edgeCache.put(key, response.clone()));
+	recordGoAccess(config, entry.id);
 	return returned(response, head, "MISS");
 }
 
@@ -92,7 +95,8 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 	const reservation = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" })
 		.reserveGo(cache, action, output, size);
 	if (reservation instanceof Response) return reservation;
-	return config.db.transaction(async (tx) => {
+	let uploadedAt: Date | undefined;
+	const response = await config.db.transaction(async (tx) => {
 		// Reset and cache deletion wait for a transfer already publishing. GC
 		// locks the entry too, so it cannot remove an in-flight R2 put.
 		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
@@ -122,10 +126,8 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 				if (!stored) return errorResponse("Action changed; retry", 409);
 				uploaded = stored.uploaded;
 			}
-			if (!entry.uploadedAt) {
-				if (!uploaded) throw new Error("Go upload returned no timestamp");
-				await tx.update(goEntries).set({ uploadedAt: uploaded, expiresAt: new Date(uploaded.getTime() + RETENTION_MS) }).where(eq(goEntries.id, entry.id));
-			}
+			if (!uploaded) throw new Error("Go upload returned no timestamp");
+			uploadedAt = uploaded;
 			return new Response(null, { status: existing ? 204 : 201, headers: { "cache-control": "no-store" } });
 		} catch (error) {
 			if (error instanceof Error && /checksum|content length|FixedLengthStream|client disconnected/i.test(error.message)) {
@@ -137,4 +139,22 @@ async function putAction(request: Request, config: WorkerConfig, cache: Cache, a
 			throw error;
 		}
 	});
+	if (!response.ok || !uploadedAt) return response;
+	// Release transfer locks before taking the org lock: every protocol takes
+	// org -> cache -> entry/session, never the opposite order.
+	const uploaded = uploadedAt;
+	try {
+		return await withOrgCapacity(config, cache.orgId, [{ cacheId: cache.id, storePathHash: `go:${reservation.id}` }], async tx => {
+			const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
+			if (!current || current.goGeneration !== cache.goGeneration) throw new CapacityError("Cache changed; retry", 503);
+			const [entry] = await tx.select().from(goEntries).where(eq(goEntries.id, reservation.id)).for("update");
+			if (!entry || entry.cacheId !== cache.id || entry.expiresAt.getTime() <= Date.now()) throw new CapacityError("Upload expired; retry", 503);
+			if (!entry.uploadedAt) await tx.update(goEntries).set({ uploadedAt: uploaded,
+				expiresAt: new Date(uploaded.getTime() + RETENTION_MS) }).where(eq(goEntries.id, entry.id));
+			return response;
+		}, { origin: new URL(request.url).origin });
+	} catch (error) {
+		if (error instanceof CapacityError) return errorResponse(error.message, error.status, error.retryable ? { "retry-after": "1" } : {});
+		throw error;
+	}
 }

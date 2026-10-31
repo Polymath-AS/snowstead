@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { test } from "node:test";
 import { Client } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -51,6 +53,13 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 		};
 		assert.equal((await call("/healthz")).status, 200);
 		assert.equal((await call("/_api/v1/admin/caches")).status, 401);
+		const { token: smokeToken } = await (await api("/admin/tokens", {
+			subject: "streaming-smoke", caches: ["smoke-*"], perms: ["push", "pull"],
+		})).json();
+		const smoke = await promisify(execFile)("bash", [
+			new URL("../../../scripts/smoke-test.sh", import.meta.url).pathname, url.toString(), smokeToken,
+		], { env: { ...process.env, ADMIN_SECRET: secrets.ADMIN_SECRET } });
+		assert.match(smoke.stdout, /0 failed/);
 		const post = (path, body) => call(`/_api/v1${path}`, {
 			method: "POST", headers: { authorization: `Bearer ${secrets.ADMIN_SECRET}`, "content-type": "application/json" },
 			body: JSON.stringify(body),
@@ -86,7 +95,7 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 					assert.equal((await call(`${nix}/${"e".repeat(32)}.narinfo`, { headers })).status, 404);
 					const session = { storePath: `/nix/store/${"a".repeat(32)}-disabled`, storePathHash: "a".repeat(32),
 						narHash: `sha256:${"1".repeat(52)}`, narSize: data.length, fileHash: "f".repeat(64), fileSize: data.length, compression: "zstd" };
-					for (const [path, body] of [[`/caches/${name}/upload-sessions`, session], [`/caches/${name}/upload-sessions/batch`, { paths: [session] }], ["/get-missing-paths", { cache: name, storePathHashes: ["a".repeat(32)] }]]) {
+					for (const [path, body] of [[`/caches/${name}/upload-streams/batch`, { paths: [session] }], ["/get-missing-paths", { cache: name, storePathHashes: ["a".repeat(32)] }]]) {
 						const response = await call(`/_api/v1${path}`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) });
 						assert.equal(response.status, 404, path);
 					}
@@ -115,12 +124,12 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 			const bytes = randomBytes(2 * 1024 * 1024 + 7);
 			const fileHash = createHash("sha256").update(bytes).digest("hex");
 			const hash = (privateCache ? "b" : "a").repeat(32);
-			const { sessionId, uploadMethod } = await (await api(`/caches/${cache}/upload-sessions`, {
-				storePath: `/nix/store/${hash}-split`, storePathHash: hash,
-				narHash: `sha256:${"1".repeat(52)}`, narSize: bytes.length, fileHash,
-				fileSize: bytes.length, compression: "zstd",
+			const { sessions: [{ sessionId }] } = await (await api(`/caches/${cache}/upload-streams/batch`, {
+				paths: [{ storePath: `/nix/store/${hash}-split`, storePathHash: hash,
+					narHash: `sha256:${"1".repeat(52)}`, narSize: bytes.length, compression: "zstd" }],
 			}, token)).json();
-			assert.equal(uploadMethod, "direct");
+			assert.match(sessionId, /^s2\./);
+			const { parts: [grant] } = await (await api(`/uploads/${sessionId}/parts`, { parts: [{ partNumber: 1, size: bytes.length }] }, token)).json();
 			let offset = 0;
 			const upload = new ReadableStream({ pull(controller) {
 				if (offset === bytes.length) return controller.close();
@@ -128,12 +137,19 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 				controller.enqueue(bytes.subarray(offset, end));
 				offset = end;
 			} });
-			assert.equal((await call(`/_api/v1/uploads/${sessionId}/blob`, {
-				method: "PUT", headers: { authorization: `Bearer ${token}`, "content-length": String(bytes.length) },
+			const uploaded = await fetch(new URL(grant.url, url), {
+				method: "PUT", headers: grant.headers,
 				body: upload, duplex: "half",
-			})).status, 200);
-			await api(`/uploads/${sessionId}/complete`, {}, token);
-			await api(`/uploads/${sessionId}/publish`, {}, token);
+			});
+			assert.equal(uploaded.status, 200);
+			assert.ok(uploaded.headers.get("etag"));
+			const item = { sessionId, narHash: `sha256:${"1".repeat(52)}`, narSize: bytes.length, fileHash, fileSize: bytes.length,
+				parts: [{ partNumber: 1, etag: uploaded.headers.get("etag").replaceAll('"', "") }] };
+			await uploaded.arrayBuffer();
+			for (let retry = 0; retry < 2; retry++) {
+				const finalized = await (await api("/uploads/finalize", { uploads: [item] }, token)).json();
+				assert.equal(finalized.results[0].published, true);
+			}
 			const path = `/${privateCache ? "private/" : ""}${cache}/${hash}.narinfo`;
 			const headers = { authorization: `Bearer ${token}` };
 			const info = await call(path, { headers });

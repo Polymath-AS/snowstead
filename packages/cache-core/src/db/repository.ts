@@ -354,58 +354,6 @@ export async function bandwidthThisMonth(db: Db, orgId: string, now: Date): Prom
 	return row?.bytes ?? 0;
 }
 
-/**
- * Serialize finite-quota reservations across protocols. Call inside the
- * transaction that records the reservation, before taking any cache locks.
- * A limit set on an unlimited org meanwhile applies from the next push.
- */
-export async function lockOrgStorageLimit(tx: Db, org: Org): Promise<Org | undefined> {
-	if (org.storageLimit === null) return org;
-	await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + org.id}, 0))`);
-	return findOrg(tx, org.id);
-}
-
-/** Check live Nix and Go usage while holding the finite-quota reservation lock. */
-export async function checkOrgStorageLimit(
-	db: Db,
-	org: Org,
-	requested: number,
-): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
-	if (org.storageLimit === null) return undefined;
-	const usage = await orgUsage(db, org.id, new Date());
-	if (usage.used + usage.pending + requested > org.storageLimit) {
-		return { ...usage, limit: org.storageLimit, requested };
-	}
-	return undefined;
-}
-
-/**
- * Records upload sessions for an org's cache unless they would take it past
- * its storage limit; returns the usage that refused them, or undefined once
- * they are recorded. Locked per org, so concurrent pushes can't both fit
- * into the same space. An org without a limit, such as a self-hosted
- * install's default org, takes no lock.
- */
-export async function createUploadSessionsWithinLimit(
-	db: Db,
-	orgId: string,
-	rows: Parameters<typeof createUploadSessions>[1],
-): Promise<(OrgUsage & { readonly limit: number; readonly requested: number }) | undefined> {
-	const org = await findOrg(db, orgId);
-	if (org?.storageLimit == null) {
-		// A limit set meanwhile applies from the next push.
-		await createUploadSessions(db, rows);
-		return undefined;
-	}
-	return db.transaction(async (tx) => {
-		const current = await lockOrgStorageLimit(tx, org);
-		const refused = current && await checkOrgStorageLimit(tx, current, rows.reduce((sum, r) => sum + r.fileSize, 0));
-		if (refused) return refused;
-		await createUploadSessions(tx, rows);
-		return undefined;
-	});
-}
-
 /** A cache's most recently published paths, newest first. */
 export async function listRecentPaths(
 	db: Db,
@@ -626,27 +574,6 @@ export async function transitionSessionStatus(
 	);
 }
 
-export async function transitionToMultipart(
-	db: Db,
-	session: Pick<UploadSession, "id" | "status" | "r2UploadKey">,
-	r2UploadId: string,
-	r2UploadKey: string,
-): Promise<UploadSession | undefined> {
-	return first(
-		db
-			.update(uploadSessions)
-			.set({ status: "uploading", r2UploadId, r2UploadKey })
-			.where(and(
-				eq(uploadSessions.id, session.id),
-				eq(uploadSessions.status, session.status),
-				sql`${uploadSessions.r2UploadKey} IS NOT DISTINCT FROM ${session.r2UploadKey}`,
-				isNull(uploadSessions.r2UploadId),
-				sql`${uploadSessions.status} IN ('pending', 'uploading')`,
-			))
-			.returning(),
-	);
-}
-
 export async function findExpiredSessions(
 	db: Db,
 	now: Date,
@@ -662,27 +589,6 @@ export async function findExpiredSessions(
 		);
 }
 
-export async function upsertUploadPart(
-	db: Db,
-	params: {
-		readonly sessionId: string;
-		readonly partNumber: number;
-		readonly etag: string;
-		readonly size: number;
-	},
-): Promise<UploadPart> {
-	return returned(
-		db
-			.insert(uploadParts)
-			.values(params)
-			.onConflictDoUpdate({
-				target: [uploadParts.sessionId, uploadParts.partNumber],
-				set: { etag: params.etag, size: params.size },
-			})
-			.returning(),
-	);
-}
-
 export async function findUploadParts(
 	db: Db,
 	sessionId: string,
@@ -692,127 +598,6 @@ export async function findUploadParts(
 		.from(uploadParts)
 		.where(eq(uploadParts.sessionId, sessionId))
 		.orderBy(uploadParts.partNumber);
-}
-
-type StreamError = { readonly error: string; readonly status: number };
-
-/** Reserve immutable part lengths for an org before handing out upload authority. */
-export async function reserveStreamPartsBatch(
-	db: Db,
-	orgId: string,
-	inputs: readonly { sessionId: string; parts: readonly { partNumber: number; size: number }[] }[],
-): Promise<Map<string, StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined>> {
-	if (inputs.length === 0) return new Map();
-	if (inputs.length > 100 || new Set(inputs.map(i => i.sessionId)).size !== inputs.length) throw new Error("Invalid reservation batch");
-	return db.transaction(async tx => {
-		const results = new Map<string, StreamError | (OrgUsage & { readonly limit: number; readonly requested: number }) | undefined>();
-		const org = await findOrg(tx, orgId);
-		if (!org) return new Map(inputs.map(i => [i.sessionId, { error: "Not found", status: 404 }]));
-		const currentOrg = await lockOrgStorageLimit(tx, org);
-		const ids = inputs.map(i => i.sessionId);
-		const sessions = new Map((await tx.select().from(uploadSessions).where(anyOf(uploadSessions.id, ids))
-			.orderBy(uploadSessions.id).for("update")).map(s => [s.id, s]));
-		const memberships = new Map((await tx.select({ id: caches.id, orgId: caches.orgId }).from(caches)
-			.where(anyOf(caches.id, [...sessions.values()].map(s => s.cacheId), "bigint"))).map(c => [c.id, c.orgId]));
-		const existing = new Map<string, Map<number, number>>();
-		for (const part of await tx.select().from(uploadParts).where(anyOf(uploadParts.sessionId, ids))) {
-			const parts = existing.get(part.sessionId) ?? new Map<number, number>();
-			parts.set(part.partNumber, part.size);
-			existing.set(part.sessionId, parts);
-		}
-		const usage = currentOrg?.storageLimit != null ? await orgUsage(tx, orgId, new Date()) : undefined;
-		let admitted = 0;
-		const freshParts: { sessionId: string; partNumber: number; size: number }[] = [];
-		const totals: { id: string; fileSize: number }[] = [];
-		for (const { sessionId, parts } of inputs) {
-			const session = sessions.get(sessionId);
-			const reserved = existing.get(sessionId) ?? new Map<number, number>();
-			const fresh = parts.filter(p => !reserved.has(p.partNumber));
-			const requested = fresh.reduce((n, p) => n + p.size, 0);
-			let refused: StreamError | (OrgUsage & { limit: number; requested: number }) | undefined;
-			if (!session || memberships.get(session.cacheId) !== orgId || session.expiresAt <= new Date()) refused = { error: "Not found", status: 404 };
-			else if (session.status !== "streaming" || !session.partSize || !session.r2UploadKey || !session.r2UploadId) refused = { error: "Conflict", status: 409 };
-			else if (parts.length === 0 || parts.length > 100 || new Set(parts.map(p => p.partNumber)).size !== parts.length
-				|| parts.some(p => !Number.isSafeInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10_000 || !Number.isSafeInteger(p.size) || p.size < 1 || p.size > session.partSize!)) refused = { error: "Invalid part reservations", status: 400 };
-			else if (parts.some(p => reserved.has(p.partNumber) && reserved.get(p.partNumber) !== p.size)) refused = { error: "Part size cannot change", status: 409 };
-			else if (session.fileSize + requested > 5 * 1024 ** 4) refused = { error: "NAR exceeds the multipart object limit", status: 400 };
-			else if (requested > 0 && usage && currentOrg?.storageLimit != null && usage.used + usage.pending + admitted + requested > currentOrg.storageLimit) {
-				refused = { ...usage, pending: usage.pending + admitted, limit: currentOrg.storageLimit, requested };
-			}
-			results.set(sessionId, refused);
-			if (!refused && session && fresh.length > 0) {
-				admitted += requested;
-				freshParts.push(...fresh.map(p => ({ ...p, sessionId })));
-				totals.push({ id: sessionId, fileSize: session.fileSize + requested });
-			}
-		}
-		if (freshParts.length > 0) {
-			await tx.insert(uploadParts).values(freshParts);
-			await tx.update(uploadSessions).set({
-				fileSize: sql`(select total."fileSize" from jsonb_to_recordset(${JSON.stringify(totals)}::jsonb)
-					as total(id text, "fileSize" bigint) where total.id = ${uploadSessions.id})`,
-			}).where(anyOf(uploadSessions.id, totals.map(t => t.id)));
-		}
-		return results;
-	});
-}
-
-/** Freeze the exact stream and receipts. Replays cannot change sealed content. */
-export async function sealUploadStreams(
-	db: Db,
-	inputs: readonly { sessionId: string; narHash: string; narSize: number; fileHash: string; fileSize: number; parts: readonly { partNumber: number; etag: string }[] }[],
-): Promise<Map<string, UploadSession | StreamError>> {
-	if (inputs.length === 0) return new Map();
-	return db.transaction(async tx => {
-		const ids = inputs.map(input => input.sessionId);
-		// Overlapping batches take their row locks in the same order.
-		const sessions = new Map((await tx.select().from(uploadSessions)
-			.where(anyOf(uploadSessions.id, ids)).orderBy(uploadSessions.id).for("update")).map(s => [s.id, s]));
-		const reservations = await tx.select().from(uploadParts).where(anyOf(uploadParts.sessionId, ids))
-			.orderBy(uploadParts.sessionId, uploadParts.partNumber);
-		const bySession = new Map<string, UploadPart[]>();
-		for (const part of reservations) {
-			const parts = bySession.get(part.sessionId) ?? [];
-			parts.push(part);
-			bySession.set(part.sessionId, parts);
-		}
-		const results = new Map<string, UploadSession | StreamError>();
-		const fresh: typeof inputs[number][] = [];
-		for (const input of inputs) {
-			const session = sessions.get(input.sessionId);
-			let error: StreamError | undefined;
-			const reserved = bySession.get(input.sessionId) ?? [];
-			const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
-			if (!session || session.expiresAt <= new Date()) error = { error: "Not found", status: 404 };
-			else if (!session.partSize || !["streaming", "finalizing", "completed"].includes(session.status)) error = { error: "Conflict", status: 409 };
-			else if (input.narHash !== session.narHash || input.narSize !== session.narSize || input.fileSize !== session.fileSize
-				|| reserved.length === 0 || parts.length !== reserved.length
-				|| reserved.some((p, i) => p.partNumber !== i + 1 || parts[i]?.partNumber !== p.partNumber || !parts[i]?.etag
-					|| (i < reserved.length - 1 && p.size !== session.partSize))) error = { error: "Stream metadata or parts do not match reservations", status: 400 };
-			else if (session.status !== "streaming" && (session.fileHash !== input.fileHash || reserved.some((p, i) => p.etag !== parts[i]?.etag))) {
-				error = { error: "Sealed stream cannot change", status: 409 };
-			}
-			if (error) results.set(input.sessionId, error);
-			else if (session) {
-				results.set(session.id, session);
-				if (session.status === "streaming") fresh.push(input);
-			}
-		}
-		if (fresh.length > 0) {
-			const receipts = fresh.flatMap(input => input.parts.map(part => ({ ...part, sessionId: input.sessionId })));
-			await tx.execute(sql`update ${uploadParts} set etag = receipts.etag
-				from jsonb_to_recordset(${JSON.stringify(receipts)}::jsonb) as receipts("sessionId" text, "partNumber" integer, etag text)
-				where ${uploadParts.sessionId} = receipts."sessionId" and ${uploadParts.partNumber} = receipts."partNumber"`);
-			const hashes = fresh.map(input => ({ id: input.sessionId, fileHash: input.fileHash }));
-			const sealed = await tx.update(uploadSessions).set({
-				fileHash: sql`(select receipt."fileHash" from jsonb_to_recordset(${JSON.stringify(hashes)}::jsonb)
-					as receipt(id text, "fileHash" text) where receipt.id = ${uploadSessions.id})`,
-				status: "finalizing",
-			}).where(anyOf(uploadSessions.id, fresh.map(input => input.sessionId))).returning();
-			for (const session of sealed) results.set(session.id, session);
-		}
-		return results;
-	});
 }
 
 /** Abort may release only an unsealed stream, never a concurrent finalization. */
@@ -895,10 +680,15 @@ export async function withUploadSourceCleanup<T>(db: Db, run: (tx: Db) => Promis
 	});
 }
 
+/** Take the canonical-deletion fence inside an already-open transaction. */
+export async function lockUploadSessions(tx: Db): Promise<void> {
+	await tx.execute(sql`lock table upload_sessions in row exclusive mode`);
+}
+
 /** Uploads may run together, but not across a canonical NAR deletion. */
 export async function withUploadSessionLock<T>(db: Db, run: (db: Db) => Promise<T>): Promise<T> {
 	return db.transaction(async (tx) => {
-		await tx.execute(sql`lock table upload_sessions in row exclusive mode`);
+		await lockUploadSessions(tx);
 		return run(tx);
 	});
 }
@@ -994,11 +784,15 @@ export async function deletePublishedPaths(
 	});
 }
 
-/** Up to `limit` completed sessions past their expiry, which nothing reads again. */
+/** Unpinned sessions from an expired completed batch; call under the source-cleanup fence. */
 export async function findExpiredCompletedSessions(db: Db, now: Date, limit: number): Promise<UploadSession[]> {
-	return db.select().from(uploadSessions)
+	const batch = db.select().from(uploadSessions)
 		.where(and(eq(uploadSessions.status, "completed"), lt(uploadSessions.expiresAt, now)))
-		.limit(limit);
+		.limit(limit).as("batch");
+	// Limit before filtering pins to preserve the cleanup batch and stop condition.
+	return db.select().from(batch).where(sql`NOT EXISTS (
+		SELECT 1 FROM ${narInstallations} WHERE ${narInstallations.sourceKey} = ${batch.r2UploadKey}
+	)`);
 }
 
 /** Deletes sessions and their parts. */

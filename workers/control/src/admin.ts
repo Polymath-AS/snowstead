@@ -33,6 +33,7 @@ import {
 	findOrg,
 	putOrg,
 	orgUsage,
+	findUploadSessions,
 	bandwidthThisMonth,
 } from "@snowstead/cache-core/db/repository";
 import { storeNarinfo } from "@snowstead/cache-core/narinfo";
@@ -396,7 +397,17 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		return errorResponse(`no org ${id}`, 404);
 	}
 	const now = new Date();
-	const [usage, served] = await Promise.all([orgUsage(config.db, id, now), bandwidthThisMonth(config.db, id, now)]);
+	const [usage, served, staged] = await Promise.all([
+		orgUsage(config.db, id, now), bandwidthThisMonth(config.db, id, now),
+		config.uploadCoordinator.getByName(id, { locationHint: "weur" }).pendingStreams(),
+	]);
+	// Keep pending usage visible without dual-writing each local part grant.
+	// Sealed streams already imported to SQL must not be counted twice.
+	const synced = new Map((await findUploadSessions(config.db, staged.map(s => s.id))).map(s => [s.id, s]));
+	const localPending = staged.reduce((bytes, stream) => {
+		const session = synced.get(stream.id);
+		return bytes + (session?.status === "streaming" ? stream.bytes : 0);
+	}, 0);
 	return jsonResponse({
 		id: org.id,
 		slug: org.slug,
@@ -405,7 +416,7 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		privateCaches: org.privateCaches,
 		customSigningKeys: org.customSigningKeys,
 		used: usage.used,
-		pending: usage.pending,
+		pending: usage.pending + localPending,
 		servedThisMonth: served,
 	}, status);
 }
@@ -429,7 +440,7 @@ const OrgSlugConflict = v.object({ cause: v.object({ code: v.literal("23505"), c
 
 /**
  * Creates an org or updates its limits and slug (cache-path.ts). A lower limit
- * than its caches hold refuses new pushes until they fit again. Creating an
+ * than its caches hold makes subsequent publications evict cold entries. Creating an
  * org needs a slug. Changing one moves every cache's URL, and caches are
  * stored at theirs: the new paths are readied here, and POST /move then
  * moves the objects (slug-move.ts). The old slug stays the org's until then.

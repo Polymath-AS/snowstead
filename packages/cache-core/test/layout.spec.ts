@@ -1,5 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
+import { stageUpload, finalizeUploads } from "./upload.js";
 
 const NAR = new Uint8Array([9, 8, 7, 6, 5]);
 
@@ -24,25 +25,14 @@ async function publish(cache: string): Promise<{ hash: string; fileHash: string;
 	const body = new Uint8Array([...NAR, counter]);
 	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
 	const fileHash = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
-	const session = await api(`/caches/${cache}/upload-sessions`, {
+	const item = await stageUpload(cache, {
 		storePath: `/nix/store/${hash}-layout`,
 		storePathHash: hash,
 		narHash: `sha256:${"1".repeat(52)}`,
 		narSize: 64,
-		fileHash,
-		fileSize: body.byteLength,
 		compression: "zstd",
-	});
-	expect(session.status).toBe(201);
-	const { sessionId } = await session.json<{ sessionId: string }>();
-	const put = await SELF.fetch(`http://example.com/_api/v1/uploads/${sessionId}/blob`, {
-		method: "PUT",
-		headers: { authorization: "Bearer test-auth-token" },
-		body,
-	});
-	expect(put.status).toBe(200);
-	expect((await api(`/uploads/${sessionId}/complete`, {})).status).toBe(200);
-	expect((await api(`/uploads/${sessionId}/publish`, {})).status).toBe(200);
+	}, body);
+	expect(await finalizeUploads([item])).toMatchObject([{ published: true }]);
 	return { hash, fileHash, body };
 }
 

@@ -4,10 +4,14 @@ import { routeOf } from "../src/route.js";
 describe("routes", () => {
 	it.each([
 		["POST", "/_api/v1/get-missing-paths", "POST /_api/v1/get-missing-paths"],
-		["POST", "/_api/v1/caches/uzaaft/upload-sessions/batch", "POST /_api/v1/caches/:cache/upload-sessions/batch"],
-		["POST", "/_api/v1/uploads/commit", "POST /_api/v1/uploads/commit"],
-		["POST", "/_api/v1/uploads/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/publish", "POST /_api/v1/uploads/:session/publish"],
-		["PUT", "/_api/v1/uploads/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/part/7", "PUT /_api/v1/uploads/:session/part/:part"],
+		["POST", "/_api/v1/caches/uzaaft/upload-streams/batch", "POST /_api/v1/caches/:cache/upload-streams/batch"],
+		["POST", "/_api/v1/uploads/parts", "POST /_api/v1/uploads/parts"],
+		["POST", "/_api/v1/uploads/finalize", "POST /_api/v1/uploads/finalize"],
+		["POST", "/_api/v1/uploads/s2.default.3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/parts", "POST /_api/v1/uploads/:session/parts"],
+		["POST", "/_api/v1/uploads/s2.default.3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/abort", "POST /_api/v1/uploads/:session/abort"],
+		["PUT", "/_api/v1/uploads/s2.default.3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/part/7", "PUT /_api/v1/uploads/:session/part/:part"],
+		["GET", "/_api/v1/admin/caches/commit", "GET /_api/v1/admin/caches/:cache"],
+		["POST", "/_api/v1/admin/tokens/commit/revoke", "POST /_api/v1/admin/tokens/:jti/revoke"],
 		["POST", "/_api/v1/admin/tokens/3f9c2c7e-1d8a-4b8e-9f3a-2b6f0c1d2e3f/revoke", "POST /_api/v1/admin/tokens/:jti/revoke"],
 		["GET", "/_api/v1/admin/caches/team", "GET /_api/v1/admin/caches/:cache"],
 		["POST", "/_api/v1/admin/caches/team/paths/delete", "POST /_api/v1/admin/caches/:cache/paths/delete"],
@@ -35,4 +39,11 @@ describe("routes", () => {
 			expect(routeOf("GET", path)).toBe("unmatched");
 		},
 	);
+
+	it.each([
+		"caches/main/upload-sessions", "caches/main/upload-sessions/batch", "uploads/commit",
+		"uploads/session/blob", "uploads/session/multipart", "uploads/session/complete", "uploads/session/publish",
+	])("retired %s is unmatched", path => {
+		expect(routeOf("POST", `/_api/v1/${path}`)).toBe("unmatched");
+	});
 });

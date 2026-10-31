@@ -84,14 +84,16 @@ control first to create the namespace and apply its Durable Object migration,
 then Nix and Go, and the gateway last. Staging uses its own control namespace.
 The coordinator has no public route and does not require a separate Worker.
 
-Only reservation SQL enters the queue, after authorization and input validation.
-Each org admits one reservation at a time, with at most 64 active/queued calls
-and a two-second queue deadline. Overload returns 429 with `Retry-After: 1`
-without opening a reservation connection. Postgres quota checks and transaction
-locks remain authoritative, including during rolling deployments. Nix batches
-reserve their sessions in one call; payloads, signing, and publication stay
-outside the coordinator. Go's separate transfer transaction still fences cache
-reset and garbage collection. Reservation traces include protocol and queue wait.
+Each org keeps Nix part grants and sealed receipts in its coordinator's SQLite
+storage. Part reservations do not open Postgres connections. Session creation
+and Go staging admission share a queue with at most 64 active/queued calls and
+a two-second deadline. Overload returns 429 with `Retry-After: 1` without
+opening a reservation connection. Nix finalization imports immutable receipts
+into Postgres before installation; its locks and durable installation records
+still fence garbage collection. Retained-capacity admission serializes Nix and
+Go publication per org. Payloads, signing, and publication stay outside the
+coordinator. Go's separate transfer transaction fences cache reset and garbage
+collection. Reservation traces include protocol and queue wait.
 
 ```bash
 # With resources and service secrets provisioned: migrate, deploy control,
@@ -179,18 +181,28 @@ if a very large NAR needs larger parts. Codec memory is additional. Slow
 uploads pause compression; queued and retrying parts keep their buffer
 reservation, so retries reuse the same bytes without recompression.
 
-The server reserves quota before granting each exact-size part upload, then
-checks the final size, compressed hash, and receipts before publishing. Each
-session uploads private staging bytes, even when the hash is already stored.
-Existing v1 clients remain supported. Deploy the database migration and new
-Workers before the streaming CLI; it does not fall back to disk spooling on
-older servers. Config and credential writes still use atomic temporary files.
+The server grants exact-size parts from a separate, bounded staging budget,
+then checks the final size, compressed hash, and receipts before publishing.
+Publication evicts least-recently-used entries across the org's Nix and Go
+caches when retained capacity is full. Public CDN reads bypass the service,
+so their access times are not observed; pushes and service reads update use.
+Each session uploads private staging bytes, even when the hash is already
+stored. Session creation overlaps transfers instead of delaying the first
+upload until every path has a session.
+
+Only the streaming upload protocol is supported; the old upload-session,
+blob, complete, publish, and commit routes have been removed. Deploy database
+migrations and new Workers before using the streaming CLI. It does not fall
+back to disk spooling on older servers. Config and credential writes still
+use atomic temporary files.
 
 Large canonical installations keep a durable source/destination pin. An
 ambiguous storage completion stays blocked rather than reopening on a timeout;
-an operator must reconcile its R2 upload before clearing that pin. Drain
-pre-upgrade canonical multipart sessions before rollout. Staged session bytes
-are retained for retries and removed by garbage collection after expiry.
+an operator must reconcile its R2 upload before clearing that pin. Outstanding
+pre-upgrade canonical multipart grants still fence installation until drained
+or reconciled; removing their API routes does not revoke those grants. Staged
+session bytes are retained for retries and removed by garbage collection
+after expiry.
 
 For local CLI development, run `cargo build -p snowstead-cli` and
 `cargo test -p snowstead-cli` inside `nix develop`. `pnpm check` includes the

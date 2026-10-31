@@ -109,7 +109,9 @@ export const publishedPaths = pgTable("published_paths", {
 	 * from. Pulls can't count, since public NARs are served without the Worker.
 	 */
 	lastPushedAt: timestamptz("last_pushed_at").notNull().defaultNow(),
+	lastAccessedAt: timestamptz("last_accessed_at"),
 }, (table) => [
+	index("idx_published_paths_lru").on(table.cacheId, sql`greatest(${table.lastPushedAt}, ${table.lastAccessedAt})`),
 	index("idx_published_paths_cache_pushed").on(table.cacheId, table.lastPushedAt),
 	uniqueIndex("published_paths_cache_store_unique").on(table.cacheId, table.storePathHash),
 	index("idx_published_paths_blob_object").on(table.blobObjectId),
@@ -280,8 +282,10 @@ export const goEntries = pgTable("go_entries", {
 	size: bytes("size").notNull(),
 	output: text("output").notNull(),
 	uploadedAt: timestamptz("uploaded_at"),
+	lastAccessedAt: timestamptz("last_accessed_at"),
 	expiresAt: timestamptz("expires_at").notNull(),
 }, (table) => [
+	index("idx_go_entries_lru").on(table.cacheId, sql`greatest(${table.uploadedAt}, ${table.lastAccessedAt})`),
 	uniqueIndex("go_entries_action").on(table.cacheId, table.generation, table.action),
 	index("go_entries_expiry").on(table.expiresAt),
 ]);

@@ -1,9 +1,9 @@
-import { and, eq, gt, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { WorkerConfig } from "./config.js";
 import type { Cache } from "./db/types.js";
 import type { Db } from "./db/connection.js";
 import { caches as cacheRows, goEntries } from "./db/schema.js";
-import { findCache, findOrg, lockOrgStorageLimit, checkOrgStorageLimit } from "./db/repository.js";
+import { findCache, findOrg } from "./db/repository.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 import { PRIVATE_CACHES_REFUSED } from "./visibility.js";
 
@@ -11,23 +11,31 @@ export function activeGoEntries(cache: Pick<Cache, "id" | "goGeneration">, now =
 	return and(eq(goEntries.cacheId, cache.id), eq(goEntries.generation, cache.goGeneration), gt(goEntries.expiresAt, now));
 }
 
-/** Reserve quota and a cleanup record; never read the request body or touch R2. */
+/** Reserve bounded staging and a cleanup record, not retained capacity. */
 export async function reserveGoUpload(db: Db, cache: Cache, action: string, output: string, size: number) {
 	return db.transaction(async (tx) => {
-		const initialOrg = await findOrg(tx, cache.orgId);
-		if (!initialOrg) return errorResponse("Not Found", 404);
-		const org = await lockOrgStorageLimit(tx, initialOrg);
+		await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"org:" + cache.orgId}, 0))`);
+		const org = await findOrg(tx, cache.orgId);
 		if (!org) return errorResponse("Not Found", 404);
 		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
 		if (!current || current.goGeneration !== cache.goGeneration) return errorResponse("Cache changed; retry", 409);
 		if (!current.isPublic && !org.privateCaches) return errorResponse(PRIVATE_CACHES_REFUSED, 403);
+		if (org.storageLimit !== null && size > org.storageLimit) return errorResponse("Artifact exceeds retained capacity", 413);
 		const now = new Date();
 		// Expired entries lose their action slot, not their cleanup record/key.
 		await tx.update(goEntries).set({ cacheId: null }).where(and(eq(goEntries.cacheId, cache.id),
 			eq(goEntries.generation, cache.goGeneration), eq(goEntries.action, action), lt(goEntries.expiresAt, now)));
 		const [existing] = await tx.select().from(goEntries).where(and(activeGoEntries(cache, now), eq(goEntries.action, action)));
 		if (existing) return existing;
-		if (await checkOrgStorageLimit(tx, org, size)) return errorResponse("Not enough storage", 413);
+		// Staging is bounded separately; retained objects are evicted only at
+		// successful publication. Even unlimited orgs have bounded temporary work.
+		const [staging] = await tx.select({ bytes: sql`coalesce(sum(${goEntries.size}), 0)`.mapWith(Number),
+			count: sql`count(*)`.mapWith(Number) })
+			.from(goEntries).innerJoin(cacheRows, eq(goEntries.cacheId, cacheRows.id))
+			.where(and(eq(cacheRows.orgId, cache.orgId), isNull(goEntries.uploadedAt), gt(goEntries.expiresAt, now)));
+		if ((staging?.count ?? 0) >= 256 || (staging?.bytes ?? 0) + size > (org.storageLimit ?? 1024 * 1024 * 1024)) {
+			return errorResponse("Upload staging is busy; retry", 503, { "retry-after": "1" });
+		}
 		const id = crypto.randomUUID();
 		const [entry] = await tx.insert(goEntries).values({ id, cacheId: cache.id, generation: cache.goGeneration, action,
 			r2Key: `go/${cache.id}/${cache.goGeneration}/${action}/${id}`, output, size,
@@ -73,7 +81,7 @@ export async function sweepGoEntries(config: WorkerConfig): Promise<number> {
 			.limit(500).for("update", { of: goEntries, skipLocked: true });
 		if (entries.length === 0) return 0;
 		await config.bucket.delete(entries.map(({ entry }) => entry.r2Key));
-		for (const { entry } of entries) await tx.delete(goEntries).where(eq(goEntries.id, entry.id));
+		await tx.delete(goEntries).where(inArray(goEntries.id, entries.map(({ entry }) => entry.id)));
 		return entries.length;
 	});
 }

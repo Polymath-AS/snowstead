@@ -5,13 +5,8 @@ import { hasCacheAccess, isOrgsToken } from "@snowstead/cache-core/jwt";
 import {
 	findCache,
 	findCacheById,
-	findUploadSession,
 	findUploadSessions,
-	transitionSessionStatus,
-	transitionToMultipart,
 	completeUploadSessions,
-	upsertUploadPart,
-	findUploadParts,
 	ensureBlobObjects,
 	findBlobObjectsByIds,
 	createPublishedPaths,
@@ -19,25 +14,26 @@ import {
 	findPublishedHashes,
 	touchPublishedPaths,
 	findOrg,
-	withUploadSessionLock,
-	sealUploadStreams,
+	lockUploadSessions,
 	abortUploadStream,
 } from "@snowstead/cache-core/db/repository";
-import { installStagedNar, installStagedNars, INSTALLATION_BUSY, INSTALLATION_INCOMPLETE } from "@snowstead/cache-core/nar-install";
-import type { UploadSession } from "@snowstead/cache-core/db/types";
-import type { CacheAt, OrgUsage } from "@snowstead/cache-core/db/repository";
+import { installStagedNars, INSTALLATION_BUSY, INSTALLATION_INCOMPLETE } from "@snowstead/cache-core/nar-install";
+import type { BlobObject, PublishedPath, UploadSession } from "@snowstead/cache-core/db/types";
+import type { CacheAt } from "@snowstead/cache-core/db/repository";
 import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
-import type { SessionResponse } from "@snowstead/cache-domain";
 import { storeNarinfo, narinfoCacheKey } from "@snowstead/cache-core/narinfo";
 import { scheduleNarinfoPurge } from "@snowstead/cache-core/cdn";
-import { IMMUTABLE, bucketFor, bucketForKey, bucketNameForKey, narKey } from "@snowstead/cache-core/layout";
-import { createPresignedPartPut, createPresignedPut } from "@snowstead/cache-core/presign";
+import { bucketFor, narKey } from "@snowstead/cache-core/layout";
+import { createPresignedPartPut } from "@snowstead/cache-core/presign";
 import { PRIVATE_CACHES_REFUSED, isPrivateCache, privateCache } from "@snowstead/cache-core/visibility";
 import { checkUpstream, knownUpstream } from "@snowstead/cache-core/upstream";
 import { jsonResponse, errorResponse, messageOf } from "@snowstead/cache-core/responses";
-import { Compression, FileHash, NarHash, StorePathBasename, StorePathHash, parseBody } from "@snowstead/cache-core/schemas";
+import { FileHash, NarHash, StorePathBasename, StorePathHash, parseBody } from "@snowstead/cache-core/schemas";
 import type { Db } from "@snowstead/cache-core/db/connection";
 import { errorForLog } from "@snowstead/cache-core/logging";
+import { bridgeUploadStreams, streamSessionId, streamSessionOrg } from "@snowstead/cache-core/upload-stream";
+import type { StreamPart } from "@snowstead/cache-core/upload-stream";
+import { CapacityError, withOrgCapacity } from "@snowstead/cache-core/capacity";
 
 // Module-scope cache: cache ID → cache, with its path. Its access and
 // visibility don't change once it has paths. Its path does when its org's
@@ -96,7 +92,7 @@ async function loadSessionWithAuthCheck(
 	sessionId: string,
 	identity: AuthIdentity,
 ): Promise<{ session: UploadSession; error?: never } | { session?: never; error: Response }> {
-	const session = await findUploadSession(config.db, sessionId);
+	const session = (await loadUploadSessions(config, [sessionId])).get(sessionId);
 	const denied = await sessionAccessError(config, session, identity);
 	if (denied || !session) {
 		return { error: errorResponse(denied?.error ?? "Not found", denied?.status ?? 404) };
@@ -104,13 +100,20 @@ async function loadSessionWithAuthCheck(
 	return { session };
 }
 
-const MISSING = "Missing required fields";
+async function loadUploadSessions(config: WorkerConfig, ids: readonly string[]): Promise<Map<string, UploadSession>> {
+	const groups = new Map<string, string[]>();
+	for (const id of ids) {
+		const org = streamSessionOrg(id);
+		if (!org) continue;
+		groups.set(org, [...(groups.get(org) ?? []), id]);
+	}
+	const sessions: UploadSession[][] = await Promise.all([...groups].map(([org, ids]) =>
+		config.uploadCoordinator.getByName(org, { locationHint: "weur" }).getStreams(ids)));
+	// A missing SQLite session never falls back to independently writable SQL.
+	return new Map(sessions.flat().map(s => [s.id, s]));
+}
 
 type HashedSession = UploadSession & { fileHash: string };
-
-function isLegacySession(session: UploadSession): session is HashedSession {
-	return session.partSize === null && session.fileHash !== null;
-}
 
 function hasFileHash(session: UploadSession): session is HashedSession {
 	return session.fileHash !== null;
@@ -120,265 +123,11 @@ function hasFileHash(session: UploadSession): session is HashedSession {
 const NarinfoWord = (field: string) =>
 	v.optional(v.nullable(v.pipe(v.string(`${field} must be printable ASCII without spaces`), v.regex(/^[!-~]+$/, `${field} must be printable ASCII without spaces`))), null);
 
-const Size = (field: string) =>
-	v.pipe(v.number("narSize and fileSize must be numbers"), v.finite(`${field} must be a positive number`), v.gtValue(0, `${field} must be a positive number`));
-
-/** The session a client asks for. Each field becomes a narinfo line. */
-const SessionParams = v.pipe(
-	v.object({
-		storePath: v.pipe(v.string(MISSING), v.nonEmpty(MISSING)),
-		storePathHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), StorePathHash),
-		narHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), NarHash),
-		narSize: Size("narSize"),
-		fileHash: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), FileHash),
-		fileSize: Size("fileSize"),
-		compression: v.pipe(v.string(MISSING), v.nonEmpty(MISSING), Compression),
-		references: v.nullish(v.array(StorePathBasename, "references must be an array"), []),
-		deriver: NarinfoWord("deriver"),
-		system: NarinfoWord("system"),
-	}, MISSING),
-	v.check(
-		({ storePath, storePathHash }) => storePath.startsWith(`/nix/store/${storePathHash}-`) && v.is(StorePathBasename, storePath.slice(11)),
-		"storePath must be /nix/store/<storePathHash>-<name>",
-	),
-);
-
-type SessionParams = v.InferOutput<typeof SessionParams>;
-
-/**
- * NARs are shared by every cache that has them, so a pusher may only add
- * one to its cache by showing it has the bytes: knowing a NAR's hash and
- * size, which its narinfo tells anyone who can read it, must not be enough
- * to claim another org's private NAR, nor to overwrite a shared one.
- *
- * Every new session uploads to its own staging key. The shared installer
- * verifies those bytes and serializes canonical writes, including large
- * multipart promotions. Only pre-existing sessions may still name a
- * canonical upload target; their completion path remains supported.
- */
 const STAGING_PREFIX = "staging/";
-
-function isStaged(session: Pick<UploadSession, "r2UploadKey">): boolean {
-	return session.r2UploadKey?.startsWith(STAGING_PREFIX) ?? false;
-}
-
-function formatBytes(bytes: number): string {
-	const units = ["bytes", "KB", "MB", "GB", "TB"];
-	let value = bytes;
-	let unit = 0;
-	while (value >= 1000 && unit < units.length - 1) {
-		value /= 1000;
-		unit++;
-	}
-	return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
-}
-
-/** Why a push was refused, in terms its pusher can act on. */
-function storageFullResponse(usage: OrgUsage & { readonly limit: number; readonly requested: number }): Response {
-	const inUse = usage.used + usage.pending;
-	const left = Math.max(0, usage.limit - inUse);
-	return errorResponse(
-		`Not enough storage: this push needs ${formatBytes(usage.requested)}, and ${formatBytes(left)} of your ${formatBytes(usage.limit)} is left.`,
-		507,
-	);
-}
 
 /** Whether a pusher may push to this cache of its org. */
 function orgAllows(identity: AuthIdentity, cache: CacheAt): boolean {
 	return identity.kind !== "jwt" || (isOrgsToken(identity.claims, cache.orgId) && hasCacheAccess(identity.claims, cache));
-}
-
-/**
- * Records sessions for paths of one cache in one statement, and says where
- * each NAR goes; the cache's org must have room for all of them.
- */
-async function createSessions(
-	config: WorkerConfig,
-	cache: CacheAt,
-	items: readonly SessionParams[],
-): Promise<SessionResponse[] | Response> {
-	if (!cache.protocols.includes("nix")) return errorResponse("Cache not found", 404);
-	// Seed the ID → cache map so session-scoped requests skip the database lookup.
-	cacheById.set(cache.id, cache);
-	// Visibility controls admission; every new upload stages in the private bucket.
-	const isPrivate = await isPrivateCache(config, cache.path);
-	if (isPrivate && (await findOrg(config.db, cache.orgId))?.privateCaches === false) {
-		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
-	}
-	const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000);
-	const presigning = Boolean(config.r2AccessKeyId && config.r2SecretAccessKey && config.r2Endpoint);
-
-	const rows = await Promise.all(items.map(async (p) => {
-		const id = crypto.randomUUID();
-		const inParts = presigning && p.fileSize > PRESIGNED_PARTS_MIN_BYTES && p.fileSize <= PRESIGNED_PUT_MAX_BYTES;
-		const r2UploadKey = `${STAGING_PREFIX}${id}`;
-		const multipart = inParts ? await config.bucket.createMultipartUpload(r2UploadKey, {
-			customMetadata: { [SESSION_METADATA]: id },
-		}) : undefined;
-		return {
-			id,
-			cacheId: cache.id,
-			storePathHash: p.storePathHash,
-			storePath: p.storePath,
-			narHash: p.narHash,
-			narSize: p.narSize,
-			fileHash: p.fileHash,
-			fileSize: p.fileSize,
-			compression: p.compression,
-			referencesJson: JSON.stringify(p.references),
-			deriver: p.deriver,
-			system: p.system,
-			status: multipart ? ("uploading" as const) : ("pending" as const),
-			r2UploadKey,
-			r2UploadId: multipart?.uploadId ?? null,
-			expiresAt,
-		};
-	}));
-	const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" })
-		.reserveNix(cache.orgId, rows);
-	if (refused) {
-		await Promise.allSettled(rows.flatMap((r) =>
-			r.r2UploadId ? [config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()] : [],
-		));
-		return refused instanceof Response ? refused : storageFullResponse(refused);
-	}
-
-	return Promise.all(rows.map(async (row): Promise<SessionResponse> => {
-		const expiresAt = row.expiresAt.toISOString();
-		if (!config.r2AccessKeyId || !config.r2SecretAccessKey || !config.r2Endpoint || row.fileSize > PRESIGNED_PUT_MAX_BYTES) {
-			return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "direct", expiresAt };
-		}
-		if (row.r2UploadId) {
-			const { r2Endpoint, r2AccessKeyId, r2SecretAccessKey } = config;
-			const count = Math.ceil(row.fileSize / PART_SIZE_BYTES);
-			const parts = await Promise.all(Array.from({ length: count }, async (_, i) => ({
-				partNumber: i + 1,
-				url: await createPresignedPartPut(
-					r2Endpoint,
-					r2AccessKeyId,
-					r2SecretAccessKey,
-					config.r2BucketName,
-					row.r2UploadKey,
-					row.r2UploadId ?? "",
-					i + 1,
-					SESSION_TTL_SECONDS,
-				),
-			})));
-			return { sessionId: row.id, r2Key: row.r2UploadKey, uploadMethod: "presigned-parts", partSize: PART_SIZE_BYTES, parts, expiresAt };
-		}
-		// One PUT; R2 checks the bytes against the file hash itself.
-		const put = await createPresignedPut(
-			config.r2Endpoint,
-			config.r2AccessKeyId,
-			config.r2SecretAccessKey,
-			bucketNameForKey(config, row.r2UploadKey),
-			row.r2UploadKey,
-			row.fileHash,
-			SESSION_TTL_SECONDS,
-			{ [SESSION_METADATA]: row.id },
-			!isStaged(row),
-		);
-		return {
-			sessionId: row.id,
-			r2Key: row.r2UploadKey,
-			uploadMethod: "presigned",
-			uploadUrl: put.url,
-			uploadHeaders: put.headers,
-			expiresAt,
-		};
-	}));
-}
-
-export async function handleCreateSession(
-	request: Request,
-	config: WorkerConfig,
-	cacheName: string,
-	identity: AuthIdentity,
-): Promise<Response> {
-	const cache = await findCache(config.db, orgOfPusher(identity), cacheName);
-	if (!cache) {
-		return errorResponse("Cache not found", 404);
-	}
-	if (!orgAllows(identity, cache)) {
-		return errorResponse("Forbidden", 403);
-	}
-
-	const params = await parseBody(request, SessionParams);
-	if (params instanceof Response) return params;
-
-	const sessions = await createSessions(config, cache, [params]);
-	if (sessions instanceof Response) return sessions;
-	return jsonResponse(sessions[0], 201);
-}
-
-/**
- * Sessions for many paths in one request, in the order asked; a pusher
- * otherwise pays a round trip to the database per path.
- */
-export async function handleCreateSessions(
-	request: Request,
-	config: WorkerConfig,
-	cacheName: string,
-	identity: AuthIdentity,
-): Promise<Response> {
-	const cache = await findCache(config.db, orgOfPusher(identity), cacheName);
-	if (!cache) {
-		return errorResponse("Cache not found", 404);
-	}
-	if (!orgAllows(identity, cache)) {
-		return errorResponse("Forbidden", 403);
-	}
-
-	const body = await parseBody(request, SessionBatch);
-	if (body instanceof Response) return body;
-
-	const sessions = await createSessions(config, cache, body.paths);
-	if (sessions instanceof Response) return sessions;
-	return jsonResponse({ sessions }, 201);
-}
-
-export async function handleMultipart(
-	config: WorkerConfig,
-	sessionId: string,
-	identity: AuthIdentity,
-): Promise<Response> {
-	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
-	if (result.error) return result.error;
-	const session = result.session;
-	if (!isLegacySession(session)) return errorResponse("Conflict", 409);
-
-	if (session.status !== "pending" && session.status !== "uploading") {
-		return errorResponse("Conflict", 409);
-	}
-
-	if (!session.r2UploadKey) {
-		return errorResponse("Internal error", 500);
-	}
-	if (session.r2UploadId) {
-		return jsonResponse({ uploadId: session.r2UploadId, r2Key: session.r2UploadKey });
-	}
-
-	// New grants always stage, even when upgrading an old canonical session.
-	const key = `${STAGING_PREFIX}${session.id}`;
-	const multipart = await bucketForKey(config, key).createMultipartUpload(key, {
-		customMetadata: { [SESSION_METADATA]: session.id },
-	});
-
-	const transitioned = await transitionToMultipart(config.db, session, multipart.uploadId, key);
-	if (!transitioned) {
-		try { await multipart.abort(); } catch { /* best effort */ }
-		const current = await loadSessionWithAuthCheck(config, sessionId, identity);
-		if (current.error) return current.error;
-		if (current.session.status === "uploading" && current.session.r2UploadId && current.session.r2UploadKey) {
-			return jsonResponse({ uploadId: current.session.r2UploadId, r2Key: current.session.r2UploadKey });
-		}
-		return errorResponse("Conflict", 409);
-	}
-
-	return jsonResponse({
-		uploadId: multipart.uploadId,
-		r2Key: key,
-	});
 }
 
 export async function handleUploadPart(
@@ -390,146 +139,11 @@ export async function handleUploadPart(
 ): Promise<Response> {
 	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
 	if (result.error) return result.error;
-	const session = result.session;
-	if (session.partSize !== null) {
-		return uploadStreamPart(request, config, session, partNumber);
-	}
-	if (!isLegacySession(session)) return errorResponse("Conflict", 409);
-
-	if (session.status !== "uploading") {
-		return errorResponse("Conflict", 409);
-	}
-
-	if (!session.r2UploadKey || !session.r2UploadId) {
-		return errorResponse("Bad request", 400);
-	}
-
-	if (!request.body) {
-		return errorResponse("Request body is empty", 400);
-	}
-
-	const multipart = bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId);
-	const uploadedPart = await multipart.uploadPart(partNumber, request.body);
-
-	await upsertUploadPart(config.db, {
-		sessionId,
-		partNumber,
-		etag: uploadedPart.etag,
-		size: 0,
-	});
-
-	return jsonResponse({ partNumber, etag: uploadedPart.etag });
-}
-
-export async function handleUploadBlob(
-	request: Request,
-	config: WorkerConfig,
-	sessionId: string,
-	identity: AuthIdentity,
-): Promise<Response> {
-	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
-	if (result.error) return result.error;
-	const session = result.session;
-	if (!isLegacySession(session)) return errorResponse("Conflict", 409);
-
-	if ((session.status !== "pending" && session.status !== "uploading") || session.r2UploadId) {
-		return errorResponse("Conflict", 409);
-	}
-
-	if (!session.r2UploadKey) {
-		return errorResponse("Internal error", 500);
-	}
-
-	if (!request.body) {
-		return errorResponse("Request body is empty", 400);
-	}
-
-	// A canonical retry is create-only too. The caller can complete its own
-	// earlier successful upload, or retarget this reservation to multipart.
-	if (session.status === "pending") {
-		const transitioned = await transitionSessionStatus(config.db, sessionId, "pending", "uploading");
-		if (!transitioned) {
-			// Re-read to check if someone else moved it to uploading (retry-safe)
-			const current = await findUploadSession(config.db, sessionId);
-			if (!current || current.status !== "uploading" || current.r2UploadId || current.r2UploadKey !== session.r2UploadKey) {
-				return errorResponse("Conflict", 409);
-			}
-		}
-	}
-
-	// R2 rejects a body whose SHA-256 is not the session's file hash, as it
-	// does for presigned uploads.
-	const uploaded = await bucketForKey(config, session.r2UploadKey).put(session.r2UploadKey, request.body, {
-		sha256: session.fileHash,
-		httpMetadata: { contentType: "application/x-nix-nar", cacheControl: IMMUTABLE },
-		customMetadata: { [SESSION_METADATA]: session.id },
-		...(!isStaged(session) ? { onlyIf: { etagDoesNotMatch: "*" } } : {}),
-	});
-	if (!uploaded) return errorResponse("Precondition failed", 412);
-
-	return jsonResponse({ uploaded: true, r2Key: session.r2UploadKey });
+	return uploadStreamPart(request, config, result.session, partNumber);
 }
 
 /** The object's metadata key naming the session that uploaded it. */
 const SESSION_METADATA = "session";
-
-/** Whether an object's bytes have this SHA-256, read through the Worker. */
-async function hashesTo(bucket: R2Bucket, key: string, sha256Hex: string): Promise<boolean> {
-	const object = await bucket.get(key);
-	if (!object) return false;
-	const digest = new crypto.DigestStream("SHA-256");
-	await object.body.pipeTo(digest);
-	return hex(await digest.digest) === sha256Hex;
-}
-
-/** Why the object a session uploaded is not the one it named, if it is not. */
-async function uploadError(config: WorkerConfig, session: HashedSession): Promise<string | undefined> {
-	if (!session.r2UploadKey) {
-		return "Internal error";
-	}
-	const bucket = bucketForKey(config, session.r2UploadKey);
-	const head = await bucket.head(session.r2UploadKey);
-	// Another pusher's upload of the same NAR proves nothing about this one.
-	if (!head || head.customMetadata?.[SESSION_METADATA] !== session.id) {
-		return "Upload incomplete";
-	}
-	if (head.size !== session.fileSize) {
-		return "File size mismatch";
-	}
-	// R2 checked a single upload against this hash already; an assembled one
-	// it can't, so that's hashed here, and goes if it's wrong.
-	const stored = head.checksums.sha256;
-	if (stored ? hex(stored) !== session.fileHash : !(await hashesTo(bucket, session.r2UploadKey, session.fileHash))) {
-		if (!stored) await bucket.delete(session.r2UploadKey);
-		return "File hash mismatch";
-	}
-	return undefined;
-}
-
-export async function handleComplete(
-	request: Request,
-	config: WorkerConfig,
-	sessionId: string,
-	identity: AuthIdentity,
-): Promise<Response> {
-	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
-	if (result.error) return result.error;
-	const session = result.session;
-	if (!isLegacySession(session)) return errorResponse("Conflict", 409);
-
-	const body = await parseBody(request, v.object({ parts: v.optional(PartList) }, OBJECT));
-	if (body instanceof Response) return body;
-	const parts = body.parts?.length ? body.parts : (await findUploadParts(config.db, sessionId)).filter((p): p is typeof p & { etag: string } => p.etag !== null);
-	const invalid = await completionError(config, session, parts);
-	if (invalid) return errorResponse(invalid.error, invalid.status);
-
-	const completed = await completeUploadSessions(config.db, [session]);
-	if (!completed.includes(sessionId)) {
-		return errorResponse("Conflict", 409);
-	}
-
-	return jsonResponse({ status: "completed" });
-}
 
 /**
  * Drops a cached 404 for a path just published, so it shows up at once
@@ -547,9 +161,8 @@ type PublishResult =
 
 /**
  * Publishes completed sessions of one cache with a few statements for all
- * of them. Each narinfo is stored before its row: it only describes a NAR
- * already uploaded and verified, so serving it before the row exists is
- * harmless, while a row without its narinfo would be a path nobody can see.
+ * of them. Capacity admits verified NARs before exposing their narinfos.
+ * The org lock covers publication and eviction; failed writes heal on retry.
  */
 async function publishSessions(
 	config: WorkerConfig,
@@ -571,91 +184,108 @@ async function publishSessions(
 	const isPrivate = visibility.isPrivate;
 	const privateGen = visibility.isPrivate ? visibility.gen : undefined;
 
-	const existing = new Map(
-		(await findPublishedPaths(config.db, cacheId, sessions.map((s) => s.storePathHash))).map((p) => [p.storePathHash, p]),
-	);
-	const fresh = sessions.filter((s) => !existing.has(s.storePathHash));
-	const blobs = await ensureBlobObjects(config.db, fresh.map((s) => ({
+	const existing = new Map<string, PublishedPath>();
+	let existingBlobs: BlobObject[] = [];
+	const blobs = await ensureBlobObjects(config.db, sessions.map((s) => ({
 		fileHash: s.fileHash,
 		fileSize: s.fileSize,
 		compression: s.compression,
 		r2Key: narKey(s.fileHash, s.compression, isPrivate),
 	})));
-	const existingBlobs = await findBlobObjectsByIds(config.db, [...existing.values()].map((p) => p.blobObjectId));
 	const blobFor = (fileHash: string, compression: string) =>
 		blobs.find((b) => b.fileHash === fileHash && b.compression === compression);
 
 	const results = new Map<string, PublishResult>();
 	const rows: (Parameters<typeof createPublishedPaths>[1][number] & { readonly session: HashedSession })[] = [];
-	await Promise.all(sessions.map(async (session) => {
-		const known = existing.get(session.storePathHash);
-		try {
-			if (known) {
-				// Publishing again rewrites the narinfo, so a publish that failed
-				// between storing it and recording the row heals on retry.
-				const blob = existingBlobs.find((b) => b.id === known.blobObjectId);
-				if (blob) await storeNarinfo(config, cache, known, blob, isPrivate);
-				results.set(session.id, { sessionId: session.id, storePathHash: session.storePathHash, published: true, alreadyExisted: true });
-				return;
-			}
-			const blob = blobFor(session.fileHash, session.compression);
-			if (!blob) {
-				results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
-				return;
-			}
-			const path = {
-				cacheId,
-				storePathHash: session.storePathHash,
-				storePath: session.storePath,
-				narHash: session.narHash,
-				narSize: session.narSize,
-				blobObjectId: blob.id,
-				referencesJson: session.referencesJson,
-				deriver: session.deriver,
-				system: session.system,
-				signaturesJson: "[]",
-			};
-			await storeNarinfo(config, cache, path, blob, isPrivate);
-			rows.push({ ...path, session });
-		} catch (err) {
-			console.error("Failed to publish", { sessionId: session.id }, errorForLog(err));
+	for (const session of sessions) {
+		const blob = blobFor(session.fileHash, session.compression);
+		if (!blob) {
 			results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
+			continue;
 		}
-	}));
+		rows.push({
+			cacheId,
+			storePathHash: session.storePathHash,
+			storePath: session.storePath,
+			narHash: session.narHash,
+			narSize: session.narSize,
+			blobObjectId: blob.id,
+			referencesJson: session.referencesJson,
+			deriver: session.deriver,
+			system: session.system,
+			signaturesJson: "[]",
+			session,
+		});
+	}
 
-	const inserted = new Set(await withUploadSessionLock(config.db, async (tx) => {
-		// The blob sweep (gc.ts) deletes a NAR only once no live session names
-		// it, so a live session's NAR is still there, and its path row keeps it
-		// from now on. A session expiring by now may have lost its NAR, and its
-		// blob row, to a sweep since it was verified: those are checked again,
-		// here, where no sweep can run until the rows are in.
-		const soon = new Date(Date.now() + EXPIRY_MARGIN_MS);
-		const atRisk = rows.filter((r) => r.session.expiresAt <= soon);
-		const gone = new Set<string>();
-		const streams = rows.filter(r => r.session.partSize !== null);
-		const currentStreams = new Map((await findUploadSessions(tx, streams.map(r => r.session.id))).map(s => [s.id, s]));
-		for (const row of streams) {
-			const current = currentStreams.get(row.session.id);
-			if (!current || !["finalizing", "completed"].includes(current.status) || current.expiresAt <= new Date()) gone.add(row.session.id);
-		}
-		await Promise.all(atRisk.map(async (r) => {
-			if (!(await bucketFor(config, isPrivate).head(narKey(r.session.fileHash, r.session.compression, isPrivate)))) gone.add(r.session.id);
-		}));
-		const kept = rows.filter((r) => !gone.has(r.session.id));
-		const current = await ensureBlobObjects(tx, kept.filter((r) => atRisk.includes(r)).map((r) => ({
-			fileHash: r.session.fileHash,
-			fileSize: r.session.fileSize,
-			compression: r.session.compression,
-			r2Key: narKey(r.session.fileHash, r.session.compression, isPrivate),
-		})));
-		for (const id of gone) {
-			results.set(id, { sessionId: id, error: "Upload incomplete: the stored NAR is gone, push again", status: 400 });
-		}
-		return createPublishedPaths(tx, kept.map(({ session, ...row }) => ({
-			...row,
-			blobObjectId: current.find((b) => b.fileHash === session.fileHash && b.compression === session.compression)?.id ?? row.blobObjectId,
-		})));
-	}));
+	let inserted: Set<string>;
+	try {
+		inserted = new Set(await withOrgCapacity(config, cache.orgId,
+			sessions.map(session => ({ cacheId, storePathHash: session.storePathHash })),
+			async tx => {
+				// Keep the deletion fence until the capacity transaction commits.
+				await lockUploadSessions(tx);
+				// Read under the org lock: a completed replay may have been evicted
+				// since request admission and must insert its row again, not merely
+				// rewrite an orphaned narinfo from a stale snapshot.
+				for (const path of await findPublishedPaths(tx, cacheId, sessions.map(s => s.storePathHash))) existing.set(path.storePathHash, path);
+				existingBlobs = await findBlobObjectsByIds(tx, [...existing.values()].map(p => p.blobObjectId));
+				for (const session of sessions) if (existing.has(session.storePathHash)) {
+					results.set(session.id, { sessionId: session.id, storePathHash: session.storePathHash, published: true, alreadyExisted: true });
+				}
+				// The blob sweep (gc.ts) deletes a NAR only once no live session names
+				// it, so a live session's NAR is still there, and its path row keeps it
+				// from now on. A session expiring by now may have lost its NAR, and its
+				// blob row, to a sweep since it was verified: those are checked again,
+				// here, where no sweep can run until the rows are in.
+				const soon = new Date(Date.now() + EXPIRY_MARGIN_MS);
+				const atRisk = rows.filter((r) => r.session.expiresAt <= soon);
+				const gone = new Set<string>();
+				const streams = rows.filter(r => r.session.partSize !== null);
+				const currentStreams = new Map((await findUploadSessions(tx, streams.map(r => r.session.id))).map(s => [s.id, s]));
+				for (const row of streams) {
+					const current = currentStreams.get(row.session.id);
+					if (!current || !["finalizing", "completed"].includes(current.status) || current.expiresAt <= new Date()) gone.add(row.session.id);
+				}
+				await Promise.all(atRisk.map(async (r) => {
+					if (!(await bucketFor(config, isPrivate).head(narKey(r.session.fileHash, r.session.compression, isPrivate)))) gone.add(r.session.id);
+				}));
+				const kept = rows.filter((r) => !gone.has(r.session.id) && !existing.has(r.storePathHash));
+				const current = await ensureBlobObjects(tx, kept.filter((r) => atRisk.includes(r)).map((r) => ({
+					fileHash: r.session.fileHash,
+					fileSize: r.session.fileSize,
+					compression: r.session.compression,
+					r2Key: narKey(r.session.fileHash, r.session.compression, isPrivate),
+				})));
+				for (const id of gone) {
+					results.set(id, { sessionId: id, error: "Upload incomplete: the stored NAR is gone, push again", status: 400 });
+				}
+				return createPublishedPaths(tx, kept.map(({ session, ...row }) => ({
+					...row,
+					blobObjectId: current.find((b) => b.fileHash === session.fileHash && b.compression === session.compression)?.id ?? row.blobObjectId,
+				})));
+			}, { origin, afterAdmission: async () => {
+				// Admit before exposing narinfo, holding the org lock through its
+				// write so concurrent eviction cannot recreate a withdrawn path.
+				// Retries repair failed external writes from the published row.
+				await Promise.all(sessions.map(async session => {
+					const result = results.get(session.id);
+					if (result && "error" in result) return;
+					const known = existing.get(session.storePathHash);
+					const path = known ?? rows.find(row => row.session.id === session.id);
+					const blob = known ? existingBlobs.find(blob => blob.id === known.blobObjectId) : blobFor(session.fileHash, session.compression);
+					if (!path || !blob) return;
+					try { await storeNarinfo(config, cache, path, blob, isPrivate); }
+					catch (error) {
+						console.error("Failed to store narinfo", { sessionId: session.id }, errorForLog(error));
+						results.set(session.id, { sessionId: session.id, error: "Internal error", status: 500 });
+					}
+				}));
+			} }));
+	} catch (error) {
+		if (!(error instanceof CapacityError)) throw error;
+		return sessions.map(s => ({ sessionId: s.id, error: error.message, status: error.status }));
+	}
 	// Re-publishes also rewrite narinfo (for example after a key change),
 	// and retries must invalidate even if a previous attempt inserted the row.
 	const published = sessions.filter((s) => {
@@ -674,29 +304,6 @@ async function publishSessions(
 	return sessions.map((s) => results.get(s.id) ?? { sessionId: s.id, error: "Internal error", status: 500 });
 }
 
-export async function handlePublish(
-	config: WorkerConfig,
-	sessionId: string,
-	identity: AuthIdentity,
-	origin: string,
-): Promise<Response> {
-	const result = await loadSessionWithAuthCheck(config, sessionId, identity);
-	if (result.error) return result.error;
-	const session = result.session;
-	if (!isLegacySession(session)) return errorResponse("Conflict", 409);
-
-	if (session.status !== "completed") {
-		return errorResponse("Conflict", 409);
-	}
-
-	const [published] = await publishSessions(config, session.cacheId, [session], origin);
-	if ("error" in published) {
-		return errorResponse(published.error, published.status);
-	}
-	return jsonResponse({ published: true, storePathHash: published.storePathHash, alreadyExisted: published.alreadyExisted });
-}
-
-const OBJECT = "Expected an object";
 const PARTS = "parts must contain {partNumber (1–10000), etag} objects";
 const UNIQUE_PARTS = "parts must have nonempty ETags and unique part numbers";
 
@@ -715,23 +322,6 @@ const PartList = v.pipe(
 
 type Part = v.InferOutput<typeof PartList>[number];
 
-/** Shared by single completion and batch commit; batch state writes stay batched. */
-async function completionError(config: WorkerConfig, session: HashedSession, parts: readonly Part[]): Promise<{ error: string; status: number } | undefined> {
-	// Presigned PUTs leave the session pending until verification.
-	if (session.status !== "uploading" && !(session.status === "pending" && !session.r2UploadId)) {
-		return { error: "Conflict", status: 409 };
-	}
-	if (!session.r2UploadKey) return { error: "Internal error", status: 500 };
-	if (session.r2UploadId && parts.length === 0) return { error: "Conflict", status: 409 };
-	if (session.r2UploadId && !isStaged(session)) {
-		await bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId).complete([...parts]);
-	}
-	const error = isStaged(session)
-		? await assembleStaged(config, session, parts) ?? await installStagedNar(config, session)
-		: await uploadError(config, session);
-	return error ? { error, status: error === INSTALLATION_BUSY || error === INSTALLATION_INCOMPLETE ? 503 : error === "Internal error" ? 500 : 400 } : undefined;
-}
-
 /** Keep the assembled proof at staging until GC so interrupted installs retry. */
 async function assembleStaged(config: WorkerConfig, session: HashedSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
@@ -746,79 +336,6 @@ async function assembleStaged(config: WorkerConfig, session: HashedSession, part
 	return undefined;
 }
 
-/**
- * Completes and publishes many uploaded sessions in one request: what
- * /complete then /publish do for each, with a few statements for all of
- * them. Staged sessions name their parts in `parts`; other multipart
- * sessions must be completed first. Results come in the order asked, each
- * a publish's response or an error with its status.
- */
-export async function handleCommit(
-	request: Request,
-	config: WorkerConfig,
-	identity: AuthIdentity,
-	origin: string,
-): Promise<Response> {
-	const body = await parseBody(request, Commit);
-	if (body instanceof Response) return body;
-	const sessionIds = [...new Set(body.sessionIds)];
-	const parts = new Map(Object.entries(body.parts));
-
-	const results = new Map<string, PublishResult>();
-	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, error, status });
-
-	const loaded = new Map((await findUploadSessions(config.db, sessionIds)).map((s) => [s.id, s]));
-	const usable: HashedSession[] = [];
-	for (const sessionId of sessionIds) {
-		const session = loaded.get(sessionId);
-		const denied = await sessionAccessError(config, session, identity);
-		if (denied || !session) {
-			fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
-		} else if (!isLegacySession(session)) {
-			fail(sessionId, "Conflict", 409);
-		} else if (session.status !== "completed" && session.r2UploadId && !isStaged(session)) {
-			// Proxied canonical multipart uploads must use /complete first.
-			fail(sessionId, "Conflict", 409);
-		} else {
-			usable.push(session);
-		}
-	}
-
-	const uploaded = usable.filter((s) => s.status !== "completed");
-	// Installers release the idle request connection across storage transfers.
-	// Do not close a sibling's SQL transaction while another install runs.
-	const invalid: Awaited<ReturnType<typeof completionError>>[] = [];
-	for (const session of uploaded) invalid.push(await completionError(config, session, parts.get(session.id) ?? []));
-	const verified = uploaded.filter((s, i) => {
-		const error = invalid[i];
-		if (error) fail(s.id, error.error, error.status);
-		return !error;
-	});
-	const moved = new Set(await completeUploadSessions(config.db, verified));
-	for (const s of verified) {
-		if (!moved.has(s.id)) fail(s.id, "Conflict", 409);
-	}
-
-	const byCache = new Map<number, HashedSession[]>();
-	for (const s of usable) {
-		if (results.has(s.id)) continue;
-		byCache.set(s.cacheId, [...(byCache.get(s.cacheId) ?? []), s]);
-	}
-	for (const [cacheId, sessions] of byCache) {
-		for (const published of await publishSessions(config, cacheId, sessions, origin)) {
-			results.set(published.sessionId, published);
-		}
-	}
-
-	return jsonResponse({ results: sessionIds.map((id) => results.get(id)) });
-}
-
-// R2 takes single PUTs up to 5 GiB; larger NARs use multipart uploads.
-const PRESIGNED_PUT_MAX_BYTES = 5 * 1024 ** 3 - (1 << 20);
-// Above this a NAR uploads in presigned parts of PART_SIZE_BYTES; R2 wants
-// every part but the last the same size, and at least 5 MiB.
-const PRESIGNED_PARTS_MIN_BYTES = 64 * 1024 ** 2;
-const PART_SIZE_BYTES = 32 * 1024 ** 2;
 const SESSION_TTL_SECONDS = 3600;
 // How close to expiry a session must be for publishing to check its NAR is
 // still there: clocks of the Worker and of the blob sweep can disagree a bit.
@@ -826,19 +343,6 @@ const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 // Each path publishes with a handful of R2 and Cache API calls; 100 keeps a
 // batch well inside a request's subrequest and Cache API limits.
 const MAX_BATCH = 100;
-
-const PATHS = `paths must be an array of 1 to ${MAX_BATCH} sessions`;
-
-const SessionBatch = v.object({
-	paths: v.pipe(v.array(SessionParams, PATHS), v.minLength(1, PATHS), v.maxLength(MAX_BATCH, PATHS)),
-});
-
-const SESSION_IDS = `sessionIds must be an array of 1 to ${MAX_BATCH} session ids`;
-
-const Commit = v.object({
-	sessionIds: v.pipe(v.array(v.string(SESSION_IDS), SESSION_IDS), v.minLength(1, SESSION_IDS), v.maxLength(MAX_BATCH, SESSION_IDS)),
-	parts: v.optional(v.record(v.string(), PartList, "parts must map session ids to their parts"), {}),
-}, OBJECT);
 
 const MAX_MISSING_PATHS_BATCH = 1000;
 
@@ -953,27 +457,33 @@ export async function handleCreateUploadStreams(
 	if (await isPrivateCache(config, cache.path) && (await findOrg(config.db, cache.orgId))?.privateCaches === false) {
 		return errorResponse(PRIVATE_CACHES_REFUSED, 403);
 	}
-	const rows = [];
+	const rows: (UploadSession & { partSize: number; r2UploadKey: string; r2UploadId: string; status: "streaming" })[] = [];
 	let reservationStarted = false;
 	try {
-		for (const path of body.paths) {
-			const id = crypto.randomUUID();
-			const r2UploadKey = `${STAGING_PREFIX}${id}`;
-			const multipart = await config.bucket.createMultipartUpload(r2UploadKey, {
-				customMetadata: { [SESSION_METADATA]: id },
-			});
-			rows.push({
-				...path, id, cacheId: cache.id, fileHash: null, fileSize: 0,
-				partSize: streamPartSize(path.narSize), referencesJson: JSON.stringify(path.references),
-				system: null, status: "streaming" as const, r2UploadKey, r2UploadId: multipart.uploadId,
-				expiresAt: new Date(Date.now() + SESSION_TTL_SECONDS * 1000),
-			});
-		}
+		const paths = body.paths.entries();
+		const created = await Promise.allSettled(Array.from({ length: Math.min(4, body.paths.length) }, async () => {
+			for (const [index, path] of paths) {
+				const id = streamSessionId(cache.orgId);
+				const r2UploadKey = `${STAGING_PREFIX}${id}`;
+				const multipart = await config.bucket.createMultipartUpload(r2UploadKey, {
+					customMetadata: { [SESSION_METADATA]: id },
+				});
+				rows[index] = {
+					...path, id, cacheId: cache.id, fileHash: null, fileSize: 0,
+					partSize: streamPartSize(path.narSize), referencesJson: JSON.stringify(path.references),
+					system: null, status: "streaming" as const, r2UploadKey, r2UploadId: multipart.uploadId,
+					createdAt: new Date(),
+					expiresAt: new Date(Date.now() + SESSION_TTL_SECONDS * 1000),
+				};
+			}
+		}));
+		const failed = created.find(r => r.status === "rejected");
+		if (failed?.status === "rejected") throw failed.reason;
 		reservationStarted = true;
-		const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" }).reserveNix(cache.orgId, rows);
+		const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" }).createStreams(cache.orgId, rows);
 		if (!refused) return jsonResponse({ sessions: rows.map((r) => ({ sessionId: r.id, partSize: r.partSize })) }, 201);
 		await Promise.allSettled(rows.map((r) => config.bucket.resumeMultipartUpload(r.r2UploadKey, r.r2UploadId).abort()));
-		return refused instanceof Response ? refused : storageFullResponse(refused);
+		return refused;
 	} catch (error) {
 		// A failed reservation can have committed. Leave uncertain rows and MPUs
 		// to GC rather than aborting a session the caller could still retry.
@@ -1016,7 +526,7 @@ async function reserveUploadParts(
 	request: Request, config: WorkerConfig, inputs: readonly { sessionId: string; parts: unknown }[], identity: AuthIdentity,
 ): Promise<Map<string, PartGrants | Response>> {
 	const results = new Map<string, PartGrants | Response>();
-	const sessions = new Map((await findUploadSessions(config.db, inputs.map(i => i.sessionId))).map(s => [s.id, s]));
+	const sessions = await loadUploadSessions(config, inputs.map(i => i.sessionId));
 	const groups = new Map<string, { sessionId: string; parts: v.InferOutput<typeof StreamParts>["parts"] }[]>();
 	// Finish all authorization checks before invoking any coordinator or signer.
 	for (const input of inputs) {
@@ -1042,13 +552,13 @@ async function reserveUploadParts(
 	}
 	await Promise.all([...groups].map(async ([orgId, uploads]) => {
 		try {
-			const reserved = await config.uploadCoordinator.getByName(orgId, { locationHint: "weur" }).reserveNixParts(orgId, uploads);
+			const coordinator = config.uploadCoordinator.getByName(orgId, { locationHint: "weur" });
+			const reserved = await coordinator.reserveStreamParts(uploads);
 			for (const input of uploads) {
-				if (!(reserved instanceof Response) && !reserved.has(input.sessionId)) throw new Error("Missing reservation result");
-				const refused = reserved instanceof Response ? reserved.clone() : reserved.get(input.sessionId);
+				if (!reserved.has(input.sessionId)) throw new Error("Missing reservation result");
+				const refused = reserved.get(input.sessionId);
 				if (refused) {
-					results.set(input.sessionId, refused instanceof Response ? refused
-						: "error" in refused ? errorResponse(refused.error, refused.status) : storageFullResponse(refused));
+					results.set(input.sessionId, errorResponse(refused.error, refused.status));
 				} else {
 					results.set(input.sessionId, await partGrants(request, config, sessions.get(input.sessionId)!, input.parts));
 				}
@@ -1088,7 +598,10 @@ async function partGrants(
 async function uploadStreamPart(request: Request, config: WorkerConfig, session: UploadSession, partNumber: number): Promise<Response> {
 	if (request.method !== "PUT") return new Response("Method Not Allowed", { status: 405, headers: { allow: "PUT" } });
 	if (session.status !== "streaming" || !session.r2UploadKey || !session.r2UploadId) return errorResponse("Conflict", 409);
-	const reserved = (await findUploadParts(config.db, session.id)).find((p) => p.partNumber === partNumber);
+	const org = streamSessionOrg(session.id);
+	if (!org) return errorResponse("Not found", 404);
+	const parts = await config.uploadCoordinator.getByName(org, { locationHint: "weur" }).getStreamParts(session.id);
+	const reserved = parts.find((p) => p.partNumber === partNumber);
 	if (!reserved || request.headers.get("content-length") !== String(reserved.size) || !request.body) {
 		return errorResponse("Part must match its reserved content-length", 400);
 	}
@@ -1116,7 +629,7 @@ export async function handleFinalizeUploadStreams(
 	const results = new Map<string, PublishResult | { sessionId: string; published: false; error: string; status: number }>();
 	const usable: HashedSession[] = [];
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, published: false, error, status });
-	const loaded = new Map((await findUploadSessions(config.db, body.uploads.map(upload => upload.sessionId))).map(s => [s.id, s]));
+	const loaded = await loadUploadSessions(config, body.uploads.map(upload => upload.sessionId));
 	const authorized: typeof body.uploads = [];
 	for (const upload of body.uploads) {
 		const sessionId = upload.sessionId;
@@ -1138,31 +651,46 @@ export async function handleFinalizeUploadStreams(
 		}
 	}
 	try {
-		// Authorization precedes every mutation. Lock/seal the authorized rows
-		// together, then leave SQL before assembling or verifying any objects.
-		const sealed = await sealUploadStreams(config.db, authorized);
+		// Seal locally first. SQL imports exact immutable receipts once, before
+		// the existing global installation/GC fence may see canonical bytes.
+		const sealed = new Map<string, UploadSession | { error: string; status: number }>();
+		const orgs = new Set(authorized.map(u => streamSessionOrg(u.sessionId)).filter(org => org !== undefined));
+		for (const org of orgs) {
+			const batch = authorized.filter(u => streamSessionOrg(u.sessionId) === org);
+			const local = await config.uploadCoordinator.getByName(org, { locationHint: "weur" }).sealStreams(batch);
+			const ready: { session: UploadSession; parts: StreamPart[] }[] = [];
+			for (const [id, result] of local) {
+				if ("error" in result) sealed.set(id, result);
+				else { ready.push(result); sealed.set(id, result.session); }
+			}
+			// SQL may already have committed publication before the DO saw its ack.
+			for (const [id, session] of await bridgeUploadStreams(config.db, ready)) sealed.set(id, session);
+		}
 		await config.releaseDb();
 		const pending: HashedSession[] = [];
-		for (const upload of authorized) {
-			const session = sealed.get(upload.sessionId)!;
-			if ("error" in session) {
-				fail(upload.sessionId, session.error, session.status);
-				continue;
+		const uploads = authorized.values();
+		await Promise.all(Array.from({ length: Math.min(4, authorized.length) }, async () => {
+			for (const upload of uploads) {
+				const session = sealed.get(upload.sessionId)!;
+				if ("error" in session) {
+					fail(upload.sessionId, session.error, session.status);
+					continue;
+				}
+				if (!hasFileHash(session)) throw new Error("Sealed stream has no file hash");
+				if (session.status === "completed") {
+					usable.push(session);
+					continue;
+				}
+				try {
+					const error = await assembleStaged(config, session, upload.parts);
+					if (error) fail(session.id, error, 400);
+					else pending.push(session);
+				} catch (error) {
+					console.error("Failed to assemble upload stream", { sessionId: session.id }, errorForLog(error));
+					fail(session.id, "Internal error", 500);
+				}
 			}
-			if (!hasFileHash(session)) throw new Error("Sealed stream has no file hash");
-			if (session.status === "completed") {
-				usable.push(session);
-				continue;
-			}
-			try {
-				const error = await assembleStaged(config, session, upload.parts);
-				if (error) fail(session.id, error, 400);
-				else pending.push(session);
-			} catch (error) {
-				console.error("Failed to assemble upload stream", { sessionId: session.id }, errorForLog(error));
-				fail(session.id, "Internal error", 500);
-			}
-		}
+		}));
 		const installed = await installStagedNars(config, pending);
 		for (const session of pending) {
 			const error = installed.get(session.id);
@@ -1181,15 +709,19 @@ export async function handleFinalizeUploadStreams(
 			// batched protocol's database savings for small store paths.
 			const published = await publishSessions(config, cacheId, sessions, origin);
 			for (const result of published) results.set(result.sessionId, result);
-			const successful = sessions.filter(s => {
+			const publishedSessions = sessions.filter(s => {
 				const result = results.get(s.id);
-				return result && !("error" in result) && s.status !== "completed";
+				return result && !("error" in result);
 			});
+			const successful = publishedSessions.filter(s => s.status !== "completed");
 			const completed = new Set(await completeUploadSessions(config.db, successful));
 			// Another retry may have completed the same sealed session meanwhile.
 			const raced = successful.filter(s => !completed.has(s.id));
 			const current = new Map((await findUploadSessions(config.db, raced.map(s => s.id))).map(s => [s.id, s]));
 			for (const session of raced) if (current.get(session.id)?.status !== "completed") fail(session.id, "Conflict", 409);
+			const org = sessions.map(s => streamSessionOrg(s.id)).find(org => org !== undefined);
+			if (org) await config.uploadCoordinator.getByName(org, { locationHint: "weur" })
+				.completeStreams(publishedSessions.filter(s => streamSessionOrg(s.id) === org && !("error" in results.get(s.id)!)).map(s => s.id));
 		} catch (error) {
 			console.error("Failed to publish upload streams", { cacheId }, errorForLog(error));
 			for (const session of sessions) fail(session.id, "Internal error", 500);
@@ -1204,6 +736,9 @@ export async function handleAbortUploadStream(
 	const loaded = await loadSessionWithAuthCheck(config, sessionId, identity);
 	if (loaded.error) return loaded.error;
 	if (loaded.session.partSize === null) return errorResponse("Conflict", 409);
+	const org = streamSessionOrg(sessionId);
+	if (!org) return errorResponse("Not found", 404);
+	if (!await config.uploadCoordinator.getByName(org, { locationHint: "weur" }).abortStream(sessionId)) return errorResponse("Conflict", 409);
 	const session = await abortUploadStream(config.db, sessionId);
 	if (!session) return errorResponse("Conflict", 409);
 	if (session.r2UploadKey && session.r2UploadId) {
@@ -1212,8 +747,4 @@ export async function handleAbortUploadStream(
 	}
 	if (session.r2UploadKey) await config.bucket.delete(session.r2UploadKey);
 	return jsonResponse({ aborted: true });
-}
-
-function hex(bytes: ArrayBuffer): string {
-	return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

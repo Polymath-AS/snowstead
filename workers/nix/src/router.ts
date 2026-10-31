@@ -12,16 +12,10 @@ import type { AuthIdentity } from "@snowstead/cache-core/auth";
 import { hasPermission } from "@snowstead/cache-core/jwt";
 import { errorResponse } from "@snowstead/cache-core/responses";
 import { CacheName, Compression, FileHash, StorePathHash, valueOf } from "@snowstead/cache-core/schemas";
+import { recordNixAccess } from "@snowstead/cache-core/capacity";
 import {
-	handleCreateSession,
-	handleMultipart,
 	handleUploadPart,
-	handleUploadBlob,
-	handleComplete,
-	handlePublish,
 	handleGetMissingPaths,
-	handleCreateSessions,
-	handleCommit,
 	handleCreateUploadStreams,
 	handleReserveUploadParts,
 	handleReserveUploadPartsBatch,
@@ -30,16 +24,10 @@ import {
 } from "./uploads.js";
 
 // Pre-compiled route patterns. Compiled once per isolate, not per request.
-const RE_SESSION_CREATE = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions$/;
-const RE_SESSION_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-sessions\/batch$/;
 const RE_STREAM_BATCH = /^\/_api\/v1\/caches\/([^/]+)\/upload-streams\/batch$/;
 const RE_STREAM_PARTS = /^\/_api\/v1\/uploads\/([^/]+)\/parts$/;
 const RE_STREAM_ABORT = /^\/_api\/v1\/uploads\/([^/]+)\/abort$/;
-const RE_MULTIPART = /^\/_api\/v1\/uploads\/([^/]+)\/multipart$/;
 const RE_PART_UPLOAD = /^\/_api\/v1\/uploads\/([^/]+)\/part\/(\d+)$/;
-const RE_BLOB = /^\/_api\/v1\/uploads\/([^/]+)\/blob$/;
-const RE_COMPLETE = /^\/_api\/v1\/uploads\/([^/]+)\/complete$/;
-const RE_PUBLISH = /^\/_api\/v1\/uploads\/([^/]+)\/publish$/;
 
 export async function handleRequest(
 	request: Request,
@@ -138,7 +126,9 @@ export async function handleRequest(
 
 	if (rest[0]?.endsWith(".narinfo") && rest.length === 1) {
 		const hashStr = rest[0].slice(0, -".narinfo".length);
-		return handleNarinfo(config, path, hashStr, method, request, scope?.gen);
+		const response = await handleNarinfo(config, path, hashStr, method, request, scope?.gen);
+		if (response.status === 200 || response.status === 204) recordNixAccess(config, cache.id, hashStr);
+		return response;
 	}
 
 	return new Response("Not Found", { status: 404 });
@@ -423,24 +413,6 @@ async function handleWriteApi(
 		return response;
 	}
 
-	const sessionBatch = pathname.match(RE_SESSION_BATCH);
-	const sessionCreate = sessionBatch ?? pathname.match(RE_SESSION_CREATE);
-	if (sessionCreate) {
-		const cacheName = sessionCreate[1];
-		// The handlers check the token reaches the cache: it may name it by id.
-		const response = sessionBatch
-			? await handleCreateSessions(request, config, cacheName, identity)
-			: await handleCreateSession(request, config, cacheName, identity);
-		writeAuditLog(config, identity, "push", cacheName, response.status, sessionBatch ? '{"endpoint":"create-sessions"}' : '{"endpoint":"create-session"}', ip);
-		return response;
-	}
-
-	if (pathname === "/_api/v1/uploads/commit") {
-		const response = await handleCommit(request, config, identity, new URL(request.url).origin);
-		writeAuditLog(config, identity, "push", null, response.status, '{"endpoint":"commit"}', ip);
-		return response;
-	}
-
 	// Session-scoped upload routes — all share the same audit pattern
 	const uploadRoutes: ReadonlyArray<{
 		readonly pattern: RegExp;
@@ -461,29 +433,9 @@ async function handleWriteApi(
 			handle: (m, c) => handleAbortUploadStream(c, m[1], identity),
 		},
 		{
-			pattern: RE_MULTIPART,
-			endpoint: "multipart",
-			handle: (m, c) => handleMultipart(c, m[1], identity),
-		},
-		{
 			pattern: RE_PART_UPLOAD,
 			endpoint: "upload-part",
 			handle: (m, c) => handleUploadPart(request, c, m[1], parseInt(m[2], 10), identity),
-		},
-		{
-			pattern: RE_BLOB,
-			endpoint: "upload-blob",
-			handle: (m, c) => handleUploadBlob(request, c, m[1], identity),
-		},
-		{
-			pattern: RE_COMPLETE,
-			endpoint: "complete",
-			handle: (m, c) => handleComplete(request, c, m[1], identity),
-		},
-		{
-			pattern: RE_PUBLISH,
-			endpoint: "publish",
-			handle: (m, c) => handlePublish(c, m[1], identity, new URL(request.url).origin),
 		},
 	];
 

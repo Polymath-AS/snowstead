@@ -22,14 +22,6 @@ export const INSTALLATION_INCOMPLETE = "NAR installation incomplete; retry";
 
 const installations = new WeakMap<WorkerConfig, Promise<void>>();
 
-/** The handler must freeze the completed staging object before calling this. */
-export async function installStagedNar(
-	config: WorkerConfig,
-	session: UploadSession & { fileHash: string },
-): Promise<string | undefined> {
-	return (await installStagedNars(config, [session])).get(session.id);
-}
-
 /** One SQL admission/cleanup phase around bounded, connection-free transfers. */
 export async function installStagedNars(
 	config: WorkerConfig,
@@ -52,7 +44,7 @@ export async function installStagedNars(
 					key: narKey(session.fileHash, session.compression, isPrivate), operationId: crypto.randomUUID(),
 					sourceKey: session.r2UploadKey, fileHash: session.fileHash, compression: session.compression,
 					isPrivate, fileSize: session.fileSize, sessionId: session.id,
-					allowMissingSession: session.partSize === null && session.r2UploadId !== null, terminal: false,
+					terminal: false,
 				});
 			}
 		}
@@ -70,11 +62,11 @@ export async function installStagedNars(
  */
 export async function installNar(
 	config: WorkerConfig, sourceKey: string, fileHash: string, compression: string, isPrivate: boolean,
-	fileSize: number, sessionId?: string, allowMissingSession = false,
+	fileSize: number, sessionId?: string,
 ): Promise<string | undefined> {
 	const job: Installation = {
 		key: narKey(fileHash, compression, isPrivate), operationId: crypto.randomUUID(), sourceKey,
-		fileHash, compression, isPrivate, fileSize, sessionId, allowMissingSession, terminal: false,
+		fileHash, compression, isPrivate, fileSize, sessionId, terminal: false,
 	};
 	return serializeInstallations(config, async () => (await installNars(config, [job])).get(job.operationId));
 }
@@ -104,7 +96,6 @@ type Installation = {
 	isPrivate: boolean;
 	fileSize: number;
 	sessionId?: string;
-	allowMissingSession?: boolean;
 	/** Only a known terminal storage outcome allows the durable gate to go. */
 	terminal: boolean;
 };
@@ -163,7 +154,7 @@ async function installNars(config: WorkerConfig, jobs: readonly Installation[]):
 }
 
 async function transferNar(config: WorkerConfig, job: Installation): Promise<string | undefined> {
-	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate, sessionId, allowMissingSession } = job;
+	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate, sessionId } = job;
 
 	const sourceBucket = bucketForKey(config, sourceKey);
 	const destination = bucketFor(config, isPrivate);
@@ -173,11 +164,7 @@ async function transferNar(config: WorkerConfig, job: Installation): Promise<str
 	try {
 		const source = await sourceBucket.head(sourceKey);
 		if (!source) return "Upload incomplete";
-		// Early v1 staged MPUs had no ownership metadata. Only those may omit
-		// it; their session-private key still proves possession. Never accept a
-		// different owner's metadata, and every new stream must have its own.
-		const owner = source.customMetadata?.session;
-		if (sessionId !== undefined && owner !== sessionId && !(allowMissingSession && owner === undefined)) return "Upload incomplete";
+		if (sessionId !== undefined && source.customMetadata?.session !== sessionId) return "Upload incomplete";
 		if (source.size !== fileSize) return "File size mismatch";
 		if (!(await verifies(sourceBucket, source, fileHash))) return "File hash mismatch";
 

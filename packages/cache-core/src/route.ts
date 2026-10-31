@@ -2,7 +2,7 @@ import { splitReadPath, DEFAULT_ORG_SLUG } from "./cache-path.js";
 
 /**
  * The route a request takes, as a template such as
- * `POST /_api/v1/uploads/:session/publish`: what traces and logs group by.
+ * `POST /_api/v1/uploads/:session/abort`: what traces and logs group by.
  * Paths carry session ids, cache names and hashes, which would otherwise
  * make every request a group of its own; paths no route serves are all
  * "unmatched", so scanners cannot add groups either.
@@ -27,14 +27,12 @@ const VALUE_AFTER: Readonly<Record<string, string>> = {
 
 const API_ROUTES = new Set([
 	"get-missing-paths",
-	"caches/:cache/upload-sessions",
-	"caches/:cache/upload-sessions/batch",
-	"uploads/commit",
-	"uploads/:session/multipart",
+	"caches/:cache/upload-streams/batch",
+	"uploads/parts",
+	"uploads/finalize",
+	"uploads/:session/parts",
+	"uploads/:session/abort",
 	"uploads/:session/part/:part",
-	"uploads/:session/blob",
-	"uploads/:session/complete",
-	"uploads/:session/publish",
 	"admin/overview",
 	"admin/tokens",
 	"admin/tokens/:jti/revoke",
@@ -67,9 +65,10 @@ function apiTemplate(pathname: string): string | undefined {
 	if (/^\/_api\/v1\/go\/[^/]+\/[^/]+\/v1\/actions\/[a-f0-9]{64}$/.test(pathname)) {
 		return API + "go/:org/:cache/v1/actions/:action";
 	}
+	if (pathname === API + "uploads/parts" || pathname === API + "uploads/finalize") return pathname;
 	const segments = pathname.slice(API.length).split("/");
 	const template = segments
-		.map((segment, i) => (segment === "commit" ? segment : (VALUE_AFTER[segments[i - 1] ?? ""] ?? segment)))
+		.map((segment, i) => VALUE_AFTER[segments[i - 1] ?? ""] ?? segment)
 		.join("/");
 	return API_ROUTES.has(template) ? API + template : undefined;
 }

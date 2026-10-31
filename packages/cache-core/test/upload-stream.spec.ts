@@ -1,8 +1,9 @@
-import { env, SELF } from "cloudflare:test";
+import { abortAllDurableObjects, createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { testDb } from "./db.js";
 import { createCache, findUploadParts, findUploadSession, orgUsage } from "../src/db/repository.js";
 import { signJwt, TOKEN_ISSUER, TOKEN_AUDIENCE } from "../src/jwt.js";
+import nix from "../../../workers/nix/src/index.js";
 
 const db = testDb();
 const AUTH = "test-auth-token";
@@ -49,7 +50,7 @@ describe("streaming upload contract", () => {
 		const bytes = new Uint8Array([31, 7, 219, 84, 2]);
 		const receipt = await upload(s.sessionId, bytes);
 		for (const endpoint of ["multipart", "complete", "publish"]) {
-			expect((await post(`/_api/v1/uploads/${s.sessionId}/${endpoint}`, {})).status).toBe(409);
+			expect((await post(`/_api/v1/uploads/${s.sessionId}/${endpoint}`, {})).status).toBe(404);
 		}
 		const changed = await post(`/_api/v1/uploads/${s.sessionId}/parts`, { parts: [{ partNumber: 1, size: bytes.length + 1 }] });
 		expect(changed.status).toBe(409);
@@ -144,7 +145,7 @@ describe("streaming upload contract", () => {
 					expect(object).toBeNull();
 				}
 			}
-			expect(await orgUsage(db, "default", new Date())).toEqual({ used: before.used + 10, pending: before.pending + 15 });
+			expect(await orgUsage(db, "default", new Date())).toEqual({ used: before.used + 10, pending: before.pending });
 		}
 		// Corrected metadata and receipts, and the authorized owner, can still finish.
 		const repaired = await post("/_api/v1/uploads/finalize", { uploads: [sessions[3].item, sessions[2].item, sessions[0].item] });
@@ -163,7 +164,8 @@ describe("streaming upload contract", () => {
 			const receipt = await upload(s.sessionId, bytes);
 			sessions.push({ ...s, item: { sessionId: s.sessionId, narHash, narSize, fileHash, fileSize: bytes.length, parts: [receipt] } });
 		}
-		expect(await orgUsage(db, "default", new Date())).toEqual({ used: before.used, pending: before.pending + 8 * bytes.length });
+		// Part metadata stays local until seal, rather than synchronously dual-writing.
+		expect(await orgUsage(db, "default", new Date())).toEqual(before);
 		const ordered = [...sessions].reverse();
 		for (let replay = 0; replay < 2; replay++) {
 			const response = await post("/_api/v1/uploads/finalize", { uploads: ordered.map(s => s.item) });
@@ -209,12 +211,12 @@ describe("streaming upload contract", () => {
 					expect((await findUploadSession(db, result.sessionId))?.fileSize).toBe(0);
 				} else {
 					expect(result.parts).toEqual([{ partNumber: 1, url: `http://example.com/_api/v1/uploads/${result.sessionId}/part/1`, headers: { "content-length": String(i + 1), authorization: `Bearer ${token}` } }]);
-					expect(await findUploadParts(db, result.sessionId)).toMatchObject([{ partNumber: 1, size: i + 1 }]);
-					expect((await findUploadSession(db, result.sessionId))?.fileSize).toBe(i + 1);
+					expect(await findUploadParts(db, result.sessionId)).toEqual([]);
+					expect((await findUploadSession(db, result.sessionId))?.fileSize).toBe(0);
 				}
 			}
 			expect(await findUploadSession(db, sessions[2].sessionId)).toEqual(deniedBefore);
-			expect(await orgUsage(db, "default", new Date())).toEqual({ ...before, pending: before.pending + 9 });
+			expect(await orgUsage(db, "default", new Date())).toEqual(before);
 		}
 		// A changed retry rejects the whole item's new bytes, not its neighbors.
 		const changed = await post("/_api/v1/uploads/parts", { uploads: [
@@ -222,9 +224,9 @@ describe("streaming upload contract", () => {
 			{ sessionId: sessions[6].sessionId, parts: [{ partNumber: 1, size: 7 }, { partNumber: 2, size: 3 }] },
 		] }, token);
 		expect(await changed.json()).toMatchObject({ results: [{ status: 409 }, { parts: [{ partNumber: 1, headers: { "content-length": "7" } }, { partNumber: 2, headers: { "content-length": "3" } }] }] });
-		expect(await findUploadParts(db, sessions[1].sessionId)).toMatchObject([{ partNumber: 1, size: 2 }]);
-		expect(await findUploadParts(db, sessions[1].sessionId)).toHaveLength(1);
-		expect(await orgUsage(db, "default", new Date())).toEqual({ ...before, pending: before.pending + 12 });
+		// The rejected item's second part was not reserved with the wrong size.
+		expect((await post(`/_api/v1/uploads/${sessions[1].sessionId}/parts`, { parts: [{ partNumber: 2, size: 11 }] }, token)).status).toBe(200);
+		expect(await orgUsage(db, "default", new Date())).toEqual(before);
 		const scalar = await post(`/_api/v1/uploads/${sessions[6].sessionId}/parts`, { parts: [{ partNumber: 2, size: 3 }] }, token);
 		expect(scalar.status).toBe(200);
 		expect(await scalar.json()).toMatchObject({ parts: [{ partNumber: 2, headers: { "content-length": "3" } }] });
@@ -238,7 +240,7 @@ describe("streaming upload contract", () => {
 		}
 	});
 
-	it("allocates competing asymmetric batches in input order without charging rejected bytes", async () => {
+	it("stages competing batches beyond retained capacity and refuses an individually oversized object", async () => {
 		const org = `batch-quota-${crypto.randomUUID().slice(0, 8)}`;
 		const admin = (path: string, method: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1/orgs/${org}${path}`, {
 			method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
@@ -255,33 +257,22 @@ describe("streaming upload contract", () => {
 		}
 		const responses = await Promise.all(batches.map(uploads => post("/_api/v1/uploads/parts", { uploads }, token)));
 		const bodies = await Promise.all(responses.map(r => r.json<{ results: { sessionId: string; status?: number; parts?: { partNumber: number; headers: Record<string, string> }[] }[] }>()));
-		const winner = bodies.findIndex(b => b.results[0].parts);
-		expect(winner).not.toBe(-1);
 		for (const [index, body] of bodies.entries()) {
 			expect(body.results.map(r => r.sessionId)).toEqual(batches[index].map(u => u.sessionId));
-			expect(body.results.map(r => r.status ?? 200)).toEqual(index === winner ? [200, 507, 200] : [507, 507, 507]);
+			expect(body.results.map(r => r.status ?? 200)).toEqual([200, 200, 200]);
 			for (const [i, result] of body.results.entries()) {
 				const size = batches[index][i].parts[0].size;
-				const admitted = index === winner && i !== 1;
-				expect((await findUploadSession(db, result.sessionId))?.fileSize).toBe(admitted ? size : 0);
-				const reserved = await findUploadParts(db, result.sessionId);
-				if (admitted) {
-					expect(reserved).toMatchObject([{ partNumber: 1, size }]);
-					expect(reserved).toHaveLength(1);
-					expect(result.parts).toMatchObject([{ partNumber: 1, headers: { "content-length": String(size) } }]);
-				} else {
-					expect(reserved).toEqual([]);
-					expect(result.parts).toBeUndefined();
-				}
+				expect(result.parts).toMatchObject([{ partNumber: 1, headers: { "content-length": String(size) } }]);
 			}
 		}
-		expect(await orgUsage(db, org, new Date())).toEqual({ used: 0, pending: 10 });
-		const replay = await post("/_api/v1/uploads/parts", { uploads: batches[winner] }, token);
-		expect(await replay.json()).toMatchObject({ results: [{ parts: [{ partNumber: 1 }] }, { status: 507 }, { parts: [{ partNumber: 1 }] }] });
-		expect(await orgUsage(db, org, new Date())).toEqual({ used: 0, pending: 10 });
+		const extra = await stream("batch", token);
+		expect((await post(`/_api/v1/uploads/${extra.sessionId}/parts`, { parts: [{ partNumber: 1, size: 11 }] }, token)).status).toBe(413);
+		const replay = await post("/_api/v1/uploads/parts", { uploads: batches[0] }, token);
+		expect(await replay.json()).toMatchObject({ results: batches[0].map(() => ({ parts: [{ partNumber: 1 }] })) });
+		expect(await orgUsage(db, org, new Date())).toEqual({ used: 0, pending: 0 });
 	});
 
-	it("reserves quota once across retries and competing streams, isolates orgs, and releases aborts", async () => {
+	it("isolates orgs and preserves aborts across competing staged streams", async () => {
 		const org = `stream-org-${crypto.randomUUID().slice(0, 8)}`;
 		const admin = (path: string, method: string, body: unknown) => SELF.fetch(`http://example.com/_api/v1/orgs/${org}${path}`, {
 			method, headers: { authorization: "Bearer test-admin-secret", "content-type": "application/json" }, body: JSON.stringify(body),
@@ -296,13 +287,60 @@ describe("streaming upload contract", () => {
 		const reserve = (id: string, t = token) => post(`/_api/v1/uploads/${id}/parts`, { parts: [{ partNumber: 1, size: 6 }] }, t);
 		expect((await reserve(a.sessionId, outsider)).status).toBe(403);
 		const responses = await Promise.all([reserve(a.sessionId), reserve(b.sessionId)]);
-		expect(responses.map(r => r.status).sort()).toEqual([200, 507]);
-		const winner = responses[0].status === 200 ? a : b;
-		const loser = winner === a ? b : a;
-		expect((await reserve(winner.sessionId)).status).toBe(200);
-		expect(await orgUsage(db, org, new Date())).toEqual({ used: 0, pending: 6 });
-		for (let i = 0; i < 2; i++) expect((await post(`/_api/v1/uploads/${winner.sessionId}/abort`, {}, token)).status).toBe(200);
-		expect((await reserve(loser.sessionId)).status).toBe(200);
-		expect((await reserve(winner.sessionId)).status).toBe(409);
+		expect(responses.map(r => r.status)).toEqual([200, 200]);
+		const usage = () => SELF.fetch(`http://example.com/_api/v1/orgs/${org}`, { headers: { authorization: "Bearer test-admin-secret" } }).then(r => r.json());
+		expect(await usage()).toMatchObject({ used: 0, pending: 12 });
+		expect((await reserve(a.sessionId)).status).toBe(200);
+		for (let i = 0; i < 2; i++) expect((await post(`/_api/v1/uploads/${a.sessionId}/abort`, {}, token)).status).toBe(200);
+		await abortAllDurableObjects();
+		expect((await reserve(b.sessionId)).status).toBe(200);
+		expect((await reserve(a.sessionId)).status).toBe(409);
+		expect(await usage()).toMatchObject({ used: 0, pending: 6 });
+		const bytes = new Uint8Array([13, 92, 51, 240, 6, 9]);
+		const receipt = await upload(b.sessionId, bytes, token);
+		const first = { sessionId: b.sessionId, narHash, narSize, fileHash: await digest(bytes), fileSize: bytes.length, parts: [receipt] };
+		expect(await (await post("/_api/v1/uploads/finalize", { uploads: [first] }, token)).json()).toMatchObject({ results: [{ published: true }] });
+		expect(await usage()).toMatchObject({ used: 6, pending: 0 });
+		const read = (hash: string) => SELF.fetch(`http://example.com/private/${org}/stream/${hash}.narinfo`, { headers: { authorization: `Bearer ${token}` } });
+		expect((await read(b.hash)).status).toBe(200);
+		const replacement = await stream("stream", token);
+		const replacementBytes = new Uint8Array([23, 4, 92, 84, 3, 6, 11]);
+		const replacementReceipt = await upload(replacement.sessionId, replacementBytes, token);
+		expect(await usage()).toMatchObject({ used: 6, pending: 7 });
+		expect((await read(b.hash)).status).toBe(200);
+		const item = { sessionId: replacement.sessionId, narHash, narSize, fileHash: await digest(replacementBytes), fileSize: 7, parts: [replacementReceipt] };
+		expect(await (await post("/_api/v1/uploads/finalize", { uploads: [item] }, token)).json()).toMatchObject({ results: [{ published: true }] });
+		expect(await usage()).toMatchObject({ used: 7, pending: 0 });
+		expect((await read(b.hash)).status).toBe(404);
+		expect((await read(replacement.hash)).status).toBe(200);
+		// A completed-session replay must restore its SQL row with its narinfo,
+		// not resurrect an untracked public path after eviction.
+		expect(await (await post("/_api/v1/uploads/finalize", { uploads: [first] }, token)).json()).toMatchObject({ results: [{ published: true }] });
+		expect(await usage()).toMatchObject({ used: 6, pending: 0 });
+		expect((await read(b.hash)).status).toBe(200);
+		expect((await read(replacement.hash)).status).toBe(404);
+	});
+
+	it("recovers durable grants and sealed receipts after restart and failed SQL synchronization", async () => {
+		const cache = await createCache(db, `stream-restart-${crypto.randomUUID().slice(0, 8)}`);
+		const s = await stream(cache.name);
+		const bytes = new Uint8Array([13, 92, 51, 240, 6]);
+		const receipt = await upload(s.sessionId, bytes);
+		await abortAllDurableObjects();
+		expect((await post(`/_api/v1/uploads/${s.sessionId}/parts`, { parts: [{ partNumber: 1, size: bytes.length + 1 }] })).status).toBe(409);
+		const item = { sessionId: s.sessionId, narHash, narSize, fileHash: await digest(bytes), fileSize: bytes.length, parts: [receipt] };
+		const request = () => new Request("http://example.com/_api/v1/uploads/finalize", {
+			method: "POST", headers: { authorization: `Bearer ${AUTH}`, "content-type": "application/json" }, body: JSON.stringify({ uploads: [item] }),
+		});
+		const ctx = createExecutionContext();
+		const failed = await nix.fetch(request(), { ...env, HYPERDRIVE: { ...env.HYPERDRIVE, connectionString: "postgres://postgres:postgres@127.0.0.1:1/unavailable" } }, ctx);
+		expect(await failed.json()).toMatchObject({ results: [{ published: false, status: 500 }] });
+		await waitOnExecutionContext(ctx);
+		expect((await post(`/_api/v1/uploads/${s.sessionId}/abort`, {})).status).toBe(409);
+		await abortAllDurableObjects();
+		for (let replay = 0; replay < 2; replay++) {
+			expect(await (await SELF.fetch(request())).json()).toMatchObject({ results: [{ published: true }] });
+		}
+		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(`nar/${item.fileHash}/zstd.nar`))!.arrayBuffer())).toEqual(bytes);
 	});
 });
