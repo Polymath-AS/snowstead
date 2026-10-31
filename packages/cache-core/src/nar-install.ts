@@ -2,9 +2,9 @@ import { AwsClient } from "aws4fetch";
 import type { WorkerConfig } from "./config.js";
 import type { UploadSession } from "./db/types.js";
 import {
-	acquireNarInstallation,
+	acquireNarInstallations,
 	setNarInstallationUpload,
-	finishNarInstallation,
+	finishNarInstallations,
 	installationOwns,
 	hasCanonicalUploadReservations,
 	findCacheById,
@@ -27,13 +27,39 @@ export async function installStagedNar(
 	config: WorkerConfig,
 	session: UploadSession & { fileHash: string },
 ): Promise<string | undefined> {
-	if (!session.r2UploadKey?.startsWith("staging/")) return "Upload incomplete";
-	if (!session.fileSize || session.fileSize > OBJECT_MAX) return "File size mismatch";
-	const cache = await findCacheById(config.db, session.cacheId);
-	if (!cache) return "Cache not found";
-	return installNar(config, session.r2UploadKey, session.fileHash, session.compression,
-		await isPrivateCache(config, cache.path), session.fileSize, session.id,
-		session.partSize === null && session.r2UploadId !== null);
+	return (await installStagedNars(config, [session])).get(session.id);
+}
+
+/** One SQL admission/cleanup phase around bounded, connection-free transfers. */
+export async function installStagedNars(
+	config: WorkerConfig,
+	sessions: readonly (UploadSession & { fileHash: string })[],
+): Promise<Map<string, string | undefined>> {
+	return serializeInstallations(config, async () => {
+		const results = new Map<string, string | undefined>();
+		const visibility = new Map<number, boolean>();
+		for (const cacheId of new Set(sessions.map(session => session.cacheId))) {
+			const cache = await findCacheById(config.db, cacheId);
+			if (cache) visibility.set(cacheId, await isPrivateCache(config, cache.path));
+		}
+		const jobs: Installation[] = [];
+		for (const session of sessions) {
+			if (!session.r2UploadKey?.startsWith("staging/")) results.set(session.id, "Upload incomplete");
+			else if (!visibility.has(session.cacheId)) results.set(session.id, "Cache not found");
+			else {
+				const isPrivate = visibility.get(session.cacheId)!;
+				jobs.push({
+					key: narKey(session.fileHash, session.compression, isPrivate), operationId: crypto.randomUUID(),
+					sourceKey: session.r2UploadKey, fileHash: session.fileHash, compression: session.compression,
+					isPrivate, fileSize: session.fileSize, sessionId: session.id,
+					allowMissingSession: session.partSize === null && session.r2UploadId !== null, terminal: false,
+				});
+			}
+		}
+		const installed = await installNars(config, jobs);
+		for (const job of jobs) results.set(job.sessionId!, installed.get(job.operationId));
+		return results;
+	});
 }
 
 /**
@@ -42,41 +68,102 @@ export async function installStagedNar(
  * No SQL transaction or connection spans hashing or transferring bytes.
  * Sources are retained: session/GC cleanup owns their lifetime.
  */
-export async function installNar(...args: Parameters<typeof installPinnedNar>): Promise<string | undefined> {
+export async function installNar(
+	config: WorkerConfig, sourceKey: string, fileHash: string, compression: string, isPrivate: boolean,
+	fileSize: number, sessionId?: string, allowMissingSession = false,
+): Promise<string | undefined> {
+	const job: Installation = {
+		key: narKey(fileHash, compression, isPrivate), operationId: crypto.randomUUID(), sourceKey,
+		fileHash, compression, isPrivate, fileSize, sessionId, allowMissingSession, terminal: false,
+	};
+	return serializeInstallations(config, async () => (await installNars(config, [job])).get(job.operationId));
+}
+
+async function serializeInstallations<T>(config: WorkerConfig, operation: () => Promise<T>): Promise<T> {
 	// A request shares one lazy SQL client. Backfill/publish batches may call
 	// us together; never close a sibling installer's client or interleave its
 	// admission transaction. Different requests still install concurrently.
-	const config = args[0];
 	const previous = installations.get(config);
 	const slot = Promise.withResolvers<void>();
 	installations.set(config, slot.promise);
 	await previous;
 	try {
-		return await installPinnedNar(...args);
+		return await operation();
 	} finally {
 		slot.resolve();
 		if (installations.get(config) === slot.promise) installations.delete(config);
 	}
 }
 
-async function installPinnedNar(
-	config: WorkerConfig,
-	sourceKey: string,
-	fileHash: string,
-	compression: string,
-	isPrivate: boolean,
-	fileSize: number,
-	sessionId?: string,
-	allowMissingSession = false,
-): Promise<string | undefined> {
-	if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || fileSize > OBJECT_MAX) return "File size mismatch";
-	const key = narKey(fileHash, compression, isPrivate);
-	const operationId = crypto.randomUUID();
-	const acquired = await acquireNarInstallation(config.db, {
-		key, operationId, sourceKey, fileHash, compression, isPrivate, fileSize,
+type Installation = {
+	key: string;
+	operationId: string;
+	sourceKey: string;
+	fileHash: string;
+	compression: string;
+	isPrivate: boolean;
+	fileSize: number;
+	sessionId?: string;
+	allowMissingSession?: boolean;
+	/** Only a known terminal storage outcome allows the durable gate to go. */
+	terminal: boolean;
+};
+
+async function installNars(config: WorkerConfig, jobs: readonly Installation[]): Promise<Map<string, string | undefined>> {
+	const results = new Map<string, string | undefined>();
+	let pending = jobs.filter(job => {
+		if (Number.isSafeInteger(job.fileSize) && job.fileSize > 0 && job.fileSize <= OBJECT_MAX) return true;
+		results.set(job.operationId, "File size mismatch");
+		return false;
 	});
-	await config.releaseDb();
-	if (!acquired) return INSTALLATION_BUSY;
+	while (pending.length > 0) {
+		// Each key has one durable gate/source pin. Equal-content sessions
+		// take successive waves, proving each source without rewriting the winner.
+		const wave = new Map<string, Installation>();
+		const next: Installation[] = [];
+		for (const job of pending) {
+			if (wave.has(job.key)) next.push(job);
+			else wave.set(job.key, job);
+		}
+		pending = next;
+		const admitted = new Set(await acquireNarInstallations(config.db, [...wave.values()].map(
+			({ key, operationId, sourceKey, fileHash, compression, isPrivate, fileSize }) =>
+				({ key, operationId, sourceKey, fileHash, compression, isPrivate, fileSize }),
+		)));
+		const ready: Installation[] = [];
+		try {
+			for (const job of wave.values()) {
+				if (!admitted.has(job.operationId)) results.set(job.operationId, INSTALLATION_BUSY);
+				else if (!job.sourceKey.startsWith("staging/") && await hasCanonicalUploadReservations(config.db, job.sourceKey)) {
+					job.terminal = true;
+					results.set(job.operationId, INSTALLATION_BUSY);
+				} else ready.push(job);
+			}
+			await config.releaseDb();
+			// At most four held source streams leave room for destination writes
+			// under the six-connection limit. Small transfers do not access SQL.
+			const small = ready.filter(job => job.fileSize <= SINGLE_PUT_MAX);
+			await Promise.all(Array.from({ length: Math.min(4, small.length) }, async () => {
+				for (let job = small.shift(); job; job = small.shift()) {
+					results.set(job.operationId, await transferNar(config, job));
+				}
+			}));
+			// Large copies register/fence their destination MPU in SQL. Run
+			// those phases only after all connection-free transfers settle.
+			for (const job of ready.filter(job => job.fileSize > SINGLE_PUT_MAX)) {
+				results.set(job.operationId, await transferNar(config, job));
+			}
+		} finally {
+			await finishNarInstallations(config.db, [...wave.values()].filter(job => admitted.has(job.operationId) && job.terminal),
+				source => bucketForKey(config, source).delete(source));
+			await config.releaseDb();
+		}
+	}
+	return results;
+}
+
+async function transferNar(config: WorkerConfig, job: Installation): Promise<string | undefined> {
+	const { key, operationId, sourceKey, fileHash, fileSize, isPrivate, sessionId, allowMissingSession } = job;
 
 	const sourceBucket = bucketForKey(config, sourceKey);
 	const destination = bucketFor(config, isPrivate);
@@ -84,11 +171,6 @@ async function installPinnedNar(
 	let writeStarted = false;
 	let success = false;
 	try {
-		if (!sourceKey.startsWith("staging/")) {
-			const reserved = await hasCanonicalUploadReservations(config.db, sourceKey);
-			await config.releaseDb();
-			if (reserved) return INSTALLATION_BUSY;
-		}
 		const source = await sourceBucket.head(sourceKey);
 		if (!source) return "Upload incomplete";
 		// Early v1 staged MPUs had no ownership metadata. Only those may omit
@@ -160,8 +242,7 @@ async function installPinnedNar(
 		if (multipart && !writeStarted) {
 			try { await multipart.abort(); } catch { terminal = false; }
 		}
-		if (terminal) await finishNarInstallation(config.db, key, operationId, source => sourceBucket.delete(source));
-		await config.releaseDb();
+		job.terminal = terminal;
 	}
 }
 

@@ -20,10 +20,10 @@ import {
 	touchPublishedPaths,
 	findOrg,
 	withUploadSessionLock,
-	sealUploadStream,
+	sealUploadStreams,
 	abortUploadStream,
 } from "@snowstead/cache-core/db/repository";
-import { installStagedNar, INSTALLATION_BUSY, INSTALLATION_INCOMPLETE } from "@snowstead/cache-core/nar-install";
+import { installStagedNar, installStagedNars, INSTALLATION_BUSY, INSTALLATION_INCOMPLETE } from "@snowstead/cache-core/nar-install";
 import type { UploadSession } from "@snowstead/cache-core/db/types";
 import type { CacheAt, OrgUsage } from "@snowstead/cache-core/db/repository";
 import { DEFAULT_ORG_ID } from "@snowstead/cache-core/db/schema";
@@ -726,14 +726,14 @@ async function completionError(config: WorkerConfig, session: HashedSession, par
 	if (session.r2UploadId && !isStaged(session)) {
 		await bucketForKey(config, session.r2UploadKey).resumeMultipartUpload(session.r2UploadKey, session.r2UploadId).complete([...parts]);
 	}
-	const error = isStaged(session) ? await promoteStaged(config, session, parts) : await uploadError(config, session);
+	const error = isStaged(session)
+		? await assembleStaged(config, session, parts) ?? await installStagedNar(config, session)
+		: await uploadError(config, session);
 	return error ? { error, status: error === INSTALLATION_BUSY || error === INSTALLATION_INCOMPLETE ? 503 : error === "Internal error" ? 500 : 400 } : undefined;
 }
 
-/** Assemble once, then verify and install through the shared canonical gate.
- * Keep the session's proof at staging until GC so interrupted installs retry.
- */
-async function promoteStaged(config: WorkerConfig, session: HashedSession, parts: readonly Part[]): Promise<string | undefined> {
+/** Keep the assembled proof at staging until GC so interrupted installs retry. */
+async function assembleStaged(config: WorkerConfig, session: HashedSession, parts: readonly Part[]): Promise<string | undefined> {
 	const key = session.r2UploadKey ?? "";
 	if (session.r2UploadId && !(await config.bucket.head(key))) {
 		try {
@@ -743,7 +743,7 @@ async function promoteStaged(config: WorkerConfig, session: HashedSession, parts
 			if (!(await config.bucket.head(key))) return `Upload incomplete: ${messageOf(err)}`;
 		}
 	}
-	return installStagedNar(config, session);
+	return undefined;
 }
 
 /**
@@ -919,6 +919,12 @@ const StreamParts = v.object({ parts: v.pipe(v.array(v.object({
 	size: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1024 ** 3)),
 })), v.minLength(1), v.maxLength(MAX_BATCH),
 v.check((parts) => new Set(parts.map((p) => p.partNumber)).size === parts.length, "Duplicate part numbers")) });
+const StreamPartsBatch = v.object({ uploads: v.pipe(v.array(v.object({
+	sessionId: v.string(),
+	// Validate each reservation independently, after authorization.
+	parts: v.unknown(),
+})), v.minLength(1), v.maxLength(MAX_BATCH),
+v.check((uploads) => new Set(uploads.map(u => u.sessionId)).size === uploads.length, "Duplicate sessions")) });
 const StreamFinalize = v.object({ uploads: v.pipe(v.array(v.object({
 	sessionId: v.string(),
 	narHash: NarHash,
@@ -982,40 +988,100 @@ export async function handleCreateUploadStreams(
 export async function handleReserveUploadParts(
 	request: Request, config: WorkerConfig, sessionId: string, identity: AuthIdentity,
 ): Promise<Response> {
-	const loaded = await loadSessionWithAuthCheck(config, sessionId, identity);
-	if (loaded.error) return loaded.error;
-	const session = loaded.session;
-	if (session.partSize === null || session.status !== "streaming" || !session.r2UploadKey || !session.r2UploadId) {
-		return errorResponse("Conflict", 409);
-	}
 	const body = await parseBody(request, StreamParts);
 	if (body instanceof Response) return body;
-	const cache = await resolveCache(config.db, session.cacheId);
-	if (!cache) return errorResponse("Not found", 404);
-	const refused = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" })
-		.reserveNixParts(cache.orgId, sessionId, body.parts);
-	if (refused) {
-		if (refused instanceof Response) return refused;
-		return "error" in refused ? errorResponse(refused.error, refused.status) : storageFullResponse(refused);
+	const results = await reserveUploadParts(request, config, [{ sessionId, parts: body.parts }], identity);
+	const result = results.get(sessionId)!;
+	return result instanceof Response ? result : jsonResponse(result);
+}
+
+export async function handleReserveUploadPartsBatch(
+	request: Request, config: WorkerConfig, identity: AuthIdentity,
+): Promise<Response> {
+	const body = await parseBody(request, StreamPartsBatch);
+	if (body instanceof Response) return body;
+	const reserved = await reserveUploadParts(request, config, body.uploads, identity);
+	const results = await Promise.all(body.uploads.map(async ({ sessionId }) => {
+		const result = reserved.get(sessionId)!;
+		return result instanceof Response
+			? { sessionId, error: (await result.json<{ error: string }>()).error, status: result.status }
+			: { sessionId, ...result };
+	}));
+	return jsonResponse({ results });
+}
+
+type PartGrants = { parts: { partNumber: number; url: string; headers: Record<string, string> }[] };
+
+async function reserveUploadParts(
+	request: Request, config: WorkerConfig, inputs: readonly { sessionId: string; parts: unknown }[], identity: AuthIdentity,
+): Promise<Map<string, PartGrants | Response>> {
+	const results = new Map<string, PartGrants | Response>();
+	const sessions = new Map((await findUploadSessions(config.db, inputs.map(i => i.sessionId))).map(s => [s.id, s]));
+	const groups = new Map<string, { sessionId: string; parts: v.InferOutput<typeof StreamParts>["parts"] }[]>();
+	// Finish all authorization checks before invoking any coordinator or signer.
+	for (const input of inputs) {
+		const session = sessions.get(input.sessionId);
+		const denied = await sessionAccessError(config, session, identity);
+		if (denied || !session) {
+			results.set(input.sessionId, errorResponse(denied?.error ?? "Not found", denied?.status ?? 404));
+			continue;
+		}
+		const parsed = v.safeParse(StreamParts, { parts: input.parts });
+		if (!parsed.success) {
+			results.set(input.sessionId, errorResponse("Invalid part reservations", 400));
+			continue;
+		}
+		const cache = await resolveCache(config.db, session.cacheId);
+		if (!cache) {
+			results.set(input.sessionId, errorResponse("Not found", 404));
+			continue;
+		}
+		const group = groups.get(cache.orgId) ?? [];
+		group.push({ sessionId: input.sessionId, parts: parsed.output.parts });
+		groups.set(cache.orgId, group);
 	}
+	await Promise.all([...groups].map(async ([orgId, uploads]) => {
+		try {
+			const reserved = await config.uploadCoordinator.getByName(orgId, { locationHint: "weur" }).reserveNixParts(orgId, uploads);
+			for (const input of uploads) {
+				if (!(reserved instanceof Response) && !reserved.has(input.sessionId)) throw new Error("Missing reservation result");
+				const refused = reserved instanceof Response ? reserved.clone() : reserved.get(input.sessionId);
+				if (refused) {
+					results.set(input.sessionId, refused instanceof Response ? refused
+						: "error" in refused ? errorResponse(refused.error, refused.status) : storageFullResponse(refused));
+				} else {
+					results.set(input.sessionId, await partGrants(request, config, sessions.get(input.sessionId)!, input.parts));
+				}
+			}
+		} catch (error) {
+			console.error("Failed to reserve upload parts", errorForLog(error));
+			for (const input of uploads) if (!results.has(input.sessionId)) results.set(input.sessionId, errorResponse("Internal error", 500));
+		}
+	}));
+	return results;
+}
+
+async function partGrants(
+	request: Request, config: WorkerConfig, session: UploadSession, reservations: readonly { partNumber: number; size: number }[],
+): Promise<PartGrants> {
 	const { r2Endpoint, r2AccessKeyId, r2SecretAccessKey } = config;
-	const key = session.r2UploadKey;
-	const uploadId = session.r2UploadId;
+	const key = session.r2UploadKey!;
+	const uploadId = session.r2UploadId!;
 	const expiresIn = Math.max(1, Math.floor((session.expiresAt.getTime() - Date.now()) / 1000));
 	// The CLI sends only supplied headers on PUT. Return its credential only
 	// for the same-origin authenticated proxy, never for an R2 presigned URL.
 	const authorization = request.headers.get("authorization");
-	const proxyHeaders = !r2Endpoint || !r2AccessKeyId || !r2SecretAccessKey
+	const proxyHeaders: Record<string, string> = !r2Endpoint || !r2AccessKeyId || !r2SecretAccessKey
 		? authorization ? { authorization } : {}
 		: {};
-	const parts = await Promise.all(body.parts.map(async ({ partNumber, size }) => ({
+	const parts = await Promise.all(reservations.map(async ({ partNumber, size }) => ({
 		partNumber,
 		url: r2Endpoint && r2AccessKeyId && r2SecretAccessKey
 			? await createPresignedPartPut(r2Endpoint, r2AccessKeyId, r2SecretAccessKey, config.r2BucketName, key, uploadId, partNumber, expiresIn, size)
-			: new URL(`/_api/v1/uploads/${encodeURIComponent(sessionId)}/part/${partNumber}`, request.url).href,
+			: new URL(`/_api/v1/uploads/${encodeURIComponent(session.id)}/part/${partNumber}`, request.url).href,
 		headers: { "content-length": String(size), ...proxyHeaders },
 	})));
-	return jsonResponse({ parts });
+	return { parts };
 }
 
 /** The proxy has the same immutable byte grant as a presigned part URL. */
@@ -1050,10 +1116,12 @@ export async function handleFinalizeUploadStreams(
 	const results = new Map<string, PublishResult | { sessionId: string; published: false; error: string; status: number }>();
 	const usable: HashedSession[] = [];
 	const fail = (sessionId: string, error: string, status: number) => results.set(sessionId, { sessionId, published: false, error, status });
+	const loaded = new Map((await findUploadSessions(config.db, body.uploads.map(upload => upload.sessionId))).map(s => [s.id, s]));
+	const authorized: typeof body.uploads = [];
 	for (const upload of body.uploads) {
 		const sessionId = upload.sessionId;
 		try {
-			const session = await findUploadSession(config.db, sessionId);
+			const session = loaded.get(sessionId);
 			const denied = await sessionAccessError(config, session, identity);
 			if (denied || !session) {
 				fail(sessionId, denied?.error ?? "Not found", denied?.status ?? 404);
@@ -1063,24 +1131,47 @@ export async function handleFinalizeUploadStreams(
 				fail(sessionId, "Conflict", 409);
 				continue;
 			}
-			const sealed = await sealUploadStream(config.db, sessionId, upload);
-			if ("error" in sealed) {
-				fail(sessionId, sealed.error, sealed.status);
-				continue;
-			}
-			if (!hasFileHash(sealed)) throw new Error("Sealed stream has no file hash");
-			if (sealed.status !== "completed") {
-				const error = await promoteStaged(config, sealed, upload.parts);
-				if (error) {
-					fail(sessionId, error, error === INSTALLATION_BUSY || error === INSTALLATION_INCOMPLETE ? 503 : 400);
-					continue;
-				}
-			}
-			usable.push(sealed);
+			authorized.push(upload);
 		} catch (error) {
 			console.error("Failed to finalize upload stream", { sessionId }, errorForLog(error));
 			fail(sessionId, "Internal error", 500);
 		}
+	}
+	try {
+		// Authorization precedes every mutation. Lock/seal the authorized rows
+		// together, then leave SQL before assembling or verifying any objects.
+		const sealed = await sealUploadStreams(config.db, authorized);
+		await config.releaseDb();
+		const pending: HashedSession[] = [];
+		for (const upload of authorized) {
+			const session = sealed.get(upload.sessionId)!;
+			if ("error" in session) {
+				fail(upload.sessionId, session.error, session.status);
+				continue;
+			}
+			if (!hasFileHash(session)) throw new Error("Sealed stream has no file hash");
+			if (session.status === "completed") {
+				usable.push(session);
+				continue;
+			}
+			try {
+				const error = await assembleStaged(config, session, upload.parts);
+				if (error) fail(session.id, error, 400);
+				else pending.push(session);
+			} catch (error) {
+				console.error("Failed to assemble upload stream", { sessionId: session.id }, errorForLog(error));
+				fail(session.id, "Internal error", 500);
+			}
+		}
+		const installed = await installStagedNars(config, pending);
+		for (const session of pending) {
+			const error = installed.get(session.id);
+			if (error) fail(session.id, error, error === INSTALLATION_BUSY || error === INSTALLATION_INCOMPLETE ? 503 : 400);
+			else usable.push(session);
+		}
+	} catch (error) {
+		console.error("Failed to finalize upload streams", errorForLog(error));
+		for (const upload of authorized) if (!results.has(upload.sessionId)) fail(upload.sessionId, "Internal error", 500);
 	}
 	const byCache = new Map<number, HashedSession[]>();
 	for (const session of usable) byCache.set(session.cacheId, [...(byCache.get(session.cacheId) ?? []), session]);
