@@ -4,6 +4,7 @@ import { resolveConfig } from "@snowstead/cache-core/config";
 import { errorForLog } from "@snowstead/cache-core/logging";
 import { handleRequest } from "./router.js";
 import { runGarbageCollection } from "./gc.js";
+import { importBandwidth } from "./bandwidth.js";
 import { retryCdnPurges } from "@snowstead/cache-core/cdn";
 
 export { UploadCoordinator } from "@snowstead/cache-core/upload-coordinator";
@@ -36,6 +37,14 @@ export default {
 				console.error("GC completed with errors", { ...counts, errors: result.errors });
 			} else {
 				console.log("GC completed", counts);
+			}
+			try {
+				const result = await importBandwidth(config, new Date());
+				if (result) console.log("Bandwidth imported", result.imported);
+				if (result?.errors.length) console.error("Bandwidth import failed in part", result.errors);
+			} catch (err) {
+				// The next run re-imports the same days.
+				console.error("Bandwidth import failed", errorForLog(err));
 			}
 		} catch (err) {
 			if (!(err instanceof DrizzleQueryError)) throw err;

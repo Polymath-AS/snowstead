@@ -90,7 +90,27 @@ export async function handleSccacheManagement(config: WorkerConfig, org: string,
 	return jsonResponse({ ...row, lastAddedAt: row.lastAddedAt ? new Date(row.lastAddedAt).toISOString() : null, retentionDays: 7 });
 }
 
-/** Entry locks fence the sweep against uploads; unrelated transfers remain independent. */
+/** Reclaim abandoned attempts in bounded pages, including crashes after R2 PUT.
+ * Reservation IDs are never reused. While a reservation exists, keep all of its
+ * attempts: even an uncommitted adoption or a stalled transfer remains safe.
+ * A crashed loser can therefore remain until its reservation's retention ends.
+ */
+export async function sweepSccacheAttempts(config: WorkerConfig): Promise<number> {
+	const cursorKey = "gc:sccache-attempts";
+	const cursor = await config.authKv.get(cursorKey);
+	const page = await config.bucket.list({ prefix: "sccache-attempt/", limit: 500, cursor: cursor ?? undefined });
+	const ids = [...new Set(page.objects.map(object => object.key.split("/")[1]))];
+	const entries = ids.length ? await config.db.select({ id: sccacheEntries.id }).from(sccacheEntries)
+		.where(sql`${sccacheEntries.id} = ANY(${sql.param(ids)}::text[])`) : [];
+	const live = new Set(entries.map(entry => entry.id));
+	const garbage = page.objects.filter(object => !live.has(object.key.split("/")[1])).map(object => object.key);
+	if (garbage.length) await config.bucket.delete(garbage);
+	if (page.truncated) await config.authKv.put(cursorKey, page.cursor);
+	else await config.authKv.delete(cursorKey);
+	return garbage.length;
+}
+
+/** Entry locks fence the sweep against adoption and publication, not transfers. */
 export async function sweepSccacheEntries(config: WorkerConfig): Promise<number> {
 	return config.db.transaction(async tx => {
 		const now = new Date();

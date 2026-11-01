@@ -1,6 +1,6 @@
 import { bucketForKey, narKey } from "@snowstead/cache-core/layout";
 import { sweepGoEntries } from "@snowstead/cache-core/go-cache";
-import { sweepSccacheEntries } from "@snowstead/cache-core/sccache";
+import { sweepSccacheEntries, sweepSccacheAttempts } from "@snowstead/cache-core/sccache";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import {
 	findExpiredSessions,
@@ -69,6 +69,7 @@ export async function runGarbageCollection(config: WorkerConfig): Promise<GcResu
 	}
 	try {
 		await sweepSccacheEntries(config);
+		await sweepSccacheAttempts(config);
 	} catch (error) {
 		errors.push(`sccache sweep: ${messageOf(error)}`);
 	}

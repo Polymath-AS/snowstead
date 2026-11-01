@@ -1,4 +1,4 @@
-import { and, eq, lt, or, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, or, isNull, sql } from "drizzle-orm";
 import type { WorkerConfig } from "./config.js";
 import type { Db } from "./db/connection.js";
 import { goEntries, orgs, publishedPaths, sccacheEntries } from "./db/schema.js";
@@ -60,21 +60,29 @@ export async function withOrgCapacity<T>(config: WorkerConfig, orgId: string, pr
 		// A global top-256 cannot need more than 256 from one cache/protocol.
 		// Keep exclusions as set filters so each LRU scan can stop early.
 		const candidates = await evictionCandidates(tx, orgId, now, protect, VICTIM_BUDGET);
-		const victims: Victim[] = [];
-		let freed = 0;
-		for (const candidate of candidates) {
-			const table = candidate.kind === "nix" ? sql`published_paths` : candidate.kind === "go" ? sql`go_entries` : sql`sccache_entries`;
-			const id = candidate.kind === "nix" ? sql`${candidate.id}::bigint` : sql`${candidate.id}`;
-			const eligible = candidate.kind === "nix" ? sql`
+		const available = new Set<string>();
+		// Lock the bounded candidate set in at most three statements, not one
+		// round trip per victim. SKIP LOCKED preserves progress around transfers.
+		for (const kind of ["nix", "go", "sccache"] as const) {
+			const ids = candidates.filter(candidate => candidate.kind === kind).map(candidate => candidate.id);
+			if (!ids.length) continue;
+			const table = kind === "nix" ? sql`published_paths` : kind === "go" ? sql`go_entries` : sql`sccache_entries`;
+			const selected = kind === "nix" ? sql`${sql.param(ids)}::bigint[]` : sql`${sql.param(ids)}::text[]`;
+			const eligible = kind === "nix" ? sql`
 				not nix_path_pinned(e.cache_id,e.store_path_hash,${now}) and
 				not exists (select 1 from upload_sessions u where u.cache_id=e.cache_id and u.store_path_hash=e.store_path_hash
 					and (u.status='finalizing' or (u.status in ('pending','uploading','streaming') and u.expires_at>${now})))
 				and not exists (select 1 from nar_installations i join blob_objects b on b.id=e.blob_object_id
 					where i.file_hash=b.file_hash and i.compression=b.compression)`
-				: sql`e.uploaded_at is not null and e.expires_at>${now} and e.generation=${candidate.kind === "go" ? sql`c.go_generation` : sql`c.sccache_generation`}`;
-			const locked = await tx.execute(sql`select e.id from ${table} e join caches c on c.id=e.cache_id
-				where e.id=${id} and c.org_id=${orgId} and ${eligible} for update of e skip locked`);
-			if (!locked.rows.length) continue;
+				: sql`e.uploaded_at is not null and e.expires_at>${now} and e.generation=${kind === "go" ? sql`c.go_generation` : sql`c.sccache_generation`}`;
+			const locked = await tx.execute<{ id: string }>(sql`select e.id::text as id from ${table} e join caches c on c.id=e.cache_id
+				where e.id=ANY(${selected}) and c.org_id=${orgId} and ${eligible} order by e.id for update of e skip locked`);
+			for (const row of locked.rows) available.add(`${kind}:${row.id}`);
+		}
+		const victims: Victim[] = [];
+		let freed = 0;
+		for (const candidate of candidates) {
+			if (!available.has(`${candidate.kind}:${candidate.id}`)) continue;
 			victims.push(candidate);
 			freed += Number(candidate.size);
 			if (usage.used - freed <= org.storageLimit) break;
@@ -83,15 +91,17 @@ export async function withOrgCapacity<T>(config: WorkerConfig, orgId: string, pr
 		await tx.execute(sql`select set_config('snowstead.eviction_reason','capacity',true)`);
 		// No external deletions before the complete plan has been proven to fit.
 		for (const victim of victims) {
-			if (victim.kind !== "nix") {
-				// Retire the action slot. The sweep owns physical cleanup; readers
-				// always check SQL before consulting their immutable CDN key.
-				const table = victim.kind === "go" ? goEntries : sccacheEntries;
-				await tx.update(table).set({ cacheId: null }).where(eq(table.id, victim.id));
-			} else {
+			if (victim.kind === "nix") {
 				await deleteCachePaths({ ...config, db: tx }, { id: victim.cacheId, orgId, isPublic: victim.isPublic,
 					path: cachePath(org.slug, victim.name) }, { storePathHashes: [victim.hash] }, publication.origin);
 			}
+		}
+		for (const kind of ["go", "sccache"] as const) {
+			const ids = victims.filter(victim => victim.kind === kind).map(victim => victim.id);
+			if (!ids.length) continue;
+			const table = kind === "go" ? goEntries : sccacheEntries;
+			// One transition-table trigger invocation for the whole product batch.
+			await tx.update(table).set({ cacheId: null }).where(inArray(table.id, ids));
 		}
 		await publication.afterAdmission?.();
 		return result;
@@ -114,9 +124,10 @@ export function recordGoAccess(config: WorkerConfig, id: string): void {
 	)).then(() => {}).catch(() => {}));
 }
 
-export function recordSccacheAccess(config: WorkerConfig, id: string): void {
+export function recordSccacheAccess(config: WorkerConfig, entry: { id: string; lastAccessedAt: Date | null }): void {
 	const now = new Date();
-	config.defer(config.db.update(sccacheEntries).set({ lastAccessedAt: now }).where(and(eq(sccacheEntries.id, id),
+	if (entry.lastAccessedAt && entry.lastAccessedAt.getTime() >= now.getTime() - ACCESS_INTERVAL_MS) return;
+	config.afterResponse(db => db.update(sccacheEntries).set({ lastAccessedAt: now }).where(and(eq(sccacheEntries.id, entry.id),
 		or(isNull(sccacheEntries.lastAccessedAt), lt(sccacheEntries.lastAccessedAt, new Date(now.getTime() - ACCESS_INTERVAL_MS))),
-	)).then(() => {}).catch(() => {}));
+	)).then(() => {}));
 }

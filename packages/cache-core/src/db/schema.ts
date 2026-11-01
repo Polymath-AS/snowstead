@@ -250,14 +250,30 @@ export const upstreamPaths = pgTable("upstream_paths", {
 });
 
 /**
- * NAR bytes the Worker served for an org's private caches, by UTC day.
- * Public caches are read from the bucket and CDN directly and aren't counted.
+ * Bytes served for each of an org's caches, by product and UTC day. Both
+ * counts are Cloudflare's sampled estimates, imported by control's cron
+ * (bandwidth.ts), which replaces a day's counts on each import.
  */
 export const bandwidthDaily = pgTable("bandwidth_daily", {
 	orgId: text("org_id").notNull().references(() => orgs.id),
+	/**
+	 * No foreign key: an org's history outlives a deleted cache. 0 holds bytes
+	 * counted before bandwidth was metered per cache; imports leave them.
+	 */
+	cacheId: integer("cache_id").notNull().default(0),
+	product: text("product").$type<"nix" | "go" | "sccache">().notNull(),
 	day: date("day", { mode: "string" }).notNull(),
+	/** Bytes the Workers served: private NARs, and Go and sccache artifacts. */
 	bytes: bytes("bytes").notNull().default(0),
-}, (table) => [primaryKey({ columns: [table.orgId, table.day] })]);
+	/** Bytes the CDN served from public caches, which never reach the Workers. */
+	publicBytes: bytes("public_bytes").notNull().default(0),
+	/** When an import last wrote the row; null for rows counted before imports. */
+	importedAt: timestamptz("imported_at"),
+}, (table) => [
+	primaryKey({ columns: [table.orgId, table.cacheId, table.product, table.day] }),
+	check("bandwidth_daily_product_valid", sql`${table.product} IN ('nix', 'go', 'sccache')`),
+	index("idx_bandwidth_daily_cache").on(table.cacheId, table.day),
+]);
 
 /**
  * Keys an org's own tooling calls the org API with. Only a hash of the key
@@ -300,6 +316,7 @@ export const sccacheEntries = pgTable("sccache_entries", {
 	action: text("action").notNull(),
 	r2Key: text("r2_key").notNull().unique(),
 	size: bytes("size").notNull(),
+	storedAt: timestamptz("stored_at"),
 	uploadedAt: timestamptz("uploaded_at"),
 	lastAccessedAt: timestamptz("last_accessed_at"),
 	expiresAt: timestamptz("expires_at").notNull(),
