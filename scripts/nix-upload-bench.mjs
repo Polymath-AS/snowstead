@@ -9,6 +9,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { parseArgs } from "node:util";
 import { createTestHarness } from "wrangler";
@@ -18,6 +19,8 @@ const { values } = parseArgs({ options: {
   "source-root": { type: "string" },
   "comparison-root": { type: "string" }, "comparison-variant": { type: "string" },
   binary: { type: "string", default: "target/release/snowstead" },
+  "comparison-binary": { type: "string" },
+  "request-delay-ms": { type: "string", default: "0" },
   rounds: { type: "string", default: "20" }, warmups: { type: "string", default: "1" },
   workloads: { type: "string", default: "tiny24,mixed25" },
   visibility: { type: "string", default: "private,public" }, jobs: { type: "string", default: "8" },
@@ -26,14 +29,17 @@ assert.ok(values.variant && values.fixtures && values.output, "--variant, --fixt
 assert.match(values.variant, /^[a-z0-9-]+$/);
 const rounds = Number(values.rounds), warmups = Number(values.warmups);
 assert.ok(Number.isInteger(rounds) && rounds > 0 && Number.isInteger(warmups) && warmups >= 0);
+const requestDelayMs = Number(values["request-delay-ms"]);
+assert.ok(Number.isInteger(requestDelayMs) && requestDelayMs >= 0 && requestDelayMs <= 2_147_483_647, "--request-delay-ms must be a nonnegative timer-safe integer");
 const repository = new URL("../", import.meta.url).pathname;
 const root = values["source-root"] ? resolve(values["source-root"]) : repository;
-const variants = [{ name: values.variant, root }];
-if (values["comparison-root"] || values["comparison-variant"]) {
+const binary = resolve(values.binary);
+const variants = [{ name: values.variant, root, binary }];
+if (values["comparison-root"] || values["comparison-variant"] || values["comparison-binary"]) {
   assert.ok(values["comparison-root"] && values["comparison-variant"], "comparison needs a root and variant");
   assert.match(values["comparison-variant"], /^[a-z0-9-]+$/);
   assert.notEqual(values.variant, values["comparison-variant"]);
-  variants.push({ name: values["comparison-variant"], root: resolve(values["comparison-root"]) });
+  variants.push({ name: values["comparison-variant"], root: resolve(values["comparison-root"]), binary: values["comparison-binary"] ? resolve(values["comparison-binary"]) : binary });
 }
 const output = resolve(values.output);
 await mkdir(output, { recursive: true });
@@ -42,7 +48,6 @@ const { Client } = require("pg");
 const { drizzle } = require("drizzle-orm/node-postgres");
 const { migrate } = require("drizzle-orm/node-postgres/migrator");
 const exec = promisify(execFile);
-const binary = resolve(values.binary);
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const fixtures = JSON.parse(await readFile(values.fixtures, "utf8"));
 const workloads = values.workloads.split(",").map(name => {
@@ -58,16 +63,20 @@ for (const path of new Set(workloads.flatMap(w => w.paths))) {
   originalNars.set(path, { sha256: digest(stdout), size: stdout.length });
 }
 const sourceFiles = ["workers/nix/src/uploads.ts", "workers/nix/src/router.ts", "workers/control/src/admin.ts", "workers/control/src/slug-move.ts", "packages/cache-core/src/narinfo.ts", "packages/cache-core/src/nar-install.ts", "packages/cache-core/src/upload-timing.ts", "packages/cache-core/src/db/repository.ts"];
-for (const { name, root } of variants) {
+for (const { name, root, binary } of variants) {
 const provenance = {
   variant: name, created: new Date().toISOString(), rounds, warmups, jobs: Number(values.jobs),
   sourceRoot: root,
   head: (await exec("git", ["rev-parse", "HEAD"], { cwd: repository })).stdout.trim(),
-  binarySha256: digest(await readFile(binary)),
+  binary, binarySha256: digest(await readFile(binary)),
   sources: Object.fromEntries(await Promise.all(sourceFiles.map(async file => [file, digest(await readFile(join(root, file)))]))),
   workloads, visibility, originalNars: Object.fromEntries(originalNars),
   reset: "New isolated PostgreSQL database and nonpersistent Worker harness for EVERY trial, including warmups. No shared or production state is modified.",
   timing: "Push: CLI wall clock, including discovery/compression/network. Requests: local forwarding proxy through consumed response body. Reads: through consumed response body. Setup, reset, validation and teardown excluded. SQL execution durations exclude Parse/Bind and network time; SQL counts cover the push window and may include background writes.",
+  requestDelayMs,
+  requestDelay: "Injected benchmark delay, NOT measured production latency. Applied after reading the request body and before forwarding each recorded inline-batch/finalize request; included in request ms and push wall clock. Other requests are not delayed.",
+  requestMetrics: "startOffsetMs/endOffsetMs are relative to push start. Publication means inline-batch or finalize. publicationConcurrencyAtArrival includes this request; publicationConcurrencyMax is the peak overlapping publication requests during this request. maxPublicationConcurrency is the trial peak. Intervals include body receipt, injected delay, forwarding, and response consumption, not client receipt. inlineItemCount is uploads.length from the four-byte big-endian length-prefixed JSON manifest, including retry attempts.",
+  fixtureDependencies: "Push uses --no-deps --allow-drv. Fixtures must explicitly list every dependency to upload, including dependencies of derivations.",
   order: "Each workload/visibility pair runs both variants, reversing variant order on alternating rounds. Warmup trials also have fresh state; they warm tooling, not cache contents.",
 };
 await writeFile(join(output, `${name}-provenance.json`), JSON.stringify(provenance, null, 2));
@@ -85,7 +94,7 @@ const secrets = { ADMIN_SECRET: "benchmark-admin-only", JWT_SECRET: "benchmark-j
 let trial = 0, failed = 0;
 try {
   for (let round = -warmups; round < rounds; round++) for (const workload of workloads) for (const mode of visibility)
-  for (const { name: variant, root } of (round % 2 === 0 ? variants : [...variants].reverse())) {
+  for (const { name: variant, root, binary } of (round % 2 === 0 ? variants : [...variants].reverse())) {
     const name = `pub_bench_${process.pid}_${trial++}`;
     const home = await mkdtemp(join(tmpdir(), "snowstead-pub-bench-"));
     let harness, proxy;
@@ -126,16 +135,38 @@ try {
       result.reset.initialStorage = await storage();
       assert.equal(result.reset.initialStorage.private.objects, 0, "fresh private R2");
       assert.equal(result.reset.initialStorage.public.objects, 0, "fresh public R2");
-      let recording = false;
+      let recording = false, pushStart;
+      const activePublications = new Set();
+      result.maxPublicationConcurrency = 0;
       proxy = createServer(async (req, res) => {
         const start = performance.now();
         const phase = req.url.includes("/inline/batch") ? "inline-batch" : req.url.includes("upload-streams") ? "allocate" : req.url.includes("get-missing") ? "discovery" : req.url.includes("finalize") ? "finalize" : req.method === "PUT" ? "upload-part" : req.url.includes("/parts") ? "reserve-parts" : "other";
         const record = recording;
+        const publication = record && ["inline-batch", "finalize"].includes(phase);
+        const sample = { phase, startOffsetMs: start - pushStart };
+        if (publication) {
+          activePublications.add(sample);
+          sample.publicationConcurrencyAtArrival = activePublications.size;
+          sample.publicationConcurrencyMax = activePublications.size;
+          result.maxPublicationConcurrency = Math.max(result.maxPublicationConcurrency, activePublications.size);
+          for (const active of activePublications) active.publicationConcurrencyMax = Math.max(active.publicationConcurrencyMax, activePublications.size);
+        }
         try {
           const chunks = [];
           for await (const chunk of req) chunks.push(chunk);
+          const requestBody = Buffer.concat(chunks);
+          if (record && phase === "inline-batch") {
+            // The API frame is a u32 BE JSON length, the manifest, then NAR payloads.
+            assert.ok(requestBody.length >= 4, "missing inline manifest length");
+            const manifestSize = requestBody.readUInt32BE(0);
+            assert.ok(manifestSize > 0 && 4 + manifestSize < requestBody.length, "invalid inline manifest length");
+            const manifest = JSON.parse(requestBody.subarray(4, 4 + manifestSize).toString("utf8"));
+            assert.ok(Array.isArray(manifest.uploads), "missing inline uploads");
+            sample.inlineItemCount = manifest.uploads.length;
+          }
+          if (publication && requestDelayMs > 0) await delay(requestDelayMs);
           const headers = { ...req.headers }; delete headers.host;
-          const response = await fetch(new URL(req.url, url), { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : Buffer.concat(chunks) });
+          const response = await fetch(new URL(req.url, url), { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : requestBody });
           let body = Buffer.from(await response.arrayBuffer());
           if (phase === "reserve-parts" && response.ok) {
             const grants = JSON.parse(body);
@@ -150,11 +181,18 @@ try {
           const returned = Object.fromEntries(response.headers);
           delete returned["transfer-encoding"]; delete returned["content-encoding"]; returned["content-length"] = body.length;
           res.writeHead(response.status, returned); res.end(body);
-          if (record) result.requests.push({ phase, ms: performance.now() - start, status: response.status, bytes: body.length,
+          Object.assign(sample, { status: response.status, bytes: body.length,
             timings: Object.fromEntries([...response.headers.get("server-timing")?.matchAll(/([a-z_]+);dur=([\d.]+)/g) ?? []].map(m => [m[1], Number(m[2])])) });
         } catch (error) {
-          if (record) result.requests.push({ phase, ms: performance.now() - start, status: 599, error: error.message });
+          Object.assign(sample, { status: 599, error: error.message });
           res.writeHead(502); res.end("Benchmark proxy failure");
+        } finally {
+          if (publication) activePublications.delete(sample);
+          if (record) {
+            const end = performance.now();
+            Object.assign(sample, { ms: end - start, endOffsetMs: end - pushStart });
+            result.requests.push(sample);
+          }
         }
       });
       await new Promise(resolve => proxy.listen(0, "127.0.0.1", resolve));
@@ -170,9 +208,9 @@ try {
       const authenticated = run("login", "--token-stdin", "--name", "uploader", "--url", origin);
       authenticated.child.stdin.end(token); await authenticated;
       const before = (await sqlLog()).length;
-      const start = performance.now(); recording = true;
+      const start = performance.now(); pushStart = start; recording = true;
       try {
-        const pushed = await run("push", "experiment", ...workload.paths, "--no-deps", "--jobs", values.jobs, "--compression-level", "3");
+        const pushed = await run("push", "experiment", ...workload.paths, "--no-deps", "--allow-drv", "--jobs", values.jobs, "--compression-level", "3");
         result.stdout = pushed.stdout; result.stderr = pushed.stderr;
         assert.match(pushed.stdout, new RegExp(`${workload.paths.length} pushed, 0 skipped`));
       } catch (error) { result.errors.push(error.message); }
