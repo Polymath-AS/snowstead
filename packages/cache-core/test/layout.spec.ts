@@ -68,18 +68,60 @@ describe("private caches never reach the public bucket", () => {
 		expect(await env.PUBLIC_BUCKET.head(`nar/${fileHash}/zstd.nar`)).toBeNull();
 		expect(await env.PUBLIC_BUCKET.head("closed/nix-cache-info")).toBeNull();
 
-		const narinfo = await env.CACHE_BUCKET.get(`narinfo/closed/${hash}.narinfo`);
-		expect(await narinfo?.text()).toContain(`URL: nar/${fileHash}/zstd.nar`);
+		expect(await env.CACHE_BUCKET.head(`narinfo/closed/${hash}.narinfo`)).toBeNull();
 		expect(await env.CACHE_BUCKET.head(`nars/sha256/${fileHash}/zstd.nar`)).not.toBeNull();
 
 		const created = await api("/admin/tokens", { subject: "layout", caches: ["closed"], perms: ["pull"] }, "test-admin-secret");
 		const { token } = await created.json<{ token: string }>();
-		const res = await SELF.fetch(`http://example.com/private/closed/${hash}.narinfo`, {
-			headers: { authorization: `Bearer ${token}` },
+		const url = `http://example.com/private/closed/${hash}.narinfo`;
+		const read = (method = "GET", headers: Record<string, string> = {}) => SELF.fetch(url, {
+			method, headers: { authorization: `Bearer ${token}`, ...headers },
 		});
+		const head = await read("HEAD");
+		expect(head.status).toBe(200);
+		expect(await head.text()).toBe("");
+		const res = await read();
 		expect(res.status).toBe(200);
-		expect(await res.text()).toContain(`URL: nar/${fileHash}/zstd.nar`);
+		const body = await res.text();
+		expect(body).toContain(`URL: nar/${fileHash}/zstd.nar`);
+		expect(res.headers.get("content-length")).toBe(String(new TextEncoder().encode(body).length));
+		expect(head.headers.get("etag")).toBe(res.headers.get("etag"));
+		expect(res.headers.get("etag")).toBeTruthy();
+		expect(res.headers.get("cache-control")).toBe("private, no-cache");
+		for (const method of ["GET", "HEAD"]) {
+			expect((await read(method, { "if-none-match": res.headers.get("etag")! })).status).toBe(304);
+			expect((await read(method, { "if-match": '"wrong"' })).status).toBe(412);
+			// An old creation date cannot validate a newly signed representation.
+			expect((await read(method, { "if-modified-since": "Thu, 01 Jan 2099 00:00:00 GMT" })).status).toBe(200);
+		}
+		const { publicKey } = await (await SELF.fetch("http://example.com/_api/v1/admin/caches/closed", {
+			headers: { authorization: "Bearer test-admin-secret" },
+		})).json<{ publicKey: string }>();
+		const [name, material] = publicKey.split(":");
+		const signature = body.split("\n").find(line => line.startsWith(`Sig: ${name}:`))!.slice(`Sig: ${name}:`.length);
+		const key = await crypto.subtle.importKey("raw", Uint8Array.from(atob(material), c => c.charCodeAt(0)), "Ed25519", false, ["verify"]);
+		expect(await crypto.subtle.verify("Ed25519", key, Uint8Array.from(atob(signature), c => c.charCodeAt(0)),
+			new TextEncoder().encode(`1;/nix/store/${hash}-layout;sha256:${"1".repeat(52)};64;`))).toBe(true);
 		expect((await SELF.fetch(`http://example.com/private/closed/${hash}.narinfo`)).status).toBe(401);
+	});
+
+	it("ignores obsolete R2 narinfo and never serves another cache's published path", async () => {
+		const own = await publish("closed");
+		const foreign = await publish("open");
+		const created = await api("/admin/tokens", { subject: "metadata", caches: ["closed"], perms: ["pull"] }, "test-admin-secret");
+		const { token } = await created.json<{ token: string }>();
+		for (const { hash } of [own, foreign]) {
+			await env.CACHE_BUCKET.put(`narinfo/closed/${hash}.narinfo`, "obsolete metadata");
+			try {
+				const response = await SELF.fetch(`http://obsolete.example/private/closed/${hash}.narinfo`, {
+					headers: { authorization: `Bearer ${token}` },
+				});
+				expect(response.status).toBe(hash === own.hash ? 200 : 404);
+				const body = await response.text();
+				expect(body).not.toContain("obsolete metadata");
+				if (hash === own.hash) expect(body).toContain(`StorePath: /nix/store/${hash}-layout`);
+			} finally { await env.CACHE_BUCKET.delete(`narinfo/closed/${hash}.narinfo`); }
+		}
 	});
 });
 

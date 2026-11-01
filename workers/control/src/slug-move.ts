@@ -10,8 +10,8 @@ import { setPrivate } from "@snowstead/cache-core/visibility";
 
 /**
  * Moving an org's caches to a new slug. Public caches are stored at their
- * URLs, and private ones' narinfo and visibility are keyed by them, so a
- * slug change moves objects. handlePutOrg readies the new paths (the
+ * URLs; private narinfo is derived from SQL. A slug change moves public
+ * objects and discards obsolete private metadata. handlePutOrg readies the new paths (the
  * private marker, nix-cache-info) and records the old slug as `movingFrom`;
  * then each call here moves one page of narinfo, public bucket first, until
  * nothing is left under the old slug and the org lets go of it.
@@ -36,14 +36,14 @@ export type MoveCursor = v.InferOutput<typeof MoveCursor>;
 
 export type MoveResult = { readonly done: true } | { readonly done: false; readonly next: MoveCursor; readonly moved: number };
 
-/** Copies the cache's still-published narinfo from the old slug to its path; the hashes it copied. */
-async function moveNarinfo(config: WorkerConfig, cache: CacheAt, from: string, hashes: readonly string[], isPrivate: boolean): Promise<string[]> {
-	const bucket = isPrivate ? config.bucket : config.publicBucket;
+/** Copies still-published public narinfo to the new path; the hashes it copied. */
+async function moveNarinfo(config: WorkerConfig, cache: CacheAt, from: string, hashes: readonly string[]): Promise<string[]> {
+	const bucket = config.publicBucket;
 	const moved: string[] = [];
 	for (const hash of await publishedHashes(config.db, cache.id, hashes)) {
-		const target = narinfoKey(cache.path, hash, isPrivate);
+		const target = narinfoKey(cache.path, hash, false);
 		if (await bucket.head(target)) continue;
-		const object = await bucket.get(narinfoKey(cachePath(from, cache.name), hash, isPrivate));
+		const object = await bucket.get(narinfoKey(cachePath(from, cache.name), hash, false));
 		if (!object) continue;
 		await bucket.put(target, await object.arrayBuffer(), {
 			httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: NARINFO_CACHE_CONTROL },
@@ -95,8 +95,8 @@ export async function moveSlugPage(config: WorkerConfig, orgId: string, at: Move
 
 	let moved = 0;
 	for (const [name, { cache, hashes, keys }] of byCache) {
-		// A cache gone since, or of the other visibility, has nothing to move.
-		const copied = cache && cache.isPublic !== isPrivate ? await moveNarinfo(config, cache, from, hashes, isPrivate) : [];
+		// Private metadata needs no copy; a cache gone since has nothing to move.
+		const copied = !isPrivate && cache?.isPublic ? await moveNarinfo(config, cache, from, hashes) : [];
 		moved += copied.length;
 		await bucket.delete(keys);
 		if (!isPrivate) {

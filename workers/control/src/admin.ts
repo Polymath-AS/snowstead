@@ -40,11 +40,11 @@ import {
 	bandwidthUpdatedAt,
 	totalBandwidth,
 } from "@snowstead/cache-core/db/repository";
-import { storeNarinfo } from "@snowstead/cache-core/narinfo";
+import { storePublicNarinfo } from "@snowstead/cache-core/narinfo";
 import { readyNewPath } from "./slug-move.js";
 import { PRIVATE_CACHES_REFUSED, setPrivate, isPrivateCache } from "@snowstead/cache-core/visibility";
 import { recordRevocation } from "@snowstead/cache-core/revocations";
-import { RESERVED_CACHE_NAMES, bucketForKey, setPublicCacheInfo } from "@snowstead/cache-core/layout";
+import { RESERVED_CACHE_NAMES, bucketForKey, placeNar, setPublicCacheInfo } from "@snowstead/cache-core/layout";
 import * as v from "valibot";
 import { CacheName, OrgId, StorePathHash, parseBody, parsed } from "@snowstead/cache-core/schemas";
 import { jsonResponse, errorResponse } from "@snowstead/cache-core/responses";
@@ -521,7 +521,7 @@ const BackfillPage = v.object({
 });
 
 /**
- * Renders and stores the narinfo of published paths after `after` (an id),
+ * Repairs NAR placement and public narinfo after `after` (a published-path id),
  * for paths published before narinfo was stored at publish, or after the
  * signing key changes. Call with each response's `next` until it is null.
  */
@@ -546,7 +546,9 @@ export async function handleBackfillNarinfo(
 		const batch = rows.slice(i, i + BACKFILL_CONCURRENCY);
 		results.push(
 			...(await Promise.allSettled(
-				batch.map((r) => storeNarinfo(config, r.cache, r.path, r.blob, visibility.get(r.cache.path) ?? true)),
+				batch.map((r) => visibility.get(r.cache.path)
+					? placeNar(config, r.blob.r2Key, r.blob.fileHash, r.blob.compression, true)
+					: storePublicNarinfo(config, r.cache, r.path, r.blob)),
 			)),
 		);
 	}
@@ -558,7 +560,7 @@ export async function handleBackfillNarinfo(
 	}
 	const last = rows.at(-1);
 	return jsonResponse({
-		written: rows.length - skipped.length,
+		written: rows.filter((r, i) => !visibility.get(r.cache.path) && results[i].status === "fulfilled").length,
 		skipped,
 		next: rows.length === limit && last ? last.path.id : null,
 	});

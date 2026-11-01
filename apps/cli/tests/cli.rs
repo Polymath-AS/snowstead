@@ -590,11 +590,17 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
             } else {
                 let index = usize::from(step == 4);
                 let id = &server_paths[index][11..43];
-                let hash = hex::encode(Sha256::digest(&body));
+                let manifest_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+                assert!(manifest_len <= 16 * 1024);
+                let manifest: Value = serde_json::from_slice(&body[4..4 + manifest_len]).unwrap();
+                let payload = &body[4 + manifest_len..];
+                let hash = hex::encode(Sha256::digest(payload));
+                assert_eq!(
+                    manifest,
+                    json!({"uploads":[{"sessionId":id,"fileHash":hash,"fileSize":payload.len()}]})
+                );
                 assert!(
-                    headers.starts_with(&format!(
-                        "POST /_api/v1/uploads/{id}/inline?fileHash={hash} "
-                    )),
+                    headers.starts_with("POST /_api/v1/uploads/inline/batch "),
                     "inline must publish its dependency first; no parts/finalize calls"
                 );
                 assert!(
@@ -602,7 +608,7 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
                         .to_ascii_lowercase()
                         .contains("content-type: application/octet-stream")
                 );
-                assert_eq!(zstd::stream::decode_all(&body[..]).unwrap(), raws[index]);
+                assert_eq!(zstd::stream::decode_all(payload).unwrap(), raws[index]);
                 if step == 2 {
                     first_bytes = Some(body);
                     continue; // Published, acknowledgement lost.
@@ -610,7 +616,7 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
                 if step == 3 {
                     assert_eq!(Some(body), first_bytes);
                 }
-                json!({"sessionId":id,"published":true})
+                json!({"results":[{"sessionId":id,"published":true}]})
             };
             let response = response.to_string();
             write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();

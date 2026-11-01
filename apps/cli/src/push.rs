@@ -260,9 +260,16 @@ pub async fn push(
         finalize.clone(),
     );
     let large_commits = Batcher::new(jobs.min(8), 1, Duration::from_millis(10), finalize);
-    // Each inline request owns a publication transaction. Match the three
-    // small-finalize lanes rather than opening one SQL connection per job.
-    let inline_commits = Arc::new(Semaphore::new(jobs.min(3)));
+    let inline_client = client.clone();
+    let inline_commits = Batcher::new(
+        jobs.min(8),
+        jobs.min(3),
+        Duration::from_millis(10),
+        move |uploads: Vec<api::InlineUpload>| {
+            let client = inline_client.clone();
+            async move { client.inline_batch(&uploads).await }
+        },
+    );
     let work = sessions
         .map_ok(|((info, outcome), (session, mut guard))| {
             let compression = compression.clone();
@@ -350,9 +357,12 @@ pub async fn push(
                         &large_commits
                     };
                     let published = if let Some(bytes) = inline_bytes {
-                        let _permit = inline_commits.acquire().await?;
-                        client
-                            .inline(&session.session_id, &hex::encode(digest.file_hash), bytes)
+                        inline_commits
+                            .request(api::InlineUpload {
+                                session_id: session.session_id.clone(),
+                                file_hash: hex::encode(digest.file_hash),
+                                bytes,
+                            })
                             .await?
                     } else {
                         commits
@@ -495,9 +505,9 @@ fn basename(info: &nix::PathInfo) -> &str {
     &info.store_path["/nix/store/".len()..]
 }
 
-/// Dependencies before dependents, so a published narinfo never names a
-/// reference that is still uploading. Among ready paths, smaller NARs go
-/// first to fill the pipeline while larger ones use codec workers.
+/// Fill dependency layers before descending into their dependents, so waiting
+/// paths do not crowd independent work out of the bounded job window. Smaller
+/// NARs go first within each layer. Publication still waits for references.
 fn publish_order(infos: Vec<nix::PathInfo>) -> Vec<nix::PathInfo> {
     let index: HashMap<&str, usize> = infos
         .iter()
@@ -506,6 +516,7 @@ fn publish_order(infos: Vec<nix::PathInfo>) -> Vec<nix::PathInfo> {
         .collect();
     let mut waiting = vec![0usize; infos.len()];
     let mut dependents = vec![Vec::new(); infos.len()];
+    let mut depth = vec![0usize; infos.len()];
     for (i, info) in infos.iter().enumerate() {
         for reference in &info.references {
             if let Some(&dep) = index.get(reference.as_str())
@@ -518,15 +529,16 @@ fn publish_order(infos: Vec<nix::PathInfo>) -> Vec<nix::PathInfo> {
     }
     let mut ready: BinaryHeap<_> = (0..infos.len())
         .filter(|&i| waiting[i] == 0)
-        .map(|i| Reverse((infos[i].nar_size, i)))
+        .map(|i| Reverse((0, infos[i].nar_size, i)))
         .collect();
     let mut order = Vec::with_capacity(infos.len());
-    while let Some(Reverse((_, i))) = ready.pop() {
+    while let Some(Reverse((_, _, i))) = ready.pop() {
         order.push(i);
         for &next in &dependents[i] {
+            depth[next] = depth[next].max(depth[i] + 1);
             waiting[next] -= 1;
             if waiting[next] == 0 {
-                ready.push(Reverse((infos[next].nar_size, next)));
+                ready.push(Reverse((depth[next], infos[next].nar_size, next)));
             }
         }
     }
@@ -788,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_order_puts_references_first_even_when_larger() {
+    fn publish_order_fills_dependency_layers_before_dependents() {
         let info = |name: &str, size: u64, references: &[&str]| nix::PathInfo {
             store_path: format!("/nix/store/{name}"),
             store_path_hash: name[..32].into(),
@@ -801,6 +813,7 @@ mod tests {
         let app = "11111111111111111111111111111111-app";
         let doc = "22222222222222222222222222222222-doc";
         let tool = "33333333333333333333333333333333-tool";
+        let independent = "55555555555555555555555555555555-independent";
         let order: Vec<_> = publish_order(vec![
             info(
                 app,
@@ -810,12 +823,14 @@ mod tests {
             info(lib, 1000, &[lib]),
             info(doc, 5, &[]),
             info(tool, 500, &[app]),
+            info(independent, 2000, &[]),
         ])
         .into_iter()
         .map(|i| i.store_path[11..].to_owned())
         .collect();
-        // Size alone would give app, doc, tool, lib.
-        assert_eq!(order, [doc, lib, app, tool]);
+        // Taking the small app immediately after lib would put its blocked
+        // dependents in job slots before the independent path can upload.
+        assert_eq!(order, [doc, lib, independent, app, tool]);
     }
 
     #[tokio::test]

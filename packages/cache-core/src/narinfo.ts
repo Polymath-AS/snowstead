@@ -5,7 +5,7 @@ import type { WorkerConfig } from "./config.js";
 import { computeFingerprint, signNarinfo } from "./signing.js";
 import { signingKeyFor } from "./cache-keys.js";
 import type { SigningKey } from "./cache-keys.js";
-import { NARINFO_CACHE_CONTROL, bucketFor, narinfoKey, narUrl, placeNar } from "./layout.js";
+import { NARINFO_CACHE_CONTROL, narinfoKey, narUrl, placeNar } from "./layout.js";
 
 export type NarinfoPath = Pick<
 	PublishedPath,
@@ -66,20 +66,19 @@ export async function signedNarinfo(key: SigningKey, path: NarinfoPath, blob: Na
 }
 
 /**
- * Renders, signs and stores a path's narinfo once, at publish, so serving
- * it reads one object: no database connection and no signing per request.
+ * Stores public narinfo for the native R2/CDN origin. Private narinfo is
+ * generated from published metadata on a Worker cache miss instead.
  * The NAR is placed first, so the narinfo never points at nothing.
  */
-export async function storeNarinfo(
+export async function storePublicNarinfo(
 	config: WorkerConfig,
 	cache: CacheAt,
 	path: NarinfoPath,
 	blob: NarinfoBlob,
-	isPrivate: boolean,
 ): Promise<void> {
-	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, isPrivate);
-	const body = await signedNarinfo(await signingKeyFor(config, cache), path, blob, isPrivate, cache.path);
-	await bucketFor(config, isPrivate).put(narinfoKey(cache.path, path.storePathHash, isPrivate), body, {
+	await placeNar(config, blob.r2Key, blob.fileHash, blob.compression, false);
+	const body = await signedNarinfo(await signingKeyFor(config, cache), path, blob, false, cache.path);
+	await config.publicBucket.put(narinfoKey(cache.path, path.storePathHash, false), body, {
 		httpMetadata: { contentType: "text/x-nix-narinfo", cacheControl: NARINFO_CACHE_CONTROL },
 	});
 }
