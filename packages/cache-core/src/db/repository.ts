@@ -200,16 +200,22 @@ export interface CacheStats {
 	readonly lastAddedAt: Date | null;
 }
 
+function cacheStatsColumns(since: Date) {
+	return {
+		paths: sql`${caches.pathCount}`.mapWith(Number),
+		size: sql`${caches.size}`.mapWith(Number),
+		addedSince: sql`count(${publishedPaths.id}) filter (where ${publishedPaths.createdAt} >= ${since.toISOString()}::timestamptz)`.mapWith(Number),
+		lastAddedAt: sql<Date | null>`max(${publishedPaths.createdAt})`.mapWith(publishedPaths.createdAt),
+	};
+}
+
 /** Every cache with its published paths counted, or just the one named, or an org's. */
 export async function listCacheStats(db: Db, since: Date, filter: { name?: string; orgId?: string } = {}): Promise<CacheStats[]> {
 	const rows = await db
 		.select({
 			cache: cacheColumns,
 			slug: orgs.slug,
-			paths: sql`${caches.pathCount}`.mapWith(Number),
-			size: sql`${caches.size}`.mapWith(Number),
-			addedSince: sql`count(${publishedPaths.id}) filter (where ${publishedPaths.createdAt} >= ${since.toISOString()}::timestamptz)`.mapWith(Number),
-			lastAddedAt: sql<Date | null>`max(${publishedPaths.createdAt})`.mapWith(publishedPaths.createdAt),
+			...cacheStatsColumns(since),
 		})
 		.from(caches)
 		.innerJoin(orgs, eq(caches.orgId, orgs.id))
@@ -221,6 +227,23 @@ export async function listCacheStats(db: Db, since: Date, filter: { name?: strin
 		.groupBy(caches.id, orgs.slug)
 		.orderBy(caches.name);
 	return rows.map(({ slug, ...stats }) => ({ ...stats, cache: located({ cache: stats.cache, slug }) }));
+}
+
+/** One org and its cache statistics, including orgs with no caches. */
+export async function orgCacheStats(db: Db, id: string, since: Date): Promise<{ org: Org; caches: CacheStats[] } | undefined> {
+	const rows = await db.select({ org: orgs, cache: cacheColumns, ...cacheStatsColumns(since) })
+		.from(orgs)
+		.leftJoin(caches, eq(caches.orgId, orgs.id))
+		.leftJoin(publishedPaths, eq(publishedPaths.cacheId, caches.id))
+		.where(eq(orgs.id, id))
+		.groupBy(orgs.id, caches.id)
+		.orderBy(caches.name);
+	const org = rows[0]?.org;
+	if (org === undefined) return undefined;
+	return {
+		org,
+		caches: rows.flatMap(({ cache, org, ...stats }) => cache === null ? [] : [{ ...stats, cache: located({ cache, slug: org.slug }) }]),
+	};
 }
 
 export async function findOrg(db: Db, id: string): Promise<Org | undefined> {

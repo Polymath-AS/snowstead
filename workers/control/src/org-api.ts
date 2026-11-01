@@ -35,6 +35,7 @@ import { OrgId, parseBody, valueOf } from "@snowstead/cache-core/schemas";
  * mint keys that outlive its revocation.
  *
  *   GET  /                           storage limit and usage
+ *   GET  /overview                   storage limit, usage, and cache summaries
  *   PUT  /                           { slug?, storageLimit?, privateCaches?, customSigningKeys? } (operator)
  *   POST /move                       { cursor }: move a page of objects after a slug change
  *   GET  /keys                       the org's API keys, without secrets
@@ -81,6 +82,9 @@ export async function handleOrgApi(request: Request, config: WorkerConfig, url: 
 	const method = request.method;
 	const route = rest.join("/");
 	const value = (i: number) => decodeURIComponent(rest[i] ?? "");
+
+	// The overview's left join also checks that the org exists.
+	if (route === "overview" && method === "GET") return handleGetOrg(config, org, true);
 
 	// Only the operator's PUT can come before the org exists.
 	if (!(method === "PUT" && route === "") && !(await findOrg(config.db, org))) {

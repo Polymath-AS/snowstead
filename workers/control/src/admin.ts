@@ -35,6 +35,7 @@ import {
 	findOrg,
 	putOrg,
 	orgUsage,
+	orgCacheStats,
 	findUploadSessions,
 	bandwidthThisMonth,
 	bandwidthUpdatedAt,
@@ -408,8 +409,9 @@ export async function handleGetCache(
 	});
 }
 
-async function orgResponse(config: WorkerConfig, id: string, status = 200): Promise<Response> {
-	const org = await findOrg(config.db, id);
+async function orgResponse(config: WorkerConfig, id: string, status = 200, includeCaches = false): Promise<Response> {
+	const overview = includeCaches ? await orgCacheStats(config.db, id, new Date(Date.now() - WEEK_MS)) : undefined;
+	const org = includeCaches ? overview?.org : await findOrg(config.db, id);
 	if (!org) {
 		return errorResponse(`no org ${id}`, 404);
 	}
@@ -437,14 +439,17 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		...totalBandwidth(served),
 		// Bandwidth is imported from Cloudflare's analytics every 6 hours.
 		bandwidthUpdatedAt: updatedAt,
+		...(overview === undefined ? {} : {
+			caches: overview.caches.map(stats => cacheSummary(stats, totalBandwidth(served.filter(row => row.cacheId === stats.cache.id)))),
+		}),
 	}, status);
 }
 
 /** An org's storage limit and what its caches hold. */
-export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise<Response> {
+export async function handleGetOrg(config: WorkerConfig, rawId: string, includeCaches = false): Promise<Response> {
 	const id = parsed(OrgId, rawId);
 	if (id instanceof Response) return id;
-	return orgResponse(config, id);
+	return orgResponse(config, id, 200, includeCaches);
 }
 
 const OrgTerms = v.strictObject({
