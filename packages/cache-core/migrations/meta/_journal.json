@@ -78,6 +78,20 @@
       "when": 1793478384143,
       "tag": "0010_needy_risque",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793544344361,
+      "tag": "0011_bandwidth_by_cache",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1793545661874,
+      "tag": "0012_sccache_transfer_state",
+      "breakpoints": true
     }
   ]
 }

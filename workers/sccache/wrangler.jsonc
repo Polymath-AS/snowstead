@@ -34,6 +34,7 @@
 		{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
 		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
 	],
+	"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_bandwidth" }],
 	"env": {
 		"production": {
 			"name": "snowstead-sccache",
@@ -49,7 +50,8 @@
 			"ratelimits": [
 				{ "name": "PUSH_LIMIT", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } },
 				{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
-			]
+			],
+			"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_bandwidth" }]
 		},
 		"staging": {
 			"name": "snowstead-staging-sccache",
@@ -65,7 +67,8 @@
 			"ratelimits": [
 				{ "name": "PUSH_LIMIT", "namespace_id": "2001", "simple": { "limit": 6000, "period": 60 } },
 				{ "name": "READ_LIMIT", "namespace_id": "2003", "simple": { "limit": 12000, "period": 60 } }
-			]
+			],
+			"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_staging_bandwidth" }]
 		}
 	}
 }

@@ -310,7 +310,8 @@ export async function globalOverview(db: Db, now: Date) {
 		physicalStoredBytes: sql`(select coalesce(sum(${blobObjects.fileSize}), 0) from ${blobObjects})`.mapWith(Number),
 		pendingBytes: sql`(select coalesce(sum(${uploadSessions.fileSize}), 0) from ${uploadSessions} where ${uploadSessions.status} = 'finalizing' or (${uploadSessions.status} in ('pending', 'uploading', 'streaming') and ${uploadSessions.expiresAt} > ${now}))`.mapWith(Number),
 		uploadsPending: sql`(select count(*) from ${uploadSessions} where ${uploadSessions.status} = 'finalizing' or (${uploadSessions.status} in ('pending', 'uploading', 'streaming') and ${uploadSessions.expiresAt} > ${now}))`.mapWith(Number),
-		privateServedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.bytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
+		servedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.bytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
+		publicServedThisMonth: sql`(select coalesce(sum(${bandwidthDaily.publicBytes}), 0) from ${bandwidthDaily} where ${bandwidthDaily.day} >= ${`${now.toISOString().slice(0, 7)}-01`})`.mapWith(Number),
 		activeTokens: sql`(select count(*) from ${apiTokens} where ${apiTokens.revokedAt} is null and (${apiTokens.expiresAt} is null or ${apiTokens.expiresAt} > ${now}))`.mapWith(Number),
 		apiKeys: sql`(select count(*) from ${orgApiKeys} where ${orgApiKeys.revokedAt} is null)`.mapWith(Number),
 	}).from(sql`(select 1) as singleton`);
@@ -353,24 +354,111 @@ export async function orgUsage(db: Db, orgId: string, now: Date): Promise<OrgUsa
 	return usage;
 }
 
-/** Adds bytes served for an org to its count for the UTC day of `now`. */
-export async function recordBandwidth(db: Db, orgId: string, bytes: number, now: Date): Promise<void> {
-	await db.insert(bandwidthDaily)
-		.values({ orgId, day: now.toISOString().slice(0, 10), bytes })
-		.onConflictDoUpdate({
-			target: [bandwidthDaily.orgId, bandwidthDaily.day],
-			set: { bytes: sql`${bandwidthDaily.bytes} + excluded.bytes` },
-		});
+export type Product = "nix" | "go" | "sccache";
+export const PRODUCTS: readonly Product[] = ["nix", "go", "sccache"];
+
+export interface Bandwidth {
+	/** Bytes the Workers served. */
+	readonly servedThisMonth: number;
+	/** Bytes the CDN served from public caches. */
+	readonly publicServedThisMonth: number;
+	/** Both, by product. */
+	readonly servedThisMonthByProduct: Readonly<Record<Product, number>>;
 }
 
-/** Bytes served for an org in the UTC month of `now`. */
-export async function bandwidthThisMonth(db: Db, orgId: string, now: Date): Promise<number> {
-	const row = await first(
-		db.select({ bytes: sql`coalesce(sum(${bandwidthDaily.bytes}), 0)`.mapWith(Number) })
-			.from(bandwidthDaily)
-			.where(and(eq(bandwidthDaily.orgId, orgId), gte(bandwidthDaily.day, `${now.toISOString().slice(0, 7)}-01`))),
-	);
-	return row?.bytes ?? 0;
+/** Bytes served this UTC month, for an org's caches or the caches named, by cache and product. */
+export async function bandwidthThisMonth(db: Db, now: Date, scope: { readonly orgId: string } | { readonly cacheIds: readonly number[] }) {
+	if ("cacheIds" in scope && scope.cacheIds.length === 0) return [];
+	return db.select({
+		cacheId: bandwidthDaily.cacheId,
+		product: bandwidthDaily.product,
+		served: sql`sum(${bandwidthDaily.bytes})`.mapWith(Number),
+		public: sql`sum(${bandwidthDaily.publicBytes})`.mapWith(Number),
+	})
+		.from(bandwidthDaily)
+		.where(and(
+			"orgId" in scope ? eq(bandwidthDaily.orgId, scope.orgId) : anyOf(bandwidthDaily.cacheId, scope.cacheIds, "bigint"),
+			gte(bandwidthDaily.day, `${now.toISOString().slice(0, 7)}-01`),
+		))
+		.groupBy(bandwidthDaily.cacheId, bandwidthDaily.product);
+}
+
+/** Adds up rows of bandwidthThisMonth. */
+export function totalBandwidth(rows: readonly { readonly product: Product; readonly served: number; readonly public: number }[]): Bandwidth {
+	const byProduct = Object.fromEntries(PRODUCTS.map((p) => [p, 0])) as Record<Product, number>;
+	let served = 0;
+	let publicServed = 0;
+	for (const row of rows) {
+		served += row.served;
+		publicServed += row.public;
+		byProduct[row.product] += row.served + row.public;
+	}
+	return { servedThisMonth: served, publicServedThisMonth: publicServed, servedThisMonthByProduct: byProduct };
+}
+
+/** When bandwidth was last imported, for any org; null before the first import. */
+export async function bandwidthUpdatedAt(db: Db): Promise<Date | null> {
+	const row = await first(db.select({ at: sql<Date | null>`max(${bandwidthDaily.importedAt})`.mapWith(bandwidthDaily.importedAt) }).from(bandwidthDaily));
+	return row?.at ?? null;
+}
+
+export interface CacheBandwidth {
+	readonly orgId: string;
+	readonly cacheId: number;
+	readonly product: Product;
+	readonly bytes: number;
+}
+
+/**
+ * Replaces one count, the Workers' or the CDN's, for every cache on a UTC
+ * day; caches not named served none. Rows from before per-cache metering
+ * (cache 0) are left as they are.
+ */
+export async function setBandwidth(db: Db, day: string, column: "bytes" | "publicBytes", rows: readonly CacheBandwidth[], now: Date): Promise<void> {
+	await db.transaction(async (tx) => {
+		await tx.update(bandwidthDaily).set({ [column]: 0, importedAt: now })
+			.where(and(eq(bandwidthDaily.day, day), sql`${bandwidthDaily.cacheId} <> 0`));
+		if (rows.length === 0) return;
+		const values = rows.map(({ orgId, cacheId, product, bytes }) => ({ orgId, cacheId, product, day, [column]: Math.round(bytes), importedAt: now }));
+		const excluded = column === "bytes" ? sql`excluded.bytes` : sql`excluded.public_bytes`;
+		await tx.insert(bandwidthDaily).values(values).onConflictDoUpdate({
+			target: [bandwidthDaily.orgId, bandwidthDaily.cacheId, bandwidthDaily.product, bandwidthDaily.day],
+			set: { [column]: excluded, importedAt: now },
+		});
+	});
+}
+
+export interface PublicCache {
+	readonly id: number;
+	readonly orgId: string;
+}
+
+/**
+ * Each public cache by its path, as its objects are stored; a cache of an
+ * org moving slugs is listed under the old slug too.
+ */
+export async function publicCachesByPath(db: Db): Promise<Map<string, PublicCache>> {
+	const rows = await db.select({ id: caches.id, name: caches.name, orgId: caches.orgId, slug: orgs.slug, movingFrom: orgs.movingFrom })
+		.from(caches).innerJoin(orgs, eq(orgs.id, caches.orgId)).where(eq(caches.isPublic, true));
+	return new Map(rows.flatMap((r) => [r.slug, r.movingFrom].flatMap((slug) =>
+		slug === null ? [] : [[cachePath(slug, r.name), { id: r.id, orgId: r.orgId }] as const])));
+}
+
+/** For each public NAR, `<file hash>/<compression>`, the public caches that hold it. */
+export async function publicNarCaches(db: Db, nars: readonly string[]): Promise<Map<string, PublicCache[]>> {
+	const rows = nars.length === 0 ? [] : await db.selectDistinct({
+		nar: sql<string>`${blobObjects.fileHash} || '/' || ${blobObjects.compression}`,
+		id: caches.id,
+		orgId: caches.orgId,
+	})
+		.from(blobObjects)
+		.innerJoin(publishedPaths, eq(publishedPaths.blobObjectId, blobObjects.id))
+		.innerJoin(caches, eq(caches.id, publishedPaths.cacheId))
+		.where(and(eq(caches.isPublic, true), sql`(${blobObjects.fileHash}, ${blobObjects.compression}) in (
+			select * from unnest(${sql.param(nars.map((n) => n.split("/")[0]))}::text[], ${sql.param(nars.map((n) => n.split("/")[1]))}::text[]))`));
+	const holders = new Map<string, PublicCache[]>();
+	for (const { nar, id, orgId } of rows) holders.set(nar, [...(holders.get(nar) ?? []), { id, orgId }]);
+	return holders;
 }
 
 /** A cache's most recently published paths, newest first. */

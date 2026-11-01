@@ -1,7 +1,8 @@
 import type { WorkerConfig } from "@snowstead/cache-core/config";
-import { cacheHasNar, findCacheByPath, findPublishedPathWithBlob, recordBandwidth } from "@snowstead/cache-core/db/repository";
+import { cacheHasNar, findCacheByPath, findPublishedPathWithBlob } from "@snowstead/cache-core/db/repository";
 import type { CacheAt } from "@snowstead/cache-core/db/repository";
 import { signingKeyFor } from "@snowstead/cache-core/cache-keys";
+import { recordBandwidth } from "@snowstead/cache-core/bandwidth";
 import { OrgSlug, cachePath, splitReadPath, DEFAULT_ORG_SLUG } from "@snowstead/cache-core/cache-path";
 import { writeAuditLog } from "@snowstead/cache-core/audit";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
@@ -372,11 +373,16 @@ async function handleNarDownload(
 	return forClient(response, isPrivate, method);
 }
 
-/** Counts a private NAR's bytes toward its org's bandwidth, after the response. */
+/** Counts a private NAR's bytes toward its cache's bandwidth. */
 function meter(config: WorkerConfig, scope: PrivateScope, bytes: number): void {
+	if (scope.id !== undefined && typeof scope.org === "string") {
+		recordBandwidth(config, { id: scope.id, orgId: scope.org }, "nix", bytes);
+		return;
+	}
+	// Visibility entries from before they carried the cache: look it up.
 	config.defer((async () => {
-		const org = scope.org ?? (await findCacheByPath(config.db, scope.slug, scope.name))?.orgId;
-		if (org !== undefined) await recordBandwidth(config.db, org, bytes, new Date());
+		const cache = await findCacheByPath(config.db, scope.slug, scope.name);
+		if (cache !== undefined) recordBandwidth(config, cache, "nix", bytes);
 	})().catch((err) => console.error("Recording bandwidth failed", errorForLog(err))));
 }
 

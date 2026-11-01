@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
 import { caches as cacheRows, sccacheEntries } from "@snowstead/cache-core/db/schema";
@@ -12,71 +12,72 @@ export async function consumeBody(request: Request, size: number): Promise<void>
 	await Promise.all([(request.body ?? new Blob([]).stream()).pipeTo(fixed.writable), fixed.readable.pipeTo(new WritableStream())]);
 }
 
-/** Reserve, transfer immutable bytes under cleanup fences, then publish at capacity. */
+/** Transfer to an attempt-owned key without a SQL connection or cleanup locks. */
 export async function uploadArchive(request: Request, config: WorkerConfig, cache: Cache, action: string, size: number): Promise<Response> {
 	await config.releaseDb();
 	const reservation = await config.uploadCoordinator.getByName(cache.orgId, { locationHint: "weur" }).reserveSccache(cache, action, size);
 	if (reservation instanceof Response) return reservation;
-	let uploadedAt: Date | undefined;
-	const response = await config.db.transaction(async tx => {
-		// Only this action is exclusively locked. Cache SHARE locks let independent
-		// uploads run concurrently while reset/delete wait for publication.
-		const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
-		if (!current || current.sccacheGeneration !== cache.sccacheGeneration) return errorResponse("Cache changed; retry", 409);
-		const [entry] = await tx.select().from(sccacheEntries).where(eq(sccacheEntries.id, reservation.id)).for("update");
-		if (!entry || entry.cacheId !== cache.id || entry.expiresAt.getTime() <= Date.now()) return errorResponse("Upload expired; retry", 409);
-		let alreadyStored = false;
-		try {
-			// Archives can differ for the same compiler key. First completed writer
-			// wins; never overwrite a completed archive or refresh its retention.
-			if (entry.uploadedAt) {
-				await consumeBody(request, size);
-				return new Response(null, { status: 204 });
-			}
-			if (entry.size !== size) return errorResponse("Upload in progress; retry", 409);
-			// A previous transfer may be awaiting/retrying capacity publication.
-			// Under the entry lock, retain its immutable bytes and original age.
-			const previous = await config.bucket.head(entry.r2Key);
-			if (previous) {
-				alreadyStored = true;
-				await consumeBody(request, size);
-				uploadedAt = previous.uploaded;
-				return new Response(null, { status: 204 });
-			}
+	if (!reservation.uploadedAt && reservation.size !== size) return errorResponse("Upload in progress; retry", 409);
+	let attempt: string | undefined;
+	let adopted = false;
+	try {
+		let storedAt = reservation.storedAt ?? reservation.uploadedAt;
+		// Recover an immutable transfer made before stored_at was introduced.
+		if (!storedAt) storedAt = (await config.bucket.head(reservation.r2Key))?.uploaded ?? null;
+		if (storedAt) await consumeBody(request, size);
+		else {
+			attempt = `sccache-attempt/${reservation.id}/${crypto.randomUUID()}`;
 			const fixed = new FixedLengthStream(size);
 			const abort = new AbortController();
 			const pumping = (request.body ?? new Blob([]).stream()).pipeTo(fixed.writable, { signal: abort.signal });
 			pumping.catch(() => {});
-			const storing = config.bucket.put(entry.r2Key, fixed.readable, {
-				httpMetadata: { contentType: "application/octet-stream" },
-			});
-			let stored;
+			const storing = config.bucket.put(attempt, fixed.readable, { httpMetadata: { contentType: "application/octet-stream" } });
 			try {
-				[stored] = await Promise.all([storing, pumping]);
+				const [stored] = await Promise.all([storing, pumping]);
+				if (!stored) throw new Error("Missing sccache upload result");
+				storedAt = stored.uploaded;
 			} catch (error) {
 				abort.abort(error);
-				// Do not let GC delete the key while a failed transfer can still finish.
 				await Promise.allSettled([storing, pumping]);
 				throw error;
 			}
-			if (!stored) throw new Error("Missing sccache upload result");
-			uploadedAt = stored.uploaded;
-			return new Response(null, { status: 201, headers: { "cache-control": "no-store" } });
-		} catch (error) {
-			if (error instanceof Error && /content length|FixedLengthStream|client disconnected/i.test(error.message)) {
-				if (!entry.uploadedAt && !alreadyStored) await tx.update(sccacheEntries).set({ cacheId: null }).where(eq(sccacheEntries.id, entry.id));
-				return errorResponse("Content length mismatch", 400);
-			}
-			throw error;
 		}
-	});
-	if (!response.ok || !uploadedAt) return response;
-	// Transfer locks are released before entering the shared org capacity gate.
-	try {
-		await publishSccacheUpload(config, cache, reservation.id, uploadedAt, new URL(request.url).origin);
-		return response;
+		// Cache -> entry, then release before entering the org capacity gate.
+		// Reset/delete/GC can finish during transfer; they must never be undone.
+		const state = await config.db.transaction(async tx => {
+			const [current] = await tx.select().from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
+			if (!current || current.sccacheGeneration !== cache.sccacheGeneration) throw new CapacityError("Cache changed; retry", 503);
+			const [entry] = await tx.select().from(sccacheEntries).where(eq(sccacheEntries.id, reservation.id)).for("update");
+			if (!entry || entry.cacheId !== cache.id || entry.expiresAt.getTime() <= Date.now()) throw new CapacityError("Upload expired; retry", 503);
+			if (entry.uploadedAt || entry.storedAt) return { uploadedAt: entry.uploadedAt, storedAt: entry.storedAt, won: false };
+			await tx.update(sccacheEntries).set({ r2Key: attempt ?? entry.r2Key, storedAt }).where(eq(sccacheEntries.id, entry.id));
+			return { uploadedAt: null, storedAt, won: true };
+		});
+		adopted = state.won;
+		if (!state.uploadedAt) await publishSccacheUpload(config, cache, reservation.id, state.storedAt!, new URL(request.url).origin);
+		return new Response(null, { status: attempt && state.won ? 201 : 204, headers: { "cache-control": "no-store" } });
 	} catch (error) {
 		if (error instanceof CapacityError) return errorResponse(error.message, error.status, error.retryable ? { "retry-after": "1" } : {});
+		if (error instanceof Error && /content length|FixedLengthStream|client disconnected/i.test(error.message)) {
+			if (attempt) await config.db.transaction(async tx => {
+				await tx.select({ id: cacheRows.id }).from(cacheRows).where(eq(cacheRows.id, cache.id)).for("share");
+				await tx.update(sccacheEntries).set({ cacheId: null }).where(and(eq(sccacheEntries.id, reservation.id),
+					isNull(sccacheEntries.storedAt), isNull(sccacheEntries.uploadedAt)));
+			});
+			return errorResponse("Content length mismatch", 400);
+		}
 		throw error;
+	} finally {
+		await config.releaseDb();
+		// On an uncertain SQL commit, never delete a possibly adopted object.
+		// The bounded orphan sweep removes failed/abandoned attempts once their
+		// reservation is gone. Definite losers can be reclaimed immediately.
+		if (attempt && !adopted) {
+			// Wait for any uncertain adoption transaction to commit or roll back.
+			const [entry] = await config.db.select({ r2Key: sccacheEntries.r2Key }).from(sccacheEntries)
+				.where(eq(sccacheEntries.id, reservation.id)).for("update");
+			await config.releaseDb();
+			if (entry?.r2Key !== attempt) await config.bucket.delete(attempt);
+		}
 	}
 }

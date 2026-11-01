@@ -109,7 +109,9 @@ describe("orgs", () => {
 
 		const created = await orgApi(`/${org}`, "PUT", { slug: org, storageLimit: 1000 });
 		expect(created.headers.get("cache-control")).toBe("no-store");
-		expect(await created.json()).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, customSigningKeys: false, used: 0, pending: 0, servedThisMonth: 0 });
+		const body = await created.json<{ bandwidthUpdatedAt: string | null }>();
+		expect(body).toEqual({ id: org, slug: org, movingFrom: null, storageLimit: 1000, privateCaches: true, customSigningKeys: false, used: 0, pending: 0,
+			servedThisMonth: 0, publicServedThisMonth: 0, servedThisMonthByProduct: { nix: 0, go: 0, sccache: 0 }, bandwidthUpdatedAt: body.bandwidthUpdatedAt });
 		const limits = { storageLimit: 0, privateCaches: false, customSigningKeys: true };
 		expect(await (await orgApi(`/${org}`, "PUT", limits)).json()).toMatchObject(limits);
 		for (const body of [{}, { slug: org }]) {

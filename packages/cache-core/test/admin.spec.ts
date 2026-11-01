@@ -75,15 +75,15 @@ describe("admin cache stats", () => {
 			await db.insert(apiTokens).values({ jti: crypto.randomUUID(), subject: "hidden-person", caches: ["*"], permsJson: '["push"]', expiresAt, revokedAt, createdBy: "admin" });
 		}
 		for (const revokedAt of [null, now]) await db.insert(orgApiKeys).values({ id: crypto.randomUUID(), orgId: org, name: "hidden-key", secretHash: "hidden-secret", revokedAt });
-		await db.insert(bandwidthDaily).values({ orgId: org, day: now.toISOString().slice(0, 10), bytes: 1234 });
-		await db.insert(bandwidthDaily).values({ orgId: org, day: "2000-01-01", bytes: 9999 });
+		await db.insert(bandwidthDaily).values({ orgId: org, day: now.toISOString().slice(0, 10), cacheId: b.id, product: "go", bytes: 1234, publicBytes: 56 });
+		await db.insert(bandwidthDaily).values({ orgId: org, day: "2000-01-01", product: "nix", bytes: 9999 });
 		const response = await admin("/overview");
 		expect(response.headers.get("cache-control")).toBe("no-store");
 		expect(await response.json()).toEqual({
 			orgs: before.orgs + 1, caches: before.caches + 2, paths: before.paths + 2,
 			storedBytes: before.storedBytes + 800, physicalStoredBytes: before.physicalStoredBytes + 400,
 			pendingBytes: before.pendingBytes + 333, uploadsPending: before.uploadsPending + 2,
-			privateServedThisMonth: before.privateServedThisMonth + 1234, activeTokens: before.activeTokens + 2, apiKeys: before.apiKeys + 1,
+			servedThisMonth: before.servedThisMonth + 1234, publicServedThisMonth: before.publicServedThisMonth + 56, activeTokens: before.activeTokens + 2, apiKeys: before.apiKeys + 1,
 		});
 	});
 
