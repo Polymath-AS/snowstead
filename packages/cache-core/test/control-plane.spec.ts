@@ -1,5 +1,5 @@
 import { env, SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { testDb } from "./db.js";
 import { apiTokens, caches, evictionLogs, goEntries, pinRevisions, pins, publishedPaths, sccacheEntries, uploadSessions } from "../src/db/schema.js";
@@ -52,7 +52,7 @@ const info = async (t: Target, query = "") => (await api(t.org, `/eviction${quer
 describe("control-plane cache policies", () => {
 	it("records authenticated use for all products after the response, coalesces writes, and scopes token detail", async () => {
 		const t = await setup(true), other = await setup();
-		const detail = async () => (await api(t.org, `/tokens/${t.jti}`, "GET", undefined, t.key)).json<{ token: { lastUsedAt: string | null } }>();
+		const detail = async (jti = t.jti) => (await api(t.org, `/tokens/${jti}`, "GET", undefined, t.key)).json<{ token: { lastUsedAt: string | null } }>();
 		expect((await detail()).token.lastUsedAt).toBeNull();
 		const config = resolveConfig(env);
 		expect((await authenticateWrite(new Request("https://example.com", { headers: { authorization: `Bearer ${t.token}` } }), config)).kind).toBe("ok");
@@ -62,16 +62,18 @@ describe("control-plane cache policies", () => {
 		await config.close();
 		const first = (await detail()).token.lastUsedAt!;
 		expect(Number.isFinite(Date.parse(first))).toBe(true);
-		for (const product of ["go", "sccache"] as const) {
-			expect((await action(t, product, "a")).status).toBe(404);
-			await db.update(apiTokens).set({ lastUsedAt: new Date(0) }).where(eq(apiTokens.jti, t.jti));
-			expect((await action(t, product, "a")).status).toBe(404);
-			await expect.poll(async () => (await detail()).token.lastUsedAt).not.toBe(new Date(0).toISOString());
+		for (const product of ["nix", "go", "sccache"] as const) {
+			const issued = await (await api(t.org, "/tokens", "POST", { subject: product, caches: ["main"], perms: [product === "nix" ? "pull" : `${product}:read`] })).json<{ token: string; jti: string }>();
+			expect((await detail(issued.jti)).token.lastUsedAt).toBeNull();
+			const response = product === "nix"
+				? await SELF.fetch(`http://example.com/${t.org}/main/${"1".repeat(32)}.narinfo`, { headers: { authorization: `Basic ${btoa(`ci:${issued.token}`)}` } })
+				: await action({ ...t, ...issued }, product, "a");
+			expect(response.status).toBe(404);
+			await expect.poll(async () => (await detail(issued.jti)).token.lastUsedAt).not.toBeNull();
 		}
-		await db.update(apiTokens).set({ lastUsedAt: new Date(0) }).where(eq(apiTokens.jti, t.jti));
 		const read = () => SELF.fetch(`http://example.com/${t.org}/main/${"1".repeat(32)}.narinfo`, { headers: { authorization: `Basic ${btoa(`ci:${t.token}`)}` } });
 		expect((await read()).status).toBe(404);
-		await expect.poll(async () => (await detail()).token.lastUsedAt).not.toBe(new Date(0).toISOString());
+		expect((await detail()).token.lastUsedAt).toBe(first);
 		const before = (await detail()).token.lastUsedAt;
 		await read();
 		const again = resolveConfig(env);
@@ -82,6 +84,23 @@ describe("control-plane cache policies", () => {
 		expect(list.tokens.find(row => row.jti === t.jti)?.lastUsedAt).toBe(before);
 		expect((await api(other.org, `/tokens/${t.jti}`, "GET", undefined, other.key)).status).toBe(404);
 		expect((await api(t.org, `/tokens/${t.jti}`, "GET", undefined, other.key)).status).toBe(403);
+	});
+
+	it("records token activity again at the five-minute boundary, not before", async () => {
+		const t = await setup(true);
+		const start = Date.now();
+		const clock = vi.spyOn(Date, "now");
+		try {
+			for (const [elapsed, expected] of [[0, 0], [299_999, 0], [300_000, 300_000]]) {
+				clock.mockReturnValue(start + elapsed);
+				const config = resolveConfig(env);
+				try {
+					expect((await authenticateWrite(new Request("https://example.com", { headers: { authorization: `Bearer ${t.token}` } }), config)).kind).toBe("ok");
+				} finally { await config.close(); }
+				const [row] = await db.select().from(apiTokens).where(eq(apiTokens.jti, t.jti));
+				expect(row.lastUsedAt?.getTime()).toBe(start + expected);
+			}
+		} finally { clock.mockRestore(); }
 	});
 
 	it("protects cyclic closures from capacity and retention, rejects missing dependencies, and audits push-token writes", async () => {

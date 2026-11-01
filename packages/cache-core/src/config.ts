@@ -4,6 +4,16 @@ import type { CdnConfig } from "./cdn.js";
 import type { RateLimiters } from "./rate-limit.js";
 import type { UploadCoordinator } from "./upload-coordinator.js";
 
+export interface AnalyticsConfig {
+	/** Zone Analytics Read on the public zone and Account Analytics Read. */
+	readonly token: string;
+	readonly accountId: string;
+	/** The Analytics Engine dataset the Workers' BANDWIDTH binding writes. */
+	readonly dataset: string;
+	/** The public bucket's CDN zone and host, when public caches are served. */
+	readonly publicZone: { readonly zoneId: string; readonly host: string } | undefined;
+}
+
 export interface WorkerConfig {
 	/** Private caches, and everything the Worker alone reads. */
 	readonly bucket: R2Bucket;
@@ -44,6 +54,10 @@ export interface WorkerConfig {
 	readonly upstreams: readonly string[];
 	/** The CDN in front of the public bucket, when purges are configured. */
 	readonly cdn: CdnConfig | undefined;
+	/** Where Workers record the bytes they serve (bandwidth.ts); unbound in tests and self-hosted installs. */
+	readonly bandwidth: AnalyticsEngineDataset | undefined;
+	/** Where control reads bandwidth from Cloudflare's analytics, when configured (bandwidth.ts). */
+	readonly analytics: AnalyticsConfig | undefined;
 	readonly ctx?: ExecutionContext;
 }
 
@@ -142,6 +156,13 @@ function readSettings(env: Env): Settings {
 		upstreams: (env.UPSTREAM_CACHES ?? "").split(/\s+/).filter(Boolean).map((u) => u.replace(/\/$/, "")),
 		cdn: env.CDN_ZONE_ID && env.CDN_PURGE_TOKEN && env.PUBLIC_CACHE_ORIGIN
 			? { zoneId: env.CDN_ZONE_ID, token: env.CDN_PURGE_TOKEN, origin: env.PUBLIC_CACHE_ORIGIN.replace(/\/$/, "") }
+			: undefined,
+		bandwidth: env.BANDWIDTH,
+		analytics: env.ANALYTICS_TOKEN && env.ANALYTICS_ACCOUNT_ID && env.BANDWIDTH_DATASET
+			? {
+				token: env.ANALYTICS_TOKEN, accountId: env.ANALYTICS_ACCOUNT_ID, dataset: env.BANDWIDTH_DATASET,
+				publicZone: env.CDN_ZONE_ID && env.PUBLIC_CACHE_ORIGIN ? { zoneId: env.CDN_ZONE_ID, host: new URL(env.PUBLIC_CACHE_ORIGIN).host } : undefined,
+			}
 			: undefined,
 		rateLimiters: { push: env.PUSH_LIMIT, api: env.API_LIMIT, read: env.READ_LIMIT },
 	};

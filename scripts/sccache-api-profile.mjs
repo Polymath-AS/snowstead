@@ -67,10 +67,10 @@ try {
   const key = i => i.toString(16).padStart(64, '0');
   const endpoint = i => new URL(`/_api/v1/sccache/default/profile/${key(i).slice(0, 3).split('').join('/')}/${key(i)}`, url);
   const body = Buffer.alloc(64 * 1024, 42);
-  async function call(i, method = 'GET') {
-    const response = await fetch(endpoint(i), { method, headers, body: method === 'PUT' ? body : undefined });
+  async function call(i, method = 'GET', payload = body) {
+    const response = await fetch(endpoint(i), { method, headers, body: method === 'PUT' ? payload : undefined });
     const data = await response.arrayBuffer();
-    if (response.status === 200 && method === 'GET') assert(Buffer.from(data).equals(body));
+    if (response.status === 200 && method === 'GET') assert(Buffer.from(data).equals(payload));
     return response.status;
   }
   function slowPut(i, delay = 1500) {
@@ -118,7 +118,7 @@ try {
       statements: queries.reduce((n,q) => n + q.calls, 0), sqlExecutionMs: queries.reduce((n,q) => n + q.total_exec_time, 0),
       peakConnections: peak('connections'), peakActive: peak('active'), peakIdleTransaction: peak('idle_in_transaction'), peakLockWaits: peak('lock_waits') };
     results.push(result); console.log(JSON.stringify(result));
-    await writeFile(join(out, name + '.json'), JSON.stringify({ result, queries, samples }, null, 2));
+    await writeFile(join(out, name + '.json'), JSON.stringify({ result, queries, samples, timings }, null, 2));
     await writeFile(join(out, 'results.json'), JSON.stringify(results, null, 2));
     if (process.env.PROFILE_EXPLAIN && name.startsWith('cleanup')) {
       const plans = [];
@@ -179,6 +179,14 @@ try {
       assert.equal(usage.used, retained);
       assert.equal(usage.pending, 0);
       assert.equal(Number((await db.query('select count(*) from sccache_entries where cache_id is null')).rows[0].count), (repeat + 1) * 16);
+    }
+    if (process.env.PROFILE_MANY_VICTIMS) {
+      const large = Buffer.alloc(4 * 1024 * 1024, 71);
+      await measure('capacity-64-victims', 16, 1, i => call(5000 + i, 'PUT', large));
+      assert.deepEqual(results.at(-1).statuses, { 201: 16 });
+      assert.equal(Number((await db.query('select count(*) from sccache_entries where cache_id is null')).rows[0].count), 48 + 16 * 64);
+      assert.equal((await api('orgs/default', undefined, 'GET')).used, retained);
+      for (let i = 0; i < 16; i++) assert.equal(await call(5000 + i, 'GET', large), 200);
     }
   } else {
     await measure('miss', 32, 1, i => call(1000 + i));

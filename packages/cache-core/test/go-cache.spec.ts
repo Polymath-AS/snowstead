@@ -1,4 +1,4 @@
-import { env, SELF } from "cloudflare:test";
+import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { testDb } from "./db.js";
@@ -306,5 +306,26 @@ describe("named Go caches", () => {
 		expect((await transfer({ org: target.org, name: "missing" })).status).toBe(404);
 		expect((await api(target.org, "/caches/missing/go")).status).toBe(404);
 		expect((await api(target.org, "/caches/missing/go/reset", "POST")).status).toBe(404);
+	});
+
+	it("records each download, edge cache hits included and HEAD excluded, as a bandwidth data point", async () => {
+		const target = await setup(true);
+		const writer = await token(target);
+		expect((await transfer(target, writer, "artifact")).status).toBe(201);
+		const { id } = (await findCache(db, target.org, target.name))!;
+		const points: AnalyticsEngineDataPoint[] = [];
+		const read = async (method: string) => {
+			const ctx = createExecutionContext();
+			const config = { ...resolveConfig(env, ctx), bandwidth: { writeDataPoint: (point?: AnalyticsEngineDataPoint) => { points.push(point!); } } };
+			const response = await handleRequest(new Request(`http://example.com/_api/v1/go/${target.org}/${target.name}/v1/actions/${action}`, {
+				method, headers: { authorization: `Bearer ${writer}` } }), config);
+			await response.arrayBuffer();
+			await waitOnExecutionContext(ctx);
+			await config.close();
+			return `${method} ${response.headers.get("x-snowstead-cache")}`;
+		};
+		expect([await read("HEAD"), await read("GET"), await read("GET")]).toEqual(["HEAD MISS", "GET MISS", "GET HIT"]);
+		const point = { indexes: [String(id)], blobs: [target.org, "go"], doubles: [8] };
+		expect(points).toEqual([point, point]);
 	});
 });

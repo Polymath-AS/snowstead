@@ -1,11 +1,11 @@
-import { env, SELF } from "cloudflare:test";
+import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { and, eq, inArray } from "drizzle-orm";
 import { testDb } from "./db.js";
 import { caches, sccacheEntries } from "../src/db/schema.js";
 import { findCache, orgUsage } from "../src/db/repository.js";
 import { resolveConfig } from "../src/config.js";
-import { sweepSccacheEntries } from "../src/sccache.js";
+import { sweepSccacheEntries, sweepSccacheAttempts } from "../src/sccache.js";
 import { handleRequest } from "../../../workers/sccache/src/router.js";
 
 const db = testDb();
@@ -143,6 +143,10 @@ describe("sccache WebDAV backend", () => {
 		const head = await transfer(org, undefined, undefined, path(key), "HEAD");
 		expect(head.status).toBe(200);
 		expect(head.headers.get("x-snowstead-cache")).toBe("HIT");
+		await expect.poll(async () => {
+			const [entry] = await db.select().from(sccacheEntries).where(eq(sccacheEntries.id, before.id));
+			return entry.lastAccessedAt?.getTime() ?? 0;
+		}).toBeGreaterThan(0);
 		const [after] = await db.select().from(sccacheEntries).where(eq(sccacheEntries.id, before.id));
 		expect(after.lastAccessedAt!.getTime()).toBeGreaterThan(0);
 		expect(after.expiresAt).toEqual(before.expiresAt);
@@ -243,7 +247,7 @@ describe("sccache WebDAV backend", () => {
 		expect(await orgUsage(db, org, now)).toEqual({ used: 0, pending: 0 });
 	});
 
-	it("allows a distinct artifact to finish while another body is stalled", async () => {
+	it.each(["distinct", "duplicate", "reset", "evict", "delete", "expire"])("allows %s while another body is stalled without reviving removed entries", async operation => {
 		const org = await setup();
 		const writer = await token(org);
 		const release = Promise.withResolvers<void>();
@@ -263,16 +267,27 @@ describe("sccache WebDAV backend", () => {
 		try {
 			await expect.poll(() => started).toBe(true);
 			let completed = false;
-			second = transfer(org, writer, "fast", path("f".repeat(64))).then(r => { completed = true; return r; });
+			second = (async () => {
+				if (operation === "distinct" || operation === "duplicate") return transfer(org, writer, "fast", path(operation === "duplicate" ? key : "f".repeat(64)));
+				if (operation === "expire") {
+					const cache = (await findCache(db, org, "main"))!;
+					await db.update(sccacheEntries).set({ expiresAt: new Date(0) }).where(eq(sccacheEntries.cacheId, cache.id));
+					await sweepSccacheEntries(config);
+					return new Response(null, { status: 200 });
+				}
+				return api(org, `/caches/main/${operation === "reset" ? "sccache/reset" : operation}`, "POST");
+			})().then(r => { completed = true; return r; });
 			await expect.poll(() => completed).toBe(true);
-			expect((await second).status).toBe(201);
+			expect((await second).ok).toBe(true);
 			expect(finished).toBe(false);
 		} finally {
 			release.resolve();
 			await Promise.allSettled([first, second]);
 			await config.close();
 		}
-		expect((await first).status).toBe(201);
+		expect((await first).status).toBe(operation === "distinct" ? 201 : operation === "duplicate" ? 204 : 503);
+		if (operation === "duplicate") expect(await (await transfer(org)).text()).toBe("fast");
+		else if (operation !== "distinct") expect((await transfer(org)).status).toBe(404);
 	});
 
 	it("bounds stalled uploads before SQL, keeps reads and other orgs usable, and recovers", async () => {
@@ -302,6 +317,30 @@ describe("sccache WebDAV backend", () => {
 		}
 		expect((await Promise.all(uploads)).map(response => response.status)).toEqual(Array(8).fill(201));
 		expect((await transfer(org, writer, "fast", path("f".repeat(64)))).status).toBe(201);
+	});
+
+	it("reclaims abandoned transfer objects only after their reservation disappears", async () => {
+		const org = await setup();
+		const writer = await token(org);
+		expect((await transfer(org, writer, "live")).status).toBe(201);
+		const cache = (await findCache(db, org, "main"))!;
+		const [entry] = await db.select().from(sccacheEntries).where(eq(sccacheEntries.cacheId, cache.id));
+		const abandoned = `sccache-attempt/${entry.id}/${crypto.randomUUID()}`;
+		const orphan = `sccache-attempt/${crypto.randomUUID()}/${crypto.randomUUID()}`;
+		await env.CACHE_BUCKET.put(abandoned, "loser");
+		await env.CACHE_BUCKET.put(orphan, "orphan");
+		const config = resolveConfig(env);
+		try {
+			await sweepSccacheAttempts(config);
+			expect(await env.CACHE_BUCKET.head(orphan)).toBeNull();
+			expect(await env.CACHE_BUCKET.head(abandoned)).not.toBeNull();
+			expect(await (await transfer(org)).text()).toBe("live");
+			await api(org, "/caches/main/evict", "POST");
+			while (await sweepSccacheEntries(config)) { /* drain the fixture */ }
+			await sweepSccacheAttempts(config);
+			expect(await env.CACHE_BUCKET.head(abandoned)).toBeNull();
+			expect(await env.CACHE_BUCKET.head(entry.r2Key)).toBeNull();
+		} finally { await config.close(); }
 	});
 
 	it("shares the sweep budget across garbage categories and skips locked entries", async () => {
@@ -362,5 +401,26 @@ describe("sccache WebDAV backend", () => {
 		await api(org, "/caches", "POST", { name: "main", protocols: ["sccache"] });
 		expect((await transfer(org)).status).toBe(404);
 		expect((await transfer(org, writer, "stale token")).status).toBe(403);
+	});
+
+	it("records each download, edge cache hits included and HEAD excluded, as a bandwidth data point", async () => {
+		const org = await setup(true);
+		const writer = await token(org);
+		expect((await transfer(org, writer, "archive")).status).toBe(201);
+		const { id } = (await findCache(db, org, "main"))!;
+		const points: AnalyticsEngineDataPoint[] = [];
+		const read = async (method: string) => {
+			const ctx = createExecutionContext();
+			const config = { ...resolveConfig(env, ctx), bandwidth: { writeDataPoint: (point?: AnalyticsEngineDataPoint) => { points.push(point!); } } };
+			const response = await handleRequest(new Request(`http://example.com/_api/v1/sccache/${org}/main/${path(key)}`, {
+				method, headers: { authorization: `Bearer ${writer}` } }), config);
+			await response.arrayBuffer();
+			await waitOnExecutionContext(ctx);
+			await config.close();
+			return `${method} ${response.headers.get("x-snowstead-cache")}`;
+		};
+		expect([await read("HEAD"), await read("GET"), await read("GET")]).toEqual(["HEAD MISS", "GET MISS", "GET HIT"]);
+		const point = { indexes: [String(id)], blobs: [org, "sccache"], doubles: [7] };
+		expect(points).toEqual([point, point]);
 	});
 });

@@ -360,10 +360,23 @@ without an org are its tokens.
   minute, set under `ratelimits` in `wrangler.jsonc`. Past it, requests get
   429 with `retry-after`. The operator's own `ADMIN_SECRET` calls go
   unlimited.
-- **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth`: the NAR bytes
-  the Worker served from the org's private caches this UTC month, counted
-  by day in `bandwidth_daily`. Public caches are served by the bucket and
-  CDN without the Worker, so they aren't counted here.
+- **Bandwidth.** `GET /orgs/:org`, and each cache in `GET /orgs/:org/caches`
+  and `GET /orgs/:org/caches/:name`, report this UTC month's bytes served:
+  `servedThisMonth` through the Workers (private NARs, Go and sccache
+  downloads, GET only, edge cache hits included), `publicServedThisMonth`
+  from public caches through the CDN, and `servedThisMonthByProduct`, both
+  together for `nix`, `go`, and `sccache`. The org also reports
+  `bandwidthUpdatedAt`. These are estimates, not meters: the Workers write
+  one Analytics Engine data point per download to the `BANDWIDTH` dataset,
+  and control's 6-hourly cron sums it, and the CDN's sampled HTTP analytics
+  for the public host, into `bandwidth_daily` by cache, product, and day,
+  re-importing yesterday and today so a day settles after it ends. Public
+  narinfo and `nix-cache-info` bytes count for their cache; a public NAR is
+  shared, so its bytes are split evenly among the public caches that hold
+  it. Paths no cache claims are left out. Bytes counted before per-cache
+  metering stay under cache 0, in their org's total only. Imports need the
+  `ANALYTICS_TOKEN` secret on control: Zone Analytics Read on `CDN_ZONE_ID`
+  and Account Analytics Read. Without it the counts stay 0.
 - **Signing keys.** Each new cache gets its own cryptographically generated
   Ed25519 key, shown as its `publicKey`. Managed key names use the immutable
   cache ID and a random UUID; managed public bytes are unique in Postgres.
@@ -384,8 +397,9 @@ safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
   and custom signing keys disallowed. Omitted limits preserve existing
   values, including concurrent updates. Unknown fields are rejected with 400.
 - Org GET and PUT responses contain `id`, `slug`, `movingFrom`,
-  `storageLimit`, `privateCaches`, `customSigningKeys`, `used`, `pending`, and
-  `servedThisMonth`.
+  `storageLimit`, `privateCaches`, `customSigningKeys`, `used`, `pending`,
+  `servedThisMonth`, `publicServedThisMonth`, `servedThisMonthByProduct`, and
+  `bandwidthUpdatedAt`.
 - `GET /_api/v1/admin/overview` retains the global operator overview.
 
 All admin endpoints and org PUTs require operator `ADMIN_SECRET`

@@ -90,6 +90,7 @@
 		{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
 		{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
 	],
+	"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_bandwidth" }],
 	// Only the gateway has public routes; maintenance belongs to control.
 	"routes": [],
 	"triggers": { "crons": [] },
@@ -118,6 +119,7 @@
 				{ "name": "API_LIMIT", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
 				{ "name": "READ_LIMIT", "namespace_id": "1003", "simple": { "limit": 12000, "period": 60 } }
 			],
+			"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_bandwidth" }],
 			"secrets_store_secrets": [{
 				"binding": "SIGNING_MASTER_KEY_STORE",
 				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",
@@ -152,6 +154,7 @@
 				{ "name": "API_LIMIT", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
 				{ "name": "READ_LIMIT", "namespace_id": "2003", "simple": { "limit": 12000, "period": 60 } }
 			],
+			"analytics_engine_datasets": [{ "binding": "BANDWIDTH", "dataset": "snowstead_staging_bandwidth" }],
 			"secrets_store_secrets": [{
 				"binding": "SIGNING_MASTER_KEY_STORE",
 				"store_id": "9c52509c6f0a46e9b93fc914a077e5b8",

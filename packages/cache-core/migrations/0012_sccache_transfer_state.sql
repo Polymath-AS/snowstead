@@ -1,0 +1,1 @@
+ALTER TABLE "sccache_entries" ADD COLUMN "stored_at" timestamp with time zone;

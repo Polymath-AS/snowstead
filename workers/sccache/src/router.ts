@@ -5,6 +5,7 @@ import { errorResponse } from "@snowstead/cache-core/responses";
 import { overLimit } from "@snowstead/cache-core/rate-limit";
 import { findSccacheTarget, SCCACHE_MAX_BYTES } from "@snowstead/cache-core/sccache";
 import { recordSccacheAccess } from "@snowstead/cache-core/capacity";
+import { recordBandwidth } from "@snowstead/cache-core/bandwidth";
 import { consumeBody, uploadArchive } from "./upload.js";
 
 /** sccache's WebDAV subset, not a general-purpose WebDAV filesystem. */
@@ -53,14 +54,15 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 	}
 	if (!["GET", "HEAD"].includes(request.method)) return errorResponse("Method Not Allowed", 405);
 	if (!entry || entry.expiresAt.getTime() <= Date.now()) return errorResponse("Not Found", 404);
+	await config.releaseDb();
 	const head = request.method === "HEAD";
 	const key = new Request(`${url.origin}/_snowstead_sccache_cdn/${entry.r2Key}`);
 	const edge = await caches.open("snowstead-sccache");
 	const hit = await edge.match(key);
 	if (hit) {
 		if (head) await hit.body?.cancel();
-		recordSccacheAccess(config, entry.id);
-		await config.releaseDb();
+		else recordBandwidth(config, cache, "sccache", Number(hit.headers.get("content-length") ?? 0));
+		recordSccacheAccess(config, entry);
 		return returned(hit, head, "HIT");
 	}
 	const result = head ? null : await config.bucket.get(entry.r2Key);
@@ -72,8 +74,8 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 		"content-length": String(object.size), etag: object.httpEtag, "cache-control": `public, max-age=${ttl}` } });
 	// Limit the tee backlog when the client and edge cache consume at different speeds.
 	if (!head && ttl > 0 && object.size <= 8 * 1024 * 1024 && config.ctx) config.ctx.waitUntil(edge.put(key, response.clone()));
-	recordSccacheAccess(config, entry.id);
-	await config.releaseDb();
+	if (!head) recordBandwidth(config, cache, "sccache", object.size);
+	recordSccacheAccess(config, entry);
 	return returned(response, head, "MISS");
 }
 

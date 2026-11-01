@@ -51,7 +51,12 @@
 		// The CDN in front of the public bucket, purged when paths are published
 		// or deleted; with the secret CDN_PURGE_TOKEN. Unset, nothing is purged.
 		"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
-		"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
+		"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com",
+		// With the secret ANALYTICS_TOKEN (Zone Analytics Read on CDN_ZONE_ID and
+		// Account Analytics Read), the 6-hourly cron imports bandwidth: the CDN's
+		// for public caches, and the Workers' BANDWIDTH dataset (bandwidth.ts).
+		"ANALYTICS_ACCOUNT_ID": "a5af70f803f5950f325622198dbd50a2",
+		"BANDWIDTH_DATASET": "snowstead_bandwidth"
 	},
 	"r2_buckets": [
 		{
@@ -110,7 +115,9 @@
 				"REQUIRE_CACHE_SIGNING_KEYS": "true",
 				"UPSTREAM_CACHES": "https://cache.nixos.org",
 				"CDN_ZONE_ID": "1631bf4fa13792b9f685ce903875585a",
-				"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com"
+				"PUBLIC_CACHE_ORIGIN": "https://cache.snowstead.com",
+				"ANALYTICS_ACCOUNT_ID": "a5af70f803f5950f325622198dbd50a2",
+				"BANDWIDTH_DATASET": "snowstead_bandwidth"
 			},
 			"r2_buckets": [
 				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-private" },
@@ -144,7 +151,9 @@
 				"CDN_ZONE_ID": "",
 				"PUBLIC_CACHE_ORIGIN": "",
 				"R2_BUCKET_NAME": "snowstead-staging-private",
-				"R2_PUBLIC_BUCKET_NAME": "snowstead-staging-public"
+				"R2_PUBLIC_BUCKET_NAME": "snowstead-staging-public",
+				"ANALYTICS_ACCOUNT_ID": "a5af70f803f5950f325622198dbd50a2",
+				"BANDWIDTH_DATASET": "snowstead_staging_bandwidth"
 			},
 			"r2_buckets": [
 				{ "binding": "CACHE_BUCKET", "bucket_name": "snowstead-staging-private" },
