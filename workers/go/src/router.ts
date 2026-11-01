@@ -3,6 +3,7 @@ import type { WorkerConfig } from "@snowstead/cache-core/config";
 import type { Cache } from "@snowstead/cache-core/db/types";
 import { caches as cacheRows, goEntries, orgs } from "@snowstead/cache-core/db/schema";
 import { cacheColumns, findCacheByPath } from "@snowstead/cache-core/db/repository";
+import { recordBandwidth } from "@snowstead/cache-core/bandwidth";
 import { authenticateWrite, actorId } from "@snowstead/cache-core/auth";
 import { hasCacheAccess, hasPermission, isOrgsToken } from "@snowstead/cache-core/jwt";
 import { errorResponse } from "@snowstead/cache-core/responses";
@@ -52,6 +53,7 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 	const cached = await edgeCache.match(key);
 	if (cached) {
 		if (head) await cached.body?.cancel();
+		else recordBandwidth(config, cache, "go", entry.size);
 		recordGoAccess(config, entry.id);
 		return returned(cached, head, "HIT");
 	}
@@ -71,6 +73,7 @@ export async function handleRequest(request: Request, config: WorkerConfig): Pro
 		"cache-control": `public, max-age=${ttl}`,
 	} });
 	if (!head && ttl > 0 && config.ctx) config.ctx.waitUntil(edgeCache.put(key, response.clone()));
+	if (!head) recordBandwidth(config, cache, "go", entry.size);
 	recordGoAccess(config, entry.id);
 	return returned(response, head, "MISS");
 }

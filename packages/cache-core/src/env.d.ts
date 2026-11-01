@@ -12,6 +12,11 @@ interface Secrets {
 	ADMIN_SECRET?: string;
 	// Cache Purge permission on the zone serving the public bucket.
 	CDN_PURGE_TOKEN?: string;
+	// Zone Analytics Read on that zone and Account Analytics Read: control
+	// imports bandwidth with it (bandwidth.ts).
+	ANALYTICS_TOKEN?: string;
+	// Bound on the nix, go and sccache Workers only, which write bandwidth to it.
+	BANDWIDTH?: AnalyticsEngineDataset;
 }
 
 interface Env extends Secrets {}

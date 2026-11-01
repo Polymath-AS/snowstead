@@ -1,7 +1,9 @@
-import { env, SELF } from "cloudflare:test";
-import { describe, it, expect, beforeAll, vi } from "vitest";
+import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
+import { describe, it, expect, beforeAll } from "vitest";
 import { testDb } from "./db.js";
 import { createBlobObject, createPublishedPath, findCache, revokeApiToken, setCachePublic } from "../src/db/repository.js";
+import { resolveConfig } from "../src/config.js";
+import { handleRequest as handleNix } from "../../../workers/nix/src/router.js";
 
 const db = testDb();
 const PRIVATE = "private-test";
@@ -263,20 +265,25 @@ describe("private NARs", () => {
 		expect((await read(`/${name}/nar/${file}/zstd.nar`, auth)).status).toBe(404);
 	});
 
-	it("count the bytes of every private NAR served, cached or not, toward the org", async () => {
-		const served = async () => {
-			const res = await SELF.fetch("http://example.com/_api/v1/orgs/default", { headers: { authorization: "Bearer test-admin-secret" } });
-			return (await res.json<{ servedThisMonth: number }>()).servedThisMonth;
+	it("record the bytes of every private NAR served, cached or not, toward its cache", async () => {
+		const points: AnalyticsEngineDataPoint[] = [];
+		const fetchNar = async (path: string, method = "GET", auth?: string) => {
+			const ctx = createExecutionContext();
+			const config = { ...resolveConfig(env, ctx), bandwidth: { writeDataPoint: (point?: AnalyticsEngineDataPoint) => { points.push(point!); } } };
+			const response = await handleNix(new Request(`http://example.com${path}`, { method, headers: auth ? { authorization: auth } : {} }), config);
+			await response.arrayBuffer();
+			await waitOnExecutionContext(ctx);
+			await config.close();
+			return response.status;
 		};
-		// Earlier reads record after their responses.
-		await new Promise((resolve) => setTimeout(resolve, 200));
-		const before = await served();
+		// The first read may be a Cache API hit from earlier tests; both count.
+		expect(await fetchNar(nar(PRIVATE), "GET", basic(pull))).toBe(200);
+		expect(await fetchNar(nar(PRIVATE), "GET", basic(pull))).toBe(200);
+		expect(await fetchNar(nar(PRIVATE), "HEAD", basic(pull))).toBe(200);
+		expect(await fetchNar(nar(PUBLIC))).toBe(200);
 
-		expect((await read(nar(PRIVATE), basic(pull))).status).toBe(200);
-		expect((await read(nar(PRIVATE), basic(pull))).status).toBe(200);
-		expect((await SELF.fetch(`http://example.com${nar(PRIVATE)}`, { method: "HEAD", headers: { authorization: basic(pull) } })).status).toBe(200);
-		expect((await read(nar(PUBLIC))).status).toBe(200);
-
-		await vi.waitFor(async () => expect(await served()).toBe(before + 2 * NAR.byteLength));
+		const { id } = (await findCache(db, "default", PRIVATE))!;
+		const point = { indexes: [String(id)], blobs: ["default", "nix"], doubles: [NAR.byteLength] };
+		expect(points).toEqual([point, point]);
 	});
 });

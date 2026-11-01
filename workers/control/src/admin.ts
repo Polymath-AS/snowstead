@@ -1,7 +1,7 @@
 import type { WorkerConfig } from "@snowstead/cache-core/config";
 import { cacheIdEntry, isCachePattern, signJwt, Permission, MAX_CACHES_PER_TOKEN, MAX_PERMS_PER_TOKEN, TOKEN_ISSUER, TOKEN_AUDIENCE } from "@snowstead/cache-core/jwt";
 import type { TokenClaims } from "@snowstead/cache-core/jwt";
-import type { CacheAt, CacheStats, PathSelection } from "@snowstead/cache-core/db/repository";
+import type { Bandwidth, CacheAt, CacheStats, PathSelection } from "@snowstead/cache-core/db/repository";
 import { signingPublicKey } from "@snowstead/cache-core/signing";
 import { newCacheKey } from "@snowstead/cache-core/cache-keys";
 import { deleteCachePaths } from "@snowstead/cache-core/path-deletion";
@@ -37,6 +37,8 @@ import {
 	orgUsage,
 	findUploadSessions,
 	bandwidthThisMonth,
+	bandwidthUpdatedAt,
+	totalBandwidth,
 } from "@snowstead/cache-core/db/repository";
 import { storePublicNarinfo } from "@snowstead/cache-core/narinfo";
 import { readyNewPath } from "./slug-move.js";
@@ -337,7 +339,7 @@ export async function handleCreateCache(
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_PATHS = 10;
 
-function cacheSummary(stats: CacheStats) {
+function cacheSummary(stats: CacheStats, bandwidth: Bandwidth) {
 	return {
 		name: stats.cache.name,
 		path: stats.cache.path,
@@ -350,7 +352,14 @@ function cacheSummary(stats: CacheStats) {
 		size: stats.size,
 		addedLastWeek: stats.addedSince,
 		lastAddedAt: stats.lastAddedAt,
+		...bandwidth,
 	};
+}
+
+/** Caches' summaries, with what each served this month. */
+async function cacheSummaries(config: WorkerConfig, stats: readonly CacheStats[]) {
+	const rows = await bandwidthThisMonth(config.db, new Date(), { cacheIds: stats.map((s) => s.cache.id) });
+	return stats.map((s) => cacheSummary(s, totalBandwidth(rows.filter((r) => r.cacheId === s.cache.id))));
 }
 
 /** The `?org=` a listing is narrowed to, if any. */
@@ -374,7 +383,7 @@ export async function handleListCaches(
 	const filter = scope ?? orgFilter(url);
 	if (filter instanceof Response) return filter;
 	const stats = await listCacheStats(config.db, new Date(Date.now() - WEEK_MS), { orgId: filter });
-	return jsonResponse({ caches: stats.map(cacheSummary) });
+	return jsonResponse({ caches: await cacheSummaries(config, stats) });
 }
 
 /** One cache's numbers, its newest paths, and the public key to trust it with. */
@@ -393,7 +402,7 @@ export async function handleGetCache(
 
 	const recent = await listRecentPaths(config.db, stats.cache.id, RECENT_PATHS);
 	return jsonResponse({
-		...cacheSummary(stats),
+		...(await cacheSummaries(config, [stats]))[0],
 		publicKey: stats.cache.signingPublicKey ?? (await signingPublicKey(config.signingKeyName, config.signingPrivateKey)),
 		recentPaths: recent.map((p) => ({ storePath: p.storePath, size: p.fileSize, addedAt: p.createdAt })),
 	});
@@ -405,8 +414,8 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		return errorResponse(`no org ${id}`, 404);
 	}
 	const now = new Date();
-	const [usage, served, staged] = await Promise.all([
-		orgUsage(config.db, id, now), bandwidthThisMonth(config.db, id, now),
+	const [usage, served, updatedAt, staged] = await Promise.all([
+		orgUsage(config.db, id, now), bandwidthThisMonth(config.db, now, { orgId: id }), bandwidthUpdatedAt(config.db),
 		config.uploadCoordinator.getByName(id, { locationHint: "weur" }).pendingStreams(),
 	]);
 	// Keep pending usage visible without dual-writing each local part grant.
@@ -425,7 +434,9 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		customSigningKeys: org.customSigningKeys,
 		used: usage.used,
 		pending: usage.pending + localPending,
-		servedThisMonth: served,
+		...totalBandwidth(served),
+		// Bandwidth is imported from Cloudflare's analytics every 6 hours.
+		bandwidthUpdatedAt: updatedAt,
 	}, status);
 }
 

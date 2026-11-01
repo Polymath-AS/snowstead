@@ -5,15 +5,34 @@ import { privateCache } from "./visibility.js";
 import { isRevoked } from "./revocations.js";
 import { findOrgApiKey } from "./db/repository.js";
 import { errorResponse } from "./responses.js";
-import { and, eq, isNull, lt, or } from "drizzle-orm";
+import { and, eq, isNull, lte, or } from "drizzle-orm";
 import { apiTokens, DEFAULT_ORG_ID } from "./db/schema.js";
 
+const TOKEN_USE_INTERVAL_MS = 5 * 60_000;
+// Only telemetry is memoized; authentication and revocation still run every time.
+// Scope by namespace so separate deployments/tests cannot suppress each other.
+const tokenUses = new WeakMap<KVNamespace, Map<string, number>>();
+
 function recordTokenUse(config: WorkerConfig, claims: TokenClaims): void {
-	const now = new Date();
-	config.afterResponse(db => db.update(apiTokens).set({ lastUsedAt: now }).where(and(
-		eq(apiTokens.jti, claims.jti), eq(apiTokens.orgId, claims.org ?? DEFAULT_ORG_ID),
-		or(isNull(apiTokens.lastUsedAt), lt(apiTokens.lastUsedAt, new Date(now.getTime() - 5 * 60_000))),
-	)).then(() => {}));
+	let uses = tokenUses.get(config.authKv);
+	if (!uses) tokenUses.set(config.authKv, uses = new Map());
+	const key = JSON.stringify([claims.org ?? DEFAULT_ORG_ID, claims.jti]);
+	const at = Date.now();
+	if ((uses.get(key) ?? 0) > at) return;
+	if (uses.size >= 4096) uses.delete(uses.keys().next().value!);
+	const until = at + TOKEN_USE_INTERVAL_MS;
+	uses.set(key, until);
+	config.afterResponse(async db => {
+		try {
+			await db.update(apiTokens).set({ lastUsedAt: new Date(at) }).where(and(
+				eq(apiTokens.jti, claims.jti), eq(apiTokens.orgId, claims.org ?? DEFAULT_ORG_ID),
+				or(isNull(apiTokens.lastUsedAt), lte(apiTokens.lastUsedAt, new Date(at - TOKEN_USE_INTERVAL_MS))),
+			));
+		} catch (error) {
+			if (uses.get(key) === until) uses.delete(key);
+			throw error;
+		}
+	});
 }
 
 /** Build a JSON error response. Always sets cache-control: no-store so auth failures don't get cached. */
