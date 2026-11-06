@@ -133,10 +133,14 @@ pub fn listen_address() -> anyhow::Result<SocketAddr> {
 /// Create a bounded pool. Queued requests wait here rather than creating
 /// more origin connections. Primary and replica pools have separate limits.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn connect_pool(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
+pub async fn connect_pool(
+    url: &str,
+    max_connections: u32,
+    min_connections: u32,
+) -> Result<PgPool, sqlx::Error> {
     let options = PgPoolOptions::new()
         .max_connections(max_connections)
-        .min_connections(0)
+        .min_connections(min_connections.min(max_connections))
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(60));
     #[cfg(feature = "observability")]
