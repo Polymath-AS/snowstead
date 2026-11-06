@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                b.file_hash || '/' || b.compression AS \"nar!\",\n                c.id,\n                c.org_id\n            FROM blob_objects AS b\n            JOIN published_paths AS p ON p.blob_object_id = b.id\n            JOIN caches AS c ON c.id = p.cache_id\n            WHERE c.is_public\n              AND (b.file_hash, b.compression) IN (\n                  SELECT * FROM unnest($1::text[], $2::text[])\n              )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "nar!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "ced623e20ce7a3280bb530f24a6a50929540a5847659849820535787ec76233c"
+}

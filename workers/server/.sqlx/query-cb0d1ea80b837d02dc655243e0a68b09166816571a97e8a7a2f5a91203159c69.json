@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO pin_paths (\n                revision_id,\n                cache_id,\n                store_path_hash\n            )\n            SELECT\n                $1,\n                $2,\n                UNNEST($3::text[])\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb0d1ea80b837d02dc655243e0a68b09166816571a97e8a7a2f5a91203159c69"
+}

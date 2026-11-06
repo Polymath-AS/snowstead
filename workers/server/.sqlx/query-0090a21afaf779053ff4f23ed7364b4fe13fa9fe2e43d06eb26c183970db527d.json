@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                p.cache_id,\n                p.store_path_hash,\n                b.file_size\n            FROM UNNEST($1::integer[], $2::text[]) AS incoming(cache_id, hash)\n            JOIN published_paths p ON p.cache_id = incoming.cache_id\n                AND p.store_path_hash = incoming.hash\n            JOIN blob_objects b ON b.id = p.blob_object_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "cache_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "file_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0090a21afaf779053ff4f23ed7364b4fe13fa9fe2e43d06eb26c183970db527d"
+}

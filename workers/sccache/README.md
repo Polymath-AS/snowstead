@@ -33,11 +33,8 @@ the cache. Use separate caches for separate trust domains.
 ## Storage and contention
 
 - GET/HEAD authorize before consulting the internal edge cache. Reads use one
-  indexed metadata query; fresh last-access timestamps skip the update entirely.
-  Stale timestamps update after the response, with a five-minute SQL predicate.
-  Token-use telemetry is also coalesced per isolate (bounded to 4096 tokens),
-  without caching authentication or revocation decisions. Reads release the
-  database connection before edge-cache or R2 access.
+  indexed metadata query plus a last-access update coalesced to five minutes,
+  and release the database connection before streaming.
   Artifacts up to 8 MiB can populate the edge cache; larger artifacts stream
   directly from the private R2 bucket to avoid an unbounded clone backlog.
 - PUT requires Content-Length and streams into R2 with exact-length validation.
@@ -70,19 +67,12 @@ the cache. Use separate caches for separate trust domains.
   through the DO. Admission ends after the callback closes its DB connections.
   Traces include `sccache_admission` with lane and queue-wait attributes.
 - The existing per-org coordinator serializes **reservation SQL only**, with
-  its bounded queue and 429 overload response. Transfers use unique attempt
-  keys with no SQL connection or transaction held during upload or body drain.
-  A short cache-then-entry transaction adopts the first completed attempt;
-  publication subsequently takes the org capacity gate. Concurrent losers cannot
-  replace the winner, and reset/deletion/expiry during transfer prevents adoption.
-  `stored_at` preserves the winner's original age across publication retries.
-  Capacity eviction locks candidates and retires compiler entries in batches,
-  not one query per victim. The eight-write admission bound remains in place;
-  stalled transfers still occupy write slots but no longer pin DB transactions.
-  Control scans 500 attempt keys per GC run with a persisted cursor and one
-  batched primary-key lookup. Crash leftovers are removed once their reservation
-  disappears; a crashed duplicate may remain through the winner's retention
-  and until the scan reaches it. Successful losers are deleted immediately.
+  its bounded queue and 429 overload response. Transfers hold a shared cache
+  lock and an exclusive per-artifact lock, never an org-wide transfer lock.
+  Distinct keys transfer concurrently; duplicate keys contend only with each
+  other. A database transaction remains open during each upload to fence reset,
+  deletion and garbage collection. This is not a lock-free backend.
+  Admission bounds this exposure per org, not globally across all tenants.
   Size the shared Hyperdrive pool for the database's total connection budget;
   Hyperdrive's configured maximum is a soft limit, not a hard admission bound.
 - Control owns statistics, reset and cleanup. Use
@@ -98,8 +88,7 @@ supported. Capability probes do not create R2 objects or reserve storage.
 
 ## Deployment and verification
 
-Apply migrations through `0012_sccache_transfer_state` before deploying the
-updated compiler Worker and control GC. Migration `0009` creates compiler metadata, quota
+Apply migration `0009` before deploying. It creates compiler metadata, quota
 totals, indexes and accounting triggers together, after the deployed
 `0008_retained_capacity` migration, which remains unchanged. Development
 databases with earlier unshipped compiler migrations must be rebuilt.
@@ -181,7 +170,5 @@ with cache count, not just the number of garbage entries.
 The profile also measures empty sweeps and detached/obsolete zero-byte entries.
 Finally it fills retained capacity and measures 48 more uploads, each requiring
 an eviction, verifying that published usage remains exactly at the limit.
-Set `PROFILE_MANY_VICTIMS=1` to add sixteen 4 MiB uploads, each replacing 64
-seed entries. The profile saves individual request timings for box plots.
 Set `PROFILE_EXPLAIN=1` to save post-cleanup selection plans outside the timed
 measurements; those plans show the no-garbage path after each sweep.

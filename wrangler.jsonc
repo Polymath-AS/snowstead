@@ -19,8 +19,8 @@
 		{ "binding": "SCCACHE", "service": "snowstead-sccache" },
 		{ "binding": "CONTROL", "service": "snowstead-control" }
 	],
-	// Hosted reads go through snowstead-web's owner/cache gateway. The R2
-	// hostname is its internal CDN origin; expose only the management API here.
+	// Org reads bypass Workers. Keep the R2 CDN hostname unchanged and forward
+	// only its legacy API paths to the Rust origin in production.
 	"routes": [
 		{ "pattern": "cache.snowstead.com/_api/*", "zone_name": "snowstead.com" }
 	],
@@ -31,12 +31,8 @@
 			"name": "snowstead",
 			"workers_dev": false,
 			"preview_urls": false,
-			"services": [
-				{ "binding": "NIX", "service": "snowstead-nix" },
-				{ "binding": "GO", "service": "snowstead-go" },
-				{ "binding": "SCCACHE", "service": "snowstead-sccache" },
-				{ "binding": "CONTROL", "service": "snowstead-control" }
-			]
+			"vars": { "API_ORIGIN": "https://api.snowstead.com" },
+			"services": []
 		},
 		"staging": {
 			"name": "snowstead-staging",

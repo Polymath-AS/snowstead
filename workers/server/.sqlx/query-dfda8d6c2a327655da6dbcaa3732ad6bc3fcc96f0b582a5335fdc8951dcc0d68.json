@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT e.id\n                FROM sccache_entries e\n                JOIN caches c ON c.id = e.cache_id\n                WHERE e.id = ANY($1)\n                    AND c.org_id = $2\n                    AND e.generation = c.sccache_generation\n                    AND e.uploaded_at IS NOT NULL\n                    AND e.expires_at > NOW()\n                ORDER BY e.id\n                FOR UPDATE OF e SKIP LOCKED\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dfda8d6c2a327655da6dbcaa3732ad6bc3fcc96f0b582a5335fdc8951dcc0d68"
+}

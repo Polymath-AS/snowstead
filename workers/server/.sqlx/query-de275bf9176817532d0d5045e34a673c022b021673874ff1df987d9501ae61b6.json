@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE upload_sessions\n                SET status = CASE WHEN status = 'completed' THEN status ELSE 'aborted' END,\n                    expires_at = NOW()\n                WHERE cache_id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de275bf9176817532d0d5045e34a673c022b021673874ff1df987d9501ae61b6"
+}

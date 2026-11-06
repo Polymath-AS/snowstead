@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE upload_sessions\n            SET status = 'completed'\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3bb23a91fdf7c4eec96e26d2a1a17dcd7203791e59e77bfe68fa5e605921f177"
+}

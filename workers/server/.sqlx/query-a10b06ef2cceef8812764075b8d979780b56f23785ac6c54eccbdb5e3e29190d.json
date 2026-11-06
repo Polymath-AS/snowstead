@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE caches\n        SET is_public = COALESCE($2, is_public),\n            retention_days = CASE WHEN $3 THEN $4 ELSE retention_days END\n        WHERE id = $1\n        RETURNING is_public,\n            retention_days,\n            created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "retention_days",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "retention_days"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Bool",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "a10b06ef2cceef8812764075b8d979780b56f23785ac6c54eccbdb5e3e29190d"
+}

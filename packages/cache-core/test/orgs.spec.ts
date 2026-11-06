@@ -168,6 +168,25 @@ describe("orgs", () => {
 		expect(caches).toEqual([expect.objectContaining({ name: a.cache, org: a.org, path: `${a.org}/${a.cache}` })]);
 	});
 
+	it("returns an org overview with only its caches, including an empty org", async () => {
+		const a = await orgWithCache(1234);
+		const b = await orgWithCache(null);
+		const response = await orgApi(`/${a.org}/overview`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(await response.json()).toMatchObject({
+			id: a.org, slug: a.org, storageLimit: 1234, used: 0, pending: 0,
+			caches: [{ name: a.cache, org: a.org, path: `${a.org}/${a.cache}`, paths: 0, size: 0, addedLastWeek: 0, lastAddedAt: null }],
+		});
+		const empty = unique("empty");
+		expect((await orgApi(`/${empty}`, "PUT", { slug: empty })).status).toBe(200);
+		expect(await (await orgApi(`/${empty}/overview`)).json()).toMatchObject({ id: empty, caches: [], used: 0, pending: 0 });
+		expect((await orgApi(`/${unique("missing")}/overview`)).status).toBe(404);
+		expect((await SELF.fetch(`http://example.com/_api/v1/orgs/${a.org}/overview`)).status).toBe(401);
+		const { key } = await (await orgApi(`/${b.org}/keys`, "POST", { name: "other org" })).json<{ key: string }>();
+		expect((await SELF.fetch(`http://example.com/_api/v1/orgs/${a.org}/overview`, { headers: { authorization: `Bearer ${key}` } })).status).toBe(403);
+	});
+
 	it("lets every org have a cache of the same name, each at its own path", async () => {
 		const a = await orgWithCache(null);
 		const b = await orgWithCache(null);
@@ -211,6 +230,9 @@ describe("storage limit", () => {
 		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 48, used: 0 });
 		expect(await finalizeUploads(items.reverse(), token)).toMatchObject([{ published: true }, { published: true }]);
 		expect(await (await orgApi(`/${org}`)).json()).toMatchObject({ pending: 16, used: 32 });
+		expect(await (await orgApi(`/${org}/overview`)).json()).toMatchObject({
+			pending: 16, used: 32, caches: [{ name: cache, paths: 2, size: 32, addedLastWeek: 2 }],
+		});
 		for (const s of sessions.slice(0, 2)) expect(await env.CACHE_BUCKET.head(`staging/${s.sessionId}`)).not.toBeNull();
 	});
 

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO token_caches (\n            token_jti,\n            cache_id,\n            pattern\n        )\n        SELECT\n            $1,\n            CASE WHEN entry LIKE 'id:%' THEN SUBSTR(entry, 4)::int END,\n            CASE WHEN entry NOT LIKE 'id:%' THEN entry END\n        FROM UNNEST($2::text[]) WITH ORDINALITY AS requested(entry, position)\n        ORDER BY position\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "987a28de97316fe72eab232177d184c90fda583afed615d682b2bd02b5b8bf0c"
+}

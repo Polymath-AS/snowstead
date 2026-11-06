@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE pin_revisions\n            SET superseded_at = NOW()\n            WHERE pin_id = $1\n                AND revision = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1a9cbeab513c3e73f649a149b927950f5602176f4a684ea6110271aa058df37e"
+}

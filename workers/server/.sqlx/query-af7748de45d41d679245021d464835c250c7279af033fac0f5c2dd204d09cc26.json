@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE sccache_entries\n                    SET last_accessed_at = NOW()\n                    WHERE id = $1\n                        AND (last_accessed_at IS NULL OR last_accessed_at < NOW() - INTERVAL '5 minutes')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af7748de45d41d679245021d464835c250c7279af033fac0f5c2dd204d09cc26"
+}

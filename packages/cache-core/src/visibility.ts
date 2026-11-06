@@ -1,5 +1,6 @@
 import * as v from "valibot";
 import type { WorkerConfig } from "./config.js";
+import { uuidv7 } from "./uuid.js";
 
 /**
  * Whether the cache at a path (cache-path.ts) is private, answered without
@@ -86,7 +87,7 @@ export async function setPrivate(
 	if (isPrivate) {
 		// A generation of its own, so copies cached before it was last private
 		// (and its paths deleted while public) are never served again.
-		const entry = { ...cache, gen: crypto.randomUUID() };
+		const entry = { ...cache, gen: uuidv7() };
 		await config.authKv.put(privateKey(cachePath), JSON.stringify(entry));
 		visibility.set(cachePath, { isPrivate: true, ...entry, until: Date.now() + KV_CACHE_TTL_SECONDS * 1000 });
 	} else {
@@ -106,7 +107,7 @@ const KV_WRITE_RETRIES = 5;
  */
 export async function nextGeneration(config: WorkerConfig, cache: { readonly path: string; readonly id: number; readonly orgId: string }): Promise<void> {
 	const key = privateKey(cache.path);
-	const entry = { org: cache.orgId, id: cache.id, gen: crypto.randomUUID() };
+	const entry = { org: cache.orgId, id: cache.id, gen: uuidv7() };
 	for (let attempt = 1; ; attempt++) {
 		try {
 			await config.authKv.put(key, JSON.stringify(entry));

@@ -1,5 +1,6 @@
 import type { WorkerConfig } from "./config.js";
 import { narinfoKey } from "./layout.js";
+import { uuidv7 } from "./uuid.js";
 
 /**
  * Public reads stay on the CDN. Purges accelerate visibility of mutations;
@@ -96,7 +97,7 @@ async function purge(cdn: CdnConfig, body: object, fetcher: typeof fetch): Promi
  */
 export async function scheduleNarinfoPurge(config: WorkerConfig, cachePath: string, hashes: readonly string[], fetcher: typeof fetch = fetch): Promise<void> {
 	if (!config.cdn || hashes.length === 0) return;
-	const key = `${PURGE_PREFIX}${String(Date.now()).padStart(16, "0")}-${crypto.randomUUID()}`;
+	const key = `${PURGE_PREFIX}${String(Date.now()).padStart(16, "0")}-${uuidv7()}`;
 	const job = { cachePath, hashes: [...new Set(hashes)] };
 	await config.bucket.put(key, JSON.stringify(job));
 	const reported = finishPurge(config, key, job, fetcher).catch((err: unknown) => console.error("CDN purge queued for retry", { key }, err));

@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH RECURSIVE closure(store_path) AS (\n            SELECT $2::text\n            UNION\n            SELECT CASE\n                WHEN ref.value LIKE '/nix/store/%' THEN ref.value\n                ELSE '/nix/store/' || ref.value\n            END\n            FROM closure c\n            JOIN published_paths p ON p.cache_id = $1\n                AND p.store_path_hash = SUBSTR(c.store_path, 12, 32)\n                AND p.store_path = c.store_path\n            CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(p.references_json::jsonb) ref(value)\n        ), bounded AS MATERIALIZED (\n            SELECT store_path\n            FROM closure\n            LIMIT 10001\n        )\n        SELECT\n            SUBSTR(c.store_path, 12, 32) AS \"hash!\",\n            p.store_path AS \"store_path?\"\n        FROM bounded c\n        LEFT JOIN published_paths p ON p.cache_id = $1\n            AND p.store_path_hash = SUBSTR(c.store_path, 12, 32)\n            AND p.store_path = c.store_path\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hash!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "store_path?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      true
+    ]
+  },
+  "hash": "df12d675cff6729ed4659894a30c7e76324a6a669bffd04b6def8e1417262558"
+}

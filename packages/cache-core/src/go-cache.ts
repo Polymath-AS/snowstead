@@ -6,6 +6,7 @@ import { caches as cacheRows, goEntries } from "./db/schema.js";
 import { findCache, findOrg } from "./db/repository.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 import { PRIVATE_CACHES_REFUSED } from "./visibility.js";
+import { uuidv7 } from "./uuid.js";
 
 export function activeGoEntries(cache: Pick<Cache, "id" | "goGeneration">, now = new Date()) {
 	return and(eq(goEntries.cacheId, cache.id), eq(goEntries.generation, cache.goGeneration), gt(goEntries.expiresAt, now));
@@ -36,7 +37,7 @@ export async function reserveGoUpload(db: Db, cache: Cache, action: string, outp
 		if ((staging?.count ?? 0) >= 256 || (staging?.bytes ?? 0) + size > (org.storageLimit ?? 1024 * 1024 * 1024)) {
 			return errorResponse("Upload staging is busy; retry", 503, { "retry-after": "1" });
 		}
-		const id = crypto.randomUUID();
+		const id = uuidv7();
 		const [entry] = await tx.insert(goEntries).values({ id, cacheId: cache.id, generation: cache.goGeneration, action,
 			r2Key: `go/${cache.id}/${cache.goGeneration}/${action}/${id}`, output, size,
 			expiresAt: new Date(now.getTime() + 3600_000),
@@ -64,7 +65,7 @@ export async function handleGoManagement(config: WorkerConfig, org: string, name
 	if (!cache) return errorResponse("Not Found", 404);
 	if (reset) {
 		if (!cache.protocols.includes("go")) return errorResponse("Not Found", 404);
-		const [updated] = await config.db.update(cacheRows).set({ goGeneration: crypto.randomUUID() })
+		const [updated] = await config.db.update(cacheRows).set({ goGeneration: uuidv7() })
 			.where(eq(cacheRows.id, cache.id)).returning();
 		if (!updated) return errorResponse("Not Found", 404);
 		return jsonResponse(await stats(config, updated));

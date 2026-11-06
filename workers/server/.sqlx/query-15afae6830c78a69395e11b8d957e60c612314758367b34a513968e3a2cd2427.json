@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                DELETE FROM eviction_logs\n                WHERE id IN (\n                    SELECT id\n                    FROM eviction_logs\n                    WHERE evicted_at < now() - INTERVAL '30 days'\n                    ORDER BY id\n                    LIMIT $1\n                    FOR UPDATE SKIP LOCKED\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "15afae6830c78a69395e11b8d957e60c612314758367b34a513968e3a2cd2427"
+}

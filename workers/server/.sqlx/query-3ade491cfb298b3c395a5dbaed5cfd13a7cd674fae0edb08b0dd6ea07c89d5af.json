@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO gc_marks (target_type, target_id, reason)\n            VALUES ('server-gc-cursor', $1, $2)\n            ON CONFLICT (target_type, target_id) DO UPDATE\n            SET\n                reason = excluded.reason,\n                marked_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3ade491cfb298b3c395a5dbaed5cfd13a7cd674fae0edb08b0dd6ea07c89d5af"
+}

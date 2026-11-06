@@ -1,0 +1,16 @@
+{
+  "name": "@snowstead/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:prepare": "../../scripts/prepare-server-queries.sh",
+    "db:check": "../../scripts/prepare-server-queries.sh --check",
+    "test:profiling": "cargo build --locked --release -p snowstead-server --features profiling && env -u SNOWSTEAD_TEST_DATABASE_URL ../../scripts/with-postgres.sh ../../scripts/with-r2.sh node profile/smoke.mjs",
+    "test": "../../scripts/with-postgres.sh ../../scripts/with-r2.sh bash -c 'export DATABASE_URL=\"$SNOWSTEAD_TEST_DATABASE_URL\"; cargo test --locked -p snowstead-server -- --include-ignored && cargo build --locked -p snowstead-server -p snowstead-cli && node --test test/*.mjs'",
+    "check": "cargo fmt --manifest-path Cargo.toml -- --check && cargo clippy --locked -p snowstead-server --all-targets -- -D warnings && pnpm test"
+  },
+  "devDependencies": {
+    "pg": "^8.23.1"
+  }
+}

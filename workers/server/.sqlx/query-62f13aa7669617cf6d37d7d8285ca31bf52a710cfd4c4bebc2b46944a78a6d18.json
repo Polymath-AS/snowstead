@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE go_entries\n                SET cache_id = NULL\n                WHERE id = ANY($1)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "62f13aa7669617cf6d37d7d8285ca31bf52a710cfd4c4bebc2b46944a78a6d18"
+}

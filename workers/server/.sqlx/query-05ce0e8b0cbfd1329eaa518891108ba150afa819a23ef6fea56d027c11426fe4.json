@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    DELETE FROM upload_parts\n                    WHERE session_id IN (\n                        SELECT id\n                        FROM upload_sessions\n                        WHERE cache_id = $1\n                    )\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "05ce0e8b0cbfd1329eaa518891108ba150afa819a23ef6fea56d027c11426fe4"
+}

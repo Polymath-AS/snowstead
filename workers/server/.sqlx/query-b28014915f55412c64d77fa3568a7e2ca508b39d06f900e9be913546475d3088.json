@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT store_path_hash\n        FROM published_paths\n        WHERE cache_id = $1\n            AND store_path_hash = ANY($2)\n            AND nix_path_pinned(cache_id, store_path_hash, NOW())\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b28014915f55412c64d77fa3568a7e2ca508b39d06f900e9be913546475d3088"
+}

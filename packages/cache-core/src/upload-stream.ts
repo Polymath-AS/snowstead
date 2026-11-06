@@ -2,10 +2,11 @@ import { sql } from "drizzle-orm";
 import type { Db } from "./db/connection.js";
 import { uploadParts, uploadSessions } from "./db/schema.js";
 import type { UploadSession } from "./db/types.js";
+import { uuidv7 } from "./uuid.js";
 
 /** Versioned locators route to one org without a Postgres session lookup. */
 export function streamSessionId(org: string): string {
-	return `s2.${org}.${crypto.randomUUID()}`;
+	return `s2.${org}.${uuidv7()}`;
 }
 
 export function streamSessionOrg(id: string): string | undefined {

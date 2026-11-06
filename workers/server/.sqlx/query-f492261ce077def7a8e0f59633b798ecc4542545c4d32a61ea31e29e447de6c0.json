@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH refreshed AS (\n            UPDATE published_paths\n            SET last_pushed_at = NOW()\n            WHERE cache_id = $1\n                AND store_path_hash = ANY($2)\n                AND last_pushed_at < NOW() - INTERVAL '1 day'\n            RETURNING id\n        )\n        SELECT store_path_hash\n        FROM published_paths\n        WHERE cache_id = $1\n            AND store_path_hash = ANY($2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f492261ce077def7a8e0f59633b798ecc4542545c4d32a61ea31e29e447de6c0"
+}

@@ -189,6 +189,54 @@ to rewrite their metadata and queue purges. The five-minute fallback
 applies after those old copies have been replaced; changing the Worker
 alone cannot shorten an already-cached response's TTL.
 
+## Rust server observability (opt-in)
+
+PostHog export is behind the Rust server's `observability` Cargo feature,
+which is off by default. Opt in with either build:
+
+```bash
+nix build .#server-observability
+# Or, inside nix develop:
+cargo build --release -p snowstead-server --features observability
+```
+
+The default `server` package and deployment bundles still use the build
+without this feature. To enable export in a deployment, explicitly select
+the observability-enabled server package. Existing Hotpath profiling is
+separate and is not enabled by `observability`.
+
+For an observability-enabled binary, configure export through its runtime
+environment, not Nix build arguments:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POSTHOG_PROJECT_TOKEN` | unset | PostHog project token; required together with `POSTHOG_HOST` to export |
+| `POSTHOG_HOST` | unset | Regional PostHog ingestion origin |
+| `OBSERVABILITY_SAMPLE_RATE` | `0.4` | Trace sampling rate (40%) |
+| `OTEL_SERVICE_NAME` | `snowstead-api` | Telemetry service name |
+| `SNOWSTEAD_RELEASE` | unset | Optional release ID |
+
+With both PostHog variables missing, logging stays in the local journal only.
+Partial or invalid configuration disables export with a safe warning that
+does not reveal credentials. Set `POSTHOG_HOST` to the regional ingestion
+origin, not a dashboard URL or signal-specific endpoint. SDK error reporting
+uses PostHog; OTLP export appends `/i/v1/traces`, `/i/v1/logs`, and
+`/i/v1/metrics` to that origin. PostHog metrics support is alpha.
+
+Export is asynchronous and bounded; request handling does not wait for
+PostHog ingestion, and telemetry can be dropped under pressure. It is not a
+durable audit log. Exported telemetry excludes secrets, raw SQL, request
+bodies, cookies, query strings, and storage keys. Keep project tokens out of
+source control, command arguments, and diagnostic output.
+
+Spans cover HTTP requests through response streaming, database queries and
+transaction waits, storage reads and mutations, multipart uploads, outbound
+HTTP requests and response reads, and maintenance stages. Operation names
+are static; arguments and provider errors are not exported. This uses the
+existing Axum middleware and `tracing-opentelemetry` bridge rather than a
+second HTTP tracing layer. All additional spans compile out without the
+`observability` feature (existing profiling remains independently opt-in).
+
 ## Setup
 
 Configure the CLI with your gateway URL and admin secret:
@@ -360,23 +408,10 @@ without an org are its tokens.
   minute, set under `ratelimits` in `wrangler.jsonc`. Past it, requests get
   429 with `retry-after`. The operator's own `ADMIN_SECRET` calls go
   unlimited.
-- **Bandwidth.** `GET /orgs/:org`, and each cache in `GET /orgs/:org/caches`
-  and `GET /orgs/:org/caches/:name`, report this UTC month's bytes served:
-  `servedThisMonth` through the Workers (private NARs, Go and sccache
-  downloads, GET only, edge cache hits included), `publicServedThisMonth`
-  from public caches through the CDN, and `servedThisMonthByProduct`, both
-  together for `nix`, `go`, and `sccache`. The org also reports
-  `bandwidthUpdatedAt`. These are estimates, not meters: the Workers write
-  one Analytics Engine data point per download to the `BANDWIDTH` dataset,
-  and control's 6-hourly cron sums it, and the CDN's sampled HTTP analytics
-  for the public host, into `bandwidth_daily` by cache, product, and day,
-  re-importing yesterday and today so a day settles after it ends. Public
-  narinfo and `nix-cache-info` bytes count for their cache; a public NAR is
-  shared, so its bytes are split evenly among the public caches that hold
-  it. Paths no cache claims are left out. Bytes counted before per-cache
-  metering stay under cache 0, in their org's total only. Imports need the
-  `ANALYTICS_TOKEN` secret on control: Zone Analytics Read on `CDN_ZONE_ID`
-  and Account Analytics Read. Without it the counts stay 0.
+- **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth`: the NAR bytes
+  the Worker served from the org's private caches this UTC month, counted
+  by day in `bandwidth_daily`. Public caches are served by the bucket and
+  CDN without the Worker, so they aren't counted here.
 - **Signing keys.** Each new cache gets its own cryptographically generated
   Ed25519 key, shown as its `publicKey`. Managed key names use the immutable
   cache ID and a random UUID; managed public bytes are unique in Postgres.
@@ -397,9 +432,8 @@ safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
   and custom signing keys disallowed. Omitted limits preserve existing
   values, including concurrent updates. Unknown fields are rejected with 400.
 - Org GET and PUT responses contain `id`, `slug`, `movingFrom`,
-  `storageLimit`, `privateCaches`, `customSigningKeys`, `used`, `pending`,
-  `servedThisMonth`, `publicServedThisMonth`, `servedThisMonthByProduct`, and
-  `bandwidthUpdatedAt`.
+  `storageLimit`, `privateCaches`, `customSigningKeys`, `used`, `pending`, and
+  `servedThisMonth`.
 - `GET /_api/v1/admin/overview` retains the global operator overview.
 
 All admin endpoints and org PUTs require operator `ADMIN_SECRET`

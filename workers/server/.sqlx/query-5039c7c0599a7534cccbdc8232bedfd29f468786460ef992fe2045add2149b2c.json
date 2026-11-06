@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            DELETE FROM go_entries\n                            WHERE id = ANY($1)\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5039c7c0599a7534cccbdc8232bedfd29f468786460ef992fe2045add2149b2c"
+}

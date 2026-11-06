@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE sccache_entries\n                    SET\n                        uploaded_at = $2,\n                        expires_at = $2::timestamptz + INTERVAL '7 days'\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0dd77a6a412ec844370ee88a00a2c7eea9ef569e80c6243b92227c17a9ae1f5f"
+}

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                signing_key_name,\n                signing_public_key\n            FROM caches\n            WHERE id = $1\n            FOR SHARE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "signing_key_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_key_name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "signing_public_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_public_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "71ec26ec89bbf2b53b106a66195d331319aa90fb0d1c7a0c7e3eae179608f63b"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO nar_installations (\n                        key,\n                        operation_id,\n                        source_key,\n                        upload_id,\n                        file_hash,\n                        compression,\n                        is_private,\n                        file_size,\n                        phase\n                    )\n                    SELECT\n                        r2_upload_key,\n                        id,\n                        r2_upload_key,\n                        r2_upload_id,\n                        file_hash,\n                        compression,\n                        NOT STARTS_WITH(r2_upload_key, 'nar/'),\n                        file_size,\n                        'legacy-unresolved'\n                    FROM upload_sessions\n                    WHERE cache_id = $1\n                        AND file_hash IS NOT NULL\n                        AND r2_upload_key IS NOT NULL\n                        AND NOT STARTS_WITH(r2_upload_key, 'staging/')\n                        AND r2_upload_id IS NOT NULL\n                        AND status <> 'completed'\n                    ON CONFLICT DO NOTHING\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e83704207a2af4eea2e3eedadcf674606ab6078cb1a65f71087cfe31867bb98d"
+}

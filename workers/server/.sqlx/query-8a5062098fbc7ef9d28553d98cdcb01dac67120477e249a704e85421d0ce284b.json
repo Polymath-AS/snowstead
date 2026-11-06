@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE go_entries\n                    SET last_accessed_at = NOW()\n                    WHERE id = $1\n                        AND (last_accessed_at IS NULL OR last_accessed_at < NOW() - INTERVAL '5 minutes')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a5062098fbc7ef9d28553d98cdcb01dac67120477e249a704e85421d0ce284b"
+}

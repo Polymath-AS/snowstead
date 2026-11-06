@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE bandwidth_daily\n        SET public_bytes = 0, imported_at = now()\n        WHERE day = $1\n          AND cache_id <> 0\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Date"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5c717fd93b8dfe086e17e998fb1d9a58ea86b5d1d92193659edd5c9897f9ecc6"
+}

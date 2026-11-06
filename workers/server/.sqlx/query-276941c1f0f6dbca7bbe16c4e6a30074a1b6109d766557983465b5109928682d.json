@@ -1,0 +1,138 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT *\n        FROM eviction_logs\n        WHERE org_id = $1\n            AND evicted_at > NOW() - INTERVAL '30 days'\n            AND ($2::bigint IS NULL OR id < $2)\n        ORDER BY id DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "cache_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cache",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "cache"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "product",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "product"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "last_accessed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "last_accessed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "evicted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "evicted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "eviction_logs",
+            "name": "reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "276941c1f0f6dbca7bbe16c4e6a30074a1b6109d766557983465b5109928682d"
+}

@@ -35,6 +35,7 @@ import {
 	findOrg,
 	putOrg,
 	orgUsage,
+	orgCacheStats,
 	findUploadSessions,
 	bandwidthThisMonth,
 	bandwidthUpdatedAt,
@@ -48,6 +49,7 @@ import { RESERVED_CACHE_NAMES, bucketForKey, placeNar, setPublicCacheInfo } from
 import * as v from "valibot";
 import { CacheName, OrgId, StorePathHash, parseBody, parsed } from "@snowstead/cache-core/schemas";
 import { jsonResponse, errorResponse } from "@snowstead/cache-core/responses";
+import { uuidv7 } from "@snowstead/cache-core/uuid";
 
 /** A cache name pattern: cache name characters, and * for any run of them. */
 const CACHE_PATTERN_RE = /^[a-z0-9*-]{1,64}$/;
@@ -124,7 +126,7 @@ export async function handleCreateToken(
 	}
 
 	const now = Date.now() / 1000;
-	const jti = crypto.randomUUID();
+	const jti = uuidv7();
 	const exp = expiresInDays === null ? null : now + expiresInDays * 86400;
 
 	const claims: TokenClaims = {
@@ -408,8 +410,9 @@ export async function handleGetCache(
 	});
 }
 
-async function orgResponse(config: WorkerConfig, id: string, status = 200): Promise<Response> {
-	const org = await findOrg(config.db, id);
+async function orgResponse(config: WorkerConfig, id: string, status = 200, includeCaches = false): Promise<Response> {
+	const overview = includeCaches ? await orgCacheStats(config.db, id, new Date(Date.now() - WEEK_MS)) : undefined;
+	const org = includeCaches ? overview?.org : await findOrg(config.db, id);
 	if (!org) {
 		return errorResponse(`no org ${id}`, 404);
 	}
@@ -437,14 +440,17 @@ async function orgResponse(config: WorkerConfig, id: string, status = 200): Prom
 		...totalBandwidth(served),
 		// Bandwidth is imported from Cloudflare's analytics every 6 hours.
 		bandwidthUpdatedAt: updatedAt,
+		...(overview === undefined ? {} : {
+			caches: overview.caches.map(stats => cacheSummary(stats, totalBandwidth(served.filter(row => row.cacheId === stats.cache.id)))),
+		}),
 	}, status);
 }
 
 /** An org's storage limit and what its caches hold. */
-export async function handleGetOrg(config: WorkerConfig, rawId: string): Promise<Response> {
+export async function handleGetOrg(config: WorkerConfig, rawId: string, includeCaches = false): Promise<Response> {
 	const id = parsed(OrgId, rawId);
 	if (id instanceof Response) return id;
-	return orgResponse(config, id);
+	return orgResponse(config, id, 200, includeCaches);
 }
 
 const OrgTerms = v.strictObject({

@@ -4,6 +4,7 @@
     .fingerprint = 0xcb3a212dbdaff4ec,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .snitch = .{ .path = "../snitch" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

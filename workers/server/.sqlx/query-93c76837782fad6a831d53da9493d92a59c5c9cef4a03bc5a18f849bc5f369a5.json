@@ -1,0 +1,133 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH expired AS (\n                UPDATE go_entries\n                SET cache_id = NULL\n                WHERE cache_id = $1\n                    AND generation = $2\n                    AND action = $3\n                    AND expires_at <= NOW()\n            )\n            SELECT\n                e.id,\n                e.cache_id,\n                e.generation,\n                e.r2_key,\n                e.size,\n                e.output,\n                e.stored_at,\n                e.uploaded_at,\n                e.expires_at,\n                (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '5 minutes') AS \"access_due!\"\n            FROM go_entries e\n            WHERE e.cache_id = $1\n                AND e.generation = $2\n                AND e.action = $3\n                AND e.expires_at > NOW()\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "cache_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "generation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "generation"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "r2_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "r2_key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "output",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "output"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "stored_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "stored_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "uploaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "uploaded_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "access_due!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "93c76837782fad6a831d53da9493d92a59c5c9cef4a03bc5a18f849bc5f369a5"
+}

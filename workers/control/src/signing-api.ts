@@ -7,6 +7,7 @@ import { importCacheKey, newCacheKey } from "@snowstead/cache-core/cache-keys";
 import { signingPublicKey } from "@snowstead/cache-core/signing";
 import { errorResponse, jsonResponse } from "@snowstead/cache-core/responses";
 import { parseBody } from "@snowstead/cache-core/schemas";
+import { uuidv7 } from "@snowstead/cache-core/uuid";
 
 const SigningRequest = v.object({
 	secretKey: v.optional(v.string("invalid Nix secret key")),
@@ -69,7 +70,7 @@ export async function handleSigningApi(request: Request, config: WorkerConfig, o
 			return errorResponse("confirm trustedPublicKeys includes all existing and staged public keys before activation", 409);
 		}
 		if (oldPublic && !rows.some(k => k.signingPublicKey === oldPublic)) {
-			await tx.insert(cacheSigningKeys).values({ id: crypto.randomUUID(), cacheId: cache.id, signingKeyName: oldPublic.split(":")[0], signingPublicKey: oldPublic, state: "retired" });
+			await tx.insert(cacheSigningKeys).values({ id: uuidv7(), cacheId: cache.id, signingKeyName: oldPublic.split(":")[0], signingPublicKey: oldPublic, state: "retired" });
 		}
 		await tx.update(cacheSigningKeys).set({ state: "retired", signingKeySealed: null }).where(and(scope, eq(cacheSigningKeys.state, "active")));
 		await tx.update(cacheSigningKeys).set({ state: "active" }).where(eq(cacheSigningKeys.id, target.id));

@@ -1,0 +1,66 @@
+[package]
+name = "snowstead-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "../../LICENSE"
+
+[features]
+default = []
+# Compile-time only: normal builds do not link hotpath or activate snitch.
+profiling = ["dep:hotpath"]
+# Production telemetry is opt-in and independent of the native profiler.
+observability = [
+    "dep:log",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-appender-tracing",
+    "dep:posthog-rs",
+    "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+axum = { workspace = true, features = ["http1", "http2", "tokio", "json", "matched-path"] }
+base64.workspace = true
+chrono = { workspace = true, features = ["now"] }
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+hotpath = { workspace = true, optional = true, features = ["hotpath"] }
+httpdate.workspace = true
+log = { version = "0.4", optional = true }
+object_store = { workspace = true, features = ["aws"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics", "logs"], optional = true }
+opentelemetry-appender-tracing = { version = "0.33.1", optional = true }
+posthog-rs = { version = "0.31.0", default-features = false, features = ["error-tracking"], optional = true }
+reqwest = { workspace = true, features = ["rustls", "json", "query"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "macros", "migrate"] }
+subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tracing-opentelemetry = { version = "0.34.0", default-features = false, optional = true }
+uuid = { workspace = true, features = ["v7"] }
+zeroize.workspace = true
+
+[build-dependencies]
+pkg-config.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+hegeltest.workspace = true
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
+prost = "0.14"
+tower = { workspace = true, features = ["util"] }
+zstd = { workspace = true, features = ["pkg-config"] }

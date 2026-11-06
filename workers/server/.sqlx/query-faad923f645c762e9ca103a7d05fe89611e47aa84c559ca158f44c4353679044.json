@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE caches\n        SET signing_key_name = $1,\n            signing_public_key = $2,\n            signing_key_sealed = $3\n        WHERE id = $4\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "faad923f645c762e9ca103a7d05fe89611e47aa84c559ca158f44c4353679044"
+}

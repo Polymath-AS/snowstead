@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT reason\n        FROM gc_marks\n        WHERE target_type = 'server-gc-cursor'\n            AND target_id = 'upload sessions'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "gc_marks",
+            "name": "reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0ef1bf9a93c9af1e4973a3726a05f824a97e17597a38ea16db36b3ffe477621f"
+}

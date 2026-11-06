@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(u.file_size), 0)::bigint AS \"staged!\"\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        WHERE c.org_id = $1\n            AND u.expires_at > NOW()\n            AND u.status IN ('streaming', 'finalizing')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "staged!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "add3399ceaa4c54d14b0615080e3382f0e7186e1af500b28a6e54e5df4b46fc4"
+}

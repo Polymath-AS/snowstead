@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT GREATEST(0, COALESCE((\n            SELECT SUM(n)\n            FROM (\n                SELECT c.size AS n\n                FROM caches c\n                WHERE c.org_id = $1\n                UNION ALL\n                SELECT e.size\n                FROM go_entries e\n                JOIN caches c ON c.id = e.cache_id\n                WHERE c.org_id = $1\n                    AND e.generation = c.go_generation\n                    AND e.uploaded_at IS NOT NULL\n                    AND e.expires_at > NOW()\n                UNION ALL\n                SELECT e.size\n                FROM sccache_entries e\n                JOIN caches c ON c.id = e.cache_id\n                WHERE c.org_id = $1\n                    AND e.generation = c.sccache_generation\n                    AND e.uploaded_at IS NOT NULL\n                    AND e.expires_at > NOW()\n            ) usage\n        ), 0) - storage_limit)::bigint AS \"bytes!\"\n        FROM orgs\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "614e8fdc0a0644b4c810e51f7f2fd13cdef133aa3a13376aae58d7da08b81b77"
+}

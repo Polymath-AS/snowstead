@@ -159,7 +159,12 @@ pub async fn path_infos(paths: &[String]) -> Result<HashMap<String, PathInfo>> {
                     nar_hash: entry.nar_hash.clone(),
                     nar_size: entry.nar_size,
                     references,
-                    deriver: entry.deriver.clone(),
+                    deriver: entry.deriver.as_deref().map(|deriver| {
+                        deriver
+                            .strip_prefix("/nix/store/")
+                            .unwrap_or(deriver)
+                            .to_owned()
+                    }),
                 },
             );
         }

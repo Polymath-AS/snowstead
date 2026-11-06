@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT\n                        u.r2_upload_key AS \"r2_upload_key!\",\n                        u.r2_upload_id AS \"r2_upload_id!\",\n                        EXISTS (\n                            SELECT 1\n                            FROM nar_installations i\n                            WHERE i.source_key = u.r2_upload_key\n                                OR STARTS_WITH(i.source_key, 'staging/' || u.id || '/')\n                        ) AS \"pinned!\"\n                    FROM upload_sessions u\n                    WHERE u.cache_id = $1\n                        AND STARTS_WITH(u.r2_upload_key, 'staging/')\n                        AND u.r2_upload_id IS NOT NULL\n                        AND u.r2_upload_id <> u.id\n                        AND u.status <> 'completed'\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "r2_upload_key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "r2_upload_key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "r2_upload_id!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "r2_upload_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "pinned!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "691e83f28052ce3b539f53408a6a65eee9b75b23e83b2ba3f6b67196804c21f6"
+}

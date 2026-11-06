@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO bandwidth_daily (org_id, cache_id, product, day, bytes)\n            VALUES ($1, $2, 'nix', (NOW() AT TIME ZONE 'UTC')::date, $3)\n            ON CONFLICT (org_id, cache_id, product, day)\n            DO UPDATE SET bytes = bandwidth_daily.bytes + EXCLUDED.bytes\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "41c3720ea343317bc4d6e1b584dfca4f68b858dd37d850e172d2ebae3f01d10b"
+}

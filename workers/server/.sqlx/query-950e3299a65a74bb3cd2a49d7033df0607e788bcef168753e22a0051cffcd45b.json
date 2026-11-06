@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE upload_sessions\n        SET status = 'expired'\n        WHERE id = $1\n            AND status <> 'completed'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "950e3299a65a74bb3cd2a49d7033df0607e788bcef168753e22a0051cffcd45b"
+}

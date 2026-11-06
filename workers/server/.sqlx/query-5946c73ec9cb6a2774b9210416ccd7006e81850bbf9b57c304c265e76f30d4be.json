@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            p.id,\n            p.store_path,\n            p.store_path_hash,\n            b.file_size,\n            p.nar_size,\n            p.created_at,\n            p.last_pushed_at\n        FROM published_paths p\n        JOIN blob_objects b ON b.id = p.blob_object_id\n        WHERE p.cache_id = $1\n            AND REGEXP_REPLACE(p.store_path, '^.*/', '') ILIKE $2\n            AND ($3::bigint IS NULL OR p.id < $3)\n        ORDER BY p.id DESC\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "store_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "file_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_size"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "nar_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "nar_size"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "last_pushed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "last_pushed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5946c73ec9cb6a2774b9210416ccd7006e81850bbf9b57c304c265e76f30d4be"
+}

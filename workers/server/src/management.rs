@@ -1,0 +1,1790 @@
+//! The existing hosted management API, backed by the same PostgreSQL policy
+//! rows as protocol admission. No management operation trusts proxy headers.
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Extension, Router,
+    body::{Body, to_bytes},
+    extract::{MatchedPath, Path, Request, State},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sqlx::PgPool;
+
+use crate::{
+    AppState,
+    auth::{self, Identity},
+    error::{ApiError, json_response},
+    signing_management,
+};
+
+#[derive(Default)]
+pub(crate) struct ApiLimits(Mutex<HashMap<String, (Instant, u32)>>);
+
+#[cfg_attr(feature = "profiling", hotpath::measure_all)]
+impl ApiLimits {
+    fn check(&self, actor: String) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let mut calls = crate::profile_block!("management.limiter_mutex_wait", self.0.lock())
+            .expect("API limiter poisoned");
+        if calls.len() >= 16384 {
+            calls.retain(|_, (until, _)| *until > now);
+            if !calls.contains_key(&actor) && calls.len() >= 16384 {
+                return Err(limited());
+            }
+        }
+        let entry = calls
+            .entry(actor)
+            .or_insert((now + Duration::from_secs(60), 0));
+        if entry.0 <= now {
+            *entry = (now + Duration::from_secs(60), 0);
+        }
+        if entry.1 >= 600 {
+            return Err(limited());
+        }
+        entry.1 += 1;
+        Ok(())
+    }
+}
+
+fn limited() -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many requests: slow down, and retry in 60 seconds",
+    )
+    .header(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("60"),
+    )
+}
+
+fn bad(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "Not Found")
+}
+fn ok(body: Value) -> Response {
+    json_response(StatusCode::OK, body)
+}
+fn internal() -> ApiError {
+    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+}
+
+fn integer(value: &Value) -> Option<i64> {
+    value
+        .as_f64()
+        .filter(|n| n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0)
+        .map(|n| n as i64)
+}
+
+fn valid_org(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+
+fn valid_name(name: &str, max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= max
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn cache_name(name: &str) -> Result<(), ApiError> {
+    if !valid_name(name, 64) {
+        return Err(bad(
+            "CacheName must be 1-64 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen",
+        ));
+    }
+    Ok(())
+}
+
+fn path(slug: &str, name: &str) -> String {
+    if slug == "default" {
+        name.into()
+    } else {
+        format!("{slug}/{name}")
+    }
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn set_cache_info(state: &AppState, path: &str, public_nix: bool) -> Result<(), ApiError> {
+    let key = format!("{path}/nix-cache-info");
+    if public_nix {
+        state
+            .storage
+            .put(false, &key, crate::reads::INFO.as_bytes())
+            .await
+    } else {
+        state.storage.delete(false, &key).await
+    }
+    .map_err(|_| internal())?;
+    crate::cdn::schedule_files(state, &[key]).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Org {
+    id: String,
+    slug: String,
+    moving_from: Option<String>,
+    storage_limit: Option<i64>,
+    private_caches: bool,
+    custom_signing_keys: bool,
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+#[cfg_attr(
+    feature = "observability",
+    tracing::instrument(
+        target = "snowstead_observability",
+        skip_all,
+        name = "management.org_sql"
+    )
+)]
+async fn org(pool: &PgPool, id: &str) -> Result<Option<Org>, ApiError> {
+    Ok(sqlx::query_as!(
+        Org,
+        r#"
+        SELECT
+            id,
+            slug,
+            moving_from,
+            storage_limit,
+            private_caches,
+            custom_signing_keys
+        FROM orgs
+        WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn body(request: Request) -> Result<Value, ApiError> {
+    let bytes = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| bad("Invalid JSON in request body"))?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| bad("Invalid JSON in request body"))?;
+    if !value.is_object() {
+        return Err(bad("expected JSON object"));
+    }
+    Ok(value)
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagementContext {
+    pub(crate) identity: Identity,
+    pub(crate) org: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RouteParams {
+    org: Option<String>,
+    cache: Option<String>,
+    jti: Option<String>,
+    key: Option<String>,
+    pin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrgPath {
+    org: String,
+}
+
+#[derive(Deserialize)]
+struct CachePath {
+    cache: String,
+}
+
+pub(crate) fn router(state: AppState) -> Router<AppState> {
+    let orgs = Router::new()
+        .route("/overview", get(org_overview))
+        .route("/move", post(move_slug))
+        .route("/caches", get(list_caches).post(create_cache))
+        .route("/caches/{cache}", get(get_cache))
+        .merge(crate::management_auth::org_router())
+        .merge(crate::management_policy::org_router())
+        .merge(signing_management::org_router());
+    let admin = Router::new()
+        .route("/orgs", get(list_orgs))
+        .route("/overview", get(global_overview))
+        .route("/caches", get(list_caches).post(create_cache))
+        .route("/caches/{cache}", get(get_cache))
+        .route("/auth/sync", post(sync_auth))
+        .route("/narinfo/backfill", post(backfill))
+        .merge(crate::management_auth::admin_router())
+        .merge(crate::management_policy::admin_router());
+    Router::new()
+        .route("/_api/v1/orgs/{org}", get(get_org).put(put_org))
+        .route("/_api/v1/orgs/{org}/", get(get_org).put(put_org))
+        .nest("/_api/v1/orgs/{org}", orgs)
+        .nest("/_api/v1/admin", admin)
+        .route_layer(middleware::from_fn_with_state(state, authorize_and_audit))
+}
+
+async fn authorize_and_audit(
+    State(state): State<AppState>,
+    Path(params): Path<RouteParams>,
+    matched: MatchedPath,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let scope = params.org;
+    let admin = scope.is_none();
+    if scope.as_ref().is_some_and(|id| !valid_org(id)) {
+        return Err(not_found());
+    }
+    let endpoint = matched
+        .as_str()
+        .strip_prefix(if admin {
+            "/_api/v1/admin"
+        } else {
+            "/_api/v1/orgs/{org}"
+        })
+        .ok_or_else(not_found)?;
+    let pin = !admin
+        && matches!(
+            endpoint,
+            "/caches/{cache}/pins" | "/caches/{cache}/pins/{pin}"
+        );
+    let identity = if admin {
+        auth::authenticate_admin(request.headers(), &state).await?
+    } else {
+        let scope = scope.as_deref().unwrap();
+        match auth::authenticate_org(request.headers(), &state, scope).await {
+            Ok(identity) => identity,
+            Err(_) if pin && request.method() != Method::GET => {
+                let identity = auth::authenticate_write(request.headers(), &state).await?;
+                let Identity::Jwt(claims) = &identity else {
+                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
+                };
+                if !claims.belongs_to(scope) || !claims.has_permission("push") {
+                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
+                }
+                let cache = sqlx::query_scalar!(
+                    r#"
+                    SELECT c.id
+                    FROM caches c
+                    WHERE c.org_id = $1
+                        AND c.name = $2
+                        AND EXISTS (
+                            SELECT 1
+                            FROM cache_protocols p
+                            WHERE p.cache_id = c.id
+                                AND p.protocol = 'nix'
+                        )
+                    "#,
+                    scope,
+                    params.cache.as_deref()
+                )
+                .fetch_optional(&state.pool)
+                .await?;
+                let cache = cache.ok_or_else(not_found)?;
+                if !claims.has_cache_access(cache, params.cache.as_deref().unwrap()) {
+                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
+                }
+                identity
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if !admin && !matches!(identity, Identity::Admin { on_behalf_of: None }) {
+        state.management_limits.check(identity.actor())?;
+    }
+    let root_put = request.method() == Method::PUT && matches!(endpoint, "" | "/");
+    if let Some(scope) = &scope
+        && !root_put
+        && org(&state.pool, scope).await?.is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no org {scope}"),
+        ));
+    }
+    let method = request.method().clone();
+    let action = audit_action(&method, endpoint, admin);
+    let ip = crate::app::client_ip(&state, &request);
+    let old = if action == Some("org.put") {
+        org(&state.pool, scope.as_deref().unwrap()).await?
+    } else {
+        None
+    };
+    // Only audited mutations need a copy, and only whitelisted fields below
+    // enter the log. In particular token and key secrets are never recorded.
+    let (mut request, input) = if action.is_some() && method != Method::GET {
+        let (parts, stream) = request.into_parts();
+        let bytes = to_bytes(stream, 1024 * 1024)
+            .await
+            .map_err(|_| bad("Invalid JSON in request body"))?;
+        let input = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        (Request::from_parts(parts, Body::from(bytes)), input)
+    } else {
+        (request, Value::Null)
+    };
+    #[cfg(feature = "observability")]
+    crate::observability::identity(&identity, scope.as_deref());
+    request.extensions_mut().insert(ManagementContext {
+        identity: identity.clone(),
+        org: scope.clone(),
+    });
+    let response = next.run(request).await;
+    if let Some(action) = action {
+        let (parts, bytes) = response.into_parts();
+        let bytes = to_bytes(bytes, 8 * 1024 * 1024)
+            .await
+            .map_err(|_| internal())?;
+        let output: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let mut detail = json!({});
+        for field in match action {
+            "token.create" => &["jti", "subject"][..],
+            "key.create" => &["id", "name"],
+            "cache.create" => &["private", "protocols", "retentionDays"],
+            "cache.delete" => &["paths"],
+            "paths.delete" => &["deleted"],
+            "signing-key.stage" | "signing-key.activate" => &["id", "publicKey"],
+            _ => &[],
+        } {
+            if let Some(v) = output.get(field) {
+                detail[*field] = v.clone();
+            }
+        }
+        if action == "key.create" || action.starts_with("signing-key.") {
+            let id = detail.as_object_mut().unwrap().remove("id");
+            if let Some(id) = id {
+                detail["key"] = id;
+            }
+        }
+        if action == "org.put" {
+            let new = if parts.status.is_success() {
+                org(&state.pool, scope.as_deref().unwrap()).await?
+            } else {
+                None
+            };
+            let terms = |o: Option<Org>| {
+                o.map(|o| json!({"slug":o.slug,"storageLimit":o.storage_limit,"privateCaches":o.private_caches,"customSigningKeys":o.custom_signing_keys}))
+            };
+            detail = json!({"old":terms(old),"new":terms(new)});
+        }
+        if action == "token.revoke" {
+            detail["jti"] = json!(params.jti);
+        }
+        if action == "key.revoke" {
+            detail["key"] = json!(params.key);
+        }
+        if action == "pin.delete" {
+            detail["name"] = json!(params.pin);
+        }
+        if action == "pin.create" && parts.status.is_success() {
+            for field in ["name", "storePath", "keep"] {
+                if let Some(value) = input.get(field) {
+                    detail[field] = value.clone();
+                }
+            }
+        }
+        let cache = if endpoint.starts_with("/caches") {
+            params.cache.or_else(|| {
+                output
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        } else {
+            None
+        };
+        let actual_action = if action == "pin.create" && parts.status == StatusCode::OK {
+            "pin.update"
+        } else {
+            action
+        };
+        if sqlx::query!(
+            r#"
+            INSERT INTO audit_logs (
+                actor,
+                action,
+                cache_name,
+                status,
+                detail,
+                org_id,
+                ip
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            identity.actor(),
+            actual_action,
+            cache,
+            i32::from(parts.status.as_u16()),
+            detail.to_string(),
+            scope.as_deref(),
+            ip
+        )
+        .execute(&state.pool)
+        .await
+        .is_err()
+        {
+            tracing::warn!("Recording management audit failed");
+        }
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    }
+    Ok(response)
+}
+
+fn audit_action(method: &Method, endpoint: &str, admin: bool) -> Option<&'static str> {
+    match (method.as_str(), endpoint) {
+        ("PUT", "" | "/") if !admin => Some("org.put"),
+        ("POST", "/tokens") => Some("token.create"),
+        ("GET", "/tokens") if admin => Some("token.list"),
+        ("POST", "/tokens/{jti}/revoke") => Some("token.revoke"),
+        ("POST", "/keys") => Some("key.create"),
+        ("POST", "/keys/{key}/revoke") => Some("key.revoke"),
+        ("POST", "/caches") => Some("cache.create"),
+        ("POST", "/caches/{cache}/signing-keys") => Some("signing-key.stage"),
+        ("POST", "/caches/{cache}/signing-keys/{key}/activate") => Some("signing-key.activate"),
+        ("POST", "/caches/{cache}/paths/delete") => Some("paths.delete"),
+        ("POST", "/caches/{cache}/delete") => Some("cache.delete"),
+        ("POST", "/caches/{cache}/purge") => Some("cache.purge"),
+        ("POST", "/caches/{cache}/evict") => Some("cache.evict"),
+        ("POST", "/caches/{cache}/go/reset") => Some("go.reset"),
+        ("POST", "/caches/{cache}/sccache/reset") => Some("sccache.reset"),
+        ("POST", "/caches/{cache}/pins") => Some("pin.create"),
+        ("DELETE", "/caches/{cache}/pins/{pin}") => Some("pin.delete"),
+        ("POST", "/auth/sync") => Some("auth.sync"),
+        ("POST", "/narinfo/backfill") => Some("narinfo.backfill"),
+        _ => None,
+    }
+}
+
+async fn get_org(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+) -> Result<Response, ApiError> {
+    org_response(&state, context.org.as_deref().unwrap(), false).await
+}
+
+async fn org_overview(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+) -> Result<Response, ApiError> {
+    org_response(&state, context.org.as_deref().unwrap(), true).await
+}
+
+async fn list_caches(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let url = query_url(&request)?;
+    let filter = context.org.or_else(|| {
+        url.query_pairs()
+            .find(|(k, _)| k == "org")
+            .map(|(_, v)| v.into_owned())
+    });
+    if filter.as_ref().is_some_and(|s| !valid_org(s)) {
+        return Err(bad("org must be an org id"));
+    }
+    Ok(ok(
+        json!({"caches":cache_summaries(&state, filter.as_deref(), None).await?}),
+    ))
+}
+
+fn query_url(request: &Request) -> Result<reqwest::Url, ApiError> {
+    reqwest::Url::parse(&format!("http://snowstead{}", request.uri()))
+        .map_err(|_| bad("Invalid URL"))
+}
+
+async fn list_orgs(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
+    // hotpath's attribute captures a shared request reference in a nested
+    // future; Body is Send but not Sync. Keep its async timing guard directly.
+    #[cfg(feature = "profiling")]
+    let _profile = hotpath::functions::build_measurement_guard_block("management.list_orgs", false);
+    let url = query_url(&request)?;
+    let filter = if request.uri().query().is_some() {
+        let raw = request.uri().query().unwrap();
+        if raw.len() + 1 > 8192 {
+            return Err(ApiError::new(
+                StatusCode::URI_TOO_LONG,
+                "Organization filter is too long",
+            ));
+        }
+        let pairs: Vec<_> = url.query_pairs().collect();
+        if pairs.is_empty()
+            || pairs.len() > 50
+            || raw.split('&').any(str::is_empty)
+            || pairs.iter().any(|(k, v)| k != "id" || !valid_org(v))
+        {
+            return Err(bad(
+                "Use 1 to 50 id parameters, each containing 1 to 128 letters, numbers, underscores, or dashes",
+            ));
+        }
+        Some(
+            pairs
+                .into_iter()
+                .map(|(_, v)| v.into_owned())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    let rows = sqlx::query_as!(
+        Org,
+        r#"
+        SELECT
+            id,
+            slug,
+            moving_from,
+            storage_limit,
+            private_caches,
+            custom_signing_keys
+        FROM orgs
+        WHERE ($1::text[] IS NULL OR id = ANY($1))
+        ORDER BY id
+        "#,
+        filter.as_deref()
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(ok(json!({"orgs":rows})))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn global_overview(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let text = crate::profile_future!(
+        sqlx::query_scalar!(
+            r#"
+        SELECT JSON_BUILD_OBJECT(
+            'orgs', (
+                SELECT COUNT(*)
+                FROM orgs
+            ),
+            'caches', (
+                SELECT COUNT(*)
+                FROM caches
+            ),
+            'paths', (
+                SELECT COALESCE(SUM(path_count), 0)
+                FROM caches
+            ),
+            'storedBytes', (
+                SELECT COALESCE(SUM(size), 0)
+                FROM caches
+            ),
+            'physicalStoredBytes', (
+                SELECT COALESCE(SUM(file_size), 0)
+                FROM blob_objects
+            ),
+            'pendingBytes', (
+                SELECT COALESCE(SUM(file_size), 0)
+                FROM upload_sessions
+                WHERE status = 'finalizing'
+                    OR (status IN ('pending', 'uploading', 'streaming') AND expires_at > NOW())
+            ),
+            'uploadsPending', (
+                SELECT COUNT(*)
+                FROM upload_sessions
+                WHERE status = 'finalizing'
+                    OR (status IN ('pending', 'uploading', 'streaming') AND expires_at > NOW())
+            ),
+            'servedThisMonth', (
+                SELECT COALESCE(SUM(bytes), 0)
+                FROM bandwidth_daily
+                WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date
+            ),
+            'publicServedThisMonth', (
+                SELECT COALESCE(SUM(public_bytes), 0)
+                FROM bandwidth_daily
+                WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date
+            ),
+            'activeTokens', (
+                SELECT COUNT(*)
+                FROM api_tokens
+                WHERE revoked_at IS NULL
+                    AND (expires_at IS NULL OR expires_at > NOW())
+            ),
+            'apiKeys', (
+                SELECT COUNT(*)
+                FROM org_api_keys
+                WHERE revoked_at IS NULL
+            )
+        )::text AS "overview!"
+        "#
+        )
+        .fetch_one(&state.pool),
+        label = "management.global_overview_sql"
+    )
+    .await?;
+    Ok(ok(serde_json::from_str(&text).map_err(|_| internal())?))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn bandwidth(
+    pool: &PgPool,
+    scope: Option<&str>,
+    cache: Option<i32>,
+) -> Result<Value, ApiError> {
+    let rows = crate::profile_future!(
+        sqlx::query!(
+            r#"
+        SELECT
+            product,
+            COALESCE(SUM(bytes), 0)::bigint AS "bytes!",
+            COALESCE(SUM(public_bytes), 0)::bigint AS "public_bytes!"
+        FROM bandwidth_daily
+        WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date
+            AND ($1::text IS NULL OR org_id = $1)
+            AND ($2::int IS NULL OR cache_id = $2)
+        GROUP BY product
+        "#,
+            scope,
+            cache
+        )
+        .fetch_all(pool),
+        label = "management.bandwidth_sql"
+    )
+    .await?;
+    let mut result = json!({"servedThisMonth":0,"publicServedThisMonth":0,"servedThisMonthByProduct":{"nix":0,"go":0,"sccache":0}});
+    let mut served = 0;
+    let mut public = 0;
+    for row in rows {
+        served += row.bytes;
+        public += row.public_bytes;
+        result["servedThisMonthByProduct"][row.product] = json!(row.bytes + row.public_bytes);
+    }
+    result["servedThisMonth"] = json!(served);
+    result["publicServedThisMonth"] = json!(public);
+    Ok(result)
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+#[cfg_attr(
+    feature = "observability",
+    tracing::instrument(
+        target = "snowstead_observability",
+        skip_all,
+        name = "management.org_response"
+    )
+)]
+async fn org_response(
+    state: &AppState,
+    id: &str,
+    include_caches: bool,
+) -> Result<Response, ApiError> {
+    let row = org(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no org {id}")))?;
+    let mut result = serde_json::to_value(row).map_err(|_| internal())?;
+    let usage = crate::profile_future!(
+        sqlx::query!(
+            r#"
+        SELECT
+            COALESCE(SUM(used), 0)::bigint AS "used!",
+            COALESCE(SUM(pending), 0)::bigint AS "pending!"
+        FROM (
+            SELECT
+                SUM(size) AS used,
+                0 AS pending
+            FROM caches
+            WHERE org_id = $1
+            UNION ALL
+            SELECT
+                0,
+                SUM(u.file_size)
+            FROM upload_sessions u
+            JOIN caches c ON c.id = u.cache_id
+            WHERE c.org_id = $1
+                AND (u.status = 'finalizing'
+                    OR (u.status IN ('pending', 'uploading', 'streaming') AND u.expires_at > NOW()))
+            UNION ALL
+            SELECT
+                SUM(e.size) FILTER (WHERE e.uploaded_at IS NOT NULL),
+                SUM(e.size) FILTER (WHERE e.uploaded_at IS NULL)
+            FROM go_entries e
+            JOIN caches c ON c.id = e.cache_id
+            WHERE c.org_id = $1
+                AND e.generation = c.go_generation
+                AND e.expires_at > NOW()
+            UNION ALL
+            SELECT
+                SUM(e.size) FILTER (WHERE e.uploaded_at IS NOT NULL),
+                SUM(e.size) FILTER (WHERE e.uploaded_at IS NULL)
+            FROM sccache_entries e
+            JOIN caches c ON c.id = e.cache_id
+            WHERE c.org_id = $1
+                AND e.generation = c.sccache_generation
+                AND e.expires_at > NOW()
+        ) usage
+        "#,
+            id
+        )
+        .fetch_one(&state.pool),
+        label = "management.org_usage_sql"
+    )
+    .await?;
+    result["used"] = json!(usage.used);
+    result["pending"] = json!(usage.pending);
+    result.as_object_mut().unwrap().extend(
+        bandwidth(&state.pool, Some(id), None)
+            .await?
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let updated: Option<DateTime<Utc>> = crate::profile_future!(
+        sqlx::query_scalar!(
+            r#"
+        SELECT MAX(imported_at)
+        FROM bandwidth_daily
+        "#
+        )
+        .fetch_one(&state.pool),
+        label = "management.bandwidth_updated_sql"
+    )
+    .await?;
+    result["bandwidthUpdatedAt"] =
+        json!(updated.map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)));
+    if include_caches {
+        result["caches"] = json!(cache_summaries(state, Some(id), None).await?);
+    }
+    Ok(ok(result))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+#[cfg_attr(
+    feature = "observability",
+    tracing::instrument(
+        target = "snowstead_observability",
+        skip_all,
+        name = "management.cache_summaries"
+    )
+)]
+async fn cache_summaries(
+    state: &AppState,
+    scope: Option<&str>,
+    name: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    // Aggregate bandwidth separately from published paths so neither relation
+    // multiplies the other's counts. Compute it once, even when stale cache
+    // statistics underestimate the selected inventory as a single row.
+    let rows = crate::profile_future!(sqlx::query_scalar!(
+        r#"
+        WITH monthly AS MATERIALIZED (
+            SELECT
+                b.cache_id,
+                SUM(b.bytes)::bigint AS origin,
+                SUM(b.public_bytes)::bigint AS public,
+                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'nix'), 0)::bigint AS nix,
+                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'go'), 0)::bigint AS go,
+                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'sccache'), 0)::bigint AS sccache
+            FROM bandwidth_daily b
+            WHERE b.day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date
+                AND b.cache_id = ANY(ARRAY(
+                    SELECT c.id
+                    FROM caches c
+                    WHERE ($1::text IS NULL OR c.org_id = $1)
+                        AND ($2::text IS NULL OR c.name = $2)
+                ))
+            GROUP BY b.cache_id
+        ), summaries AS (
+            SELECT
+                c.id,
+                c.name,
+                JSONB_BUILD_OBJECT(
+                    'name', c.name,
+                    'path', CASE WHEN o.slug = 'default' THEN c.name ELSE o.slug || '/' || c.name END,
+                    'private', NOT c.is_public,
+                    'org', c.org_id,
+                    'protocols', ARRAY(
+                        SELECT protocol
+                        FROM cache_protocols
+                        WHERE cache_id = c.id
+                        ORDER BY protocol DESC
+                    ),
+                    'retentionDays', c.retention_days,
+                    'createdAt', TO_CHAR(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                    'paths', c.path_count,
+                    'size', c.size,
+                    'addedLastWeek', COUNT(p.id) FILTER (WHERE p.created_at >= NOW() - INTERVAL '7 days'),
+                    'lastAddedAt', TO_CHAR(MAX(p.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                ) AS summary
+            FROM caches c
+            JOIN orgs o ON o.id = c.org_id
+            LEFT JOIN published_paths p ON p.cache_id = c.id
+            WHERE ($1::text IS NULL OR c.org_id = $1)
+                AND ($2::text IS NULL OR c.name = $2)
+            GROUP BY c.id, o.slug
+        )
+        SELECT (s.summary || JSONB_BUILD_OBJECT(
+            'servedThisMonth', COALESCE(m.origin, 0),
+            'publicServedThisMonth', COALESCE(m.public, 0),
+            'servedThisMonthByProduct', JSONB_BUILD_OBJECT(
+                'nix', COALESCE(m.nix, 0),
+                'go', COALESCE(m.go, 0),
+                'sccache', COALESCE(m.sccache, 0)
+            )
+        ))::text AS "summary!"
+        FROM summaries s
+        LEFT JOIN monthly m ON m.cache_id = s.id
+        ORDER BY s.name
+        "#,
+        scope,
+        name
+    ).fetch_all(&state.pool), label = "management.cache_summaries_sql").await?;
+    rows.iter()
+        .map(|text| serde_json::from_str(text).map_err(|_| internal()))
+        .collect()
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn get_cache(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    Path(params): Path<CachePath>,
+) -> Result<Response, ApiError> {
+    let state = &state;
+    let scope = context.org.as_deref().unwrap_or("default");
+    let name = params.cache.as_str();
+    cache_name(name)?;
+    let mut result = cache_summaries(state, Some(scope), Some(name))
+        .await?
+        .pop()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no cache named {name}")))?;
+    let cache = sqlx::query!(
+        r#"
+        SELECT
+            id,
+            signing_public_key
+        FROM caches
+        WHERE org_id = $1
+            AND name = $2
+        "#,
+        scope,
+        name
+    )
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(not_found)?;
+    result["publicKey"] = json!(match cache.signing_public_key {
+        Some(key) => Some(key),
+        None => signing_management::shared_public_key(&state.config)?,
+    });
+    let rows = sqlx::query_scalar!(
+        r#"
+        SELECT JSON_BUILD_OBJECT(
+            'storePath', p.store_path,
+            'size', b.file_size,
+            'addedAt', TO_CHAR(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        )::text AS "path!"
+        FROM published_paths p
+        JOIN blob_objects b ON b.id = p.blob_object_id
+        WHERE p.cache_id = $1
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT 10
+        "#,
+        cache.id
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    result["recentPaths"] = Value::Array(
+        rows.iter()
+            .map(|s| serde_json::from_str(s).map_err(|_| internal()))
+            .collect::<Result<_, _>>()?,
+    );
+    Ok(ok(result))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn put_org(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    Path(params): Path<OrgPath>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    if !matches!(context.identity, Identity::Admin { .. }) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
+    }
+    let state = &state;
+    let id = params.org.as_str();
+    let raw = body(request).await?;
+    if raw.as_object().unwrap().keys().any(|k| {
+        !["slug", "storageLimit", "privateCaches", "customSigningKeys"].contains(&k.as_str())
+    }) {
+        return Err(bad("Invalid organization settings"));
+    }
+    for field in ["privateCaches", "customSigningKeys"] {
+        if raw.get(field).is_some_and(|v| !v.is_boolean()) {
+            return Err(bad(format!("{field} must be a boolean")));
+        }
+    }
+    if raw
+        .get("storageLimit")
+        .is_some_and(|v| !v.is_null() && !integer(v).is_some_and(|n| n >= 0))
+    {
+        return Err(bad(
+            "storageLimit must be a non-negative safe integer or null",
+        ));
+    }
+    let mut tx =
+        crate::profile_future!(state.pool.begin(), label = "management.put_org_pool_begin").await?;
+    // Slug uniqueness spans slug and moving_from, not just either index.
+    // Serialize claims before taking the org lock; protocol writers never
+    // acquire this namespace lock, so they cannot form a lock cycle.
+    if raw.get("slug").is_some() {
+        crate::profile_future!(
+            crate::db::advisory_lock(&mut tx, "org-slugs"),
+            label = "management.slug_namespace_lock_wait"
+        )
+        .await?;
+    }
+    let org_key = format!("org:{id}");
+    crate::profile_future!(
+        crate::db::advisory_lock(&mut tx, &org_key),
+        label = "management.put_org_lock_wait"
+    )
+    .await?;
+    let current = sqlx::query!(
+        r#"
+        SELECT
+            slug,
+            moving_from
+        FROM orgs
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+        id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let mut slug = current.as_ref().map(|o| o.slug.clone());
+    if let Some(wanted) = raw.get("slug")
+        && Some(wanted) != slug.as_ref().map(|s| json!(s)).as_ref()
+    {
+        if id == "default" {
+            return Err(bad("the default org's slug can't change"));
+        }
+        let wanted=wanted.as_str().filter(|s|valid_name(s,39)).ok_or_else(||bad("slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash"))?;
+        if ["default", "nar", "private", "_api", "healthz"].contains(&wanted) {
+            return Err(bad(format!("{wanted} is reserved")));
+        }
+        let holder = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM orgs
+                WHERE id <> $1
+                    AND (slug = $2 OR moving_from = $2)
+            ) AS "exists!"
+            "#,
+            id,
+            wanted
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if holder {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("{wanted} is taken"),
+            ));
+        }
+        if current.as_ref().is_some_and(|o| o.moving_from.is_some()) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the last slug change is still moving the org's caches; finish it with POST /move first",
+            ));
+        }
+        slug = Some(wanted.into());
+    }
+    let slug = slug.ok_or_else(|| bad("slug is needed to create an org"))?;
+    let mut moving = current.as_ref().and_then(|o| o.moving_from.clone());
+    if current.as_ref().is_some_and(|old| old.slug != slug) {
+        let has_caches: bool = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM caches
+                WHERE org_id = $1
+            ) AS "exists!"
+            "#,
+            id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_caches {
+            moving = current.as_ref().map(|o| o.slug.clone());
+        }
+        let names = sqlx::query_scalar!(
+            r#"
+            SELECT c.name
+            FROM caches c
+            WHERE c.org_id = $1
+                AND c.is_public
+                AND EXISTS (
+                    SELECT 1
+                    FROM cache_protocols p
+                    WHERE p.cache_id = c.id
+                        AND p.protocol = 'nix'
+                )
+            "#,
+            id
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for name in names {
+            set_cache_info(state, &path(&slug, &name), true).await?;
+        }
+    }
+    sqlx::query!(
+        r#"
+        INSERT INTO orgs (
+            id,
+            slug,
+            moving_from,
+            storage_limit,
+            private_caches,
+            custom_signing_keys
+        )
+        VALUES ($1, $2, $3, $4, COALESCE($6, TRUE), COALESCE($7, FALSE))
+        ON CONFLICT (id) DO UPDATE
+        SET slug = $2,
+            moving_from = $3,
+            storage_limit = CASE WHEN $5 THEN $4 ELSE orgs.storage_limit END,
+            private_caches = COALESCE($6, orgs.private_caches),
+            custom_signing_keys = COALESCE($7, orgs.custom_signing_keys)
+        "#,
+        id,
+        &slug,
+        moving,
+        raw.get("storageLimit").and_then(integer),
+        raw.get("storageLimit").is_some(),
+        raw.get("privateCaches").and_then(Value::as_bool),
+        raw.get("customSigningKeys").and_then(Value::as_bool)
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    org_response(state, id, false).await
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn create_cache(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let state = &state;
+    let scope = context.org.as_deref();
+    let raw = body(request).await?;
+    let name = raw.get("name").and_then(Value::as_str).unwrap_or("");
+    cache_name(name)?;
+    if ["nar", "private", "nix-cache-info"].contains(&name) {
+        return Err(bad(format!("{name} is reserved")));
+    }
+    let requested_org = match raw.get("org") {
+        None => "default",
+        Some(value) => value
+            .as_str()
+            .filter(|id| valid_org(id))
+            .ok_or_else(|| bad("org must be an org id"))?,
+    };
+    let id = scope.unwrap_or(requested_org);
+    let private = raw
+        .get("private")
+        .map(|v| v.as_bool().ok_or_else(|| bad("private must be a boolean")))
+        .transpose()?;
+    let retention = raw.get("retentionDays");
+    if retention
+        .is_some_and(|v| !v.is_null() && !integer(v).is_some_and(|n| (1..=3650).contains(&n)))
+    {
+        return Err(bad(
+            "retentionDays must be a whole number of days from 1 to 3650, or null",
+        ));
+    }
+    let requested = if let Some(p) = raw.get("protocols") {
+        let p = p
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+        let mut result = Vec::new();
+        for value in p {
+            let protocol = value
+                .as_str()
+                .filter(|s| ["nix", "go", "sccache"].contains(s))
+                .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+            if result.iter().any(|p| p == protocol) {
+                return Err(bad("protocols must not contain duplicates"));
+            }
+            result.push(protocol.to_owned());
+        }
+        Some(result)
+    } else {
+        None
+    };
+    let mut tx = crate::profile_future!(
+        state.pool.begin(),
+        label = "management.create_cache_pool_begin"
+    )
+    .await?;
+    let org_key = format!("org:{id}");
+    crate::profile_future!(
+        crate::db::advisory_lock(&mut tx, &org_key),
+        label = "management.create_cache_org_lock_wait"
+    )
+    .await?;
+    let policy = sqlx::query!(
+        r#"
+        SELECT
+            slug,
+            private_caches
+        FROM orgs
+        WHERE id = $1
+        FOR SHARE
+        "#,
+        id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let policy =
+        policy.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no org {id}")))?;
+    let slug = policy.slug;
+    let allowed = policy.private_caches;
+    let existing = sqlx::query!(
+        r#"
+        SELECT
+            id,
+            is_public,
+            retention_days,
+            created_at
+        FROM caches
+        WHERE org_id = $1
+            AND name = $2
+        FOR UPDATE
+        "#,
+        id,
+        name
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let old_protocols: Vec<String> = if let Some(c) = &existing {
+        sqlx::query_scalar!(
+            r#"
+            SELECT protocol
+            FROM cache_protocols
+            WHERE cache_id = $1
+            ORDER BY protocol DESC
+            "#,
+            c.id
+        )
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    let protocols = requested
+        .or_else(|| existing.as_ref().map(|_| old_protocols.clone()))
+        .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+    if old_protocols.iter().any(|p| !protocols.contains(p)) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Enabled protocols cannot be removed",
+        ));
+    }
+    if existing.is_none()
+        && state.config.require_cache_signing_keys
+        && state.config.signing_master_key.is_empty()
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cache signing requires SIGNING_MASTER_KEY",
+        ));
+    }
+    if private == Some(true) && !allowed && existing.as_ref().is_none_or(|c| c.is_public) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this org does not allow private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made",
+        ));
+    }
+    let changing = existing
+        .as_ref()
+        .is_some_and(|c| private == Some(c.is_public));
+    if changing {
+        let cache = existing.as_ref().unwrap().id;
+        let present = sqlx::query!(
+            r#"
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM published_paths
+                    WHERE cache_id = $1
+                ) AS "paths!",
+                EXISTS (
+                    SELECT 1
+                    FROM go_entries e
+                    JOIN caches c ON c.id = e.cache_id
+                    WHERE c.id = $1
+                        AND e.generation = c.go_generation
+                        AND e.expires_at > NOW()
+                ) AS "go!",
+                EXISTS (
+                    SELECT 1
+                    FROM sccache_entries e
+                    JOIN caches c ON c.id = e.cache_id
+                    WHERE c.id = $1
+                        AND e.generation = c.sccache_generation
+                        AND e.expires_at > NOW()
+                ) AS "sccache!"
+            "#,
+            cache
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if present.paths {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "only a cache without published paths can change visibility",
+            ));
+        }
+        for (kind, present) in [("go", present.go), ("sccache", present.sccache)] {
+            if present {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "only a cache without {} entries or uploads can change visibility; reset {} data first",
+                        if kind == "go" { "Go" } else { kind },
+                        if kind == "go" { "Go" } else { kind }
+                    ),
+                ));
+            }
+        }
+    }
+    let created = existing.is_none();
+    let cache: i32 = if let Some(c) = &existing {
+        c.id
+    } else {
+        sqlx::query_scalar!(
+            r#"
+            INSERT INTO caches (
+                name,
+                org_id,
+                is_public
+            )
+            VALUES ($1, $2, $3)
+            RETURNING id
+            "#,
+            name,
+            id,
+            private != Some(true)
+        )
+        .fetch_one(&mut *tx)
+        .await?
+    };
+    if created && let Some(key) = signing_management::new_cache_key(&state.config, cache).await? {
+        sqlx::query!(
+            r#"
+            UPDATE caches
+            SET signing_key_name = $2,
+                signing_public_key = $3,
+                signing_key_sealed = $4
+            WHERE id = $1
+            "#,
+            cache,
+            &key.signing_key_name,
+            &key.signing_public_key,
+            &key.signing_key_sealed
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"
+            INSERT INTO cache_signing_keys (
+                id,
+                cache_id,
+                signing_key_name,
+                signing_public_key,
+                signing_key_sealed,
+                managed_public_key,
+                state
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'active')
+            "#,
+            key.id,
+            cache,
+            key.signing_key_name,
+            key.signing_public_key,
+            key.signing_key_sealed,
+            key.managed_public_key
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query!(
+        r#"
+        INSERT INTO cache_protocols (
+            cache_id,
+            protocol
+        )
+        SELECT
+            $1,
+            UNNEST($2::text[])
+        ON CONFLICT DO NOTHING
+        "#,
+        cache,
+        &protocols
+    )
+    .execute(&mut *tx)
+    .await?;
+    let updated = sqlx::query!(
+        r#"
+        UPDATE caches
+        SET is_public = COALESCE($2, is_public),
+            retention_days = CASE WHEN $3 THEN $4 ELSE retention_days END
+        WHERE id = $1
+        RETURNING is_public,
+            retention_days,
+            created_at
+        "#,
+        cache,
+        private.map(|p| !p),
+        retention.is_some(),
+        retention.and_then(integer).map(|n| n as i32)
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let (public, days, at) = (
+        updated.is_public,
+        updated.retention_days,
+        updated.created_at,
+    );
+    set_cache_info(
+        state,
+        &path(&slug, name),
+        public && protocols.iter().any(|p| p == "nix"),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(json_response(
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        json!({"name":name,"path":path(&slug,name),"private":!public,"protocols":protocols,"retentionDays":days,"createdAt":at.to_rfc3339_opts(SecondsFormat::Millis,true),"created":created,"changed":changing||(!created&&protocols.iter().any(|p|!old_protocols.contains(p)))}),
+    ))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn sync_auth(State(state): State<AppState>) -> Result<Response, ApiError> {
+    // Authentication reads SQL directly; no KV replica needs synchronization.
+    let counts = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) AS "caches!",
+            COUNT(*) FILTER (WHERE NOT is_public) AS "private!"
+        FROM caches
+        "#
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let revoked = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM api_tokens
+        WHERE revoked_at IS NOT NULL
+            AND (expires_at IS NULL OR expires_at > NOW())
+        "#
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(ok(
+        json!({"caches":counts.caches,"private":counts.private,"revocations":revoked}),
+    ))
+}
+
+struct Published {
+    id: i64,
+    cache_id: i32,
+    org_id: String,
+    name: String,
+    slug: String,
+    is_public: bool,
+    store_path: String,
+    store_path_hash: String,
+    nar_hash: String,
+    nar_size: i64,
+    references_json: String,
+    deriver: Option<String>,
+    system: Option<String>,
+    signatures_json: String,
+    file_hash: String,
+    file_size: i64,
+    compression: String,
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn write_narinfo(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: &Published,
+    target: &str,
+) -> Result<(), ApiError> {
+    let private = !row.is_public;
+    let source = if private {
+        format!("nars/sha256/{}/{}.nar", row.file_hash, row.compression)
+    } else {
+        format!("nar/{}/{}.nar", row.file_hash, row.compression)
+    };
+    state
+        .storage
+        .head(private, &source)
+        .await
+        .map_err(|_| internal())?;
+    if !private {
+        set_cache_info(state, target, true).await?;
+    }
+    let info = crate::signing::Narinfo {
+        store_path: row.store_path.clone(),
+        store_path_hash: row.store_path_hash.clone(),
+        nar_hash: row.nar_hash.clone(),
+        nar_size: row.nar_size,
+        references: serde_json::from_str(&row.references_json).map_err(|_| internal())?,
+        deriver: row.deriver.clone(),
+        system: row.system.clone(),
+        signatures: serde_json::from_str(&row.signatures_json).map_err(|_| internal())?,
+        file_hash: row.file_hash.clone(),
+        file_size: row.file_size,
+        compression: row.compression.clone(),
+    };
+    let rendered = crate::signing::render(
+        &mut **tx,
+        &state.config,
+        row.cache_id,
+        target,
+        private,
+        &info,
+    )
+    .await?;
+    let key = if private {
+        format!("narinfo/{target}/{}.narinfo", row.store_path_hash)
+    } else {
+        format!("{target}/{}.narinfo", row.store_path_hash)
+    };
+    state
+        .storage
+        .put(private, &key, rendered.as_bytes())
+        .await
+        .map_err(|_| internal())?;
+    if !private {
+        crate::cdn::schedule_narinfo(state, target, std::slice::from_ref(&row.store_path_hash))
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn backfill(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
+    let state = &state;
+    let input = body(request).await?;
+    let after = input
+        .get("after")
+        .map(|v| {
+            integer(v)
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| bad("after must be a non-negative integer"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let limit = input
+        .get("limit")
+        .map(|v| {
+            integer(v)
+                .filter(|n| (1..=1000).contains(n))
+                .ok_or_else(|| bad("limit must be between 1 and 1000"))
+        })
+        .transpose()?
+        .unwrap_or(500);
+    let rows = sqlx::query_as!(
+        Published,
+        r#"
+        SELECT
+            p.id,
+            p.cache_id,
+            c.org_id,
+            c.name,
+            o.slug,
+            c.is_public,
+            p.store_path,
+            p.store_path_hash,
+            p.nar_hash,
+            p.nar_size,
+            p.references_json,
+            p.deriver,
+            p.system,
+            p.signatures_json,
+            b.file_hash,
+            b.file_size,
+            b.compression
+        FROM published_paths p
+        JOIN caches c ON c.id = p.cache_id
+        JOIN orgs o ON o.id = c.org_id
+        JOIN blob_objects b ON b.id = p.blob_object_id
+        WHERE p.id > $1
+        ORDER BY p.id
+        LIMIT $2
+        "#,
+        after,
+        limit
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut skipped = Vec::new();
+    for row in &rows {
+        let target = path(&row.slug, &row.name);
+        let written: Result<(), ApiError> = async {
+            let mut tx = crate::profile_future!(
+                state.pool.begin(),
+                label = "management.backfill_pool_begin"
+            )
+            .await?;
+            let org_key = format!("org:{}", row.org_id);
+            crate::profile_future!(
+                crate::db::advisory_lock(&mut tx, &org_key),
+                label = "management.backfill_org_lock_wait"
+            )
+            .await?;
+            // Recheck membership and slug after the fence. A concurrent delete
+            // or move must not let a stale backfill overwrite current metadata.
+            let fresh = sqlx::query_as!(
+                Published,
+                r#"
+                SELECT
+                    p.id,
+                    p.cache_id,
+                    c.org_id,
+                    c.name,
+                    o.slug,
+                    c.is_public,
+                    p.store_path,
+                    p.store_path_hash,
+                    p.nar_hash,
+                    p.nar_size,
+                    p.references_json,
+                    p.deriver,
+                    p.system,
+                    p.signatures_json,
+                    b.file_hash,
+                    b.file_size,
+                    b.compression
+                FROM published_paths p
+                JOIN caches c ON c.id = p.cache_id
+                JOIN orgs o ON o.id = c.org_id
+                JOIN blob_objects b ON b.id = p.blob_object_id
+                WHERE p.id = $1
+                "#,
+                row.id
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(not_found)?;
+            write_narinfo(state, &mut tx, &fresh, &path(&fresh.slug, &fresh.name)).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if written.is_err() {
+            skipped.push(format!("{target}/{}", row.store_path_hash));
+        }
+    }
+    Ok(ok(
+        json!({"written":rows.len()-skipped.len(),"skipped":skipped,"next":if rows.len()==limit as usize{rows.last().map(|r|r.id)}else{None}}),
+    ))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn move_slug(
+    State(state): State<AppState>,
+    Path(params): Path<OrgPath>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let state = &state;
+    let id = params.org.as_str();
+    let input = body(request).await?;
+    let at = input.get("cursor").filter(|v| !v.is_null());
+    let phase = at
+        .map(|v| {
+            v.get("phase")
+                .and_then(Value::as_str)
+                .filter(|s| ["public", "private"].contains(s))
+                .ok_or_else(|| bad("cursor must be a previous answer's next"))
+        })
+        .transpose()?
+        .unwrap_or("public");
+    let cursor = at.and_then(|v| v.get("cursor"));
+    let after = cursor
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| bad("cursor must be a previous answer's next"))
+        })
+        .transpose()?;
+    let mut tx = crate::profile_future!(
+        state.pool.begin(),
+        label = "management.move_slug_pool_begin"
+    )
+    .await?;
+    let org_key = format!("org:{id}");
+    crate::profile_future!(
+        crate::db::advisory_lock(&mut tx, &org_key),
+        label = "management.move_slug_org_lock_wait"
+    )
+    .await?;
+    let moving: Option<String> = sqlx::query_scalar!(
+        r#"
+        SELECT moving_from
+        FROM orgs
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+        id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let Some(from) = moving else {
+        return Ok(ok(json!({"done":true})));
+    };
+    // List objects, not SQL rows: orphan metadata must also leave the old URL.
+    // Keep the org publication fence through copy and withdrawal.
+    let private = phase == "private";
+    let prefix = if private {
+        format!("narinfo/{from}")
+    } else {
+        from.clone()
+    };
+    let keys = state
+        .storage
+        .list(private, &prefix, after, 200)
+        .await
+        .map_err(|_| internal())?;
+    let mut moved = 0;
+    let mut invalidated = Vec::new();
+    for key in &keys {
+        let Some(relative) = key.strip_prefix(&format!("{prefix}/")) else {
+            continue;
+        };
+        let parts: Vec<_> = relative.split('/').collect();
+        // A default-org cache named like the old slug has only one segment.
+        let [name, file] = parts.as_slice() else {
+            continue;
+        };
+        if *file != "nix-cache-info" && !file.ends_with(".narinfo") {
+            continue;
+        }
+        if let Some(hash) = file.strip_suffix(".narinfo") {
+            let target = sqlx::query_scalar!(
+                r#"
+                SELECT o.slug
+                FROM published_paths p
+                JOIN caches c ON c.id = p.cache_id
+                JOIN orgs o ON o.id = c.org_id
+                WHERE c.org_id = $1
+                    AND c.name = $2
+                    AND c.is_public = $3
+                    AND p.store_path_hash = $4
+                "#,
+                id,
+                name,
+                !private,
+                hash
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(slug) = target {
+                let target = if private {
+                    format!("narinfo/{}/{file}", path(&slug, name))
+                } else {
+                    format!("{}/{file}", path(&slug, name))
+                };
+                match state.storage.head(private, &target).await {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match state.storage.copy(private, key, private, &target).await {
+                            Ok(_) => moved += 1,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+                                return Err(ApiError::new(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "Object exceeds upload buffer limit",
+                                ));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                return Err(ApiError::new(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "Upload capacity exhausted",
+                                ));
+                            }
+                            Err(_) => return Err(internal()),
+                        }
+                    }
+                    Err(_) => return Err(internal()),
+                }
+                if !private {
+                    invalidated.push(target);
+                }
+            }
+        }
+        state
+            .storage
+            .delete(private, key)
+            .await
+            .map_err(|_| internal())?;
+        if !private {
+            invalidated.push(key.clone());
+        }
+    }
+    crate::cdn::schedule_files(state, &invalidated).await?;
+    let result = if keys.len() == 200 {
+        json!({"done":false,"next":{"phase":phase,"cursor":keys.last().unwrap()},"moved":moved})
+    } else if phase == "public" {
+        json!({"done":false,"next":{"phase":"private"},"moved":moved})
+    } else {
+        let names = sqlx::query_scalar!(
+            r#"
+            SELECT name
+            FROM caches
+            WHERE org_id = $1
+            "#,
+            id
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for name in names {
+            set_cache_info(state, &path(&from, &name), false).await?;
+        }
+        sqlx::query!(
+            r#"
+            UPDATE orgs
+            SET moving_from = NULL
+            WHERE id = $1
+            "#,
+            id
+        )
+        .execute(&mut *tx)
+        .await?;
+        json!({"done":true})
+    };
+    tx.commit().await?;
+    Ok(ok(result))
+}

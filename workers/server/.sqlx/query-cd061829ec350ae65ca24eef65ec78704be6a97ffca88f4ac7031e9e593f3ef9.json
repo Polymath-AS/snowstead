@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO blob_objects (file_hash, file_size, compression, r2_key)\n                    VALUES ($1, $2, $3, $4)\n                    ON CONFLICT (file_hash, compression) DO NOTHING\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cd061829ec350ae65ca24eef65ec78704be6a97ffca88f4ac7031e9e593f3ef9"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT c.id\n                    FROM caches c\n                    WHERE c.org_id = $1\n                        AND c.name = $2\n                        AND EXISTS (\n                            SELECT 1\n                            FROM cache_protocols p\n                            WHERE p.cache_id = c.id\n                                AND p.protocol = 'nix'\n                        )\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1116816bc72a21e1c95a83d62bbec1bab8ccaabebbcbcb3fbef5378994ad579c"
+}
