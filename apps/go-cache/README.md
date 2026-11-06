@@ -28,10 +28,9 @@ There is no automatic eviction; do not delete its files while builds are running
 Remote requests require HTTPS, except HTTP on localhost or a loopback IP.
 For public reads, explicitly set `SNOWSTEAD_GO_CACHE_READ_ONLY=true` and leave
 `SNOWSTEAD_GO_CACHE_TOKEN` unset. Writes always require a nonempty token. The
-standalone prototype still requires a token on reads; anonymous access is for
-public named caches in the main service. Invalid/missing remote configuration
-disables remote access. Redirects are never followed. Credentials, when present,
-use bearer authentication. Requests stop after five seconds without body-stream
+Rust service supports anonymous reads for public named caches. Invalid or missing
+remote configuration disables remote access. Redirects are never followed.
+Credentials, when present, use bearer authentication. Requests stop after five seconds without body-stream
 progress; response headers also have a five-second deadline. Healthy transfers
 may take longer than five seconds. There is also a 69-second absolute request
 limit: five seconds plus the 64 MiB maximum artifact at 1 MiB/s. This bounds
@@ -81,6 +80,4 @@ inside `nix develop`. This exercises the public protocol against a synthetic
 loopback HTTP origin, verifies bytes and digests, and samples helper peak RSS
 on Linux. Defaults are three repetitions of 32 GETs and PUTs per 1 and 16 MiB
 artifact; `BENCH_REPEATS`, `BENCH_REQUESTS`, and comma-separated `BENCH_MIB`
-override the workload. It is not a Worker or WAN benchmark. For real Terraform
-builds against local workerd/R2, use `scripts/go-cache-terraform.sh` as documented
-in `workers/go-cache/README.md`.
+override the workload. It is not a Rust server or WAN benchmark.
