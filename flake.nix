@@ -46,7 +46,7 @@
           pname = "snowstead";
           version = "0.0.0";
           src = self;
-          hash = "sha256-c2eVjvCOW9LKHfltidqcRxQodg+4bXeU+2WwX1XTnjE=";
+          hash = "sha256-VBIneLuePGMnxVgwWN4FFD6cLzJzt7SzPrjQYAE5hVI=";
           fetcherVersion = 3;
         };
     in
@@ -198,11 +198,8 @@
             pnpmDeps = pnpmDepsFor pkgs;
 
             buildPhase = ''
-              # Domain package: full check (tsc + unit tests)
-              pnpm --filter @snowstead/cache-domain check
-
-              # Services: type-check only (integration tests need workerd/Postgres).
-              pnpm --filter @snowstead/cache-core --filter './workers/*' --filter '!@snowstead/server' exec tsc --noEmit
+              # Runtime integration tests run separately with disposable services.
+              pnpm --filter @snowstead/gateway-worker check
             '';
 
             installPhase = ''

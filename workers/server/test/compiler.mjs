@@ -89,7 +89,7 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
   assert.ok(address, line);
   const url = `http://${address}`;
 
-  // Same Rust+C++ inputs, flags, and lifecycle as worker-split.mjs:232-270.
+  // Exercise unmodified Rust and C++ compiler clients with fresh local caches.
   const dir = join(home, "sccache");
   await mkdir(dir);
   const clientEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("SCCACHE_")));

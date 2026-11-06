@@ -4,14 +4,13 @@
   "name": "snowstead",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
-  "description": "Cloudflare-native Nix binary cache",
+  "description": "Nix and compiler artifact cache",
   "scripts": {
-    "build": "echo 'wrangler bundles at deploy time'",
+    "build": "cargo build --locked --release -p snowstead-server -p snowstead-cli",
     "deploy": "scripts/deploy.sh production",
     "dev": "scripts/dev.sh",
-    "dev:profile": "scripts/dev-profile.sh",
-    "check": "pnpm -r check && scripts/with-postgres.sh node --test packages/cache-core/integration/worker-split.mjs apps/cli/test/upload.test.mjs",
-    "cf-typegen": "pnpm --filter @snowstead/cache-core cf-typegen && pnpm --filter @snowstead/gateway-worker cf-typegen"
+    "check": "pnpm -r check && node --test workers/gateway/test/*.mjs",
+    "cf-typegen": "pnpm --filter @snowstead/gateway-worker cf-typegen"
   },
   "devDependencies": {
     "wrangler": "^4.152.0"
