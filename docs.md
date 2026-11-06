@@ -189,6 +189,60 @@ to rewrite their metadata and queue purges. The five-minute fallback
 applies after those old copies have been replaced; changing the Worker
 alone cannot shorten an already-cached response's TTL.
 
+## Rust API compatibility
+
+The Rust server implements the hosted Nix, Go, sccache, and management APIs.
+The migration target is API compatibility with documented improvements, not
+identical behavior for every Worker input or storage state. Do not claim
+1:1 parity from passing the two implementations' separate test suites.
+
+The following differences are intentional:
+
+- **Integrity and authorization:** Rust verifies compressed NAR content,
+  declared hashes, and sizes before publication. It checks token revocation
+  in SQL on each authentication and requires current publication/membership
+  for NAR reads. It does not reproduce the Worker's corrupt-upload acceptance,
+  revocation propagation gaps, or stale cached authorization.
+- **Upload recovery:** failed compiler transfers do not commit their declared
+  output. Pending attempts share a byte reservation; the first verified
+  transfer adopted under the organization lock commits its actual output and
+  size. A corrected retry may change either before adoption without cancelling
+  another writer. Once adopted, Go outputs are immutable, and different-size
+  sccache retries cannot publish an unfinished adopted object. Replays of
+  published sccache entries still leave the original bytes unchanged.
+- **HTTP behavior:** unsupported methods use Axum's 405 responses and GET
+  routes support HEAD. Unmatched API routes return 404 without authenticating
+  a nonexistent operation. Validation messages are not byte-for-byte copies
+  of Worker errors. Compiler ETags identify the immutable entry, rather than
+  exposing the storage provider's ETag. Clients must treat them as opaque.
+- **Management inputs:** path deletion accepts RFC3339 timestamps with an
+  offset or complete `YYYY-MM-DD` dates at midnight UTC. JavaScript's other
+  date formats, including `YYYY-MM`, are not supported. Audited management
+  request bodies are limited to 1 MiB; oversized bodies currently return 400.
+- **Storage and caching:** Rust compiler reads access storage rather than the
+  Worker's Cache API and return `x-snowstead-cache: MISS`. Expiration is checked
+  after storage access and again before returning a response; transfers are
+  not interrupted if their entry expires after response streaming starts.
+  Direct public narinfo misses use `no-store`, not negative edge caching.
+  Public CDN handoff remains a separate configured path.
+- **Backfill:** missing canonical NARs are repaired from the recorded blob
+  source before narinfo is written. Rust also writes private narinfo and
+  includes it in `written`; private metadata remains in the private bucket
+  and may be preserved during slug moves.
+- **Accounting and maintenance:** origin downloads attempt immediate SQL
+  bandwidth increments independently of optional telemetry; these count
+  selected object bytes, not confirmed client receipt. The public importer
+  updates public bytes separately, rather than replacing origin totals from
+  sampled Worker analytics. Maintenance uses bounded cleanup batches, a token
+  expiry grace period, and retention selection that skips caches with no work.
+- **Admission and tracing:** removal of request/upload-count admission caps
+  and optional tracing are deliberate changes. Protocol validation, retained
+  storage limits, staging safeguards, and bounded buffers still apply.
+
+Cloudflare Cache API/CDN behavior, all storage failure interleavings, and all
+maintenance recovery states have not been exhaustively compared. These
+differences are not a claim that every unlisted behavior has been proven equal.
+
 ## Rust server observability (opt-in)
 
 PostHog export is behind the Rust server's `observability` Cargo feature,

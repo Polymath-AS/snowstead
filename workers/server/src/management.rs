@@ -1433,6 +1433,7 @@ struct Published {
     file_hash: String,
     file_size: i64,
     compression: String,
+    r2_key: String,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1443,16 +1444,30 @@ async fn write_narinfo(
     target: &str,
 ) -> Result<(), ApiError> {
     let private = !row.is_public;
-    let source = if private {
+    let target_key = if private {
         format!("nars/sha256/{}/{}.nar", row.file_hash, row.compression)
     } else {
         format!("nar/{}/{}.nar", row.file_hash, row.compression)
     };
-    state
-        .storage
-        .head(private, &source)
-        .await
-        .map_err(|_| internal())?;
+    match state.storage.head(private, &target_key).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Published content may still live at its recorded upload key or
+            // in the other visibility's bucket. Repair placement before writing
+            // metadata, retaining the source for its existing cleanup owner.
+            state
+                .storage
+                .copy(
+                    !row.r2_key.starts_with("nar/"),
+                    &row.r2_key,
+                    private,
+                    &target_key,
+                )
+                .await
+                .map_err(|_| internal())?;
+        }
+        Err(_) => return Err(internal()),
+    }
     if !private {
         set_cache_info(state, target, true).await?;
     }
@@ -1537,7 +1552,8 @@ async fn backfill(State(state): State<AppState>, request: Request) -> Result<Res
             p.signatures_json,
             b.file_hash,
             b.file_size,
-            b.compression
+            b.compression,
+            b.r2_key
         FROM published_paths p
         JOIN caches c ON c.id = p.cache_id
         JOIN orgs o ON o.id = c.org_id
@@ -1588,7 +1604,8 @@ async fn backfill(State(state): State<AppState>, request: Request) -> Result<Res
                     p.signatures_json,
                     b.file_hash,
                     b.file_size,
-                    b.compression
+                    b.compression,
+                    b.r2_key
                 FROM published_paths p
                 JOIN caches c ON c.id = p.cache_id
                 JOIN orgs o ON o.id = c.org_id

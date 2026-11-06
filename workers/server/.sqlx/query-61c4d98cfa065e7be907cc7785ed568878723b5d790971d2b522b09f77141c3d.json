@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE go_entries\n                    SET\n                        r2_key = $2,\n                        stored_at = $3,\n                        size = $4,\n                        output = $5\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "61c4d98cfa065e7be907cc7785ed568878723b5d790971d2b522b09f77141c3d"
+}
