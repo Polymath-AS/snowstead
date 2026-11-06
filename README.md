@@ -97,6 +97,9 @@ the URI username. Use verified TLS and a read-only role.
 `DATABASE_READ_MAX_CONNECTIONS` defaults to 8 and must be positive. This is a
 separate per-process pool limit; budget for application instances, deployment
 overlap, and other clients. Do not assume replica connections divide evenly.
+The primary pool keeps at least 2 connections warm and the replica pool keeps
+at least 1, capped by each pool's configured maximum. Excess idle connections
+are eligible to close after 60 seconds.
 
 When `DATABASE_READ_URL` is unset, reads share the existing primary pool with
 no additional connections. An invalid or unreachable configured replica fails

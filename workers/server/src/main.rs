@@ -61,7 +61,7 @@ async fn run_server() -> anyhow::Result<()> {
         max_connections > 0,
         "DATABASE_MAX_CONNECTIONS must be positive"
     );
-    let pool = connect_pool(&url, max_connections)
+    let pool = connect_pool(&url, max_connections, 2)
         .await
         .map_err(|_| anyhow::anyhow!("Database connection failed"))?;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -99,7 +99,7 @@ async fn run_server() -> anyhow::Result<()> {
                 max_connections > 0,
                 "DATABASE_READ_MAX_CONNECTIONS must be positive"
             );
-            state.read_pool = connect_pool(&url, max_connections)
+            state.read_pool = connect_pool(&url, max_connections, 1)
                 .await
                 .map_err(|_| anyhow::anyhow!("Read database connection failed"))?;
         }
