@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "cf-typegen": "wrangler types --config ../../wrangler.jsonc --env-interface GatewayEnv --include-runtime false"
+    "cf-typegen": "wrangler types --config ../../wrangler.jsonc --env-interface GatewayEnv --include-runtime false --strict-vars false --env-file /dev/null"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
