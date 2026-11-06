@@ -1,8 +1,8 @@
 # Snowstead
 
-A Cloudflare-native cache for Nix paths and Go, Rust, and C/C++ compiler outputs.
+A cache for Nix paths and Go, Rust, and C/C++ compiler outputs.
 
-The [sccache backend](workers/sccache/README.md) works with unmodified sccache
+The Rust server works with unmodified sccache
 clients over WebDAV. Enable `--protocols sccache` and use scoped
 `sccache:read,sccache:write` tokens for Rust and C/C++ CI builds.
 
@@ -21,35 +21,24 @@ Existing-cache updates may omit it to preserve the selection, or add protocols
 but not remove them (for example, `snowstead cache set main --protocols nix,go`).
 Existing database caches keep Nix and Go enabled; sccache requires explicit opt-in.
 
-Go objects use the private bucket and internal Cache API, expire seven days
+Go objects use the private bucket, expire seven days
 after upload, and count toward organization storage limits. Resetting Go leaves
-Nix paths intact. Apply the included database migrations before deploying the
-updated services. Management and garbage collection belong to control; artifact
-reads and writes belong to the private Go Worker.
-
-The isolated [Go prototype](workers/go-cache/README.md) and its Terraform build
-gate remain disposable local benchmarks, not the hosted named-cache API.
+Nix paths intact. The Rust server owns all protocols, management, and maintenance.
 
 The [control-plane API](docs.md#cache-policy-api) exposes token last-use times,
 cross-product eviction candidates and 30-day history, named Nix closure pins,
-and a whole-cache eviction that keeps settings and credentials. Apply migration
-`0010` after the compiler-cache migration `0009` before deploying these endpoints.
+and a whole-cache eviction that keeps settings and credentials.
 These features are API-only; they do not add dashboard or CLI commands.
 
 ## Workspace
 
 ```
-workers/gateway/      Public URL routing through service bindings
-workers/nix/          Nix reads and upload protocol
-workers/go/           Hosted Go action-cache protocol
-workers/sccache/      Rust/C/C++ artifacts for sccache's WebDAV client
-workers/go-cache/     Isolated prototype for disposable benchmark harnesses
-workers/control/      Organizations, caches, tokens, signing management, and maintenance
-packages/cache-core/  Shared auth, storage policy, database, migrations, and integration tests
-packages/cache-domain/  Shared types and input parsers
+workers/gateway/      Forwarding-only gateway to API_ORIGIN
+workers/server/       Rust API, protocols, maintenance, migrations, and tests
 apps/cli/             CLI for pushing store paths
 apps/go-cache/        Native GOCACHEPROG helper
-scripts/              smoke-test.sh
+infra/                Rust service deployment
+scripts/              Development and verification harnesses
 ```
 
 ## Setup
@@ -65,55 +54,30 @@ pnpm install
 pnpm check # type-check + tests across the workspace
 ```
 
-The worker's tests run against a throwaway Postgres that
-`scripts/with-postgres.sh` starts (or the server `SNOWSTEAD_TEST_DATABASE_URL`
-names). To run all five hosted Workers locally through the gateway on http://localhost:8787:
+Run the Rust server locally on http://127.0.0.1:8787:
 
 ```bash
 pnpm dev
 ```
 
-It starts a Postgres cluster in `.dev/postgres` that keeps its data
-between runs, migrates it, and on the first run writes `.dev.vars` with
-local secrets (`ADMIN_SECRET=local-admin-secret`, a fresh signing key).
-Delete `.dev/` to start over.
-
-After changing `packages/cache-core/src/db/schema.ts`, run
-`pnpm --filter @snowstead/cache-core db:generate` and commit the migration.
-
+It starts disposable Postgres and S3 services, applies the Rust migrations,
+and generates fresh local secrets. It does not read or write `.dev.vars`;
+local state is discarded when the stack stops. Database migrations live in
+`workers/server/migrations`.
 
 ## Deploy
 
-See [docs.md](docs.md) for resource setup, secret provisioning, and the
-existing-installation cutover. The gateway has no storage or secrets;
-Nix, Go, sccache, and control share the existing database, buckets, and authorization state.
-Hosted reads enter through the web gateway, which uses the existing R2/CDN
-origin for public objects. Production cache Worker routes remain API-only.
-
-Control owns the SQLite-backed `UploadCoordinator` Durable Object namespace;
-Nix, Go, and sccache bind to it for shared per-organization upload coordination. Deploy
-control first to create the namespace and apply its Durable Object migration,
-then Nix, Go, and sccache, and the gateway last. Staging uses its own control namespace.
-The coordinator has no public route and does not require a separate Worker.
-
-Each org keeps Nix part grants and sealed receipts in its coordinator's SQLite
-storage. Part reservations do not open Postgres connections. Session creation
-and Go staging admission share a queue with at most 64 active/queued calls and
-a two-second deadline. Overload returns 429 with `Retry-After: 1` without
-opening a reservation connection. Nix finalization imports immutable receipts
-into Postgres before installation; its locks and durable installation records
-still fence garbage collection. Retained-capacity admission serializes Nix and
-Go publication per org. Payloads, signing, and publication stay outside the
-coordinator. Go's separate transfer transaction fences cache reset and garbage
-collection. Reservation traces include protocol and queue wait.
+Deploy the Rust service and its migrations through [infra/deploy.sh](infra/deploy.sh).
+See [docs.md](docs.md#deployment) for gateway configuration and cutover cautions.
+The gateway only forwards to `API_ORIGIN`; it has no storage or backend secrets.
+Hosted public reads retain the existing R2/CDN origin.
 
 ```bash
-# With resources and service secrets provisioned: migrate, deploy control,
-# then Nix and Go, then switch the existing public Worker to the gateway.
-DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
+# Deploy only the production gateway; no database migrations run here.
+pnpm deploy
 ```
 
-The default configuration requires per-cache keys and fails closed without
+The hosted configuration requires per-cache keys and fails closed without
 the master key. Existing caches without their own key need a staged key
 and explicit trust-overlap activation before they can publish. Self-hosters
 who deliberately want the legacy shared key can set
@@ -204,7 +168,7 @@ upload until every path has a session.
 
 Only the streaming upload protocol is supported; the old upload-session,
 blob, complete, publish, and commit routes have been removed. Deploy database
-migrations and new Workers before using the streaming CLI. It does not fall
+migrations and the Rust server before using the streaming CLI. It does not fall
 back to disk spooling on older servers. Config and credential writes still
 use atomic temporary files.
 
@@ -218,7 +182,7 @@ after expiry.
 
 For local CLI development, run `cargo build -p snowstead-cli` and
 `cargo test -p snowstead-cli` inside `nix develop`. `pnpm check` includes the
-Rust checks and a real CLI upload against disposable Workers and Postgres.
+Rust checks and a real CLI upload against the disposable local stack.
 
 For development-only function and thread profiling, use
 `nix run .#hotpath -- push main /nix/store/…`. This runs the same CLI with
@@ -264,7 +228,7 @@ See [docs.md](docs.md) for token management and parallelism options.
 
 ```nix
 # configuration.nix or flake
-nix.settings.substituters = [ "https://your-worker.workers.dev/main" ];
+nix.settings.substituters = [ "https://cache.example.com/main" ];
 ```
 
 ## License

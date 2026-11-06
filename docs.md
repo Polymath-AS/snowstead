@@ -2,129 +2,58 @@
 
 ## Deployment
 
-The root `wrangler.jsonc` is the public **gateway** (`snowstead`). It routes
-management APIs to `snowstead-control`, Nix reads/uploads to `snowstead-nix`,
-`/_api/v1/go/` artifact requests to `snowstead-go`, and `/_api/v1/sccache/`
-compiler artifacts to `snowstead-sccache`
-over HTTP service bindings, forwarding the original URL, headers, and body.
-It has no database, storage, signing, or authorization logic. The service
-configs are under `workers/control`, `workers/nix`, `workers/go`, and `workers/sccache`.
-Only control runs garbage collection and CDN-purge retries. Hosted reads enter
-through snowstead-web's owner/cache gateway, which uses the existing R2/CDN
-origin for public objects. The production cache Worker exposes only `/_api/*`;
-its workers.dev and preview aliases stay disabled. Staging keeps its existing
-read hostname and wildcard route.
+The Rust backend is `workers/server`; SQL migrations live in
+`workers/server/migrations`. It owns Nix, Go, sccache, management, and scheduled
+maintenance. Deploy it and run migrations through [infra/deploy.sh](infra/deploy.sh).
+It connects directly to Postgres and S3-compatible storage, without Worker
+service bindings, KV, Hyperdrive, or Durable Objects.
 
-The Nix and control services retain Smart Placement; the routing-only gateway
-stays at the edge without placement.
+The root `wrangler.jsonc` deploys the forwarding-only gateway (`snowstead`).
+`API_ORIGIN` selects the Rust origin; the gateway has no database, storage,
+signing, authorization, or maintenance logic. `pnpm deploy` deploys only this
+production gateway and does not run database migrations. Backend secrets belong
+to the Rust runtime, not the gateway. Hosted reads retain the existing R2/CDN
+origin for public objects; production gateway routes remain API-only.
 
-The services share the environment's existing R2 buckets, AUTH_KV, Hyperdrive,
-database, and signing-master-key source. Shared code and migrations live in
-`packages/cache-core`. The Worker split itself leaves existing data unchanged;
-Go support additionally requires migrations `0004` and `0005` before rollout.
-Give Go the same `JWT_SECRET` as control so it can verify scoped Go tokens;
-Go permissions are independent of Nix push/pull permissions. Go management and
-cleanup remain in control, not the protocol Worker.
-
-The [sccache backend](workers/sccache/README.md) requires migration `0009` and
-the same `JWT_SECRET` as control. Deploy control first, then the protocol
-Workers, then the gateway. sccache access requires explicit protocol selection
-and `sccache:read` / `sccache:write` permissions.
+Staging must set its own `API_ORIGIN` before deploying the gateway:
 
 ```bash
-wrangler r2 bucket create snowstead-private
-# Uploads land near the pusher and replicate to the bucket; reads stay
-# consistent. Free, and only faster for pushers far from the bucket.
-wrangler r2 bucket local-uploads enable snowstead-private
-# Postgres on PlanetScale, with a role holding pg_read_all_data and
-# pg_write_all_data. Query caching off: uploads must read their own writes.
-wrangler hyperdrive create snowstead --caching-disabled \
-  --connection-string "postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
-# Set the production Hyperdrive id in both service configs.
-# Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
-wrangler secret put JWT_SECRET --config workers/nix/wrangler.jsonc --env production
-wrangler secret put JWT_SECRET --config workers/go/wrangler.jsonc --env production
-wrangler secret put JWT_SECRET --config workers/sccache/wrangler.jsonc --env production
-wrangler secret put JWT_SECRET --config workers/control/wrangler.jsonc --env production
-wrangler secret put ADMIN_SECRET --config workers/control/wrangler.jsonc --env production
-# Generate 32 cryptographically random bytes, base64; keep a private backup
-# separately from Postgres. Paste through the hidden prompt, not shell arguments.
-# The account store container is owned by the infrastructure Terraform stack.
-wrangler secrets-store secret create <STORE_ID> \
-  --name snowstead-production-signing-master-key --scopes workers --remote
-# S3 keys of an R2 token limited to the two buckets (key id: the token id,
-# secret: the SHA-256 of its value). With them uploads go straight to R2
-# through presigned URLs; without them they go through the Worker. Private
-# NARs are always served by the Worker, which checks the reader.
-wrangler secret put R2_ACCESS_KEY_ID --config workers/nix/wrangler.jsonc --env production
-wrangler secret put R2_SECRET_ACCESS_KEY --config workers/nix/wrangler.jsonc --env production
-wrangler secret put R2_ENDPOINT --config workers/nix/wrangler.jsonc --env production # https://<account id>.r2.cloudflarestorage.com
-# migrates the database directly (not through Hyperdrive), then deploys
-DATABASE_URL="postgres://USER:PASSWORD@HOST:5432/postgres?sslmode=require" pnpm deploy
+API_ORIGIN=https://staging-api.example.com scripts/deploy.sh staging
 ```
 
-| Secret | Purpose |
-|--------|---------|
-| `JWT_SECRET` | HMAC-SHA256 key for JWT token signing |
-| `ADMIN_SECRET` | Bearer token for the admin API |
-| `SIGNING_MASTER_KEY_STORE` | Secrets Store binding to the 32-byte base64 AES-GCM key sealing per-cache signing keys |
-| `SIGNING_PRIVATE_KEY` | Legacy shared Ed25519 key; only for explicit self-hosted shared-key mode |
+Use an independently provisioned staging backend, database, buckets, and secrets;
+never point it at production data. The populated benchmark database is not staging.
 
-`SIGNING_KEY_NAME` is a non-secret key-name prefix in both service configs.
-Hosted deployment explicitly selects `--env production`, whose bindings are
-not inherited from the local configuration. Staging must use its own R2, KV,
-database, Hyperdrive and environment-prefixed secret source. Cloudflare permits
-one Secrets Store per account: source names isolate deployment configuration,
-not account-level IAM. Terraform owns the store, never secret values.
+For local development, `pnpm dev` runs Rust on http://127.0.0.1:8787 with
+disposable Postgres and S3 services and fresh local secrets, without `.dev.vars`.
 
+# Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
 ### Existing-installation cutover
 
-Deploy control, Nix, Go, and sccache **before** replacing the existing `snowstead` Worker
-with the gateway. Keep the original JWT secret, signing-master-key source,
-bucket names, KV namespace, and database; generating replacement secrets would
-invalidate tokens or make existing sealed keys unreadable. Give both services
-the same `CDN_PURGE_TOKEN` when CDN purging is enabled. Legacy self-hosted
-installations also move `AUTH_TOKEN` to Nix and shared signing settings to both.
-No secret belongs on the gateway; remove its obsolete secrets after acceptance.
+Back up and restore-test the existing database before migration. Preserve the
+original `JWT_SECRET`, `ADMIN_SECRET`, signing master key, database, buckets,
+object keys, cache URLs, and CDN rules. Supply the existing master-key value as
+Rust's `SIGNING_MASTER_KEY`; a new key makes sealed signing keys unreadable.
+Legacy self-hosters must also preserve `AUTH_TOKEN` and shared signing settings
+until their clients migrate. Keep secret values out of source control and logs.
 
-For first deployment, private per-service JSON secret files can be supplied
-with Wrangler's `--secrets-file` option. Do not commit them. Test the private
-services through a local gateway before switching public traffic. Keep the
-old deployment available for rollback. `pnpm deploy` migrates the existing
-schema, deploys control, then Nix, Go, and sccache, and updates the gateway last. The old
-Worker and control may briefly both run maintenance during this sequence;
-schedule the cutover between cron invocations rather than running concurrent GC.
-The gateway explicitly clears its former schedules. No bucket, database,
-KV namespace, public object key, cache URL, or CDN rule is replaced.
+Validate the Rust backend against existing objects and clients before changing
+traffic. Retain a tested rollback path and legacy state, including KV, until
+all readers and writers have moved. Drain or reconcile outstanding uploads;
+removing old routes does not revoke existing multipart grants. Do not run old
+and new maintenance concurrently or re-enable the legacy bandwidth importer:
+it can overwrite Rust's origin counters. See infra's cutover record before any
+further traffic change. Removing the TypeScript source is not authorization to
+delete deployed resources or data, and does not prove exhaustive API parity.
 
-The master key is loaded lazily through `SIGNING_MASTER_KEY_STORE.get()` only
-when signing or creating keys. Successful reads are reused by the isolate;
-failed reads can be retried and never fall back to a different key. A plain
-`SIGNING_MASTER_KEY` secret is supported for local/self-hosted installations
-only when the store binding is absent. Never replace an existing master key
-without a re-encryption migration; a database backup alone cannot recover
-sealed signing keys.
+Fresh databases use `snowstead-server migrate`. Existing installations must
+follow the checked migration ledger: a Drizzle-only database must first use
+the pre-baseline Rust release; the complete legacy SQLx history requires the
+explicit `migrate --rebaseline` operator action. The current binary refuses to
+infer or overwrite an unknown schema. Historical releases remain in Git;
+source removal does not change this upgrade requirement.
 
-Staging uses `cache-staging.snowstead.com`, serving reads through its Worker
-instead of production's public CDN. Its database starts empty with the same
-migrations; the populated benchmark `dev` branch is not staging. After setting
-the non-secret bindings from Terraform's staging handoff:
-
-```bash
-# A private JSON file containing distinct staging ADMIN_SECRET and JWT_SECRET.
-# Do not copy production values or commit this file.
-pnpm exec wrangler deploy --config workers/nix/wrangler.jsonc --env staging --secrets-file /private/staging-nix.json
-pnpm exec wrangler deploy --config workers/go/wrangler.jsonc --env staging --secrets-file /private/staging-go.json
-pnpm exec wrangler deploy --config workers/control/wrangler.jsonc --env staging --secrets-file /private/staging-control.json
-pnpm exec wrangler deploy --env staging
-```
-
-Staging uses authenticated proxied uploads until its own bucket-scoped R2
-credentials are configured. Its S3 bucket names are explicit, so adding them
-cannot silently target production's default bucket names. Staging disables
-workers.dev and preview aliases.
-
-The default `REQUIRE_CACHE_SIGNING_KEYS: "true"` refuses cache creation
+The hosted `REQUIRE_CACHE_SIGNING_KEYS=true` policy refuses cache creation
 without a master key and refuses publication without a per-cache key.
 Self-hosters may explicitly set it to `"false"` to use
 `SIGNING_PRIVATE_KEY` for caches without their own key. Existing shared-key
@@ -161,10 +90,9 @@ secret `CDN_PURGE_TOKEN`, an API token with Cache Purge on the zone;
 without them nothing is purged. Automatic purges are saved under
 `cdn-purges/` in the **private** bucket before dispatch. Requests are batched
 and paced, with bounded retries for network errors, 429s, and 5xx responses.
-The five-minute cron retries unfinished jobs and respects `Retry-After`;
-GC still runs every six hours. Persistent failures appear in Worker error
-logs as `CDN purge backlog remains`. Fix the configuration or credentials
-and the backlog resumes. No new bucket or database table is needed.
+Rust's maintenance loop retries unfinished jobs and respects `Retry-After`.
+Inspect the service logs for persistent failures, fix the configuration or
+credentials, and the backlog resumes. No new bucket or database table is needed.
 
 To purge by hand (an empty object purges the cache prefix, while
 `storePathHashes` targets up to 500 narinfo URLs):
@@ -186,8 +114,61 @@ content-addressed NARs. This is cache invalidation, not erasure of public data.
 **Upgrading:** existing objects and CDN entries may still have the former
 one-year TTL. Run `POST /_api/v1/admin/narinfo/backfill` through all pages
 to rewrite their metadata and queue purges. The five-minute fallback
-applies after those old copies have been replaced; changing the Worker
+applies after those old copies have been replaced; changing the server
 alone cannot shorten an already-cached response's TTL.
+
+## Rust and C/C++ compiler cache
+
+Snowstead implements the WebDAV subset used by unmodified sccache. Enable the
+`sccache` protocol and issue a cache-scoped token. Nix and Go permissions do
+not grant compiler access.
+
+```sh
+snowstead cache create compiler --protocols sccache --private
+snowstead token create ci --caches compiler --perms sccache:read,sccache:write
+
+export SCCACHE_WEBDAV_ENDPOINT=https://cache.snowstead.com/_api/v1/sccache/ORG_SLUG/compiler/
+export SCCACHE_WEBDAV_TOKEN="$SNOWSTEAD_TOKEN"
+export RUSTC_WRAPPER=sccache
+export CARGO_INCREMENTAL=0
+cargo build --release
+sccache --show-stats
+```
+
+Use a client built with WebDAV support. For CMake, set
+`-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`, or
+invoke `sccache cc` / `sccache c++` directly. Stop an existing sccache daemon
+before changing its endpoint or credentials. Do not set
+`SCCACHE_WEBDAV_KEY_PREFIX`: the endpoint already identifies the namespace.
+Clients can set `SCCACHE_WEBDAV_DISABLE_CREATE_DIR=true` to avoid directory
+probes; older clients can use the virtual directories.
+
+For untrusted pull requests, use `SCCACHE_WEBDAV_RW_MODE=READ_ONLY` and a token
+with only `sccache:read`. Public caches allow anonymous reads. Give write
+credentials only to protected jobs building reviewed code: a writer can poison
+compiler outputs. Use separate caches for separate trust domains.
+
+PUT requires Content-Length and exact-length validation, with a 64 MiB archive
+limit. Archives expire seven days after publication. Duplicate writes preserve
+the published bytes and do not extend retention. Storage counts toward shared
+organization capacity; compiler staging also has a separate byte budget.
+The endpoint supports `a/b/c/<64-lowercase-hex-key>`, `.sccache_check`, and
+virtual directory PROPFIND/MKCOL, not general WebDAV listing, DELETE, MOVE, or COPY.
+
+Org-management credentials can read statistics with
+`GET /_api/v1/orgs/:org/caches/:name/sccache` and reset only compiler data with
+`POST /_api/v1/orgs/:org/caches/:name/sccache/reset`. Reset leaves Nix and Go intact.
+
+`pnpm check` exercises real Rust and C++ clients against Rust with disposable
+Postgres/S3 and fresh local client caches. For longer local build benchmarks:
+
+```sh
+nix develop --command scripts/with-postgres.sh scripts/with-r2.sh node scripts/sccache-build-bench.mjs
+```
+
+The benchmark builds pinned ripgrep and RocksDB releases, checks outputs, and
+records client statistics under `.amp/in/artifacts/compiler-backend-bench/`.
+It measures a local stack, not production or WAN performance.
 
 ## Rust API compatibility
 
@@ -296,13 +277,13 @@ second HTTP tracing layer. All additional spans compile out without the
 Configure the CLI with your gateway URL and admin secret:
 
 ```bash
-snowstead login prod https://your-worker.workers.dev $ADMIN_SECRET
+snowstead login --token-stdin --url https://cache.example.com --name prod < admin-token-file
 ```
 
 ## Using as a substituter
 
 ```nix
-nix.settings.substituters = [ "https://your-worker.workers.dev/main" ];
+nix.settings.substituters = [ "https://cache.example.com/main" ];
 ```
 
 ## Private caches
@@ -332,23 +313,20 @@ On the machines that substitute from it:
 
 ```
 # /etc/nix/netrc
-machine your-worker.workers.dev
+machine cache.example.com
 password <the pull token>
 ```
 
 ```nix
 nix.settings = {
-  substituters = [ "https://your-worker.workers.dev/team" ];
+  substituters = [ "https://cache.example.com/team" ];
   netrc-file = "/etc/nix/netrc";
 };
 ```
 
-Only empty caches can change visibility. Private-cache deletion changes a
-generation in KV, so old cached narinfo and NARs stop being served as the
-new value propagates. The KV and isolate cache TTLs are 30 seconds, but KV
-is eventually consistent and propagation can take 60 seconds or more;
-there is no strict global deadline. Private NAR downloads are authorized
-and streamed by the Worker, never redirected to a reusable presigned URL.
+Only empty caches can change visibility. Private reads check current SQL
+authorization and publication state. Private NAR downloads are authorized
+and streamed by the Rust server, never redirected to a reusable presigned URL.
 
 ## Managing tokens
 
@@ -380,7 +358,7 @@ snowstead token revoke $JTI "employee offboarded"
 Log in with a push token (not the admin secret):
 
 ```bash
-snowstead login prod https://your-worker.workers.dev $PUSH_TOKEN
+snowstead login --token-stdin --url https://cache.example.com --name prod < push-token-file
 ```
 
 Then push:
@@ -404,14 +382,13 @@ Use `--jobs <n>` to control how many paths are in flight (default 32).
 
 Paths that an upstream cache already serves are not pushed: whoever
 substitutes from a cache has its upstreams too. The upstreams are the
-`UPSTREAM_CACHES` var in `wrangler.jsonc`, space-separated
-(`https://cache.nixos.org` by default); set it empty to push everything.
+`UPSTREAM_CACHES` runtime variable, space-separated; set it empty to push everything.
 The server remembers paths found upstream, so each is looked up there once.
 
 ## Migrating from AUTH_TOKEN
 
-1. Set `JWT_SECRET` and `ADMIN_SECRET` via `wrangler secret put`
-2. Log in with the admin secret: `snowstead login prod $URL $ADMIN_SECRET`
+1. Set `JWT_SECRET` and `ADMIN_SECRET` in the Rust runtime's secret environment.
+2. Log in with the admin secret: `snowstead login --token-stdin --url "$URL" --name prod < admin-token-file`
 3. Create scoped tokens: `snowstead token create ci-runner --caches main`
 4. Update publishers to log in with their JWT
 5. Remove `AUTH_TOKEN` to disable legacy auth
@@ -457,15 +434,12 @@ without an org are its tokens.
   the token's org, so `snowstead push main` pushes to that org's `main`.
 - **Storage limits.** A push that would take an org's caches past its
   limit is refused with 507 before anything uploads.
-- **Rate limits.** Pushes (per token), org API calls (per key or dashboard
-  user), and private reads (per cache and address) each have a limit per
-  minute, set under `ratelimits` in `wrangler.jsonc`. Past it, requests get
-  429 with `retry-after`. The operator's own `ADMIN_SECRET` calls go
-  unlimited.
-- **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth`: the NAR bytes
-  the Worker served from the org's private caches this UTC month, counted
-  by day in `bandwidth_daily`. Public caches are served by the bucket and
-  CDN without the Worker, so they aren't counted here.
+- **Admission.** Rust does not retain the Worker's per-minute request caps.
+  Storage limits, staging safeguards, and bounded runtime resources still apply.
+- **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth` for the current UTC
+  month's origin bytes. Rust records selected object bytes in SQL, not confirmed
+  client receipts. Configured CDN imports report public bytes separately as
+  `publicServedThisMonth`.
 - **Signing keys.** Each new cache gets its own cryptographically generated
   Ed25519 key, shown as its `publicKey`. Managed key names use the immutable
   cache ID and a random UUID; managed public bytes are unique in Postgres.
@@ -495,21 +469,19 @@ authentication; org API keys cannot change their own limits or list all orgs.
 `org.put` records old/new slug and limits in the affected org's audit log,
 with the operator or forwarded dashboard actor identity.
 
-Limits are read from Postgres on every enforcement lookup, not held in KV.
+Limits are read from Postgres on every enforcement lookup.
 Updates apply immediately on subsequent requests. Lowering a limit never
 deletes published data or makes a private cache public: it refuses disallowed
 new pushes and new private caches, and blocks BYOK import/activation while
 leaving already-active keys working.
 
-After upgrading to orgs, run `POST /_api/v1/admin/auth/sync` once: it
-writes each private cache's org into KV, where pulls check it. This existing
-visibility index is unrelated to org limits; changing limits requires
-no KV synchronization.
+Rust reads authorization from SQL; no KV synchronization is required.
+The compatibility `POST /_api/v1/admin/auth/sync` route does not populate KV.
 
 ### Cache policy API
 
-Apply migration `0010_needy_risque.sql` after `0009` before deploying. All
-endpoints below use `/_api/v1/orgs/:org` (the org ID, not its mutable slug),
+Apply the Rust migrations through infra before deploying. All endpoints below
+use `/_api/v1/orgs/:org` (the org ID, not its mutable slug),
 return JSON with `Cache-Control: no-store`, and require `ADMIN_SECRET` or that
 org's management API key unless stated otherwise. Dates are ISO strings; sizes
 are integer bytes. Errors use `{ "error": "message" }`.
@@ -527,13 +499,12 @@ lastUsedAt, expiresAt, createdBy, revokedAt, revokedBy, revocationReason }`.
 org token-list shape. The operator-wide admin token list is unchanged.
 `expiresAt`, `revokedAt`, `revokedBy`, and `revocationReason` can be null.
 
-Successful JWT authentication for Nix, Go, and sccache schedules a conditional
-SQL update after foreground transactions and upload admission finish, using a
-separate connection under `waitUntil`. A token's timestamp changes at most once
+Successful JWT authentication for Nix, Go, and sccache attempts a conditional
+SQL update through the bounded connection pool. A token's timestamp changes at most once
 per five minutes, including concurrent calls. It records authentication, not
 successful artifact delivery. Anonymous public/CDN reads cannot identify a
 token. This is best-effort activity telemetry, not a security audit or exact
-request counter; failed background writes can leave it stale.
+request counter; failed writes can leave it stale.
 
 #### Eviction visibility
 
@@ -571,7 +542,7 @@ removal transactionally: capacity (`capacity`), expired-data GC (`retention`),
 product resets, explicit path deletion and cache deletion (`clear`), or the
 whole-cache endpoint below (`evict`). Later physical cleanup does not duplicate
 events. Logs retain the cache's ID and name even after deletion/name reuse.
-Only the last 30 days are returned; control's scheduled GC sweeps older rows.
+Only the last 30 days are returned; Rust's scheduled GC sweeps older rows.
 
 #### Named Nix pins
 
@@ -695,13 +666,8 @@ No CDN purge is needed for this additive rotation. Any future rewrite must
 purge the rewritten narinfo URLs after R2 writes; purge implementation is
 outside signing management.
 
-Each publish re-reads the current sealed key version before selecting a
-bounded (256-entry), promise-coalescing memo of non-extractable, signing-only
-CryptoKeys. Decrypted tenant secret bytes are not memoized; transient byte
-buffers are cleared after use where practical. This is not a guarantee of
-complete memory erasure in a JavaScript runtime.
-There is no signing on public reads. Keep Hyperdrive query caching disabled
-as required by setup above: stale database reads would delay key changes.
+Publication uses the current signing key from Postgres. There is no signing
+on public reads.
 A publish already in flight at activation may finish with the prior key,
 which is another reason to retain overlapping trust. Rotation does not
 rotate `SIGNING_MASTER_KEY`; retain that deployment secret to open active
