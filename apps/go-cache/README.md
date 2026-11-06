@@ -73,11 +73,3 @@ Close and EOF drain all pending work before the summary; close responds last.
 No background uploads are lost at close. There is no automatic eviction.
 
 Run `go test ./...` and `go test -race ./...` in this directory.
-
-From the repository root, build the helper and run
-`node scripts/go-cache-helper-bench.mjs /absolute/path/to/snowstead-go-cache`
-inside `nix develop`. This exercises the public protocol against a synthetic
-loopback HTTP origin, verifies bytes and digests, and samples helper peak RSS
-on Linux. Defaults are three repetitions of 32 GETs and PUTs per 1 and 16 MiB
-artifact; `BENCH_REPEATS`, `BENCH_REQUESTS`, and comma-separated `BENCH_MIB`
-override the workload. It is not a Rust server or WAN benchmark.
