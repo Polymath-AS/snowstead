@@ -5,6 +5,7 @@ import { caches as cacheRows, sccacheEntries } from "@snowstead/cache-core/db/sc
 import { CapacityError } from "@snowstead/cache-core/capacity";
 import { publishSccacheUpload } from "@snowstead/cache-core/sccache";
 import { errorResponse } from "@snowstead/cache-core/responses";
+import { uuidv7 } from "@snowstead/cache-core/uuid";
 
 /** Drain probes and duplicate writes while enforcing their declared length. */
 export async function consumeBody(request: Request, size: number): Promise<void> {
@@ -26,7 +27,7 @@ export async function uploadArchive(request: Request, config: WorkerConfig, cach
 		if (!storedAt) storedAt = (await config.bucket.head(reservation.r2Key))?.uploaded ?? null;
 		if (storedAt) await consumeBody(request, size);
 		else {
-			attempt = `sccache-attempt/${reservation.id}/${crypto.randomUUID()}`;
+			attempt = `sccache-attempt/${reservation.id}/${uuidv7()}`;
 			const fixed = new FixedLengthStream(size);
 			const abort = new AbortController();
 			const pumping = (request.body ?? new Blob([]).stream()).pipeTo(fixed.writable, { signal: abort.signal });

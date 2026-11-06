@@ -1,0 +1,129 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                e.id,\n                e.cache_id,\n                e.generation,\n                e.r2_key,\n                e.size,\n                NULL::text AS output,\n                e.stored_at,\n                e.uploaded_at,\n                e.expires_at,\n                (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '5 minutes') AS \"access_due!\"\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.id = $1\n                AND c.sccache_generation = $2\n                AND c.is_public = $3\n                AND e.generation = $2\n                AND e.action = $4\n                AND e.expires_at > NOW()\n                AND e.uploaded_at IS NOT NULL\n                AND EXISTS (\n                    SELECT 1\n                    FROM cache_protocols p\n                    WHERE p.cache_id = c.id\n                        AND p.protocol = 'sccache'\n                )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "cache_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "generation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "generation"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "r2_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "r2_key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "output",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "stored_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "stored_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "uploaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "uploaded_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sccache_entries",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "access_due!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      null,
+      true,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "1818fa97d91cffb0aa02a59ef54238b25b4388b7dc8f822ecd34ad6c22ca268c"
+}

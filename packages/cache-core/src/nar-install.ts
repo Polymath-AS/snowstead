@@ -13,6 +13,7 @@ import { bucketFor, bucketForKey, bucketNameForKey, IMMUTABLE, narKey } from "./
 import { isPrivateCache } from "./visibility.js";
 import { errorForLog } from "./logging.js";
 import { UploadTiming } from "./upload-timing.js";
+import { uuidv7 } from "./uuid.js";
 
 const SINGLE_PUT_MAX = 5 * 1024 ** 3 - 1024 ** 2;
 const OBJECT_MAX = 5 * 1024 ** 4;
@@ -43,7 +44,7 @@ export async function installStagedNars(
 			else {
 				const isPrivate = visibility.get(session.cacheId)!;
 				jobs.push({
-					key: narKey(session.fileHash, session.compression, isPrivate), operationId: crypto.randomUUID(),
+					key: narKey(session.fileHash, session.compression, isPrivate), operationId: uuidv7(),
 					sourceKey: session.r2UploadKey, fileHash: session.fileHash, compression: session.compression,
 					isPrivate, fileSize: session.fileSize, sessionId: session.id,
 					inlineBytes: session.inlineBytes,
@@ -68,7 +69,7 @@ export async function installNar(
 	fileSize: number, sessionId?: string,
 ): Promise<string | undefined> {
 	const job: Installation = {
-		key: narKey(fileHash, compression, isPrivate), operationId: crypto.randomUUID(), sourceKey,
+		key: narKey(fileHash, compression, isPrivate), operationId: uuidv7(), sourceKey,
 		fileHash, compression, isPrivate, fileSize, sessionId, terminal: false,
 	};
 	return serializeInstallations(config, async () => (await installNars(config, [job])).get(job.operationId));

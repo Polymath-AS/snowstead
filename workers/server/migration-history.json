@@ -1,0 +1,77 @@
+[
+  {
+    "version": 0,
+    "description": "init",
+    "checksum": "6d6bee1d7e50cb16aca630947dc683a220547e4eff402d2fe42317407302cbaecc715c8cac50058dba5339e177e89126"
+  },
+  {
+    "version": 1,
+    "description": "cache totals",
+    "checksum": "af6650cb9d16c1f17430a671a9bed42da6e863038f8cfba9654d7df0208e74f05b1983538fb2c66e06607514ff4f1706"
+  },
+  {
+    "version": 2,
+    "description": "bouncy sersi",
+    "checksum": "230b76823ca8948f92f23d6580a44486f60d9061bafca419745254c0c92cec206d5b666815a4a415c986c8326d8f19bf"
+  },
+  {
+    "version": 3,
+    "description": "org signing permissions",
+    "checksum": "8f5b0f4b7fa4ece76a91c00f928ee5ffb2503e6eed4310b2ef4c31042f2f2135818ffb38f857ea7a5d69c9b73cc592d2"
+  },
+  {
+    "version": 4,
+    "description": "optional token expiry",
+    "checksum": "3c3ea3d5714a4b4e6473646e6d8f20ccd81653aa596d43cd2bbe7ca94a0cfbc485bc6b9f1c463b73a2af713a6f35f56a"
+  },
+  {
+    "version": 5,
+    "description": "lucky bromley",
+    "checksum": "973a2b8526929498f76a1ee4455db6b83757f41466f79557d76fffc54c800d04d7cfcbbf9cb0d37f5c4d63b8bf5b1871"
+  },
+  {
+    "version": 6,
+    "description": "cache protocols",
+    "checksum": "edfb0aca62da938964fb11eb74e4c9539f651687611e55a84890a020a991833078b47e598b14e25e01634038e708defd"
+  },
+  {
+    "version": 7,
+    "description": "wealthy stingray",
+    "checksum": "4239b24a8c6f077412f4f3d466f885a3135e72ae5ad67d6a6511fc2d8cd4b41653a7cfc67007ca6c2a5626736931fc25"
+  },
+  {
+    "version": 8,
+    "description": "retained capacity",
+    "checksum": "5a9bd841f1e71c727426bdc3f8b92076ecd6b9e8358e7fe8c54c140f5bc8d446b9e24d3d7d132ce1752355dd67458a47"
+  },
+  {
+    "version": 9,
+    "description": "parallel starhawk",
+    "checksum": "7b1c63690ebf24c89782e73d5d25641e63fe95ba1d67ddcaabd1063c291dfee8108bd19e1bbab07fa1bc5a518b216a70"
+  },
+  {
+    "version": 10,
+    "description": "needy risque",
+    "checksum": "01ce42b2285ca777496a7776a2e82a93596b08d0eee9db475786126def63ea3ed14f207e81d484c6dccc4ad3b920e64c"
+  },
+  {
+    "version": 11,
+    "description": "bandwidth by cache",
+    "checksum": "57b6a751d648765aec852e0c506bf30eaf87a75e0c68f6b0284bc6b8ab4e2552f415203d77c8710b3e021cb16ea30359"
+  },
+  {
+    "version": 12,
+    "description": "sccache transfer state",
+    "checksum": "2ffcc101b7cccfffecbe78feb40eae651a5a72a5c4946ba3d06b5c0b530975223458c4a6fbc3647a771c31756fd75d39"
+  },
+  {
+    "version": 13,
+    "description": "server upload receipts",
+    "checksum": "f54672d9e2f987ed710c37385866de045ba1f9e3167a62044ffebd8c0f89b5404629fa8769d75c6baeddef34c37f848a"
+  },
+  {
+    "version": 14,
+    "description": "go transfer state",
+    "checksum": "1cd0b9ac6a2275a2bf4cc1809da6134ce3e2c15ff663980d36739bcef85516a243ab9bf8fb6ff205336c56f6f083a912"
+  }
+]

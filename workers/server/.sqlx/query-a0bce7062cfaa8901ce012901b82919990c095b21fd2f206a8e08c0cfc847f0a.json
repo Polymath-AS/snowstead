@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT EXISTS(\n                SELECT 1\n                FROM blob_objects b\n                WHERE b.id = $1\n                    AND NOT EXISTS(\n                        SELECT 1\n                        FROM published_paths p\n                        WHERE p.blob_object_id = b.id\n                    )\n                    AND NOT EXISTS(\n                        SELECT 1\n                        FROM nar_installations i\n                        WHERE i.file_hash = b.file_hash\n                            AND i.compression = b.compression\n                    )\n                    AND NOT EXISTS(\n                        SELECT 1\n                        FROM upload_sessions u\n                        WHERE (\n                            (\n                                u.file_hash = b.file_hash\n                                AND u.compression = b.compression\n                            )\n                            OR u.r2_upload_key = b.r2_key\n                            OR u.r2_upload_key = 'nar/' || b.file_hash || '/' || b.compression || '.nar'\n                            OR u.r2_upload_key = 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar'\n                        )\n                            AND (\n                                u.expires_at > now()\n                                OR (\n                                    u.status <> 'completed'\n                                    AND u.r2_upload_id IS NOT NULL\n                                    AND u.r2_upload_key IS NOT NULL\n                                    AND NOT starts_with(u.r2_upload_key, 'staging/')\n                                )\n                            )\n                    )\n            ) AS \"eligible!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "eligible!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a0bce7062cfaa8901ce012901b82919990c095b21fd2f206a8e08c0cfc847f0a"
+}

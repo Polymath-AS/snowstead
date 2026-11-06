@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COALESCE(SUM(used), 0)::bigint AS \"used!\",\n            COALESCE(SUM(pending), 0)::bigint AS \"pending!\"\n        FROM (\n            SELECT\n                SUM(size) AS used,\n                0 AS pending\n            FROM caches\n            WHERE org_id = $1\n            UNION ALL\n            SELECT\n                0,\n                SUM(u.file_size)\n            FROM upload_sessions u\n            JOIN caches c ON c.id = u.cache_id\n            WHERE c.org_id = $1\n                AND (u.status = 'finalizing'\n                    OR (u.status IN ('pending', 'uploading', 'streaming') AND u.expires_at > NOW()))\n            UNION ALL\n            SELECT\n                SUM(e.size) FILTER (WHERE e.uploaded_at IS NOT NULL),\n                SUM(e.size) FILTER (WHERE e.uploaded_at IS NULL)\n            FROM go_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.go_generation\n                AND e.expires_at > NOW()\n            UNION ALL\n            SELECT\n                SUM(e.size) FILTER (WHERE e.uploaded_at IS NOT NULL),\n                SUM(e.size) FILTER (WHERE e.uploaded_at IS NULL)\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.sccache_generation\n                AND e.expires_at > NOW()\n        ) usage\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "used!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "pending!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "1732b6cd18f668b462d8bf9344f1ea61e0bda3e5e106d587df17f5681e7059d0"
+}

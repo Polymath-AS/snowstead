@@ -116,19 +116,22 @@ describe("named Go caches", () => {
 				pending.push(reserve().then(response => { responses.push(response); return response; }));
 				await expect.poll(waiting).toBe(1);
 				for (let i = 0; i < 95; i++) pending.push(reserve().then(response => { responses.push(response); return response; }));
-				await expect.poll(() => responses.some(response => response.status === 429)).toBe(true);
+				// Wait for all 32 requests beyond the 64-slot limit to arrive before
+				// aging the queue. A single rejection can leave late arrivals fresh.
+				await expect.poll(() => responses.filter(response => response.status === 429).length, { timeout: 10000 }).toBe(32);
 				expect(await waiting()).toBe(1);
 				expect((await transfer(cold, coldWriter, "unblocked")).status).toBe(201);
 				await new Promise(resolve => setTimeout(resolve, 2100));
 			});
 		} finally { await Promise.allSettled(pending); }
+		expect(responses).toHaveLength(96);
 		expect(responses.every(response => [201, 429].includes(response.status))).toBe(true);
 		expect(responses.filter(response => response.status === 201)).toHaveLength(1);
 		expect(responses.filter(response => response.status === 429).every(response => response.headers.get("retry-after") === "1")).toBe(true);
 		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 1, pending: 0 });
 		expect((await reserve()).status).toBe(201);
 		expect(await (await api(hot.org, "")).json()).toMatchObject({ used: 2, pending: 0 });
-	});
+	}, 20000);
 
 	it("completes a distinct upload while an earlier upload body is paused", async () => {
 		const target = await setup();

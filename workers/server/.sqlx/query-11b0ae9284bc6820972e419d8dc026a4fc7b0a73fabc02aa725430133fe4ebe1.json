@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                DELETE FROM audit_logs\n                WHERE id IN (\n                    SELECT id\n                    FROM audit_logs\n                    WHERE timestamp < now() - INTERVAL '30 days'\n                    ORDER BY id\n                    LIMIT $1\n                    FOR UPDATE SKIP LOCKED\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "11b0ae9284bc6820972e419d8dc026a4fc7b0a73fabc02aa725430133fe4ebe1"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO cache_protocols (\n            cache_id,\n            protocol\n        )\n        SELECT\n            $1,\n            UNNEST($2::text[])\n        ON CONFLICT DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e5757c67fcd95a3f5ecd0b8ae43e32c185cb74656273f235b3b7070423aa2a43"
+}

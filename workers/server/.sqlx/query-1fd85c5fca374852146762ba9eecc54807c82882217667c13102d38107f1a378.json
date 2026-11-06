@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO orgs (\n            id,\n            slug,\n            moving_from,\n            storage_limit,\n            private_caches,\n            custom_signing_keys\n        )\n        VALUES ($1, $2, $3, $4, COALESCE($6, TRUE), COALESCE($7, FALSE))\n        ON CONFLICT (id) DO UPDATE\n        SET slug = $2,\n            moving_from = $3,\n            storage_limit = CASE WHEN $5 THEN $4 ELSE orgs.storage_limit END,\n            private_caches = COALESCE($6, orgs.private_caches),\n            custom_signing_keys = COALESCE($7, orgs.custom_signing_keys)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Bool",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1fd85c5fca374852146762ba9eecc54807c82882217667c13102d38107f1a378"
+}

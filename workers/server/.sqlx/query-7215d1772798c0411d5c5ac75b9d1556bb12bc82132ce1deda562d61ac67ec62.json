@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            product,\n            COALESCE(SUM(bytes), 0)::bigint AS \"bytes!\",\n            COALESCE(SUM(public_bytes), 0)::bigint AS \"public_bytes!\"\n        FROM bandwidth_daily\n        WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date\n            AND ($1::text IS NULL OR org_id = $1)\n            AND ($2::int IS NULL OR cache_id = $2)\n        GROUP BY product\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "product",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bandwidth_daily",
+            "name": "product"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "public_bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "7215d1772798c0411d5c5ac75b9d1556bb12bc82132ce1deda562d61ac67ec62"
+}

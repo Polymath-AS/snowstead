@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                p.store_path,\n                p.nar_hash,\n                p.nar_size,\n                p.references_json,\n                p.deriver,\n                p.system,\n                p.signatures_json,\n                b.file_hash,\n                b.file_size,\n                b.compression\n            FROM published_paths p\n            JOIN blob_objects b ON b.id = p.blob_object_id\n            WHERE p.cache_id = $1\n                AND p.store_path_hash = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "nar_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "nar_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "nar_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "nar_size"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "references_json",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "references_json"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "deriver",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "deriver"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "system",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "system"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "signatures_json",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "signatures_json"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "file_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "file_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_size"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "compression",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "compression"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e6b335eb28a68a0d290de3ddfbc26e51c1bb445296180ccda669e6d2337c1394"
+}

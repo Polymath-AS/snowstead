@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            p.id,\n            p.current_revision,\n            r.store_path AS \"store_path?\"\n        FROM pins p\n        LEFT JOIN pin_revisions r ON r.pin_id = p.id\n            AND r.revision = p.current_revision\n        WHERE p.cache_id = $1\n            AND p.name = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pins",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "current_revision",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pins",
+            "name": "current_revision"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "store_path?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pin_revisions",
+            "name": "store_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "81018a636c5d1b2c96e625e20ee0efc85c86dcb1247b410b879e6efb20147ea0"
+}

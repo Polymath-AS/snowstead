@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT\n                    e.id,\n                    c.org_id,\n                    e.cache_id\n                FROM go_entries e\n                LEFT JOIN caches c ON c.id = e.cache_id\n                WHERE e.expires_at <= now()\n                    OR e.cache_id IS NULL\n                    OR e.generation <> c.go_generation\n                ORDER BY e.expires_at, e.id\n                LIMIT $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "cache_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e7047fa05904a3c67acdd51122aa5a90bdbd5ef65be43b08dad8f9e2e5659aa4"
+}

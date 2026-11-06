@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(n), 0)::bigint AS \"protected!\"\n        FROM (\n            SELECT b.file_size AS n\n            FROM published_paths e\n            JOIN caches c ON c.id = e.cache_id\n            JOIN blob_objects b ON b.id = e.blob_object_id\n            WHERE c.org_id = $1\n                AND EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = e.store_path_hash\n                )\n            UNION ALL\n            SELECT e.size\n            FROM go_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.go_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n                AND EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = 'go:' || e.id\n                )\n            UNION ALL\n            SELECT e.size\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.sccache_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n                AND EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = 'sccache:' || e.id\n                )\n        ) protected\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "protected!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1bae4413d76664ad64e39c8ae12e4cfd178b726e81df5dc7d21157175a5704b4"
+}

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +11,7 @@ import { Client } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { createTestHarness } from "wrangler";
+import gatewayWorker from "../../../workers/gateway/src/index.ts";
 
 test("gateway streams Nix and Go artifacts and shares control-plane policy across real Workers", { timeout: 120_000 }, async () => {
 	const database = new URL(process.env.SNOWSTEAD_TEST_DATABASE_URL);
@@ -280,5 +282,60 @@ test("gateway streams Nix and Go artifacts and shares control-plane policy acros
 		await server?.close();
 		await admin.query(`DROP DATABASE "${name}" WITH (FORCE)`);
 		await admin.end();
+	}
+});
+
+test("legacy API forwards authenticated binary requests and preserves origin redirects", { timeout: 30_000 }, async () => {
+	const origin = createServer(async (request, response) => {
+		if (request.url === "/_api/v1/redirect") {
+			response.writeHead(307, { location: "/not-an-api-endpoint", "cache-control": "no-store" });
+			response.end();
+			return;
+		}
+		const chunks = [];
+		for await (const chunk of request) chunks.push(chunk);
+		response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
+		response.end(JSON.stringify({
+			url: request.url, method: request.method, host: request.headers.host,
+			authorization: request.headers.authorization,
+			contentType: request.headers["content-type"],
+			body: Buffer.concat(chunks).toString("base64"),
+		}));
+	});
+	await new Promise(resolve => origin.listen(0, "127.0.0.1", resolve));
+	const upstream = `http://127.0.0.1:${origin.address().port}`;
+	const gateway = createTestHarness({
+		root: new URL("../../../", import.meta.url).pathname,
+		workers: [{ configPath: "wrangler.jsonc", env: "production", vars: { API_ORIGIN: upstream } }],
+	});
+	try {
+		const { url } = await gateway.listen();
+		const body = randomBytes(257 * 1024);
+		for (const method of ["PUT", "POST", "PROPFIND", "MKCOL"]) {
+			const path = "/_api/v1/sccache/default/compiler/a/b/c/" + "abc".padEnd(64, "d") + "?cursor=a%2Fb&cursor=c";
+			const response = await fetch(new URL(path, url), {
+				method, body,
+				headers: { authorization: "Bearer forward-fixture", "content-type": "application/octet-stream" },
+			});
+			assert.equal(response.status, 201);
+			assert.equal(response.headers.get("cache-control"), "no-store");
+			assert.deepEqual(await response.json(), {
+				url: path, method, host: new URL(upstream).host,
+				authorization: "Bearer forward-fixture", contentType: "application/octet-stream",
+				body: body.toString("base64"),
+			});
+		}
+		// Wrangler's outbound proxy follows redirects despite redirect: manual.
+		// Exercise the public handler against the HTTP origin without that proxy.
+		const redirect = await gatewayWorker.fetch(new Request(new URL("/_api/v1/redirect", url), {
+			headers: { authorization: "Bearer forward-fixture" },
+		}), { API_ORIGIN: upstream });
+		assert.equal(redirect.status, 307);
+		assert.equal(redirect.headers.get("location"), "/not-an-api-endpoint");
+		assert.equal(redirect.headers.get("cache-control"), "no-store");
+		await redirect.arrayBuffer();
+	} finally {
+		await gateway.close();
+		await new Promise((resolve, reject) => origin.close(error => error ? reject(error) : resolve()));
 	}
 });

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO upstream_paths (store_path_hash, upstream)\n            SELECT *\n            FROM UNNEST($1::text[], $2::text[])\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "042cef62001cdb3a1305bf78abc143fa5efd492f87d9406dce883a528caa30fd"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE upload_sessions\n        SET status = CASE WHEN status = 'streaming' THEN 'finalizing' ELSE status END,\n            file_hash = $2\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "272abb25b26bda2beb5dd4d247f5dbe70b206fa7902b6dc25f5e4ec02bb08bc4"
+}

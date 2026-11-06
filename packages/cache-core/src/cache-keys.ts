@@ -1,6 +1,7 @@
 import type { WorkerConfig } from "./config.js";
 import type { Cache } from "./db/types.js";
 import { importSigningKey } from "./signing.js";
+import { uuidv7 } from "./uuid.js";
 
 /**
  * Each cache signs its paths with a key of its own, so one leaking or being
@@ -62,7 +63,7 @@ function boundTo(cacheId: number, id: string, name: string, publicKey: string): 
 export async function newCacheKey(config: WorkerConfig, cache: { readonly id: number }): Promise<NewCacheKey | null> {
 	if (!await config.signingMasterKey()) return null;
 
-	const id = crypto.randomUUID();
+	const id = uuidv7();
 	const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
 	if (!("privateKey" in pair)) throw new Error("Ed25519 generated no key pair");
 	// PKCS#8 for Ed25519 ends with the 32-byte seed.
@@ -96,7 +97,7 @@ export async function importCacheKey(config: WorkerConfig, cacheId: number, mate
 		if (!await crypto.subtle.verify("Ed25519", publicKey, await crypto.subtle.sign("Ed25519", privateKey, challenge), challenge)) {
 			throw new Error("invalid Nix secret key");
 		}
-		return await sealCacheKey(config, cacheId, crypto.randomUUID(), match[1], secret, false);
+		return await sealCacheKey(config, cacheId, uuidv7(), match[1], secret, false);
 	} finally {
 		secret.fill(0);
 		pkcs8.fill(0);

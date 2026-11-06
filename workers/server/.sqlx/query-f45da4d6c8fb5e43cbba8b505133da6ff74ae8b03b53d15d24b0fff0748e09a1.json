@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM gc_marks\n            WHERE target_type = 'server-gc-cursor'\n                AND target_id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f45da4d6c8fb5e43cbba8b505133da6ff74ae8b03b53d15d24b0fff0748e09a1"
+}

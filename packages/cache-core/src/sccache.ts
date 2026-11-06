@@ -7,6 +7,7 @@ import { cacheColumns, findCache, findOrg } from "./db/repository.js";
 import { errorResponse, jsonResponse } from "./responses.js";
 import { PRIVATE_CACHES_REFUSED } from "./visibility.js";
 import { CapacityError, withOrgCapacity } from "./capacity.js";
+import { uuidv7 } from "./uuid.js";
 
 const SCCACHE_RETENTION_MS = 7 * 86400_000;
 export const SCCACHE_MAX_BYTES = 64 * 1024 * 1024;
@@ -61,7 +62,7 @@ export async function reserveSccacheUpload(db: Db, cache: Cache, action: string,
 		if (staging.count >= 256 || staging.bytes + size > (org.storageLimit ?? 1024 * 1024 * 1024)) {
 			return errorResponse("Upload staging is busy; retry", 503, { "retry-after": "1" });
 		}
-		const id = crypto.randomUUID();
+		const id = uuidv7();
 		const [entry] = await tx.insert(sccacheEntries).values({ id, cacheId: cache.id, generation: cache.sccacheGeneration, action,
 			r2Key: `sccache/${cache.id}/${cache.sccacheGeneration}/${action}/${id}`, size,
 			expiresAt: new Date(now.getTime() + 3600_000),
@@ -77,7 +78,7 @@ export async function handleSccacheManagement(config: WorkerConfig, org: string,
 	let cache = await findCache(config.db, org, name);
 	if (!cache || !cache.protocols.includes("sccache")) return errorResponse("Not Found", 404);
 	if (reset) {
-		const [updated] = await config.db.update(cacheRows).set({ sccacheGeneration: crypto.randomUUID() })
+		const [updated] = await config.db.update(cacheRows).set({ sccacheGeneration: uuidv7() })
 			.where(eq(cacheRows.id, cache.id)).returning();
 		if (!updated) return errorResponse("Not Found", 404);
 		cache = { ...cache, ...updated };

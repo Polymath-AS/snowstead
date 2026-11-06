@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        LOCK TABLE upload_sessions IN ROW EXCLUSIVE MODE\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d359b57a37a834b0a0d8508d1ccd6b3f80e59361192d32ca854c79c41dae11fe"
+}

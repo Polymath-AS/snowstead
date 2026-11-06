@@ -185,29 +185,60 @@ fn login_preserves_camel_case_config_and_replaces_permissions() {
 #[test]
 fn invalid_commands_fail_before_credentials_or_http() {
     let home = tempfile::tempdir().unwrap();
-    for args in [
-        vec!["cache", "create", "main"],
-        vec!["cache", "create", "main", "--protocols", "nix,nix"],
-        vec!["cache", "create", "main", "--protocols", "nix,"],
-        vec!["cache", "create", "main", "--protocols", "other"],
-        vec!["cache", "set", "main"],
-        vec!["cache", "set", "main", "--private", "--public"],
-        vec!["push", "main", "/anything", "--jobs", "0"],
-        vec!["push", "main", "/anything", "--compression-level", "20"],
-        vec!["push", "main"],
-        vec!["push", "main", ".#app"],
-        vec![
-            "push",
-            "main",
-            "/nix/store/00000000000000000000000000000000-app.drv",
-        ],
-        vec!["token", "create", "ci", "--expires", "0"],
+    for (args, diagnostic) in [
+        (vec!["cache", "create", "main"], "--protocols <PROTOCOLS>"),
+        (
+            vec!["cache", "create", "main", "--protocols", "nix,nix"],
+            "must be a unique comma-separated list",
+        ),
+        (
+            vec!["cache", "create", "main", "--protocols", "nix,"],
+            "must be a unique comma-separated list",
+        ),
+        (
+            vec!["cache", "create", "main", "--protocols", "other"],
+            "must be a unique comma-separated list",
+        ),
+        (
+            vec!["cache", "set", "main"],
+            "cache set requires --private, --public, or --protocols",
+        ),
+        (
+            vec!["cache", "set", "main", "--private", "--public"],
+            "cannot be used with '--public'",
+        ),
+        (
+            vec!["push", "main", "/anything", "--jobs", "0"],
+            "must be a positive integer",
+        ),
+        (
+            vec!["push", "main", "/anything", "--compression-level", "20"],
+            "20 is not in 1..=19",
+        ),
+        (vec!["push", "main"], "No store paths given on stdin"),
+        (
+            vec!["push", "main", ".#app"],
+            "is not an existing store path",
+        ),
+        (
+            vec![
+                "push",
+                "main",
+                "/nix/store/00000000000000000000000000000000-app.drv",
+            ],
+            "is a derivation, not a build output",
+        ),
+        (
+            vec!["token", "create", "ci", "--expires", "0"],
+            "must be a positive integer",
+        ),
     ] {
         let result = run(home.path(), &args);
         assert!(!result.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(
-            !String::from_utf8_lossy(&result.stderr).contains("No server specified"),
-            "{args:?}"
+            stderr.contains(diagnostic),
+            "{args:?}: expected {diagnostic:?}, got {stderr:?}"
         );
     }
 }
@@ -576,7 +607,7 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
                     assert_eq!(spec["narHash"], metadata[path]["narHash"]);
                     assert_eq!(spec["narSize"], metadata[path]["narSize"]);
                     assert_eq!(spec["compression"], "zstd");
-                    assert_eq!(spec["deriver"], metadata[path]["deriver"]);
+                    assert_eq!(spec["deriver"], format!("{}-fixture.drv", "0".repeat(32)));
                     let expected_refs: Vec<_> = metadata[path]["references"]
                         .as_array()
                         .unwrap()

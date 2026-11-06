@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM published_paths\n            WHERE cache_id = $1\n                AND store_path_hash = ANY($2)\n                AND NOT nix_path_pinned(cache_id, store_path_hash, NOW())\n            RETURNING store_path_hash\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "712a2bd431bb1d682ea96d74ffd8befe1c803b27129a24f4d4c16ef4b90e6278"
+}

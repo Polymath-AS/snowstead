@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                DELETE FROM gc_marks\n                WHERE target_type = 'server-gc-cursor'\n                    AND target_id = 'upload sessions'\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "189de4eb05715abc51a01ede3ba28c07ca905ccbe54807558734e9e8963db0bc"
+}

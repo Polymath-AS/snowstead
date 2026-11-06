@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        LOCK TABLE upload_sessions IN SHARE MODE\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "710b7cc8368c7f710a5d6a184da3e57b8bf5aba65c3947cebda2c812fb421d83"
+}

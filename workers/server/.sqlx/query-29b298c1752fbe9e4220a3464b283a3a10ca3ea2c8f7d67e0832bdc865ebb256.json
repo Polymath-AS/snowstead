@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT store_path_hash\n            FROM upstream_paths\n            WHERE store_path_hash = ANY($1)\n                AND upstream = ANY($2)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upstream_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "29b298c1752fbe9e4220a3464b283a3a10ca3ea2c8f7d67e0832bdc865ebb256"
+}

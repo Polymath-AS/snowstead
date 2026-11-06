@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT\n                    COUNT(*) AS \"count!\",\n                    COALESCE(SUM(e.size), 0)::bigint AS \"bytes!\"\n                FROM go_entries e\n                JOIN caches c ON c.id = e.cache_id\n                WHERE c.org_id = $1\n                    AND e.uploaded_at IS NULL\n                    AND e.expires_at > NOW()\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2c2255b54ba9e40978bfa300e7a5d9e1f2a96c8dfeb3d1905fd1d6d615ee5ced"
+}

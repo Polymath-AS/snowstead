@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE upload_parts\n            SET etag = $3,\n                storage_key = $4\n            WHERE session_id = $1\n                AND part_number = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6b7b750330a7395a50332ae06b03ff9795c5d06584ea49243b91ad887035b990"
+}

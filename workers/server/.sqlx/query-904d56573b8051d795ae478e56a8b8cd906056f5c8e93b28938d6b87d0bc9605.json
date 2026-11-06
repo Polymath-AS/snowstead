@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    DELETE FROM published_paths\n                    WHERE id IN (\n                        SELECT id\n                        FROM published_paths\n                        WHERE cache_id = $1\n                        ORDER BY id\n                        LIMIT 500\n                    )\n                    RETURNING store_path_hash\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "904d56573b8051d795ae478e56a8b8cd906056f5c8e93b28938d6b87d0bc9605"
+}

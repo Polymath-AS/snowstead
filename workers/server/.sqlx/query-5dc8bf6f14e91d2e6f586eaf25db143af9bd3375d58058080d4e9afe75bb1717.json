@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO upload_parts (session_id, part_number, size)\n        SELECT\n            $1,\n            p.number,\n            p.size\n        FROM UNNEST($2::integer[], $3::bigint[]) AS p(number, size)\n        ON CONFLICT (session_id, part_number) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5dc8bf6f14e91d2e6f586eaf25db143af9bd3375d58058080d4e9afe75bb1717"
+}

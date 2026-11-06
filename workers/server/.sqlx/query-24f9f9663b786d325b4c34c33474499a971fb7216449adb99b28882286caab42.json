@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"count!\"\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        WHERE c.org_id = $1\n            AND u.expires_at > NOW()\n            AND u.status IN ('streaming', 'finalizing')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "24f9f9663b786d325b4c34c33474499a971fb7216449adb99b28882286caab42"
+}

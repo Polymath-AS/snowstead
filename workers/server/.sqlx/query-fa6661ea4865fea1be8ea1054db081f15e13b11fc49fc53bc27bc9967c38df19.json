@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1\n            FROM pin_paths m\n            JOIN pin_revisions r ON r.id = m.revision_id\n            JOIN pins p ON p.id = r.pin_id\n            WHERE p.id = $1\n                AND (r.revision = p.current_revision\n                    OR p.keep_kind = 'forever'\n                    OR (p.keep_kind = 'revisions' AND r.revision > p.current_revision - p.keep_value)\n                    OR (p.keep_kind = 'days' AND r.superseded_at > NOW() - p.keep_value * INTERVAL '1 day'))\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM published_paths e\n                    WHERE e.cache_id = m.cache_id\n                        AND e.store_path_hash = m.store_path_hash\n                )\n        ) AS \"missing!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "missing!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fa6661ea4865fea1be8ea1054db081f15e13b11fc49fc53bc27bc9967c38df19"
+}

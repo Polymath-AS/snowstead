@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT JSON_BUILD_OBJECT(\n            'orgs', (\n                SELECT COUNT(*)\n                FROM orgs\n            ),\n            'caches', (\n                SELECT COUNT(*)\n                FROM caches\n            ),\n            'paths', (\n                SELECT COALESCE(SUM(path_count), 0)\n                FROM caches\n            ),\n            'storedBytes', (\n                SELECT COALESCE(SUM(size), 0)\n                FROM caches\n            ),\n            'physicalStoredBytes', (\n                SELECT COALESCE(SUM(file_size), 0)\n                FROM blob_objects\n            ),\n            'pendingBytes', (\n                SELECT COALESCE(SUM(file_size), 0)\n                FROM upload_sessions\n                WHERE status = 'finalizing'\n                    OR (status IN ('pending', 'uploading', 'streaming') AND expires_at > NOW())\n            ),\n            'uploadsPending', (\n                SELECT COUNT(*)\n                FROM upload_sessions\n                WHERE status = 'finalizing'\n                    OR (status IN ('pending', 'uploading', 'streaming') AND expires_at > NOW())\n            ),\n            'servedThisMonth', (\n                SELECT COALESCE(SUM(bytes), 0)\n                FROM bandwidth_daily\n                WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date\n            ),\n            'publicServedThisMonth', (\n                SELECT COALESCE(SUM(public_bytes), 0)\n                FROM bandwidth_daily\n                WHERE day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date\n            ),\n            'activeTokens', (\n                SELECT COUNT(*)\n                FROM api_tokens\n                WHERE revoked_at IS NULL\n                    AND (expires_at IS NULL OR expires_at > NOW())\n            ),\n            'apiKeys', (\n                SELECT COUNT(*)\n                FROM org_api_keys\n                WHERE revoked_at IS NULL\n            )\n        )::text AS \"overview!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "overview!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "05dddeeb6d4567d6a89005830eaccee0c5b176d4d1131186e66b55202b47c620"
+}

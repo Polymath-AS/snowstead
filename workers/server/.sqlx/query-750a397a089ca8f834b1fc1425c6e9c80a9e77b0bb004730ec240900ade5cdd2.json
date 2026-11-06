@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH active AS MATERIALIZED (\n            SELECT\n                u.cache_id,\n                u.store_path_hash\n            FROM upload_sessions u\n            JOIN caches c ON c.id = u.cache_id\n            WHERE c.org_id = $1\n                AND (u.status = 'finalizing'\n                    OR (u.status IN ('pending', 'uploading', 'streaming') AND u.expires_at > NOW()))\n        ), victims AS (\n            SELECT\n                'nix'::text AS kind,\n                e.id::text AS id,\n                c.id AS cache_id,\n                c.name,\n                e.store_path AS key,\n                b.file_size AS size,\n                e.last_accessed_at,\n                GREATEST(e.last_pushed_at, e.last_accessed_at) AS used\n            FROM published_paths e\n            JOIN caches c ON c.id = e.cache_id\n            JOIN blob_objects b ON b.id = e.blob_object_id\n            WHERE c.org_id = $1\n                AND NOT nix_path_pinned(e.cache_id, e.store_path_hash, NOW())\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM active a\n                    WHERE a.cache_id = e.cache_id\n                        AND a.store_path_hash = e.store_path_hash\n                )\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM nar_installations i\n                    WHERE i.file_hash = b.file_hash\n                        AND i.compression = b.compression\n                )\n            UNION ALL\n            SELECT\n                'go',\n                e.id,\n                c.id,\n                c.name,\n                e.action,\n                e.size,\n                e.last_accessed_at,\n                GREATEST(e.uploaded_at, e.last_accessed_at)\n            FROM go_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.go_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n            UNION ALL\n            SELECT\n                'sccache',\n                e.id,\n                c.id,\n                c.name,\n                e.action,\n                e.size,\n                e.last_accessed_at,\n                GREATEST(e.uploaded_at, e.last_accessed_at)\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.sccache_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n        )\n        SELECT\n            kind AS \"kind!\",\n            id AS \"id!\",\n            cache_id AS \"cache_id!\",\n            name AS \"name!\",\n            key AS \"key!\",\n            size AS \"size!\",\n            last_accessed_at,\n            used,\n            EXTRACT(EPOCH FROM used)::text AS \"epoch!\"\n        FROM victims\n        WHERE $2::text IS NULL\n            OR (used, kind, id) > (TO_TIMESTAMP($2::double precision), $3::text, $4::text)\n        ORDER BY used, kind, id\n        LIMIT $5\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "cache_id!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "size!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "last_accessed_at",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "used",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "epoch!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "750a397a089ca8f834b1fc1425c6e9c80a9e77b0bb004730ec240900ade5cdd2"
+}

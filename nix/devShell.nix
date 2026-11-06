@@ -15,13 +15,16 @@ pkgs.mkShell {
     cliPkgs.zig_0_17
     pkgs.pkg-config
     pkgs.zstd
-    # The GOCACHEPROG helper and real Terraform build gate.
+    # The GOCACHEPROG helper and real compiler-client checks.
     pkgs.go
     pkgs.sccache
     pkgs.stdenv.cc
     pkgs.time
     # Tests run against a throwaway cluster (scripts/with-postgres.sh).
     pkgs.postgresql
+    # Disposable S3 endpoint for the R2-backed server's real-client tests.
+    pkgs.minio
+    pkgs.minio-client
     # scripts/load-test.sh
     pkgs.oha
     pkgs.jq

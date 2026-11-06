@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO blob_objects (\n                        file_hash,\n                        file_size,\n                        compression,\n                        r2_key\n                    )\n                    SELECT\n                        file_hash,\n                        file_size,\n                        compression,\n                        r2_upload_key\n                    FROM upload_sessions\n                    WHERE cache_id = $1\n                        AND file_hash IS NOT NULL\n                        AND r2_upload_key IS NOT NULL\n                        AND NOT STARTS_WITH(r2_upload_key, 'staging/')\n                    ON CONFLICT DO NOTHING\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e219741144c1084b0233d3524f03d518f9f474392b65ba28abf8a363ba79de6"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO gc_marks (target_type, target_id, reason)\n            VALUES ('server-gc-cursor', 'upload sessions', $1)\n            ON CONFLICT (target_type, target_id) DO UPDATE\n            SET\n                reason = excluded.reason,\n                marked_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6c473116c9fc73f5ff4b0f0954f46a38e8252efcc8b0c7cd6c396c924b0dd090"
+}

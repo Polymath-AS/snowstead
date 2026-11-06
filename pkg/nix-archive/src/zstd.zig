@@ -20,6 +20,7 @@ pub const c_checksumFlag: c_int = 201;
 pub const c_nbWorkers: c_int = 400;
 pub const c_windowLog: c_int = 101;
 pub const c_enableLongDistanceMatching: c_int = 160;
+pub const d_windowLogMax: c_int = 100;
 
 pub const e_continue: c_int = 0;
 pub const e_end: c_int = 2;
@@ -33,6 +34,7 @@ pub extern "c" fn ZSTD_CStreamOutSize() usize;
 
 pub extern "c" fn ZSTD_createDCtx() ?*DCtx;
 pub extern "c" fn ZSTD_freeDCtx(dctx: ?*DCtx) usize;
+pub extern "c" fn ZSTD_DCtx_setParameter(dctx: *DCtx, param: c_int, value: c_int) usize;
 pub extern "c" fn ZSTD_decompressStream(dctx: *DCtx, output: *OutBuffer, input: *InBuffer) usize;
 pub extern "c" fn ZSTD_DStreamOutSize() usize;
 

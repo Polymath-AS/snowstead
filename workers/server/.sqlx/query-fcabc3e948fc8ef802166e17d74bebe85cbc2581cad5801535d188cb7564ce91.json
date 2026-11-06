@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(n), 0)::bigint AS \"used!\"\n        FROM (\n            SELECT c.size AS n\n            FROM caches c\n            WHERE c.org_id = $1\n            UNION ALL\n            SELECT e.size\n            FROM go_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.go_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n            UNION ALL\n            SELECT e.size\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.sccache_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n        ) usage\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "used!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fcabc3e948fc8ef802166e17d74bebe85cbc2581cad5801535d188cb7564ce91"
+}

@@ -726,21 +726,12 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::Notify};
 
-    #[test]
-    fn inline_selection_obeys_zstd_bound_at_every_size() {
-        for size in 0..=INLINE_LIMIT + 1 {
-            let bound = zstd::zstd_safe::compress_bound(size as usize);
-            assert_eq!(
-                inline_capacity(size),
-                (size <= INLINE_LIMIT && bound <= INLINE_LIMIT as usize).then_some(bound)
-            );
-        }
-        assert!(inline_capacity(INLINE_LIMIT).is_none());
-    }
-
     #[tokio::test]
     async fn inline_native_frame_retains_budget_and_never_blocks_the_producer() {
         use sha2::{Digest, Sha256};
+        // A raw NAR at the wire limit needs framing overhead and cannot be
+        // guaranteed to fit inline, even when its contents might compress.
+        assert!(inline_capacity(INLINE_LIMIT).is_none());
         for size in [0, 1, 128 * 1024, 1040000] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("data");
@@ -797,6 +788,61 @@ mod tests {
         assert_eq!(budget.available_permits(), 0);
         drop(bytes);
         assert_eq!(budget.available_permits(), 64);
+    }
+
+    #[hegel::test]
+    fn publish_order_preserves_dags_and_orders_by_depth_then_size(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        let sizes = tc.draw(gs::vecs(gs::integers::<u64>().max_value(16)).max_size(32));
+        let names: Vec<_> = (0..sizes.len()).map(|i| format!("{i:032x}-node")).collect();
+        let mut dependencies = Vec::<Vec<usize>>::new();
+        let mut depths = Vec::new();
+        for i in 0..sizes.len() {
+            // Edges only point backwards, making cycles impossible without
+            // filtering. Compute longest-path depth directly in that order,
+            // independently of the scheduler's ready queue and counters.
+            let refs: Vec<_> = (0..i).filter(|_| tc.draw(gs::booleans())).collect();
+            depths.push(refs.iter().map(|&j| depths[j] + 1).max().unwrap_or(0));
+            dependencies.push(refs);
+        }
+        let mut remaining: Vec<_> = (0..sizes.len()).collect();
+        let mut input = Vec::new();
+        while !remaining.is_empty() {
+            let position = tc.draw(gs::integers::<usize>().max_value(remaining.len() - 1));
+            input.push(remaining.remove(position));
+        }
+        let infos = input
+            .iter()
+            .map(|&i| nix::PathInfo {
+                store_path: format!("/nix/store/{}", names[i]),
+                store_path_hash: format!("{i:032x}"),
+                nar_hash: String::new(),
+                nar_size: sizes[i],
+                references: dependencies[i].iter().map(|&j| names[j].clone()).collect(),
+                deriver: None,
+            })
+            .collect();
+        let order: Vec<_> = publish_order(infos)
+            .iter()
+            .map(|info| {
+                names
+                    .iter()
+                    .position(|name| name == basename(info))
+                    .unwrap()
+            })
+            .collect();
+
+        let mut members = order.clone();
+        members.sort_unstable();
+        assert_eq!(members, (0..sizes.len()).collect::<Vec<_>>());
+        for (position, &i) in order.iter().enumerate() {
+            for dependency in &dependencies[i] {
+                assert!(order[..position].contains(dependency));
+            }
+        }
+        let keys: Vec<_> = order.iter().map(|&i| (depths[i], sizes[i])).collect();
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]

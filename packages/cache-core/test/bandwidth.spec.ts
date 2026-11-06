@@ -169,6 +169,9 @@ describe("bandwidth reports", () => {
 		await db.insert(orgs).values({ id: org, slug: org });
 		const { cache: main } = await ensureCache(db, "main", true, org);
 		const { cache: other } = await ensureCache(db, "other", true, org);
+		await publish(main.id, await nar());
+		await publish(main.id, await nar());
+		await publish(other.id, await nar());
 		const now = new Date();
 		const day = now.toISOString().slice(0, 10);
 		await db.insert(bandwidthDaily).values([
@@ -189,5 +192,14 @@ describe("bandwidth reports", () => {
 		});
 		const { caches } = await (await get("/caches")).json<{ caches: { name: string; servedThisMonth: number }[] }>();
 		expect(caches.map((c) => [c.name, c.servedThisMonth])).toEqual([["main", 20], ["other", 1]]);
+		const overview = await (await get("/overview")).json<{ caches: { name: string; servedThisMonth: number }[] }>();
+		expect(overview).toMatchObject({
+			id: org, used: 300, servedThisMonth: 121, publicServedThisMonth: 34,
+			caches: [
+				{ name: "main", paths: 2, size: 200, addedLastWeek: 2 },
+				{ name: "other", paths: 1, size: 100, addedLastWeek: 1 },
+			],
+		});
+		expect(overview.caches.map((c) => [c.name, c.servedThisMonth])).toEqual([["main", 20], ["other", 1]]);
 	});
 });

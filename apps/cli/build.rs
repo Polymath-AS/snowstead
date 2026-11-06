@@ -6,7 +6,10 @@ fn main() {
     let archive = root.join("../../pkg/nix-archive/src/root.zig");
     println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-changed=../../pkg/nix-archive");
+    println!("cargo:rerun-if-changed=../../pkg/snitch");
     println!("cargo:rerun-if-env-changed=ZIG");
+    // The shared verifier imports snitch; CLI archives always compile it out.
+    std::fs::write(out.join("snitch_options.zig"), "pub const snitch = false;\npub const snitch_timing = true;\npub const snitch_memory = true;\n").unwrap();
     let target = match env::var("TARGET").unwrap().as_str() {
         "x86_64-unknown-linux-gnu" => "x86_64-linux-gnu",
         "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
@@ -39,7 +42,17 @@ fn main() {
             .args(["--dep", "nix-archive"])
             .arg(format!("-Mroot={}", root.join("native/nar.zig").display()))
             .arg(format!("-mcpu={cpu}"))
+            .args(["--dep", "snitch"])
             .arg(format!("-Mnix-archive={}", archive.display()))
+            .args(["--dep", "build_options"])
+            .arg(format!(
+                "-Msnitch={}",
+                root.join("../../pkg/snitch/src/snitch.zig").display()
+            ))
+            .arg(format!(
+                "-Mbuild_options={}",
+                out.join("snitch_options.zig").display()
+            ))
             .arg(format!(
                 "-femit-bin={}",
                 out.join(format!("lib{name}.a")).display()

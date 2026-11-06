@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM nar_installations\n            WHERE key = $1\n                AND operation_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2328c534d66aca54cb373d9f41307ac2fb03f0bdeada663ca342b4654ae9b668"
+}

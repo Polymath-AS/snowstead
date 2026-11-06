@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE go_entries\n                    SET\n                        uploaded_at = $2,\n                        expires_at = $2::timestamptz + INTERVAL '7 days'\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "edb648855c82ce8b3062b67f35d8268d187fd6bd40e21a243213170fe0d106c5"
+}

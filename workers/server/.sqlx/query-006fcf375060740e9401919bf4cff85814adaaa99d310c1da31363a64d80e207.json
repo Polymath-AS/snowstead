@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                DELETE FROM api_tokens\n                WHERE jti IN (\n                    SELECT jti\n                    FROM api_tokens\n                    WHERE expires_at < now() - $1 * INTERVAL '1 second'\n                    ORDER BY jti\n                    LIMIT $2\n                    FOR UPDATE SKIP LOCKED\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "006fcf375060740e9401919bf4cff85814adaaa99d310c1da31363a64d80e207"
+}

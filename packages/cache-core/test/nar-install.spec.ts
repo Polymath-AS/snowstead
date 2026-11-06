@@ -1,4 +1,5 @@
 import { env } from "cloudflare:test";
+import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AwsClient } from "aws4fetch";
 import { eq } from "drizzle-orm";
@@ -98,7 +99,7 @@ describe("verified canonical NAR installation", () => {
 			releaseDb: async () => { await base.releaseDb(); released = true; },
 		});
 		expect((await installStagedNars(cfg, [f.session])).get(f.session.id)).toBeUndefined();
-		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
+		expect(Buffer.from(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer()).equals(f.bytes)).toBe(true);
 		expect(await env.CACHE_BUCKET.head(f.sourceKey)).not.toBeNull();
 		expect(await gate(f.key)).toBeUndefined();
 	});
@@ -242,7 +243,7 @@ describe("verified canonical NAR installation", () => {
 		});
 		expect((await installStagedNars(config({ bucket: privateBucket, publicBucket }), [f.session])).get(f.session.id)).toContain("retry");
 		expect(await gate(f.key)).toMatchObject({ sourceKey: f.sourceKey });
-		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
+		expect(Buffer.from(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer()).equals(f.bytes)).toBe(true);
 	});
 
 	it.each([false, true])("recovers verified bytes after an ambiguous PUT without releasing its gate (inline: %s)", async inline => {
@@ -261,7 +262,7 @@ describe("verified canonical NAR installation", () => {
 		const retained = await gate(f.key);
 		const before = await env.PUBLIC_BUCKET.head(f.key);
 		expect(Boolean(await env.CACHE_BUCKET.head(f.sourceKey))).toBe(!inline);
-		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
+		expect(Buffer.from(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer()).equals(f.bytes)).toBe(true);
 		expect((await installStagedNars(config({ publicBucket }), [session])).get(f.session.id)).toBeUndefined();
 		expect(await gate(f.key)).toEqual(retained);
 		expect((await env.PUBLIC_BUCKET.head(f.key))?.version).toBe(before?.version);
@@ -387,7 +388,7 @@ describe("verified canonical NAR installation", () => {
 		const privateKey = narKey(f.fileHash, "zstd", true);
 		await env.CACHE_BUCKET.put(privateKey, f.bytes);
 		await placeNar(config(), privateKey, f.fileHash, "zstd", false);
-		expect(new Uint8Array(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer())).toEqual(f.bytes);
+		expect(Buffer.from(await (await env.PUBLIC_BUCKET.get(f.key))!.arrayBuffer()).equals(f.bytes)).toBe(true);
 		expect(await env.CACHE_BUCKET.head(privateKey)).not.toBeNull();
 		expect(await gate(f.key)).toBeUndefined();
 	});

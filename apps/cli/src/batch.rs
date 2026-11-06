@@ -20,7 +20,7 @@ impl<T: Send + 'static, R: Send + 'static> Batcher<T, R> {
         F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = anyhow::Result<Vec<R>>> + Send + 'static,
     {
-        assert!(concurrency > 0);
+        debug_assert!(concurrency > 0);
         let (sender, mut receiver) = mpsc::channel::<(T, Reply<R>)>(max_size);
         let operation = Arc::new(operation);
         tokio::spawn(async move {
@@ -196,19 +196,22 @@ mod tests {
 
     #[tokio::test]
     async fn slow_batch_does_not_block_other_batches_or_exceed_concurrency() {
-        let gate = Arc::new(Semaphore::new(0));
+        let first_gate = Arc::new(Semaphore::new(0));
+        let other_gate = Arc::new(Semaphore::new(0));
         let (started, mut starts) = mpsc::unbounded_channel();
         let batch = Batcher::new(1, 2, Duration::ZERO, {
-            let gate = gate.clone();
+            let first_gate = first_gate.clone();
+            let other_gate = other_gate.clone();
             move |items: Vec<u32>| {
-                let gate = gate.clone();
+                let gate = if items[0] == 0 {
+                    first_gate.clone()
+                } else {
+                    other_gate.clone()
+                };
                 let started = started.clone();
                 async move {
                     started.send(items[0]).unwrap();
-                    let _permit = gate.acquire().await.unwrap();
-                    if items[0] == 0 {
-                        anyhow::bail!("first batch failed");
-                    }
+                    gate.acquire().await.unwrap().forget();
                     Ok(items.into_iter().map(|id| id * 7).collect())
                 }
             }
@@ -233,15 +236,21 @@ mod tests {
                 .await
                 .is_err()
         );
-        gate.add_permits(1);
+        other_gate.add_permits(1);
         tokio::time::timeout(Duration::from_secs(2), async {
-            assert_eq!(starts.recv().await, Some(5));
-            assert!(first.await.unwrap().is_err());
             assert_eq!(second.await.unwrap().unwrap(), 21);
+            assert_eq!(starts.recv().await, Some(5));
+            assert!(
+                !first.is_finished(),
+                "a completed lane must be reused while the first batch is blocked"
+            );
+            other_gate.add_permits(1);
             assert_eq!(third.await.unwrap().unwrap(), 35);
+            first_gate.add_permits(1);
+            assert_eq!(first.await.unwrap().unwrap(), 0);
         })
         .await
-        .expect("failed batches must release capacity and preserve other replies");
+        .expect("a slow batch must not block completion or reuse of another lane");
     }
 
     #[tokio::test]

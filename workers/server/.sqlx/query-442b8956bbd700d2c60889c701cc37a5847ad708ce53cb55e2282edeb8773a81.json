@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO pins (\n            id,\n            cache_id,\n            name,\n            keep_kind,\n            keep_value,\n            current_revision\n        )\n        VALUES ($1, $2, $3, $4, $5, $6)\n        ON CONFLICT (cache_id, name) DO UPDATE\n        SET keep_kind = EXCLUDED.keep_kind,\n            keep_value = EXCLUDED.keep_value,\n            current_revision = EXCLUDED.current_revision\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "442b8956bbd700d2c60889c701cc37a5847ad708ce53cb55e2282edeb8773a81"
+}

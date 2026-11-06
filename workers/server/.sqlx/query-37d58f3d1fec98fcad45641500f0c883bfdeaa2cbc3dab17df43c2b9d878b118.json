@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH monthly AS MATERIALIZED (\n            SELECT\n                b.cache_id,\n                SUM(b.bytes)::bigint AS origin,\n                SUM(b.public_bytes)::bigint AS public,\n                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'nix'), 0)::bigint AS nix,\n                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'go'), 0)::bigint AS go,\n                COALESCE(SUM(b.bytes + b.public_bytes) FILTER (WHERE b.product = 'sccache'), 0)::bigint AS sccache\n            FROM bandwidth_daily b\n            WHERE b.day >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')::date\n                AND b.cache_id = ANY(ARRAY(\n                    SELECT c.id\n                    FROM caches c\n                    WHERE ($1::text IS NULL OR c.org_id = $1)\n                        AND ($2::text IS NULL OR c.name = $2)\n                ))\n            GROUP BY b.cache_id\n        ), summaries AS (\n            SELECT\n                c.id,\n                c.name,\n                JSONB_BUILD_OBJECT(\n                    'name', c.name,\n                    'path', CASE WHEN o.slug = 'default' THEN c.name ELSE o.slug || '/' || c.name END,\n                    'private', NOT c.is_public,\n                    'org', c.org_id,\n                    'protocols', ARRAY(\n                        SELECT protocol\n                        FROM cache_protocols\n                        WHERE cache_id = c.id\n                        ORDER BY protocol DESC\n                    ),\n                    'retentionDays', c.retention_days,\n                    'createdAt', TO_CHAR(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),\n                    'paths', c.path_count,\n                    'size', c.size,\n                    'addedLastWeek', COUNT(p.id) FILTER (WHERE p.created_at >= NOW() - INTERVAL '7 days'),\n                    'lastAddedAt', TO_CHAR(MAX(p.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')\n                ) AS summary\n            FROM caches c\n            JOIN orgs o ON o.id = c.org_id\n            LEFT JOIN published_paths p ON p.cache_id = c.id\n            WHERE ($1::text IS NULL OR c.org_id = $1)\n                AND ($2::text IS NULL OR c.name = $2)\n            GROUP BY c.id, o.slug\n        )\n        SELECT (s.summary || JSONB_BUILD_OBJECT(\n            'servedThisMonth', COALESCE(m.origin, 0),\n            'publicServedThisMonth', COALESCE(m.public, 0),\n            'servedThisMonthByProduct', JSONB_BUILD_OBJECT(\n                'nix', COALESCE(m.nix, 0),\n                'go', COALESCE(m.go, 0),\n                'sccache', COALESCE(m.sccache, 0)\n            )\n        ))::text AS \"summary!\"\n        FROM summaries s\n        LEFT JOIN monthly m ON m.cache_id = s.id\n        ORDER BY s.name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "summary!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "37d58f3d1fec98fcad45641500f0c883bfdeaa2cbc3dab17df43c2b9d878b118"
+}

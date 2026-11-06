@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM published_paths\n        WHERE id IN (\n            SELECT p.id\n            FROM published_paths p\n            JOIN caches c ON c.id = p.cache_id\n            WHERE c.id = $1\n                AND p.last_pushed_at < now() - c.retention_days * INTERVAL '1 day'\n                AND NOT nix_path_pinned(p.cache_id, p.store_path_hash, now())\n            ORDER BY p.last_pushed_at, p.id\n            LIMIT $2\n        )\n        RETURNING store_path_hash\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ee51fa3a6e992332160edccf4eef6b7e98781e15163a3c5ba1a2fcc906b61d0b"
+}

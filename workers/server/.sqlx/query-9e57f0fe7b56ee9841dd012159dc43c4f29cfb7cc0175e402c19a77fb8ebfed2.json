@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT e.id\n                FROM go_entries e\n                JOIN caches c ON c.id = e.cache_id\n                WHERE e.id = ANY($1)\n                    AND c.org_id = $2\n                    AND e.generation = c.go_generation\n                    AND e.uploaded_at IS NOT NULL\n                    AND e.expires_at > NOW()\n                ORDER BY e.id\n                FOR UPDATE OF e SKIP LOCKED\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "go_entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9e57f0fe7b56ee9841dd012159dc43c4f29cfb7cc0175e402c19a77fb8ebfed2"
+}

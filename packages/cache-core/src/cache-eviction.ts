@@ -3,6 +3,7 @@ import type { WorkerConfig } from "./config.js";
 import type { CacheAt } from "./db/repository.js";
 import { caches, pins, uploadSessions, goEntries, sccacheEntries } from "./db/schema.js";
 import { deleteCachePaths } from "./path-deletion.js";
+import { uuidv7 } from "./uuid.js";
 
 /** Logical deletion is atomic; external deletes are idempotent and precede commit. */
 export async function evictCache(config: WorkerConfig, cache: CacheAt, origin: string) {
@@ -14,7 +15,7 @@ export async function evictCache(config: WorkerConfig, cache: CacheAt, origin: s
 		if (!current) return { evicted: true, name: cache.name, removed: { nix: 0, go: 0, sccache: 0 }, pinsDeleted: 0 };
 		await tx.execute(sql`select set_config('snowstead.eviction_reason','evict',true)`);
 		const pinsDeleted = (await tx.delete(pins).where(eq(pins.cacheId, cache.id)).returning({ id: pins.id })).length;
-		await tx.update(caches).set({ goGeneration: crypto.randomUUID(), sccacheGeneration: crypto.randomUUID() }).where(eq(caches.id, cache.id));
+		await tx.update(caches).set({ goGeneration: uuidv7(), sccacheGeneration: uuidv7() }).where(eq(caches.id, cache.id));
 		// Keep cleanup records; a late Nix finalization rechecks status under the org fence.
 		await tx.update(uploadSessions).set({ status: "aborted", expiresAt: new Date() }).where(eq(uploadSessions.cacheId, cache.id));
 		const removed = { nix: 0, go: 0, sccache: 0 };

@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "./db/connection.js";
 import { caches, pins, pinRevisions, pinPaths } from "./db/schema.js";
+import { uuidv7 } from "./uuid.js";
 
 export type PinKeep = "forever" | { days: number } | { revisions: number };
 export class PinError extends Error {
@@ -57,7 +58,7 @@ export async function putPin(db: Db, org: string, cacheId: number, name: string,
 		if (closure.rows.some(row => row.storePath === null) || !closure.rows.some(row => row.storePath === storePath)) {
 			throw new PinError("The root and its entire closure must be published in this cache", 409);
 		}
-		const id = existing?.id ?? crypto.randomUUID();
+		const id = existing?.id ?? uuidv7();
 		const revision = current?.storePath === storePath ? existing!.currentRevision : (existing?.currentRevision ?? 0) + 1;
 		const policy = { keepKind: keep === "forever" ? "forever" as const : "days" in keep ? "days" as const : "revisions" as const,
 			keepValue: keep === "forever" ? null : "days" in keep ? keep.days : keep.revisions };
@@ -65,7 +66,7 @@ export async function putPin(db: Db, org: string, cacheId: number, name: string,
 			.onConflictDoUpdate({ target: [pins.cacheId, pins.name], set: { currentRevision: revision, ...policy } });
 		if (!current || current.storePath !== storePath) {
 			if (current) await tx.update(pinRevisions).set({ supersededAt: new Date() }).where(eq(pinRevisions.id, current.id));
-			const revisionId = crypto.randomUUID();
+			const revisionId = uuidv7();
 			await tx.insert(pinRevisions).values({ id: revisionId, pinId: id, revision, storePath });
 			// Bounded set insert, no per-dependency round trips.
 			await tx.insert(pinPaths).values(closure.rows.map(row => ({ revisionId, cacheId, storePathHash: row.hash })));

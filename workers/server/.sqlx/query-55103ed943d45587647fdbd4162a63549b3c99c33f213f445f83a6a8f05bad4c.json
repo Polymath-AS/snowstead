@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            signing_key_name,\n            signing_public_key,\n            signing_key_sealed\n        FROM caches\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "signing_key_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_key_name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "signing_public_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "signing_key_sealed",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_key_sealed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "55103ed943d45587647fdbd4162a63549b3c99c33f213f445f83a6a8f05bad4c"
+}
