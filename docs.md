@@ -160,15 +160,7 @@ Org-management credentials can read statistics with
 `POST /_api/v1/orgs/:org/caches/:name/sccache/reset`. Reset leaves Nix and Go intact.
 
 `pnpm check` exercises real Rust and C++ clients against Rust with disposable
-Postgres/S3 and fresh local client caches. For longer local build benchmarks:
-
-```sh
-nix develop --command scripts/with-postgres.sh scripts/with-r2.sh node scripts/sccache-build-bench.mjs
-```
-
-The benchmark builds pinned ripgrep and RocksDB releases, checks outputs, and
-records client statistics under `.amp/in/artifacts/compiler-backend-bench/`.
-It measures a local stack, not production or WAN performance.
+Postgres/S3 and fresh local client caches.
 
 ## Rust API compatibility
 

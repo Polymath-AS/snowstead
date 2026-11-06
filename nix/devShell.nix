@@ -19,14 +19,11 @@ pkgs.mkShell {
     pkgs.go
     pkgs.sccache
     pkgs.stdenv.cc
-    pkgs.time
     # Tests run against a throwaway cluster (scripts/with-postgres.sh).
     pkgs.postgresql
     # Disposable S3 endpoint for the R2-backed server's real-client tests.
     pkgs.minio
     pkgs.minio-client
-    # scripts/load-test.sh
-    pkgs.oha
     pkgs.jq
-  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.poop ];
+  ];
 }
