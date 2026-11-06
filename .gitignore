@@ -12,3 +12,4 @@ result
 .env
 .dev.vars
 .dev/
+/infra/secrets/*.age

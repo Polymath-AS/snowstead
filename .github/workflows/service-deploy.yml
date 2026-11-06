@@ -1,0 +1,51 @@
+name: Deploy service
+
+on:
+  workflow_dispatch:
+    inputs:
+      migrate:
+        description: Apply compatible SQLx migrations with the migration role
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Deploy only reviewed master; no arbitrary revision or pull-request code.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v21
+      - name: Install workspace dependencies
+        run: nix develop --command pnpm install --frozen-lockfile
+      - name: Check the workspace and protocol integration
+        run: nix develop --command pnpm check
+      - name: Check application activation and deployment schema
+        run: nix build --no-link -L .#checks.x86_64-linux.host .#checks.x86_64-linux.service .#checks.x86_64-linux.deployment
+      - name: Build and export exact deployment closures
+        run: |
+          paths=$(nix build --no-link --print-out-paths .#deploy.nodes.staging.profiles.service.path .#server .#devShells.x86_64-linux.infra)
+          mkdir -p "$RUNNER_TEMP/release-cache"
+          printf '%s\n' "$paths" > "$RUNNER_TEMP/release-cache/store-paths"
+          mapfile -t closures <<< "$paths"
+          nix copy --to "file://$RUNNER_TEMP/release-cache" "${closures[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-closures
+          path: ${{ runner.temp }}/release-cache
+          retention-days: 7
+
+  staging:
+    needs: build
+    uses: ./.github/workflows/service-release-host.yml
+    with:
+      target: staging
+      migrate: ${{ inputs.migrate }}
+    secrets: inherit

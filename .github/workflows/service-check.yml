@@ -1,0 +1,28 @@
+name: Service infrastructure
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v21
+      - name: Install workspace dependencies
+        run: nix develop --command pnpm install --frozen-lockfile
+      - name: Check the workspace and protocol integration
+        run: nix develop --command pnpm check
+      - name: Build the server and exercise application activation
+        run: nix build --no-link -L .#server .#checks.x86_64-linux.host .#checks.x86_64-linux.service .#checks.x86_64-linux.deployment
+      - name: Evaluate the Ubuntu application profile
+        run: |
+          nix eval --raw .#deploy.nodes.staging.profiles.service.path.drvPath
+      - name: Check deployment shell
+        run: |
+          nix shell --inputs-from . nixpkgs#shellcheck nixpkgs#actionlint --command bash -c 'shellcheck infra/*.sh && actionlint .github/workflows/service-*.yml'

@@ -1,0 +1,66 @@
+name: Release service host
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      migrate:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v21
+      - name: Check inventory before accessing secrets
+        env:
+          TARGET: ${{ inputs.target }}
+        run: test "$(nix eval --json ".#deploymentReady.$TARGET")" = true
+      - uses: actions/download-artifact@v4
+        with:
+          name: service-closures
+          path: ${{ runner.temp }}/release-cache
+      - name: Import this run's tested closures
+        run: |
+          # This artifact belongs to this protected workflow run, not an
+          # untrusted external substituter. No long-lived signing key is needed.
+          mapfile -t paths < "$RUNNER_TEMP/release-cache/store-paths"
+          nix copy --no-check-sigs --from "file://$RUNNER_TEMP/release-cache" "${paths[@]}"
+      - name: Install WireGuard
+        run: sudo apt-get update && sudo apt-get install -y wireguard-tools
+      - name: Configure deployment access
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVICE_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SERVICE_SSH_KNOWN_HOSTS }}
+          WIREGUARD_CONFIG: ${{ secrets.SERVICE_WIREGUARD_CONFIG }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$WIREGUARD_CONFIG" > "$RUNNER_TEMP/wg-release.conf"
+          sudo wg-quick up "$RUNNER_TEMP/wg-release.conf"
+      - name: Migrate if requested and activate
+        env:
+          TARGET: ${{ inputs.target }}
+          MIGRATE: ${{ inputs.migrate }}
+          NIX_SSHOPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
+        run: |
+          args=("$TARGET")
+          if [[ "$MIGRATE" == true ]]; then args+=(--migrate); fi
+          nix develop .#infra --command bash infra/deploy.sh "${args[@]}"
+      - name: Remove deployment access
+        if: always()
+        run: |
+          if sudo wg show wg-release >/dev/null 2>&1; then
+            sudo wg-quick down "$RUNNER_TEMP/wg-release.conf"
+          fi
+          rm -f ~/.ssh/id_ed25519 ~/.ssh/known_hosts "$RUNNER_TEMP/wg-release.conf"
