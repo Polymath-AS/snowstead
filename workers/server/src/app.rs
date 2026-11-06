@@ -28,6 +28,8 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) pool: PgPool,
+    /// Pool for explicitly stale-tolerant reads; shares the primary by default.
+    pub read_pool: PgPool,
     pub(crate) config: Arc<Config>,
     pub(crate) http: reqwest::Client,
     pub(crate) tasks: TaskTracker,
@@ -68,6 +70,7 @@ impl AppState {
                 )
             })?;
         Ok(Self {
+            read_pool: pool.clone(),
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),
@@ -149,6 +152,7 @@ pub async fn serve(
     .await;
     retry_stop.cancel();
     state.finish_background().await;
+    state.read_pool.close().await;
     state.pool.close().await;
     served
 }

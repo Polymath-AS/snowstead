@@ -291,6 +291,85 @@ async fn org_settings_inventory_and_cache_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn only_global_overview_uses_the_read_pool(pool: PgPool) {
+    // Independent data models replica lag without a physical standby.
+    sqlx::raw_sql(
+        "CREATE SCHEMA replica;
+        CREATE TABLE replica.orgs (LIKE public.orgs INCLUDING ALL);
+        CREATE TABLE replica.caches (LIKE public.caches INCLUDING ALL);
+        CREATE TABLE replica.blob_objects (LIKE public.blob_objects INCLUDING ALL);
+        CREATE TABLE replica.upload_sessions (LIKE public.upload_sessions INCLUDING ALL);
+        CREATE TABLE replica.bandwidth_daily (LIKE public.bandwidth_daily INCLUDING ALL);
+        CREATE TABLE replica.api_tokens (LIKE public.api_tokens INCLUDING ALL);
+        CREATE TABLE replica.org_api_keys (LIKE public.org_api_keys INCLUDING ALL);
+        INSERT INTO replica.orgs(id,slug) VALUES ('old_alpha','old-alpha'),('old_beta','old-beta');
+        INSERT INTO replica.caches(name,org_id,path_count,size) VALUES ('old','old_alpha',3,17);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let read_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone().options([
+            ("search_path", "replica"),
+            ("default_transaction_read_only", "on"),
+        ]))
+        .await
+        .unwrap();
+    let mut state = state(pool.clone());
+    state.read_pool = read_pool.clone();
+    let app = router(state);
+    let (status, _, overview) =
+        call(&app, "GET", "/_api/v1/admin/overview", Value::Null, None).await;
+    assert_eq!(status, StatusCode::OK, "{overview}");
+    assert_eq!(
+        overview,
+        json!({"orgs":2,"caches":1,"paths":3,"storedBytes":17,
+            "physicalStoredBytes":0,"pendingBytes":0,"uploadsPending":0,
+            "servedThisMonth":0,"publicServedThisMonth":0,"activeTokens":0,"apiKeys":0})
+    );
+
+    let (status, _, created) = call(
+        &app,
+        "PUT",
+        "/_api/v1/orgs/fresh",
+        json!({"slug":"fresh","storageLimit":123}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["storageLimit"], 123);
+    let (status, _, fetched) = call(&app, "GET", "/_api/v1/orgs/fresh", Value::Null, None).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched, created);
+    assert_eq!(
+        call(&app, "GET", "/_api/v1/admin/overview", Value::Null, None)
+            .await
+            .2,
+        overview
+    );
+
+    // Replica failure must not silently route the overview back to primary.
+    read_pool.close().await;
+    assert_eq!(
+        call(&app, "GET", "/_api/v1/admin/overview", Value::Null, None)
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        call(&app, "GET", "/_api/v1/orgs/fresh", Value::Null, None)
+            .await
+            .2,
+        created
+    );
+    assert_eq!(
+        call(&app, "GET", "/healthz", Value::Null, None).await.0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn blocked_policy_update_does_not_block_another_org_slug_claim(pool: PgPool) {
     sqlx::query("INSERT INTO orgs (id,slug) VALUES ('org_alpha','alpha')")
         .execute(&pool)
