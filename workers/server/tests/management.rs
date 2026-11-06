@@ -584,6 +584,95 @@ async fn cache_summaries_keep_monthly_products_and_paths_separate(pool: PgPool) 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn metadata_backfill_repairs_recorded_nar_placement(pool: PgPool) {
+    let storage = if std::env::var_os("SNOWSTEAD_TEST_R2_ENDPOINT").is_some() {
+        Storage::new(&Config::from_env()).unwrap()
+    } else {
+        common::storage()
+    };
+    let app = router(state_with_storage(pool.clone(), storage.clone()));
+    sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_repair','repair');
+        INSERT INTO caches (name,org_id,is_public) VALUES ('public','org_repair',true),('secret','org_repair',false);
+        INSERT INTO cache_protocols (cache_id,protocol) SELECT id,'nix' FROM caches;")
+        .execute(&pool).await.unwrap();
+    for private in [false, true] {
+        let name = if private { "secret" } else { "public" };
+        let hash = if private { "d" } else { "c" }.repeat(64);
+        let source = if private {
+            format!("nar/{hash}/none.nar")
+        } else {
+            format!("nars/sha256/{hash}/none.nar")
+        };
+        let target = if private {
+            format!("nars/sha256/{hash}/none.nar")
+        } else {
+            format!("nar/{hash}/none.nar")
+        };
+        sqlx::query("INSERT INTO blob_objects (file_hash,file_size,compression,r2_key) VALUES ($1,5,'none',$2)")
+            .bind(&hash).bind(&source).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO published_paths (cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
+            SELECT c.id,repeat('0',32),'/nix/store/00000000000000000000000000000000-example','sha256:'||repeat('0',64),5,b.id
+            FROM caches c CROSS JOIN blob_objects b WHERE c.name=$1 AND b.file_hash=$2")
+            .bind(name).bind(&hash).execute(&pool).await.unwrap();
+        storage.put(!private, &source, b"bytes").await.unwrap();
+        assert!(storage.head(private, &target).await.is_err());
+    }
+    let backfill = || {
+        call(
+            &app,
+            "POST",
+            "/_api/v1/admin/narinfo/backfill",
+            json!({}),
+            None,
+        )
+    };
+    let (status, _, result) = backfill().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result, json!({"written":2,"skipped":[],"next":null}));
+    for private in [false, true] {
+        let (name, hash, prefix) = if private {
+            ("secret", "d".repeat(64), "nars/sha256")
+        } else {
+            ("public", "c".repeat(64), "nar")
+        };
+        let object = storage
+            .open(private, &format!("{prefix}/{hash}/none.nar"))
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut { object.reader }, &mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+        let info_key = format!(
+            "{}repair/{name}/{}.narinfo",
+            if private { "narinfo/" } else { "" },
+            "0".repeat(32)
+        );
+        assert!(storage.head(private, &info_key).await.is_ok());
+        assert!(storage.head(!private, &info_key).await.is_err());
+        // Once placed, a missing recorded source must not prevent re-signing.
+        let source = format!(
+            "{}/{hash}/none.nar",
+            if private { "nar" } else { "nars/sha256" }
+        );
+        storage.delete(!private, &source).await.unwrap();
+    }
+    assert_eq!(
+        backfill().await.2,
+        json!({"written":2,"skipped":[],"next":null})
+    );
+    storage
+        .delete(false, &format!("nar/{}/none.nar", "c".repeat(64)))
+        .await
+        .unwrap();
+    assert_eq!(
+        backfill().await.2,
+        json!({"written":1,"skipped":[format!("repair/public/{}", "0".repeat(32))],"next":null})
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
     let one = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

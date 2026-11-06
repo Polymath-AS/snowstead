@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE sccache_entries\n                    SET\n                        r2_key = $2,\n                        stored_at = $3,\n                        size = $4\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "62a422d5158d9da28140340fb5702c568f2891d94e5cc9ca3d63ec96dd625556"
+}

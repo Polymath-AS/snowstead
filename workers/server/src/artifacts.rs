@@ -291,6 +291,9 @@ pub async fn download(
     if metadata.size != entry.size as u64 {
         return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"));
     }
+    if entry.expires_at <= Utc::now() {
+        return Err(error(StatusCode::NOT_FOUND, "Not Found"));
+    }
     // Neither telemetry write depends on the other. Wait for both, without
     // borrowing a transaction or making transfer success depend on telemetry.
     let bandwidth = async {
@@ -346,6 +349,9 @@ pub async fn download(
         }
     };
     tokio::join!(bandwidth, access);
+    if entry.expires_at <= Utc::now() {
+        return Err(error(StatusCode::NOT_FOUND, "Not Found"));
+    }
     let body = reader.map_or_else(Body::empty, |reader| {
         Body::from_stream(crate::profile_stream!(
             ReaderStream::new(reader),
@@ -604,10 +610,29 @@ async fn reserve(
         .fetch_optional(&mut *tx)
         .await?,
     };
-    if let Some(entry) = existing {
-        tx.commit().await?;
-        return Ok(entry);
-    }
+    let existing = match existing {
+        Some(entry)
+            if entry.stored_at.is_some()
+                || entry.uploaded_at.is_some()
+                || size <= entry.size as u64 =>
+        {
+            tx.commit().await?;
+            return Ok(entry);
+        }
+        Some(entry) => {
+            // A lost pre-migration acknowledgement may leave an immutable
+            // object without stored_at. It needs no reservation growth.
+            match state.storage.head(true, &entry.r2_key).await {
+                Ok(_) => {
+                    tx.commit().await?;
+                    return Ok(entry);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(entry),
+                Err(_) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")),
+            }
+        }
+        None => None,
+    };
     if limit.is_some_and(|n| size > n as u64) {
         return Err(too_large());
     }
@@ -649,10 +674,36 @@ async fn reserve(
             .await?
         }
     };
-    if staging.count >= 256
-        || staging.bytes.saturating_add(size as i64) > limit.unwrap_or(1024 * 1024 * 1024)
+    let additional = (size as i64).saturating_sub(existing.as_ref().map_or(0, |e| e.size));
+    if (existing.is_none() && staging.count >= 256)
+        || staging.bytes.saturating_add(additional) > limit.unwrap_or(1024 * 1024 * 1024)
     {
         return Err(busy("Upload staging is busy; retry"));
+    }
+    if let Some(mut entry) = existing {
+        match product {
+            Product::Go => {
+                sqlx::query!(
+                    "UPDATE go_entries SET size = $2 WHERE id = $1",
+                    &entry.id,
+                    size as i64,
+                )
+                .execute(&mut *tx)
+                .await?
+            }
+            Product::Sccache => {
+                sqlx::query!(
+                    "UPDATE sccache_entries SET size = $2 WHERE id = $1",
+                    &entry.id,
+                    size as i64,
+                )
+                .execute(&mut *tx)
+                .await?
+            }
+        };
+        entry.size = size as i64;
+        tx.commit().await?;
+        return Ok(entry);
     }
     let id = uuid::Uuid::now_v7().to_string();
     let key = format!(
@@ -875,9 +926,10 @@ async fn finish(
     state: &AppState,
     target: &Target,
     product: Product,
-    id: &str,
+    expected: &Entry,
     attempt: Option<Transfer>,
 ) -> Result<Response, ApiError> {
+    let id = &expected.id;
     let kind = product.name();
     let mut tx =
         crate::profile_future!(state.pool.begin(), label = "artifacts.adopt_pool_begin").await?;
@@ -885,6 +937,27 @@ async fn finish(
     policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
     let won = entry.stored_at.is_none() && entry.uploaded_at.is_none();
+    if !won
+        && ((product == Product::Go
+            && (entry.size != expected.size || entry.output != expected.output))
+            || (product == Product::Sccache
+                && entry.uploaded_at.is_none()
+                && entry.size != expected.size))
+    {
+        if let Some(transfer) = &attempt
+            && transfer.key != entry.r2_key
+        {
+            let _ = state.storage.delete(true, &transfer.key).await;
+        }
+        return Err(error(
+            StatusCode::CONFLICT,
+            if product == Product::Go {
+                "Action already has a different output"
+            } else {
+                "Upload in progress; retry"
+            },
+        ));
+    }
     if won {
         let transfer = attempt
             .as_ref()
@@ -896,12 +969,16 @@ async fn finish(
                     UPDATE go_entries
                     SET
                         r2_key = $2,
-                        stored_at = $3
+                        stored_at = $3,
+                        size = $4,
+                        output = $5
                     WHERE id = $1
                     "#,
                     id,
                     &transfer.key,
                     transfer.stored_at,
+                    expected.size,
+                    expected.output.as_deref(),
                 )
                 .execute(&mut *tx)
                 .await?
@@ -912,12 +989,14 @@ async fn finish(
                     UPDATE sccache_entries
                     SET
                         r2_key = $2,
-                        stored_at = $3
+                        stored_at = $3,
+                        size = $4
                     WHERE id = $1
                     "#,
                     id,
                     &transfer.key,
                     transfer.stored_at,
+                    expected.size,
                 )
                 .execute(&mut *tx)
                 .await?
@@ -1019,7 +1098,7 @@ pub async fn upload(
     output: Option<&str>,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let entry = reserve(state, target, product, action, size, output).await?;
+    let mut entry = reserve(state, target, product, action, size, output).await?;
     let mismatch = || {
         error(
             StatusCode::BAD_REQUEST,
@@ -1030,7 +1109,20 @@ pub async fn upload(
             },
         )
     };
-    if product == Product::Go && (entry.output.as_deref() != output || entry.size != size as i64) {
+    let stored = entry.stored_at.or(entry.uploaded_at);
+    let recovered = if stored.is_none() {
+        match state.storage.head(true, &entry.r2_key).await {
+            Ok(metadata) => Some(metadata.last_modified),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")),
+        }
+    } else {
+        None
+    };
+    if product == Product::Go
+        && (stored.is_some() || recovered.is_some())
+        && (entry.output.as_deref() != output || entry.size != size as i64)
+    {
         if consume_hash(body, size)
             .await
             .map_err(|_| mismatch())?
@@ -1045,22 +1137,12 @@ pub async fn upload(
         ));
     }
     if product == Product::Sccache
-        && entry.stored_at.is_none()
         && entry.uploaded_at.is_none()
+        && (stored.is_some() || recovered.is_some())
         && entry.size != size as i64
     {
         return Err(error(StatusCode::CONFLICT, "Upload in progress; retry"));
     }
-    let stored = entry.stored_at.or(entry.uploaded_at);
-    let recovered = if stored.is_none() {
-        match state.storage.head(true, &entry.r2_key).await {
-            Ok(metadata) => Some(metadata.last_modified),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")),
-        }
-    } else {
-        None
-    };
     let attempt = if stored.is_some() || recovered.is_some() {
         let digest = consume_hash(body, size).await.map_err(|_| mismatch())?;
         if product == Product::Go && Some(digest.as_str()) != output {
@@ -1078,8 +1160,8 @@ pub async fn upload(
             entry.id,
             uuid::Uuid::now_v7()
         );
-        // Failures clean up only this attempt's object. Other writers can be
-        // using the shared reservation, which remains bounded by its expiry.
+        // Attempts share a byte reservation, not an output commitment. The
+        // first verified transfer to be adopted fixes the output and size.
         let digest = match state.storage.write_body(true, &key, body, size).await {
             Ok(hash) => hash,
             Err(e) => {
@@ -1104,10 +1186,12 @@ pub async fn upload(
     // on shutdown. Cancellation cannot remove a source after SQL adopts it.
     let owned = state.clone();
     let target = target.clone();
+    entry.size = size as i64;
+    entry.output = output.map(str::to_owned);
     state
         .tasks
         .spawn(crate::profile_future!(
-            async move { finish(&owned, &target, product, &entry.id, attempt).await },
+            async move { finish(&owned, &target, product, &entry, attempt).await },
             label = "artifacts.publication"
         ))
         .await

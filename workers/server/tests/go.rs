@@ -221,22 +221,17 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
             &url,
             Some(&write),
             &[
-                ("content-length", &bytes.len().to_string()),
+                ("content-length", "3"),
                 ("x-snowstead-output-id", &"0".repeat(64))
             ],
-            bytes
+            b"bad"
         )
         .await
         .0,
         StatusCode::BAD_REQUEST
     );
-    // A failed attempt does not release a reservation shared with other
-    // writers. A different output can replace it only after expiry.
-    assert_eq!(put(&app, &url, &write, bytes).await, StatusCode::CONFLICT);
-    sqlx::query("UPDATE go_entries SET expires_at=now()-interval '1 second'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // A failed transfer must not commit its output or size. A corrected retry
+    // can publish without waiting for the shared reservation to expire.
     assert_eq!(put(&app, &url, &write, bytes).await, StatusCode::CREATED);
     let expiry: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT expires_at FROM go_entries WHERE cache_id IS NOT NULL")
@@ -336,6 +331,66 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn compiler_expiration_is_checked_after_waiting_for_access_recording(pool: PgPool) {
+    let app = router(fixture(&pool).await);
+    let credential = token("org_a", "compiler", &["go:write", "go:read"]);
+    let url = path("compiler", '9');
+    assert_eq!(
+        put(&app, &url, &credential, b"expires during read").await,
+        StatusCode::CREATED
+    );
+    for method in ["GET", "HEAD"] {
+        let expires: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "UPDATE go_entries SET expires_at=now()+interval '2 seconds',last_accessed_at=NULL RETURNING expires_at",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut lock = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *lock)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM go_entries FOR UPDATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let pending = {
+            let app = app.clone();
+            let url = url.clone();
+            let credential = credential.clone();
+            tokio::spawn(async move { send(&app, method, &url, Some(&credential), &[], &[]).await })
+        };
+        // The row lock stalls telemetry, after the object has been opened.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read must reach access recording while the entry is still live");
+        tokio::time::sleep(
+            (expires - chrono::Utc::now()).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(10),
+        )
+        .await;
+        lock.rollback().await.unwrap();
+        let (status, _, _) = pending.await.unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn failed_duplicate_cannot_expire_an_inflight_compiler_upload(pool: PgPool) {
     let bounded = PgPoolOptions::new()
         .max_connections(1)
@@ -380,10 +435,10 @@ async fn failed_duplicate_cannot_expire_an_inflight_compiler_upload(pool: PgPool
             .await
             .unwrap()
             .unwrap();
-        // Reuse the reservation's output and size. Go rejects the checksum;
-        // sccache has no checksum, so reject a truncated body instead.
+        // A larger failed duplicate grows the shared byte reservation but
+        // must not invalidate the original writer or change its stored size.
         let invalid = if product == "go" {
-            vec![b'!'; bytes.len()]
+            vec![b'!'; bytes.len() + 5]
         } else {
             vec![b'!'; bytes.len() - 1]
         };
@@ -395,7 +450,7 @@ async fn failed_duplicate_cannot_expire_an_inflight_compiler_upload(pool: PgPool
                 &url,
                 Some(&credential),
                 &[
-                    ("content-length", &bytes.len().to_string()),
+                    ("content-length", &(bytes.len() + 5).to_string()),
                     ("x-snowstead-output-id", &digest),
                 ],
                 &invalid,
@@ -529,11 +584,45 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
             send(&app, "GET", &url, Some(&credential), &[], &[]).await.2,
             winner
         );
+        if product == "sccache" {
+            sqlx::query("UPDATE sccache_entries SET uploaded_at=NULL WHERE cache_id IS NOT NULL")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                put(&app, &url, &credential, b"different size").await,
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                put(&app, &url, &credential, winner).await,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                send(&app, "GET", &url, Some(&credential), &[], &[]).await.2,
+                winner
+            );
+        }
         // Model a pre-migration transfer whose file reached storage but whose
         // database acknowledgement was lost. Both retries must recover the
         // same immutable file; neither may reclaim it as a losing attempt.
         sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {product}_entries SET stored_at=NULL,uploaded_at=NULL WHERE cache_id IS NOT NULL")))
             .execute(&pool).await.unwrap();
+        if product == "sccache" {
+            sqlx::query("UPDATE orgs SET storage_limit=10 WHERE id='org_a'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            // Existing immutable bytes need no extra staging reservation:
+            // conflict handling must take precedence over charging growth.
+            assert_eq!(
+                put(&app, &url, &credential, &[0; 11]).await,
+                StatusCode::CONFLICT
+            );
+            sqlx::query("UPDATE orgs SET storage_limit=NULL WHERE id='org_a'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let make = || {
             let barrier = barrier.clone();
