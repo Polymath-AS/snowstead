@@ -85,6 +85,24 @@ who deliberately want the legacy shared key can set
 `SIGNING_PRIVATE_KEY` and `SIGNING_KEY_NAME`. See the signing-key lifecycle
 and recovery guidance in [docs.md](docs.md).
 
+### Optional read replica
+
+Set `DATABASE_READ_URL` to a replica PostgreSQL URI to serve only
+`GET /_api/v1/admin/overview` totals from that replica. These reporting values
+may lag. All other queries, including authorization and organization overviews,
+continue to use the primary `DATABASE_URL`.
+
+For PlanetScale direct replicas, use port `5432` and append `%7Creplica` to
+the URI username. Use verified TLS and a read-only role.
+`DATABASE_READ_MAX_CONNECTIONS` defaults to 8 and must be positive. This is a
+separate per-process pool limit; budget for application instances, deployment
+overlap, and other clients. Do not assume replica connections divide evenly.
+
+When `DATABASE_READ_URL` is unset, reads share the existing primary pool with
+no additional connections. An invalid or unreachable configured replica fails
+startup. Runtime replica errors do not fall back to primary. Migrations ignore
+replica settings, and `pnpm dev` clears them to keep the local stack disposable.
+
 ## Push store paths
 
 Build the CLI (or `nix run .` for one-off use):

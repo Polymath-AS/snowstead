@@ -626,7 +626,8 @@ async fn global_overview(State(state): State<AppState>) -> Result<Response, ApiE
         )::text AS "overview!"
         "#
         )
-        .fetch_one(&state.pool),
+        // Reporting totals may lag; authorization and mutations use primary.
+        .fetch_one(&state.read_pool),
         label = "management.global_overview_sql"
     )
     .await?;

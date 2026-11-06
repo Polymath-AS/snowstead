@@ -89,7 +89,23 @@ async fn run_server() -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let state = AppState::new(pool, config, storage, http)?;
+    let mut state = AppState::new(pool, config, storage, http)?;
+    match std::env::var("DATABASE_READ_URL") {
+        Ok(url) => {
+            let max_connections: u32 = std::env::var("DATABASE_READ_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "8".to_owned())
+                .parse()?;
+            anyhow::ensure!(
+                max_connections > 0,
+                "DATABASE_READ_MAX_CONNECTIONS must be positive"
+            );
+            state.read_pool = connect_pool(&url, max_connections)
+                .await
+                .map_err(|_| anyhow::anyhow!("Read database connection failed"))?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(_) => anyhow::bail!("DATABASE_READ_URL must be valid Unicode"),
+    }
     let listener = tokio::net::TcpListener::bind(listen_address()?).await?;
     tracing::info!(address = %listener.local_addr()?, "Snowstead listening");
     serve(listener, state, shutdown()).await?;

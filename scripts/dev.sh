@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cargo build --locked --manifest-path "$ROOT/Cargo.toml" -p snowstead-server
-exec env -u SNOWSTEAD_TEST_DATABASE_URL \
+exec env -u SNOWSTEAD_TEST_DATABASE_URL -u DATABASE_READ_URL -u DATABASE_READ_MAX_CONNECTIONS \
   "$ROOT/scripts/with-postgres.sh" "$ROOT/scripts/with-r2.sh" bash -c '
     set -euo pipefail
     export DATABASE_URL="$SNOWSTEAD_TEST_DATABASE_URL"
