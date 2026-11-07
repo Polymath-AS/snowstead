@@ -129,6 +129,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[sqlx::test(migrations = false)]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
     async fn cancelled_begin_cannot_capture_later_autocommit_writes(observer: PgPool) {
         sqlx::query("CREATE TABLE cancellation_probe (id integer PRIMARY KEY)")
             .execute(&observer)
