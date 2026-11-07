@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        SELECT\n                            c.sccache_generation AS generation,\n                            c.is_public AS public,\n                            o.private_caches,\n                            o.storage_limit\n                        FROM caches c\n                        JOIN orgs o ON o.id = c.org_id\n                        WHERE c.id = $1\n                            AND c.org_id = $2\n                            AND EXISTS (\n                                SELECT 1\n                                FROM cache_protocols p\n                                WHERE p.cache_id = c.id\n                                    AND p.protocol = 'sccache'\n                            )\n                        FOR SHARE OF c, o NOWAIT\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "generation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "sccache_generation"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "private_caches",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "private_caches"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "storage_limit",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "storage_limit"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "a9aef6e34b85fffb4d6eb3a4691142aafbf5dbfc942c7d401ad77cfab2d04b80"
+}

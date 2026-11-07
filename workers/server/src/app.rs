@@ -38,6 +38,8 @@ pub struct AppState {
     pub(crate) management_limits: Arc<management::ApiLimits>,
     pub(crate) protocol_limits: Arc<protocol_policy::ProtocolLimits>,
     pub(crate) verification_slots: Arc<Semaphore>,
+    pub(crate) sql_waiters: Arc<Semaphore>,
+    pub(crate) sql_writers: Arc<crate::db::Writers>,
     proxy_ips: Arc<[IpAddr]>,
 }
 
@@ -71,6 +73,8 @@ impl AppState {
             })?;
         Ok(Self {
             read_pool: pool.clone(),
+            sql_waiters: Arc::new(Semaphore::new(pool.options().get_max_connections() as usize)),
+            sql_writers: Arc::default(),
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),

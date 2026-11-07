@@ -234,18 +234,29 @@ impl Client {
             sessions: Vec<Session>,
         }
         let path = format!("/_api/v1/caches/{}/upload-streams/batch", segment(cache)?);
-        let data: Sessions = decode(
-            "create-sessions",
-            self.request(
-                "create-sessions",
-                Method::POST,
-                &path,
-                Some(json!({"paths":paths})),
-            )
-            .await?,
-        )
-        .await?;
-        Ok(data.sessions)
+        for attempt in 1..=4 {
+            let response = self
+                .request(
+                    "create-sessions",
+                    Method::POST,
+                    &path,
+                    Some(json!({"paths":paths})),
+                )
+                .await?;
+            // The server returns busy before committing session creation.
+            // Never replay transport failures or gateway errors: their commit
+            // outcome is unknown and creation is not idempotent.
+            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                if attempt == 4 {
+                    bail!("create-sessions: failed after 4 attempts");
+                }
+                backoff(attempt).await;
+                continue;
+            }
+            let data: Sessions = decode("create-sessions", response).await?;
+            return Ok(data.sessions);
+        }
+        unreachable!("bounded creation attempts return a result")
     }
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
     pub async fn finalize(&self, uploads: &[Finalize]) -> Result<Vec<CommitResult>> {
@@ -1294,13 +1305,15 @@ pub(crate) mod tests {
         assert_eq!(requests[2], requests[3]);
     }
     #[tokio::test]
-    async fn post_retries_are_bounded_and_integrity_and_create_fail_fast() {
+    async fn post_retries_are_bounded_and_ambiguous_creation_is_not_replayed() {
         let mut scenarios = vec![
             ("reserve", vec![429, 502, 503, 504]),
             ("finalize", vec![429, 502, 503, 504]),
             ("busy", vec![200; 4]),
-            ("create", vec![503]),
+            ("create", vec![503; 4]),
             ("create", vec![0]),
+            ("create", vec![502]),
+            ("create", vec![504]),
         ];
         for operation in ["reserve", "finalize"] {
             for status in [400, 403, 507] {
@@ -1330,6 +1343,24 @@ pub(crate) mod tests {
             if count == 4 { assert!(text.contains("4 attempts")); }
             assert_eq!(server.await.unwrap().len(), count);
         })).await;
+    }
+
+    #[tokio::test]
+    async fn creation_retries_busy_without_replaying_an_unknown_commit() {
+        let (client, server) = scripted(vec![
+            (503, json!({"error":"Concurrent write; retry"})),
+            (
+                201,
+                json!({"sessions":[{"sessionId":"created","partSize":8388608,"inline":false}]}),
+            ),
+        ])
+        .await;
+        let sessions = client.create_sessions("main", &[]).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "created");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
     }
     #[tokio::test]
     async fn finalize_rejects_missing_extra_or_reordered_results_without_retry() {

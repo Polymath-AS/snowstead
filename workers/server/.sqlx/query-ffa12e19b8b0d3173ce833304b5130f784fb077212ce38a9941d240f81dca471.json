@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT storage_limit\n        FROM orgs\n        WHERE id = $1\n        FOR SHARE NOWAIT\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "storage_limit",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "storage_limit"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "ffa12e19b8b0d3173ce833304b5130f784fb077212ce38a9941d240f81dca471"
+}

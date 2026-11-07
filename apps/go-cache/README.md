@@ -43,6 +43,9 @@ failures. Puts are published locally before uploading; failed uploads never
 prevent local reuse.
 The first network failure (including a download-body timeout), HTTP 401, 403,
 429, or 5xx disables remote reads and writes for the rest of that helper process.
+An upload 503 with `Retry-After: 1` is a retryable busy response: the helper
+replays the same artifact up to four attempts with jittered backoff. Only an
+exhausted retry budget disables the remote for that response.
 Already-started requests can finish or time out; later requests use local data
 or miss immediately. A new helper process retries the remote. HTTP 404 and 409
 do not disable it. Invalid artifacts are never served. Local filesystem errors

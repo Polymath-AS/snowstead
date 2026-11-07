@@ -342,30 +342,6 @@ impl Storage {
         }
     }
 
-    /// Delete independent objects with at most four requests in flight. Keep
-    /// draining after an error so callers retain their publication fences until
-    /// every deletion has settled, including siblings targeting reusable keys.
-    #[cfg_attr(
-        feature = "observability",
-        tracing::instrument(
-            target = "snowstead_observability",
-            skip_all,
-            name = "storage.delete_many"
-        )
-    )]
-    pub(crate) async fn delete_many(&self, keys: Vec<(bool, String)>) -> io::Result<()> {
-        let mut pending = futures_util::stream::iter(keys)
-            .map(|(private, key)| async move { self.delete(private, &key).await })
-            .buffer_unordered(4);
-        let mut error = None;
-        while let Some(result) = pending.next().await {
-            if let Err(failure) = result {
-                error.get_or_insert(failure);
-            }
-        }
-        error.map_or(Ok(()), Err)
-    }
-
     #[cfg_attr(
         feature = "observability",
         tracing::instrument(target = "snowstead_observability", skip_all, name = "storage.copy")
@@ -619,11 +595,6 @@ mod tests {
         aborts: AtomicUsize,
         fail_part: AtomicBool,
         fail_complete: AtomicBool,
-        delete_gate: Mutex<Option<Arc<Semaphore>>>,
-        deletes_started: AtomicUsize,
-        deletes_active: AtomicUsize,
-        deletes_max: AtomicUsize,
-        deletes_finished: AtomicUsize,
     }
 
     #[derive(Debug, Default)]
@@ -677,29 +648,7 @@ mod tests {
             &self,
             paths: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
-            let inner = self.inner.clone();
-            let observations = self.observations.clone();
-            paths
-                .then(move |path| {
-                    let inner = inner.clone();
-                    let observations = observations.clone();
-                    async move {
-                        let path = path?;
-                        observations.deletes_started.fetch_add(1, Ordering::SeqCst);
-                        let active = observations.deletes_active.fetch_add(1, Ordering::SeqCst) + 1;
-                        observations.deletes_max.fetch_max(active, Ordering::SeqCst);
-                        let gate = observations.delete_gate.lock().unwrap().clone();
-                        if let Some(gate) = gate {
-                            gate.acquire().await.unwrap().forget();
-                        }
-                        let result = inner.delete(&path).await;
-                        observations.deletes_active.fetch_sub(1, Ordering::SeqCst);
-                        observations.deletes_finished.fetch_add(1, Ordering::SeqCst);
-                        result?;
-                        Ok(path)
-                    }
-                })
-                .boxed()
+            self.inner.delete_stream(paths)
         }
 
         fn list(
@@ -1098,34 +1047,6 @@ mod tests {
             assert_eq!(read(&storage, false, "object").await, b"old");
         }
         assert_eq!(observations.aborts.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn delete_many_bounds_in_flight_requests_across_buckets() {
-        let store = Arc::new(ObservedStore::default());
-        let observations = store.observations.clone();
-        let gate = Arc::new(Semaphore::new(0));
-        *observations.delete_gate.lock().unwrap() = Some(gate.clone());
-        let storage = Storage::from_stores(store.clone(), store);
-        let deletion = tokio::spawn(async move {
-            storage
-                .delete_many((0..9).map(|i| (i % 2 == 0, format!("key/{i}"))).collect())
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while observations.deletes_active.load(Ordering::SeqCst) != 4 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(observations.deletes_started.load(Ordering::SeqCst), 4);
-        assert!(!deletion.is_finished());
-        gate.add_permits(9);
-        deletion.await.unwrap().unwrap();
-        assert_eq!(observations.deletes_max.load(Ordering::SeqCst), 4);
-        assert_eq!(observations.deletes_finished.load(Ordering::SeqCst), 9);
-        assert_eq!(observations.deletes_active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

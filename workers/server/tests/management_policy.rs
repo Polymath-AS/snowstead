@@ -545,7 +545,7 @@ async fn object_exists(store: &InMemory, key: &str) -> bool {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_nars(pool: PgPool) {
+async fn withdrawal_queues_known_metadata_in_both_slug_paths_but_retains_shared_nars(pool: PgPool) {
     let public = Arc::new(InMemory::new());
     let private = Arc::new(InMemory::new());
     let storage = Storage::from_stores(public.clone(), private.clone());
@@ -637,12 +637,21 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
         );
         let store = if is_private { &private } else { &public };
         for slug in ["policy-a", "policy-old"] {
-            for (hash, exists) in [(&hashes[0], false), (&hashes[1], true), (&hashes[2], false)] {
+            for (hash, queued) in [(&hashes[0], true), (&hashes[1], false), (&hashes[2], true)] {
                 let key = format!(
                     "{}{slug}/shared/{hash}.narinfo",
                     if is_private { "narinfo/" } else { "" }
                 );
-                assert_eq!(object_exists(store, &key).await, exists, "{key}");
+                assert!(object_exists(store, &key).await, "{key}");
+                let found: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM object_cleanup WHERE is_private=$1 AND key=$2)",
+                )
+                .bind(is_private)
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(found, queued, "{key}");
             }
         }
         // Exercise timestamp selection as well, with the retained path protected.
@@ -674,7 +683,7 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
         assert_eq!(result["deleted"], json!([timed.to_string().repeat(32)]));
         for slug in ["policy-a", "policy-old"] {
             assert!(
-                !object_exists(
+                object_exists(
                     store,
                     &format!(
                         "{}{slug}/shared/{}.narinfo",
@@ -685,7 +694,7 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
                 .await
             );
         }
-        // Whole-cache eviction additionally removes orphan narinfo, paginated.
+        // Orphan objects are not authoritative and need not be listed/deleted.
         for n in 0..501 {
             let hash = format!("{n:032}");
             let key = format!(
@@ -713,13 +722,15 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
         for kind in ["go", "sccache"] {
             let key = format!("{kind}/evicted-{is_private}");
             assert_eq!(result["removed"][kind], 1);
-            assert!(!object_exists(&private, &key).await);
+            assert!(object_exists(&private, &key).await);
+            assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE is_private AND key=$1 AND upload_id IS NULL)")
+                .bind(&key).fetch_one(&pool).await.unwrap());
             assert!(object_exists(&public, &key).await);
         }
         for slug in ["policy-a", "policy-old"] {
             let prefix = format!("{}{slug}/shared", if is_private { "narinfo/" } else { "" });
             let keys = storage.list(is_private, &prefix, None, 1000).await.unwrap();
-            assert!(keys.iter().all(|k| !k.ends_with(".narinfo")), "{keys:?}");
+            assert!(keys.iter().any(|k| k.ends_with(".narinfo")), "{keys:?}");
             assert!(object_exists(&public, &format!("{slug}/shared/nix-cache-info")).await);
         }
         // Metadata published since eviction must be withdrawn by cache deletion.
@@ -755,10 +766,20 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
         assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(result["paths"], 1);
         for slug in ["policy-a", "policy-old"] {
-            assert!(!object_exists(&public, &format!("{slug}/shared/nix-cache-info")).await);
+            let key = format!("{slug}/shared/nix-cache-info");
+            assert!(object_exists(&public, &key).await);
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM object_cleanup WHERE NOT is_private AND key=$1)"
+                )
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            );
             let prefix = format!("{}{slug}/shared", if is_private { "narinfo/" } else { "" });
             assert!(
-                storage
+                !storage
                     .list(is_private, &prefix, None, 1000)
                     .await
                     .unwrap()
@@ -774,10 +795,6 @@ async fn r2_withdrawal_removes_metadata_in_both_slug_paths_but_retains_shared_na
 #[derive(Debug, Default)]
 struct DeleteControl {
     fail: AtomicBool,
-    pause: AtomicBool,
-    entered: tokio::sync::Notify,
-    rejected: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -785,6 +802,7 @@ struct ControlledStore {
     inner: Arc<dyn ObjectStore>,
     key: String,
     control: Arc<DeleteControl>,
+    repair: Option<(PgPool, &'static str)>,
 }
 
 impl std::fmt::Display for ControlledStore {
@@ -815,6 +833,19 @@ impl ObjectStore for ControlledStore {
         path: &Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if path.as_ref() == self.key
+            && !options.head
+            && let Some((pool, action)) = &self.repair
+        {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                // This pool has one connection. A held SQL transaction would
+                // prevent the provider call from observing its durable lease.
+                let durable: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nar_installations WHERE source_key=$1 AND session_id IS NULL AND cache_id IS NOT NULL AND phase='preparing' AND expires_at>NOW())")
+                    .bind(&self.key).fetch_one(pool).await.unwrap();
+                assert!(durable);
+                sqlx::query(*action).execute(pool).await.unwrap();
+            }).await.expect("provider I/O must not hold a SQL connection");
+        }
         self.inner.get_opts(path, options).await
     }
     fn delete_stream(
@@ -832,20 +863,11 @@ impl ObjectStore for ControlledStore {
                 let control = control.clone();
                 async move {
                     let path = path?;
-                    if path.as_ref() == key {
-                        if control.fail.load(Ordering::SeqCst) {
-                            control.rejected.notify_one();
-                            return Err(object_store::Error::Generic {
-                                store: "test",
-                                source: Box::new(std::io::Error::other(
-                                    "injected deletion failure",
-                                )),
-                            });
-                        }
-                        if control.pause.swap(false, Ordering::SeqCst) {
-                            control.entered.notify_one();
-                            control.resume.notified().await;
-                        }
+                    if path.as_ref() == key && control.fail.load(Ordering::SeqCst) {
+                        return Err(object_store::Error::Generic {
+                            store: "test",
+                            source: Box::new(std::io::Error::other("injected deletion failure")),
+                        });
                     }
                     inner.delete(&path).await?;
                     Ok(path)
@@ -877,7 +899,7 @@ impl ObjectStore for ControlledStore {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn failed_sibling_delete_drains_before_republication_and_retains_retry_rows(pool: PgPool) {
+async fn metadata_store_failures_do_not_block_sql_withdrawal(pool: PgPool) {
     let public = Arc::new(InMemory::new());
     let delayed_key = format!("policy-a/shared/{}.narinfo", "a".repeat(32));
     let failed_key = format!("policy-a/shared/{}.narinfo", "b".repeat(32));
@@ -890,9 +912,11 @@ async fn failed_sibling_delete_drains_before_republication_and_retains_retry_row
                 inner: public.clone(),
                 key: failed_key.clone(),
                 control: failed.clone(),
+                repair: None,
             }),
             key: delayed_key.clone(),
             control: delayed.clone(),
+            repair: None,
         }),
         Arc::new(InMemory::new()),
     );
@@ -908,63 +932,19 @@ async fn failed_sibling_delete_drains_before_republication_and_retains_retry_row
             .put(false, &failed_key, b"retry metadata")
             .await
             .unwrap();
-        delayed.pause.store(true, Ordering::SeqCst);
-        let delete_app = app.clone();
-        let deletion = tokio::spawn(async move {
-            let input = if operation == "paths/delete" {
-                json!({"storePathHashes":["a".repeat(32), "b".repeat(32)]})
-            } else {
-                json!({})
-            };
-            send(&delete_app, "POST", &path(operation), "policy-admin", input).await
-        });
-        // Both requests must start while the delayed sibling is still pending.
-        for notification in [&delayed.entered, &failed.rejected] {
-            tokio::time::timeout(std::time::Duration::from_secs(3), notification.notified())
-                .await
-                .unwrap();
-        }
-        assert!(!deletion.is_finished());
-        let writer_storage = storage.clone();
-        let writer_pool = pool.clone();
-        let writer_key = delayed_key.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (published_tx, mut published_rx) = tokio::sync::oneshot::channel();
-        let writer = tokio::spawn(async move {
-            let mut tx = writer_pool.begin().await.unwrap();
-            started_tx.send(()).unwrap();
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:policy_a',0))")
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-            sqlx::query("SELECT id FROM caches WHERE org_id='policy_a' FOR SHARE")
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-            writer_storage
-                .put(false, &writer_key, b"new metadata")
-                .await
-                .unwrap();
-            tx.commit().await.unwrap();
-            published_tx.send(()).unwrap();
-        });
-        started_rx.await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut published_rx)
-                .await
-                .is_err()
-        );
-        assert!(!deletion.is_finished());
-        delayed.resume.notify_one();
-        assert_eq!(deletion.await.unwrap().0, StatusCode::INTERNAL_SERVER_ERROR);
-        writer.await.unwrap();
-        published_rx.await.unwrap();
+        let input = if operation == "paths/delete" {
+            json!({"storePathHashes":["a".repeat(32), "b".repeat(32)]})
+        } else {
+            json!({})
+        };
+        let (status, result) = send(&app, "POST", &path(operation), "policy-admin", input).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            2
+            0
         );
         let stored = public
             .get(&Path::from(delayed_key.clone()))
@@ -973,18 +953,243 @@ async fn failed_sibling_delete_drains_before_republication_and_retains_retry_row
             .bytes()
             .await
             .unwrap();
-        assert_eq!(stored.as_ref(), b"new metadata");
+        assert_eq!(stored.as_ref(), b"old metadata");
         assert!(object_exists(&public, &failed_key).await);
-    }
-    failed.fail.store(false, Ordering::SeqCst);
-    assert_eq!(
-        send(&app, "POST", &path("delete"), "policy-admin", json!({}))
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM object_cleanup WHERE NOT is_private AND key=$1)"
+            )
+            .bind(&failed_key)
+            .fetch_one(&pool)
             .await
-            .0,
-        StatusCode::OK
-    );
+            .unwrap()
+        );
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn backfill_copy_has_durable_ownership_and_rejects_stale_adoption(pool: PgPool) {
+    fixture(&pool).await;
+    publish(&pool, 'a', "repair", json!([])).await;
+    let source = "nars/objects/original/content/zstd.nar";
+    sqlx::query("UPDATE blob_objects SET r2_key=$1")
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let one = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let public = Arc::new(InMemory::new());
+    let private = Arc::new(InMemory::new());
+    for (action, expected_written, expected_skipped) in [
+        (
+            "UPDATE nar_installations SET phase='revoked' WHERE cache_id=(SELECT id FROM caches WHERE org_id='policy_a')",
+            0,
+            1,
+        ),
+        (
+            "UPDATE blob_objects SET public_key='nar/objects/winner/content/none.nar'",
+            0,
+            0,
+        ),
+        ("SELECT 1", 1, 0),
+    ] {
+        sqlx::query("UPDATE blob_objects SET public_key=NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let storage = Storage::from_stores(
+            public.clone(),
+            Arc::new(ControlledStore {
+                inner: private.clone(),
+                key: source.into(),
+                control: Arc::default(),
+                repair: Some((one.clone(), action)),
+            }),
+        );
+        storage.put(true, source, b"twelve bytes").await.unwrap();
+        // New immutable records cannot silently reuse this legacy fallback.
+        storage
+            .put(
+                false,
+                &format!("nar/policy-{}/zstd.nar", "a".repeat(32)),
+                b"twelve bytes",
+            )
+            .await
+            .unwrap();
+        let app = router(
+            AppState::new(
+                one.clone(),
+                config(),
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        );
+        let (status, result) = send(
+            &app,
+            "POST",
+            "/_api/v1/admin/narinfo/backfill",
+            "policy-admin",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["written"], expected_written);
+        assert_eq!(
+            result["skipped"].as_array().unwrap().len(),
+            expected_skipped
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let pointer: Option<String> = sqlx::query_scalar("SELECT public_key FROM blob_objects")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if let Some(pointer) = pointer {
+            assert!(
+                !sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE key=$1)"
+                )
+                .bind(&pointer)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            );
+        }
+        let keys = storage.list(false, "nar/objects", None, 100).await.unwrap();
+        for key in keys {
+            let adopted: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blob_objects WHERE public_key=$1)")
+                    .bind(&key)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let queued: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE NOT is_private AND key=$1)",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            // Earlier iterations' objects stay queued, never synchronously deleted.
+            assert!(adopted || queued, "unowned repair destination: {key}");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT r2_key FROM blob_objects")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            source
+        );
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn absent_named_deletion_and_empty_eviction_cancel_only_affected_sessions(pool: PgPool) {
+    let state = fixture(&pool).await;
+    let hash = "a".repeat(32);
+    let app = router(state);
+    sqlx::raw_sql("INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_hash,file_size,compression,status,expires_at)
+        SELECT c.org_id || '-' || s.name,c.id,repeat(s.hash,32),'/nix/store/staged','sha256:test',20,'hash',12,'zstd',s.status,now()+interval '1 hour'
+        FROM caches c CROSS JOIN (VALUES ('target','a','pending'),('unrelated','b','pending'),('done','a','completed')) s(name,hash,status);")
+        .execute(&pool).await.unwrap();
+    for operation in ["paths/delete", "paths/delete", "evict", "evict"] {
+        let input = if operation == "paths/delete" {
+            json!({"storePathHashes":[hash]})
+        } else {
+            json!({})
+        };
+        let (status, result) = send(&app, "POST", &path(operation), "policy-admin", input).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let sessions: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,status FROM upload_sessions ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                ("policy_a-done".into(), "completed".into()),
+                ("policy_a-target".into(), "aborted".into()),
+                (
+                    "policy_a-unrelated".into(),
+                    if operation == "evict" {
+                        "aborted"
+                    } else {
+                        "pending"
+                    }
+                    .into()
+                ),
+                ("policy_b-done".into(), "completed".into()),
+                ("policy_b-target".into(), "pending".into()),
+                ("policy_b-unrelated".into(), "pending".into()),
+            ]
+        );
+        if operation == "evict" {
+            let expiry: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT id,expires_at<=NOW() FROM upload_sessions WHERE status<>'completed' ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                expiry,
+                vec![
+                    ("policy_a-target".into(), true),
+                    ("policy_a-unrelated".into(), true),
+                    ("policy_b-target".into(), false),
+                    ("policy_b-unrelated".into(), false),
+                ]
+            );
+        }
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn policy_contention_fails_fast_without_withdrawing_rows(pool: PgPool) {
+    let app = router(fixture(&pool).await);
+    publish(&pool, 'a', "root", json!([])).await;
+    for advisory in [false, true] {
+        let mut holder = pool.begin().await.unwrap();
+        let query = if advisory {
+            "SELECT pg_advisory_xact_lock(hashtextextended('org:policy_a',0))"
+        } else {
+            "SELECT id FROM caches WHERE org_id='policy_a' FOR UPDATE"
+        };
+        sqlx::query(query).execute(&mut *holder).await.unwrap();
+        let (status, result) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send(
+                &app,
+                "POST",
+                &path("paths/delete"),
+                "policy-admin",
+                json!({"storePathHashes":["a".repeat(32)]}),
+            ),
+        )
+        .await
+        .expect("policy writes must not queue behind locks");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
+        holder.rollback().await.unwrap();
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup")
             .fetch_one(&pool)
             .await
             .unwrap(),
@@ -993,129 +1198,24 @@ async fn failed_sibling_delete_drains_before_republication_and_retains_retry_row
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn r2_delete_failure_rolls_back_sql_and_withdrawal_fences_republication(pool: PgPool) {
-    let public = Arc::new(InMemory::new());
-    let private = Arc::new(InMemory::new());
-    let hash = "a".repeat(32);
-    let key = format!("policy-a/shared/{hash}.narinfo");
-    let control = Arc::new(DeleteControl::default());
-    let storage = Storage::from_stores(
-        Arc::new(ControlledStore {
-            inner: public.clone(),
-            key: key.clone(),
-            control: control.clone(),
-        }),
-        private,
-    );
-    let state = fixture_with_storage(&pool, storage.clone()).await;
+async fn cleanup_queue_failure_rolls_back_metadata_and_session_cancellation(pool: PgPool) {
+    let app = router(fixture(&pool).await);
     publish(&pool, 'a', "root", json!([])).await;
-    storage.put(false, &key, b"old metadata").await.unwrap();
-    let app = router(state.clone());
-    control.fail.store(true, Ordering::SeqCst);
-    for operation in ["paths/delete", "evict", "delete"] {
-        let input = if operation == "paths/delete" {
-            json!({"storePathHashes":[hash]})
-        } else {
-            json!({})
-        };
-        let (status, result) = send(&app, "POST", &path(operation), "policy-admin", input).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(object_exists(&public, &key).await);
-    }
-    control.fail.store(false, Ordering::SeqCst);
-    control.pause.store(true, Ordering::SeqCst);
-    let delete_app = app.clone();
-    let input = json!({"storePathHashes":[hash]});
-    let deletion = tokio::spawn(async move {
-        send(
-            &delete_app,
-            "POST",
-            &path("paths/delete"),
-            "policy-admin",
-            input,
-        )
-        .await
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        control.entered.notified(),
+    sqlx::raw_sql("INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_hash,file_size,compression,expires_at)
+        SELECT 'rollback-session',id,repeat('a',32),'/nix/store/staged','sha256:test',20,'hash',12,'zstd',now()+interval '1 hour' FROM caches WHERE org_id='policy_a';")
+        .execute(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION reject_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected queue failure'; END $$;
+        CREATE TRIGGER reject_cleanup BEFORE INSERT ON object_cleanup FOR EACH ROW EXECUTE FUNCTION reject_cleanup();")
+        .execute(&pool).await.unwrap();
+    let (status, _) = send(
+        &app,
+        "POST",
+        &path("paths/delete"),
+        "policy-admin",
+        json!({"storePathHashes":["a".repeat(32)]}),
     )
-    .await
-    .unwrap();
-    // Model the exact org/cache publication lock order used by uploads/backfill.
-    // The replacement cannot put its metadata while withdrawal is suspended.
-    let writer_storage = storage.clone();
-    let writer_pool = pool.clone();
-    let writer_key = key.clone();
-    let (published_tx, mut published_rx) = tokio::sync::oneshot::channel();
-    let writer = tokio::spawn(async move {
-        let mut tx = writer_pool.begin().await.unwrap();
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:policy_a',0))")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        sqlx::query("SELECT id FROM caches WHERE org_id='policy_a' FOR SHARE")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        writer_storage
-            .put(false, &writer_key, b"new metadata")
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        published_tx.send(()).unwrap();
-    });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut published_rx)
-            .await
-            .is_err()
-    );
-    control.resume.notify_one();
-    assert_eq!(deletion.await.unwrap().0, StatusCode::OK);
-    writer.await.unwrap();
-    published_rx.await.unwrap();
-    let stored = public
-        .get(&Path::from(key))
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(stored.as_ref(), b"new metadata");
-
-    // A late cache-info failure must roll back the cache and its published
-    // rows even after earlier metadata deletes succeeded; the retry can finish.
-    let info = "policy-a/shared/nix-cache-info";
-    let later_key = format!("policy-a/shared/{}.narinfo", "b".repeat(32));
-    publish(&pool, 'b', "retry", json!([])).await;
-    storage
-        .put(false, &later_key, b"retry metadata")
-        .await
-        .unwrap();
-    storage.put(false, info, b"cache info").await.unwrap();
-    let control = Arc::new(DeleteControl::default());
-    control.fail.store(true, Ordering::SeqCst);
-    let storage = Storage::from_stores(
-        Arc::new(ControlledStore {
-            inner: public.clone(),
-            key: info.to_owned(),
-            control: control.clone(),
-        }),
-        Arc::new(InMemory::new()),
-    );
-    let state = AppState::new(pool.clone(), config(), storage, reqwest::Client::new()).unwrap();
-    let app = router(state);
-    let (status, result) = send(&app, "POST", &path("delete"), "policy-admin", json!({})).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
-    assert!(!object_exists(&public, &later_key).await);
-    assert!(object_exists(&public, info).await);
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
             .fetch_one(&pool)
@@ -1123,11 +1223,84 @@ async fn r2_delete_failure_rolls_back_sql_and_withdrawal_fences_republication(po
             .unwrap(),
         1
     );
-    control.fail.store(false, Ordering::SeqCst);
-    let (status, result) = send(&app, "POST", &path("delete"), "policy-admin", json!({})).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM upload_sessions WHERE id='rollback-session'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "pending"
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn management_never_materializes_mutable_metadata(pool: PgPool) {
+    let storage = common::storage();
+    let app = router(fixture_with_storage(&pool, storage.clone()).await);
+    publish(&pool, 'a', "root", json!([])).await;
+    let (status, result) = send(
+        &app,
+        "POST",
+        "/_api/v1/admin/narinfo/backfill",
+        "policy-admin",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["paths"], 1);
-    assert!(!object_exists(&public, info).await);
+    let (status, result) = send(
+        &app,
+        "POST",
+        "/_api/v1/orgs/policy_a/caches",
+        "policy-admin",
+        json!({"name":"new-cache","protocols":["nix"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    let (status, result) = send(
+        &app,
+        "PUT",
+        "/_api/v1/orgs/policy_a",
+        "policy-admin",
+        json!({"slug":"new-policy"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (status, result) = send(
+        &app,
+        "POST",
+        "/_api/v1/orgs/policy_a/move",
+        "policy-admin",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["done"], true);
+    for private in [false, true] {
+        for prefix in ["nar", "nars", "narinfo", "policy-a", "new-policy"] {
+            assert!(
+                storage
+                    .list(private, prefix, None, 1000)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            > 0
+    );
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -1209,7 +1382,7 @@ async fn cache_deletion_adopts_legacy_canonical_objects_and_preserves_uncertain_
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 #[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
-async fn cache_deletion_aborts_only_unpinned_unfinished_provider_mpus(pool: PgPool) {
+async fn cache_deletion_queues_only_unpinned_unfinished_provider_mpus(pool: PgPool) {
     use axum::body::Bytes;
     use object_store::{aws::AmazonS3Builder, multipart::MultipartStore};
 
@@ -1229,8 +1402,7 @@ async fn cache_deletion_aborts_only_unpinned_unfinished_provider_mpus(pool: PgPo
         .unwrap();
     let storage = Storage::new(&r2).unwrap();
     let app = router(fixture_with_storage(&pool, storage.clone()).await);
-    // An unsupported abort is an uncertain failure, not evidence that the MPU
-    // disappeared. Retry the identical request with the provider-backed store.
+    // A store without abort support proves SQL withdrawal never calls it.
     let unavailable = router(
         AppState::new(
             pool.clone(),
@@ -1309,19 +1481,6 @@ async fn cache_deletion_aborts_only_unpinned_unfinished_provider_mpus(pool: PgPo
                 .unwrap();
         }
         let url = format!("/_api/v1/orgs/policy_a/caches/{case}/delete");
-        if case == "unfinished" {
-            let (status, result) =
-                send(&unavailable, "POST", &url, "policy-admin", json!({})).await;
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{result}");
-            let retained: (String, String, String, i64) = sqlx::query_as(
-                "SELECT u.status,u.r2_upload_key,u.r2_upload_id,(SELECT count(*) FROM upload_parts WHERE session_id=u.id)
-                FROM upload_sessions u JOIN caches c ON c.id=u.cache_id WHERE u.id=$1",
-            ).bind(&id).fetch_one(&pool).await.unwrap();
-            assert_eq!(
-                retained,
-                ("streaming".into(), key.clone(), upload.clone(), 1)
-            );
-        }
         if matches!(case, "pinned" | "pinned-part") {
             let (status, result) = send(&app, "POST", &url, "policy-admin", json!({})).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
@@ -1349,22 +1508,15 @@ async fn cache_deletion_aborts_only_unpinned_unfinished_provider_mpus(pool: PgPo
                 .put_part(&object, &upload, 0, Bytes::from_static(b"data").into())
                 .await
                 .unwrap();
-            // Reconcile the installation lease; retry must now abort this
-            // same MPU rather than merely discard its SQL ownership.
+            // Reconcile the installation lease; retry transfers this MPU's
+            // original provider ID to the cleanup queue.
             sqlx::query("DELETE FROM nar_installations WHERE operation_id=$1")
                 .bind(&id)
                 .execute(&pool)
                 .await
                 .unwrap();
         }
-        // Aborting an already completed MPU can return NotFound, masking an
-        // unwanted call. An abort-unsupported store proves no call is made.
-        let deletion_app = if case == "completed" {
-            &unavailable
-        } else {
-            &app
-        };
-        let (status, result) = send(deletion_app, "POST", &url, "policy-admin", json!({})).await;
+        let (status, result) = send(&unavailable, "POST", &url, "policy-admin", json!({})).await;
         assert_eq!(status, StatusCode::OK, "{case}: {result}");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM caches WHERE id=$1")
@@ -1390,19 +1542,40 @@ async fn cache_deletion_aborts_only_unpinned_unfinished_provider_mpus(pool: PgPo
                 .unwrap(),
             0
         );
+        let queued: Option<String> =
+            sqlx::query_scalar("SELECT upload_id FROM object_cleanup WHERE is_private AND key=$1")
+                .bind(&key)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
+        let should_abort = matches!(
+            case,
+            "unfinished" | "already-aborted" | "pinned" | "pinned-part"
+        );
+        assert_eq!(queued.as_deref(), should_abort.then_some(upload.as_str()));
+        if should_abort {
+            if case != "already-aborted" {
+                provider
+                    .put_part(&object, &upload, 0, Bytes::from_static(b"data").into())
+                    .await
+                    .unwrap();
+            }
+            // Model the asynchronous queue consumer, using the retained ID.
+            let _ = provider
+                .abort_multipart(&object, queued.as_ref().unwrap())
+                .await;
+        }
         if case.ends_with("completed") {
             assert_eq!(storage.head(true, &key).await.unwrap().size, 4);
         } else {
             let completed = provider
                 .complete_multipart(&object, &upload, vec![part])
                 .await;
-            if matches!(
-                case,
-                "unfinished" | "already-aborted" | "pinned" | "pinned-part"
-            ) {
+            if should_abort {
                 assert!(
                     completed.is_err(),
-                    "deleted session must not leave a completable MPU"
+                    "queued provider abort must make the MPU non-completable"
                 );
             } else {
                 completed.unwrap();

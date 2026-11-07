@@ -1,12 +1,12 @@
 //! Retained capacity is logical, across all three products. Callers hold the
 //! org transaction lock through admission and publication. Physical orphan
-//! reclamation is separate; public narinfo is withdrawn before SQL deletion.
-use std::collections::{BTreeMap, HashSet};
+//! reclamation is separate; SQL publication controls public narinfo visibility.
+use std::collections::HashSet;
 
+use crate::db::Transaction;
 use axum::http::StatusCode;
-use sqlx::{Postgres, Transaction};
 
-use crate::{AppState, error::ApiError};
+use crate::error::ApiError;
 
 struct Victim {
     kind: String,
@@ -16,8 +16,7 @@ struct Victim {
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn admit(
-    tx: &mut Transaction<'_, Postgres>,
-    state: &AppState,
+    tx: &mut Transaction,
     org: &str,
     limit: i64,
     incoming_bytes: i64,
@@ -309,6 +308,9 @@ pub async fn admit(
     }
     let mut victims = Vec::new();
     let mut freed = 0i64;
+    let busy = candidates
+        .iter()
+        .any(|v| !available.contains(&(v.kind.clone(), v.id.clone())));
     for v in candidates {
         if !available.contains(&(v.kind.clone(), v.id.clone())) {
             continue;
@@ -321,8 +323,16 @@ pub async fn admit(
     }
     if total.saturating_sub(freed) > limit {
         return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Capacity victims are busy or exceed the eviction budget; retry",
+            if busy {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::PAYLOAD_TOO_LARGE
+            },
+            if busy {
+                "Capacity victims are busy; retry"
+            } else {
+                "Insufficient evictable capacity within the 256-object budget; delete retained paths first"
+            },
         ));
     }
     sqlx::query!(
@@ -355,8 +365,6 @@ pub async fn admit(
         )
         .fetch_all(&mut **tx)
         .await?;
-        let mut purges: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut keys = Vec::new();
         for row in metadata {
             let (slug, moving_from, name, hash, public) = (
                 row.slug,
@@ -376,17 +384,14 @@ pub async fn admit(
                 } else {
                     format!("narinfo/{path}/{hash}.narinfo")
                 };
-                keys.push((!public, key));
-                if public {
-                    purges.entry(path).or_default().push(hash.clone());
-                }
+                sqlx::query(
+                    "INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(!public)
+                .bind(key)
+                .execute(&mut **tx)
+                .await?;
             }
-        }
-        state.storage.delete_many(keys).await.map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-        })?;
-        for (path, hashes) in purges {
-            crate::cdn::schedule_narinfo(state, &path, &hashes).await?;
         }
         sqlx::query!(
             r#"

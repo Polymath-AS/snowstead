@@ -83,7 +83,10 @@ async fn ledger(pool: &PgPool) -> Result<serde_json::Value> {
 async fn fresh_and_idempotent() -> Result<()> {
     isolated(|pool| async move {
         migrations::run(&pool).await?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(
+            count(&pool).await?,
+            migrations::MIGRATOR.iter().len() as i64
+        );
         let custom_keys: bool =
             sqlx::query_scalar("SELECT custom_signing_keys FROM orgs WHERE id = 'default'")
                 .fetch_one(&pool)
@@ -93,7 +96,10 @@ async fn fresh_and_idempotent() -> Result<()> {
             .await?;
         migrations::run(&pool).await?;
         migrations::rebaseline(&pool).await?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(
+            count(&pool).await?,
+            migrations::MIGRATOR.iter().len() as i64
+        );
         let names: Vec<String> = sqlx::query_scalar("SELECT name FROM caches")
             .fetch_all(&pool)
             .await?;
@@ -112,7 +118,7 @@ async fn rebaseline_preserves_data_and_both_legacy_ledgers() -> Result<()> {
         let caches: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(c)) FROM caches c").fetch_one(&pool).await?;
         assert!(migrations::run(&pool).await.is_err(), "must not auto-rebaseline");
         migrations::rebaseline(&pool).await?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(count(&pool).await?, migrations::MIGRATOR.iter().len() as i64);
         let retained: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations_legacy m").fetch_one(&pool).await?;
         assert_eq!(retained, before);
         let after: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(c)) FROM caches c").fetch_one(&pool).await?;
@@ -192,7 +198,10 @@ async fn failed_rebaseline_rolls_back_and_allows_retry() -> Result<()> {
         pool.execute("DROP EVENT TRIGGER reject_new_ledger; DROP FUNCTION reject_new_ledger()")
             .await?;
         migrations::rebaseline(&pool).await?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(
+            count(&pool).await?,
+            migrations::MIGRATOR.iter().len() as i64
+        );
         Ok(())
     })
     .await
@@ -246,7 +255,7 @@ async fn cancellation_closes_the_locked_dedicated_session() -> Result<()> {
         migration_pool.close().await;
         blocker.rollback().await?;
         tokio::time::timeout(std::time::Duration::from_secs(10), migrations::rebaseline(&pool)).await??;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(count(&pool).await?, migrations::MIGRATOR.iter().len() as i64);
         Ok(())
     }).await
 }
@@ -257,7 +266,10 @@ async fn concurrent_runners_use_the_sqlx_lock() -> Result<()> {
         let (first, second) = tokio::join!(migrations::run(&pool), migrations::run(&pool));
         first?;
         second?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(
+            count(&pool).await?,
+            migrations::MIGRATOR.iter().len() as i64
+        );
         Ok(())
     })
     .await
@@ -271,7 +283,10 @@ async fn concurrent_rebaselines_are_idempotent() -> Result<()> {
             tokio::join!(migrations::rebaseline(&pool), migrations::rebaseline(&pool));
         first?;
         second?;
-        assert_eq!(count(&pool).await?, 1);
+        assert_eq!(
+            count(&pool).await?,
+            migrations::MIGRATOR.iter().len() as i64
+        );
         Ok(())
     })
     .await

@@ -123,18 +123,15 @@ fn path(slug: &str, name: &str) -> String {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn set_cache_info(state: &AppState, path: &str, public_nix: bool) -> Result<(), ApiError> {
+async fn set_cache_info(tx: &mut crate::db::Transaction, path: &str) -> Result<(), ApiError> {
     let key = format!("{path}/nix-cache-info");
-    if public_nix {
-        state
-            .storage
-            .put(false, &key, crate::reads::INFO.as_bytes())
-            .await
-    } else {
-        state.storage.delete(false, &key).await
-    }
-    .map_err(|_| internal())?;
-    crate::cdn::schedule_files(state, &[key]).await
+    sqlx::query(
+        "INSERT INTO object_cleanup (is_private, key) VALUES (FALSE, $1) ON CONFLICT DO NOTHING",
+    )
+    .bind(key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -941,8 +938,11 @@ async fn put_org(
             "storageLimit must be a non-negative safe integer or null",
         ));
     }
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "management.put_org_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, id),
+        label = "management.put_org_pool_begin"
+    )
+    .await?;
     // Slug uniqueness spans slug and moving_from, not just either index.
     // Serialize claims before taking the org lock; protocol writers never
     // acquire this namespace lock, so they cannot form a lock cycle.
@@ -966,7 +966,7 @@ async fn put_org(
             moving_from
         FROM orgs
         WHERE id = $1
-        FOR UPDATE
+        FOR UPDATE NOWAIT
         "#,
         id
     )
@@ -1047,7 +1047,7 @@ async fn put_org(
         .fetch_all(&mut *tx)
         .await?;
         for name in names {
-            set_cache_info(state, &path(&slug, &name), true).await?;
+            set_cache_info(&mut tx, &path(&slug, &name)).await?;
         }
     }
     sqlx::query!(
@@ -1137,7 +1137,7 @@ async fn create_cache(
         None
     };
     let mut tx = crate::profile_future!(
-        state.pool.begin(),
+        crate::db::begin(state, id),
         label = "management.create_cache_pool_begin"
     )
     .await?;
@@ -1154,7 +1154,7 @@ async fn create_cache(
             private_caches
         FROM orgs
         WHERE id = $1
-        FOR SHARE
+        FOR SHARE NOWAIT
         "#,
         id
     )
@@ -1174,7 +1174,7 @@ async fn create_cache(
         FROM caches
         WHERE org_id = $1
             AND name = $2
-        FOR UPDATE
+        FOR UPDATE NOWAIT
         "#,
         id,
         name
@@ -1371,12 +1371,7 @@ async fn create_cache(
         updated.retention_days,
         updated.created_at,
     );
-    set_cache_info(
-        state,
-        &path(&slug, name),
-        public && protocols.iter().any(|p| p == "nix"),
-    )
-    .await?;
+    set_cache_info(&mut tx, &path(&slug, name)).await?;
     tx.commit().await?;
     Ok(json_response(
         if created {
@@ -1418,96 +1413,192 @@ async fn sync_auth(State(state): State<AppState>) -> Result<Response, ApiError> 
 
 struct Published {
     id: i64,
-    cache_id: i32,
     org_id: String,
     name: String,
     slug: String,
-    is_public: bool,
-    store_path: String,
     store_path_hash: String,
-    nar_hash: String,
-    nar_size: i64,
-    references_json: String,
-    deriver: Option<String>,
-    system: Option<String>,
-    signatures_json: String,
-    file_hash: String,
-    file_size: i64,
-    compression: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct BackfillSnapshot {
+    cache_id: i32,
+    blob_id: i64,
+    is_public: bool,
     r2_key: String,
+    public_key: Option<String>,
+    private_key: Option<String>,
+    file_hash: String,
+    compression: String,
+    file_size: i64,
+}
+
+async fn backfill_snapshot(
+    tx: &mut crate::db::Transaction,
+    row: &Published,
+) -> Result<BackfillSnapshot, ApiError> {
+    sqlx::query_as::<_, BackfillSnapshot>(
+        "SELECT c.id AS cache_id, b.id AS blob_id, c.is_public, b.r2_key, b.public_key,
+            b.private_key, b.file_hash, b.compression, b.file_size
+         FROM published_paths p JOIN caches c ON c.id=p.cache_id
+         JOIN orgs o ON o.id=c.org_id JOIN blob_objects b ON b.id=p.blob_object_id
+         WHERE p.id=$1 AND c.org_id=$2 AND p.store_path_hash=$3
+         FOR UPDATE OF c,o,b,p NOWAIT",
+    )
+    .bind(row.id)
+    .bind(&row.org_id)
+    .bind(&row.store_path_hash)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(not_found)
+}
+
+// An uncertain finish commit may already have adopted the key. Only the
+// matching, still-unadopted reservation can transfer ownership to cleanup.
+async fn retire_backfill(state: &AppState, key: &str, operation: &str) -> Result<(), ApiError> {
+    sqlx::query("WITH retired AS (
+        DELETE FROM nar_installations i WHERE i.key=$1 AND i.operation_id=$2
+            AND NOT EXISTS (SELECT 1 FROM blob_objects b WHERE b.public_key=i.key OR b.private_key=i.key)
+        RETURNING is_private,key
+    ) INSERT INTO object_cleanup(is_private,key) SELECT is_private,key FROM retired ON CONFLICT DO NOTHING")
+        .bind(key).bind(operation).execute(&state.pool).await?;
+    Ok(())
+}
+
+async fn repair_backfill(state: &AppState, row: &Published) -> Result<bool, ApiError> {
+    let operation = uuid::Uuid::now_v7().to_string();
+    let mut tx = crate::db::begin(state, &row.org_id).await?;
+    crate::db::advisory_lock(&mut tx, &format!("org:{}", row.org_id)).await?;
+    let snapshot = backfill_snapshot(&mut tx, row).await?;
+    let nar_fence = format!("nar:{}:{}", snapshot.file_hash, snapshot.compression);
+    crate::db::advisory_lock(&mut tx, &nar_fence).await?;
+    let private = !snapshot.is_public;
+    let destination = format!(
+        "{}/objects/{operation}/{}/{}.nar",
+        if private { "nars" } else { "nar" },
+        snapshot.file_hash,
+        snapshot.compression
+    );
+    let pointer = if private {
+        &snapshot.private_key
+    } else {
+        &snapshot.public_key
+    };
+    let target = pointer.clone().unwrap_or_else(|| {
+        format!(
+            "{}/{}/{}.nar",
+            if private { "nars/sha256" } else { "nar" },
+            snapshot.file_hash,
+            snapshot.compression
+        )
+    });
+    let source = if private {
+        &snapshot.public_key
+    } else {
+        &snapshot.private_key
+    }
+    .as_deref()
+    .unwrap_or(&snapshot.r2_key)
+    .to_owned();
+    sqlx::query(
+        "INSERT INTO nar_installations (
+        key,operation_id,source_key,file_hash,compression,is_private,file_size,
+        cache_id,expires_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+INTERVAL '1 hour')",
+    )
+    .bind(&destination)
+    .bind(&operation)
+    .bind(&source)
+    .bind(&snapshot.file_hash)
+    .bind(&snapshot.compression)
+    .bind(private)
+    .bind(snapshot.file_size)
+    .bind(snapshot.cache_id)
+    .execute(&mut *tx)
+    .await?;
+    if let Err(error) = tx.commit().await {
+        let _ = retire_backfill(state, &destination, &operation).await;
+        return Err(error.into());
+    }
+    let result = async {
+        // No SQL transaction is held during provider calls. The reservation
+        // owns the unique destination and pins its recorded source for GC.
+        let copied = match state.storage.head(private, &target).await {
+            // Immutable records never use the legacy canonical fallback at
+            // read time. They need an adopted bucket pointer even if it exists.
+            Ok(_) => pointer.is_none() && snapshot.r2_key.contains("/objects/"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => return Err(internal()),
+        };
+        if copied {
+            state.storage.copy(!source.starts_with("nar/"), &source, private, &destination)
+                .await.map_err(|_| internal())?;
+        }
+        let mut tx = crate::db::begin(state, &row.org_id).await?;
+        crate::db::advisory_lock(&mut tx, &format!("org:{}", row.org_id)).await?;
+        crate::db::advisory_lock(&mut tx, &nar_fence).await?;
+        let fresh = backfill_snapshot(&mut tx, row).await?;
+        if fresh.cache_id != snapshot.cache_id || fresh.blob_id != snapshot.blob_id
+            || fresh.is_public != snapshot.is_public
+            || fresh.r2_key != snapshot.r2_key {
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Publication changed; retry"));
+        }
+        let owned: Option<String> = sqlx::query_scalar("SELECT operation_id FROM nar_installations
+            WHERE key=$1 AND operation_id=$2 AND expires_at>NOW() AND phase<>'revoked'
+            FOR UPDATE NOWAIT")
+            .bind(&destination).bind(&operation)
+            .fetch_optional(&mut *tx).await?;
+        if owned.is_none() {
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Repair expired; retry"));
+        }
+        let adopted = if copied {
+            let query = if private {
+                "UPDATE blob_objects SET private_key=$1 WHERE id=$2 AND private_key IS NOT DISTINCT FROM $3"
+            } else {
+                "UPDATE blob_objects SET public_key=$1 WHERE id=$2 AND public_key IS NOT DISTINCT FROM $3"
+            };
+            sqlx::query(query).bind(&destination).bind(snapshot.blob_id).bind(pointer)
+                .execute(&mut *tx).await?.rows_affected() == 1
+        } else { false };
+        if !adopted {
+            sqlx::query("INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                .bind(private).bind(&destination).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM nar_installations WHERE key=$1 AND operation_id=$2")
+            .bind(&destination).bind(&operation).execute(&mut *tx).await?;
+        retire_narinfo(&mut tx, row, &path(&row.slug, &row.name)).await?;
+        tx.commit().await?;
+        Ok(adopted)
+    }.await;
+    if result.is_err() {
+        // Failure here is still safe: durable expiry retains cleanup ownership.
+        let _ = retire_backfill(state, &destination, &operation).await;
+    }
+    result
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn write_narinfo(
-    state: &AppState,
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn retire_narinfo(
+    tx: &mut crate::db::Transaction,
     row: &Published,
     target: &str,
 ) -> Result<(), ApiError> {
-    let private = !row.is_public;
-    let target_key = if private {
-        format!("nars/sha256/{}/{}.nar", row.file_hash, row.compression)
-    } else {
-        format!("nar/{}/{}.nar", row.file_hash, row.compression)
-    };
-    match state.storage.head(private, &target_key).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Published content may still live at its recorded upload key or
-            // in the other visibility's bucket. Repair placement before writing
-            // metadata, retaining the source for its existing cleanup owner.
-            state
-                .storage
-                .copy(
-                    !row.r2_key.starts_with("nar/"),
-                    &row.r2_key,
-                    private,
-                    &target_key,
-                )
-                .await
-                .map_err(|_| internal())?;
-        }
-        Err(_) => return Err(internal()),
+    // Narinfo is rendered from SQL at read time; retire known legacy keys.
+    for (private, key) in [
+        (false, format!("{target}/{}.narinfo", row.store_path_hash)),
+        (
+            true,
+            format!("narinfo/{target}/{}.narinfo", row.store_path_hash),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(private)
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
     }
-    if !private {
-        set_cache_info(state, target, true).await?;
-    }
-    let info = crate::signing::Narinfo {
-        store_path: row.store_path.clone(),
-        store_path_hash: row.store_path_hash.clone(),
-        nar_hash: row.nar_hash.clone(),
-        nar_size: row.nar_size,
-        references: serde_json::from_str(&row.references_json).map_err(|_| internal())?,
-        deriver: row.deriver.clone(),
-        system: row.system.clone(),
-        signatures: serde_json::from_str(&row.signatures_json).map_err(|_| internal())?,
-        file_hash: row.file_hash.clone(),
-        file_size: row.file_size,
-        compression: row.compression.clone(),
-    };
-    let rendered = crate::signing::render(
-        &mut **tx,
-        &state.config,
-        row.cache_id,
-        target,
-        private,
-        &info,
-    )
-    .await?;
-    let key = if private {
-        format!("narinfo/{target}/{}.narinfo", row.store_path_hash)
-    } else {
-        format!("{target}/{}.narinfo", row.store_path_hash)
-    };
-    state
-        .storage
-        .put(private, &key, rendered.as_bytes())
-        .await
-        .map_err(|_| internal())?;
-    if !private {
-        crate::cdn::schedule_narinfo(state, target, std::slice::from_ref(&row.store_path_hash))
-            .await?;
-    }
+    set_cache_info(tx, target).await?;
     Ok(())
 }
 
@@ -1538,27 +1629,13 @@ async fn backfill(State(state): State<AppState>, request: Request) -> Result<Res
         r#"
         SELECT
             p.id,
-            p.cache_id,
             c.org_id,
             c.name,
             o.slug,
-            c.is_public,
-            p.store_path,
-            p.store_path_hash,
-            p.nar_hash,
-            p.nar_size,
-            p.references_json,
-            p.deriver,
-            p.system,
-            p.signatures_json,
-            b.file_hash,
-            b.file_size,
-            b.compression,
-            b.r2_key
+            p.store_path_hash
         FROM published_paths p
         JOIN caches c ON c.id = p.cache_id
         JOIN orgs o ON o.id = c.org_id
-        JOIN blob_objects b ON b.id = p.blob_object_id
         WHERE p.id > $1
         ORDER BY p.id
         LIMIT $2
@@ -1569,66 +1646,16 @@ async fn backfill(State(state): State<AppState>, request: Request) -> Result<Res
     .fetch_all(&state.pool)
     .await?;
     let mut skipped = Vec::new();
+    let mut written = 0;
     for row in &rows {
         let target = path(&row.slug, &row.name);
-        let written: Result<(), ApiError> = async {
-            let mut tx = crate::profile_future!(
-                state.pool.begin(),
-                label = "management.backfill_pool_begin"
-            )
-            .await?;
-            let org_key = format!("org:{}", row.org_id);
-            crate::profile_future!(
-                crate::db::advisory_lock(&mut tx, &org_key),
-                label = "management.backfill_org_lock_wait"
-            )
-            .await?;
-            // Recheck membership and slug after the fence. A concurrent delete
-            // or move must not let a stale backfill overwrite current metadata.
-            let fresh = sqlx::query_as!(
-                Published,
-                r#"
-                SELECT
-                    p.id,
-                    p.cache_id,
-                    c.org_id,
-                    c.name,
-                    o.slug,
-                    c.is_public,
-                    p.store_path,
-                    p.store_path_hash,
-                    p.nar_hash,
-                    p.nar_size,
-                    p.references_json,
-                    p.deriver,
-                    p.system,
-                    p.signatures_json,
-                    b.file_hash,
-                    b.file_size,
-                    b.compression,
-                    b.r2_key
-                FROM published_paths p
-                JOIN caches c ON c.id = p.cache_id
-                JOIN orgs o ON o.id = c.org_id
-                JOIN blob_objects b ON b.id = p.blob_object_id
-                WHERE p.id = $1
-                "#,
-                row.id
-            )
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(not_found)?;
-            write_narinfo(state, &mut tx, &fresh, &path(&fresh.slug, &fresh.name)).await?;
-            tx.commit().await?;
-            Ok(())
-        }
-        .await;
-        if written.is_err() {
-            skipped.push(format!("{target}/{}", row.store_path_hash));
+        match repair_backfill(state, row).await {
+            Ok(repaired) => written += usize::from(repaired),
+            Err(_) => skipped.push(format!("{target}/{}", row.store_path_hash)),
         }
     }
     Ok(ok(
-        json!({"written":rows.len()-skipped.len(),"skipped":skipped,"next":if rows.len()==limit as usize{rows.last().map(|r|r.id)}else{None}}),
+        json!({"written":written,"processed":rows.len()-skipped.len(),"skipped":skipped,"next":if rows.len()==limit as usize{rows.last().map(|r|r.id)}else{None}}),
     ))
 }
 
@@ -1642,24 +1669,22 @@ async fn move_slug(
     let id = params.org.as_str();
     let input = body(request).await?;
     let at = input.get("cursor").filter(|v| !v.is_null());
-    let phase = at
-        .map(|v| {
-            v.get("phase")
-                .and_then(Value::as_str)
-                .filter(|s| ["public", "private"].contains(s))
-                .ok_or_else(|| bad("cursor must be a previous answer's next"))
-        })
-        .transpose()?
-        .unwrap_or("public");
+    at.map(|v| {
+        v.get("phase")
+            .and_then(Value::as_str)
+            .filter(|s| ["public", "private"].contains(s))
+            .ok_or_else(|| bad("cursor must be a previous answer's next"))
+    })
+    .transpose()?;
     let cursor = at.and_then(|v| v.get("cursor"));
-    let after = cursor
+    cursor
         .map(|v| {
             v.as_str()
                 .ok_or_else(|| bad("cursor must be a previous answer's next"))
         })
         .transpose()?;
     let mut tx = crate::profile_future!(
-        state.pool.begin(),
+        crate::db::begin(state, id),
         label = "management.move_slug_pool_begin"
     )
     .await?;
@@ -1674,7 +1699,7 @@ async fn move_slug(
         SELECT moving_from
         FROM orgs
         WHERE id = $1
-        FOR UPDATE
+        FOR UPDATE NOWAIT
         "#,
         id
     )
@@ -1683,126 +1708,39 @@ async fn move_slug(
     let Some(from) = moving else {
         return Ok(ok(json!({"done":true})));
     };
-    // List objects, not SQL rows: orphan metadata must also leave the old URL.
-    // Keep the org publication fence through copy and withdrawal.
-    let private = phase == "private";
-    let prefix = if private {
-        format!("narinfo/{from}")
-    } else {
-        from.clone()
-    };
-    let keys = state
-        .storage
-        .list(private, &prefix, after, 200)
-        .await
-        .map_err(|_| internal())?;
-    let mut moved = 0;
-    let mut invalidated = Vec::new();
-    for key in &keys {
-        let Some(relative) = key.strip_prefix(&format!("{prefix}/")) else {
-            continue;
-        };
-        let parts: Vec<_> = relative.split('/').collect();
-        // A default-org cache named like the old slug has only one segment.
-        let [name, file] = parts.as_slice() else {
-            continue;
-        };
-        if *file != "nix-cache-info" && !file.ends_with(".narinfo") {
-            continue;
-        }
-        if let Some(hash) = file.strip_suffix(".narinfo") {
-            let target = sqlx::query_scalar!(
-                r#"
-                SELECT o.slug
-                FROM published_paths p
-                JOIN caches c ON c.id = p.cache_id
-                JOIN orgs o ON o.id = c.org_id
-                WHERE c.org_id = $1
-                    AND c.name = $2
-                    AND c.is_public = $3
-                    AND p.store_path_hash = $4
-                "#,
-                id,
-                name,
-                !private,
-                hash
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(slug) = target {
-                let target = if private {
-                    format!("narinfo/{}/{file}", path(&slug, name))
-                } else {
-                    format!("{}/{file}", path(&slug, name))
-                };
-                match state.storage.head(private, &target).await {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        match state.storage.copy(private, key, private, &target).await {
-                            Ok(_) => moved += 1,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
-                                return Err(ApiError::new(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "Object exceeds upload buffer limit",
-                                ));
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                return Err(ApiError::new(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "Upload capacity exhausted",
-                                ));
-                            }
-                            Err(_) => return Err(internal()),
-                        }
-                    }
-                    Err(_) => return Err(internal()),
-                }
-                if !private {
-                    invalidated.push(target);
-                }
-            }
-        }
-        state
-            .storage
-            .delete(private, key)
-            .await
-            .map_err(|_| internal())?;
-        if !private {
-            invalidated.push(key.clone());
-        }
-    }
-    crate::cdn::schedule_files(state, &invalidated).await?;
-    let result = if keys.len() == 200 {
-        json!({"done":false,"next":{"phase":phase,"cursor":keys.last().unwrap()},"moved":moved})
-    } else if phase == "public" {
-        json!({"done":false,"next":{"phase":"private"},"moved":moved})
-    } else {
-        let names = sqlx::query_scalar!(
-            r#"
+    // Reads already resolve the new slug from SQL. Retire only known old keys;
+    // orphan object discovery is not part of a policy transaction.
+    let names = sqlx::query_scalar!(
+        r#"
             SELECT name
             FROM caches
             WHERE org_id = $1
             "#,
-            id
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for name in names {
-            set_cache_info(state, &path(&from, &name), false).await?;
-        }
-        sqlx::query!(
-            r#"
+        id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for name in names {
+        let hashes = sqlx::query_scalar!(
+                "SELECT p.store_path_hash FROM published_paths p JOIN caches c ON c.id = p.cache_id WHERE c.org_id = $1 AND c.name = $2",
+                id,
+                name
+            ).fetch_all(&mut *tx).await?;
+        crate::management_policy::MetadataTarget::new(true, &from, None, &name)
+            .withdraw(&mut tx, &hashes)
+            .await?;
+        set_cache_info(&mut tx, &path(&from, &name)).await?;
+    }
+    sqlx::query!(
+        r#"
             UPDATE orgs
             SET moving_from = NULL
             WHERE id = $1
             "#,
-            id
-        )
-        .execute(&mut *tx)
-        .await?;
-        json!({"done":true})
-    };
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(ok(result))
+    Ok(ok(json!({"done":true})))
 }

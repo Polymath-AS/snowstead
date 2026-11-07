@@ -1,5 +1,6 @@
 //! Generation-scoped compiler artifacts. SQL reserves/adopts/publishes; HTTP
 //! bodies stream to attempt-owned files without borrowing a pool connection.
+use crate::db::Transaction;
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -8,7 +9,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
 use tokio_util::io::ReaderStream;
 
 use crate::{
@@ -69,6 +69,16 @@ fn error(status: StatusCode, message: &str) -> ApiError {
 fn busy(message: &str) -> ApiError {
     error(StatusCode::SERVICE_UNAVAILABLE, message)
         .header(header::RETRY_AFTER, HeaderValue::from_static("1"))
+}
+fn lock_error(error: sqlx::Error) -> ApiError {
+    if error
+        .as_database_error()
+        .is_some_and(|error| error.code().as_deref() == Some("55P03"))
+    {
+        busy("Upload is busy; retry")
+    } else {
+        error.into()
+    }
 }
 const PRIVATE_REFUSED: &str = "this org does not allow private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made";
 
@@ -405,7 +415,7 @@ pub async fn consume(body: Body, size: u64) -> Result<(), ApiError> {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn org_lock(tx: &mut Transaction<'_, Postgres>, org: &str) -> Result<(), ApiError> {
+async fn org_lock(tx: &mut Transaction, org: &str) -> Result<(), ApiError> {
     let key = format!("org:{org}");
     crate::profile_future!(
         crate::db::advisory_lock(tx, &key),
@@ -426,7 +436,7 @@ struct Policy {
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn policy(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     target: &Target,
     product: Product,
     changed_status: StatusCode,
@@ -453,7 +463,7 @@ async fn policy(
                                 WHERE p.cache_id = c.id
                                     AND p.protocol = 'go'
                             )
-                        FOR SHARE OF c, o
+                        FOR SHARE OF c, o NOWAIT
                         "#,
                         target.cache_id,
                         &target.org,
@@ -480,7 +490,7 @@ async fn policy(
                                 WHERE p.cache_id = c.id
                                     AND p.protocol = 'sccache'
                             )
-                        FOR SHARE OF c, o
+                        FOR SHARE OF c, o NOWAIT
                         "#,
                         target.cache_id,
                         &target.org,
@@ -492,7 +502,8 @@ async fn policy(
         },
         label = "artifacts.policy_row_lock"
     )
-    .await?;
+    .await
+    .map_err(lock_error)?;
     let changed = || {
         if changed_status == StatusCode::SERVICE_UNAVAILABLE {
             busy("Cache changed; retry")
@@ -527,10 +538,13 @@ async fn reserve(
     output: Option<&str>,
 ) -> Result<Entry, ApiError> {
     let kind = product.name();
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "artifacts.reserve_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, &target.org),
+        label = "artifacts.reserve_pool_begin"
+    )
+    .await?;
     org_lock(&mut tx, &target.org).await?;
-    let limit = policy(&mut tx, target, product, StatusCode::CONFLICT).await?;
+    let mut limit = policy(&mut tx, target, product, StatusCode::CONFLICT).await?;
     let too_large = || {
         error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -568,13 +582,15 @@ async fn reserve(
                 AND e.generation = $2
                 AND e.action = $3
                 AND e.expires_at > NOW()
+            FOR UPDATE OF e NOWAIT
             "#,
             target.cache_id,
             &target.generation,
             action,
         )
         .fetch_optional(&mut *tx)
-        .await?,
+        .await
+        .map_err(lock_error)?,
         Product::Sccache => sqlx::query_as!(
             Entry,
             r#"
@@ -602,13 +618,15 @@ async fn reserve(
                 AND e.generation = $2
                 AND e.action = $3
                 AND e.expires_at > NOW()
+            FOR UPDATE OF e NOWAIT
             "#,
             target.cache_id,
             &target.generation,
             action,
         )
         .fetch_optional(&mut *tx)
-        .await?,
+        .await
+        .map_err(lock_error)?,
     };
     let existing = match existing {
         Some(entry)
@@ -621,15 +639,27 @@ async fn reserve(
         }
         Some(entry) => {
             // A lost pre-migration acknowledgement may leave an immutable
-            // object without stored_at. It needs no reservation growth.
+            // object without stored_at. It needs no reservation growth. Probe
+            // without holding SQL locks, then revalidate before growing.
+            tx.commit().await?;
             match state.storage.head(true, &entry.r2_key).await {
-                Ok(_) => {
-                    tx.commit().await?;
-                    return Ok(entry);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(entry),
+                Ok(_) => return Ok(entry),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")),
             }
+            tx = crate::db::begin(state, &target.org).await?;
+            org_lock(&mut tx, &target.org).await?;
+            limit = policy(&mut tx, target, product, StatusCode::CONFLICT).await?;
+            let current = locked_entry(&mut tx, target, product, &entry.id).await?;
+            if current.r2_key != entry.r2_key
+                || current.size != entry.size
+                || current.output != entry.output
+                || current.stored_at != entry.stored_at
+                || current.uploaded_at != entry.uploaded_at
+            {
+                return Err(busy("Upload changed; retry"));
+            }
+            Some(current)
         }
         None => None,
     };
@@ -806,13 +836,15 @@ async fn reserve(
                     AND e.generation = $2
                     AND e.action = $3
                     AND e.expires_at > NOW()
+                FOR UPDATE OF e NOWAIT
                 "#,
                 target.cache_id,
                 &target.generation,
                 action,
             )
             .fetch_optional(&mut *tx)
-            .await?,
+            .await
+            .map_err(lock_error)?,
             Product::Sccache => sqlx::query_as!(
                 Entry,
                 r#"
@@ -832,13 +864,15 @@ async fn reserve(
                     AND e.generation = $2
                     AND e.action = $3
                     AND e.expires_at > NOW()
+                FOR UPDATE OF e NOWAIT
                 "#,
                 target.cache_id,
                 &target.generation,
                 action,
             )
             .fetch_optional(&mut *tx)
-            .await?,
+            .await
+            .map_err(lock_error)?,
         }
         .ok_or_else(|| error(StatusCode::CONFLICT, "Action changed; retry"))?,
     };
@@ -848,7 +882,7 @@ async fn reserve(
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn locked_entry(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     target: &Target,
     product: Product,
     id: &str,
@@ -872,7 +906,7 @@ async fn locked_entry(
                         (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '5 minutes') AS "access_due!"
                     FROM go_entries e
                     WHERE e.id = $1
-                    FOR UPDATE
+                    FOR UPDATE NOWAIT
                     "#,
                     id,
                 )
@@ -894,7 +928,7 @@ async fn locked_entry(
                         (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '5 minutes') AS "access_due!"
                     FROM sccache_entries e
                     WHERE e.id = $1
-                    FOR UPDATE
+                    FOR UPDATE NOWAIT
                     "#,
                     id,
                 )
@@ -904,7 +938,8 @@ async fn locked_entry(
         },
         label = "artifacts.entry_row_lock"
     )
-    .await?
+    .await
+    .map_err(lock_error)?
     .ok_or_else(|| busy("Upload expired; retry"))?;
     if entry.cache_id != Some(target.cache_id)
         || entry.generation != target.generation
@@ -931,8 +966,11 @@ async fn finish(
 ) -> Result<Response, ApiError> {
     let id = &expected.id;
     let kind = product.name();
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "artifacts.adopt_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, &target.org),
+        label = "artifacts.adopt_pool_begin"
+    )
+    .await?;
     org_lock(&mut tx, &target.org).await?;
     policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
@@ -944,6 +982,7 @@ async fn finish(
                 && entry.uploaded_at.is_none()
                 && entry.size != expected.size))
     {
+        tx.rollback().await?;
         if let Some(transfer) = &attempt
             && transfer.key != entry.r2_key
         {
@@ -1012,15 +1051,17 @@ async fn finish(
     {
         let _ = state.storage.delete(true, &transfer.key).await;
     }
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "artifacts.publish_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, &target.org),
+        label = "artifacts.publish_pool_begin"
+    )
+    .await?;
     org_lock(&mut tx, &target.org).await?;
     let limit = policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
     if let Some(limit) = limit {
         crate::capacity::admit(
             &mut tx,
-            state,
             &target.org,
             limit,
             if entry.uploaded_at.is_none() {

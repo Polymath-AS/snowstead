@@ -208,31 +208,11 @@ fn endpoint(config: &Config) -> String {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn schedule_narinfo(
-    state: &AppState,
-    path: &str,
-    hashes: &[String],
-) -> Result<(), ApiError> {
-    if !enabled(state) || hashes.is_empty() {
-        return Ok(());
-    }
-    schedule(state, job(path, Some(hashes))?).await
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn schedule_cache(state: &AppState, path: &str) -> Result<(), ApiError> {
     if !enabled(state) {
         return Ok(());
     }
     schedule(state, job(path, None)?).await
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn schedule_files(state: &AppState, keys: &[String]) -> Result<(), ApiError> {
-    if !enabled(state) || keys.is_empty() {
-        return Ok(());
-    }
-    schedule(state, files_job(keys)?).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -772,13 +752,13 @@ mod tests {
         // Scheduling must persist before dispatch. Saturate dispatch so these
         // tests never reach the production endpoint, even in the background.
         let permits = DISPATCH.acquire_many(4).await.unwrap();
-        schedule_narinfo(&state, "cache", &[hash(1), hash(1)])
+        schedule(&state, job("cache", Some(&[hash(1), hash(1)])).unwrap())
             .await
             .unwrap();
         schedule_cache(&state, "cache").await.unwrap();
-        schedule_files(
+        schedule(
             &state,
-            &["cache/nix-cache-info".into(), "cache/nix-cache-info".into()],
+            files_job(&["cache/nix-cache-info".into(), "cache/nix-cache-info".into()]).unwrap(),
         )
         .await
         .unwrap();

@@ -53,6 +53,15 @@ explicit `migrate --rebaseline` operator action. The current binary refuses to
 infer or overwrite an unknown schema. Historical releases remain in Git;
 source removal does not change this upgrade requirement.
 
+Apply the additive `0001_optimistic_publication.sql` migration before deploying
+the new server. It adds bucket pointers, durable object ownership, completion
+receipts, and the exact-key cleanup queue without removing legacy objects.
+Drain old writers and maintenance before cutover. Legacy canonical ownership
+records never expire automatically; reconcile ambiguous provider operations
+before an operator releases their source/destination pins.
+After publishing immutable pointers, do not roll back to a server that cannot
+read them. Use a compatible reader release or a forward fix.
+
 The hosted `REQUIRE_CACHE_SIGNING_KEYS=true` policy refuses cache creation
 without a master key and refuses publication without a per-cache key.
 Self-hosters may explicitly set it to `"false"` to use
@@ -62,12 +71,24 @@ do not silently replace a key clients already trust.
 
 ### Public caches on a custom domain
 
-For self-hosted direct cache URLs, public caches can be served straight from
-the `snowstead-public` bucket. The bucket needs a custom domain on a zone in
-the same account, Worker routes for `/_api/*` and `/private/*` on that hostname,
-and a Cache Rule. Hosted production instead keeps this as the web gateway's
-internal CDN origin. Cloudflare caches only some file
-extensions by default, and `.narinfo` and `.nar` are not among them:
+Use the Rust origin as the substituter URL, including for public caches.
+Rust renders narinfo from current SQL publication and signing state, and
+serves `nix-cache-info` after resolving the cache in SQL. Neither metadata
+endpoint redirects to the CDN or reads mutable metadata from R2.
+Public narinfo has a five-minute TTL and an ETag derived from the rendered
+bytes; misses use `no-store`. Public cache-info has a one-hour TTL.
+Private metadata requires authorization and uses `private, no-cache`.
+
+Only public NAR bytes use the bucket hostname. With `PUBLIC_CACHE_ORIGIN`
+configured, Rust validates publication and redirects to the committed bucket
+pointer (or a validated legacy key). Without it, Rust streams public NARs.
+Private NARs always stream through Rust after authorization, without reusable
+presigned redirects. Hosted production keeps `cache.snowstead.com` as the
+public NAR origin, not the substituter metadata origin.
+
+For a self-hosted public bucket, use a dedicated custom domain on a zone in
+the same account and a Cache Rule. Keep API and private reads on Rust.
+Cloudflare does not cache `.nar` by default:
 
 ```bash
 wrangler r2 bucket create snowstead-public
@@ -81,11 +102,13 @@ Cache Rule, on the zone:
 - Cache eligibility: eligible; Edge TTL: use cache-control if present,
   bypass if not, and 60 seconds for status 404; Browser TTL: respect origin.
 
-NARs are content-addressed and cached for a year. Narinfo can be deleted or
-re-signed, so it is cached for five minutes, without `immutable`. Misses are
-cached for a minute. Publishing, re-publishing, backfilling, and deleting
-paths (including retention) request CDN purges to accelerate visibility.
-Purging needs the vars `CDN_ZONE_ID` and `PUBLIC_CACHE_ORIGIN` and the
+New NAR objects have unique immutable keys; SQL stores separate public/private
+bucket pointers while retaining logical content deduplication. Public NARs
+use a one-year immutable TTL. The bucket rule's one-minute negative TTL
+does not apply to Rust metadata misses.
+
+Legacy CDN invalidation remains available. Purging needs the vars
+`CDN_ZONE_ID` and `PUBLIC_CACHE_ORIGIN` and the
 secret `CDN_PURGE_TOKEN`, an API token with Cache Purge on the zone;
 without them nothing is purged. Automatic purges are saved under
 `cdn-purges/` in the **private** bucket before dispatch. Requests are batched
@@ -111,11 +134,50 @@ acknowledged the request, not that eviction was verified everywhere.
 Purges don't remove clients' local copies, Nix's negative cache, or shared
 content-addressed NARs. This is cache invalidation, not erasure of public data.
 
-**Upgrading:** existing objects and CDN entries may still have the former
-one-year TTL. Run `POST /_api/v1/admin/narinfo/backfill` through all pages
-to rewrite their metadata and queue purges. The five-minute fallback
-applies after those old copies have been replaced; changing the server
-alone cannot shorten an already-cached response's TTL.
+**Upgrading:** old raw CDN narinfo/cache-info and client copies can remain
+stale, including former one-year TTLs. Switch substituters to the Rust origin.
+SQL withdrawal, slug changes, and signing activation do not erase those copies.
+Backfill repairs missing NAR bucket pointers and queues known legacy metadata
+keys for asynchronous deletion; it does not rewrite mutable metadata or
+shorten existing edge/client TTLs. Plan explicit legacy CDN invalidation where
+needed. Purges do not clear client caches or revoke public bytes already shared.
+
+### Optimistic publication and cleanup
+
+Nix publication first records ownership of a unique destination key and
+protects its source. Storage copying runs outside SQL transactions and does
+not reserve retained capacity. A short SQL transaction then checks ownership,
+expiry, current policy, and signing configuration, admits retained capacity,
+and atomically adopts the bucket pointer, publishes the path, and saves the
+completion receipt. Replaying that receipt does not republish withdrawn paths.
+A stale attempt cannot adopt its object or overwrite published bytes.
+
+These are SQL-only, fail-fast decisions, not literal lock freedom.
+They use bounded connection acquisition, `pg_try_advisory_xact_lock`, explicit
+`NOWAIT` locks, and a 100 ms `lock_timeout` after acquiring the org fence.
+Same-process writers wait on a per-org gate before borrowing a connection,
+with the pool's acquisition deadline and a bounded queue of at most one waiter
+per configured pool connection. Queue slots do not borrow connections.
+Transaction startup finishes even if its caller disconnects: cancelling SQLx
+0.9 during `BEGIN` can otherwise return an untracked transaction to the pool.
+The gate ends with each transaction and never spans storage I/O. PostgreSQL
+still serializes writers across server instances; rejected writers must retry.
+The CLI retries explicit session-creation 503 responses up to four attempts,
+but does not replay a lost creation response. The Go helper retries uploads
+marked `503` with `Retry-After: 1` before opening its circuit breaker.
+
+Capacity remains logical and shared across Nix, Go, and sccache. Admission
+counts committed retained entries, separately from staging budgets.
+LRU ordering still uses the later of publication and access, with existing
+pin and active-upload protections. Direct CDN downloads do not update access.
+Quota eviction and publication commit together after storage preparation.
+Failed preparation or a rolled-back publication does not evict existing content.
+
+Deletion, retention, and eviction withdraw SQL visibility atomically and queue
+known exact keys for asynchronous cleanup. Storage failure does not roll back
+the committed withdrawal. Maintenance retries idempotent deletion outside SQL
+transactions. Expiry revokes adoption of new attempts, not provider work;
+orphan sweeps find late writes. Legacy canonical ownership never autoexpires.
 
 ## Rust and C/C++ compiler cache
 
@@ -197,11 +259,12 @@ The following differences are intentional:
   after storage access and again before returning a response; transfers are
   not interrupted if their entry expires after response streaming starts.
   Direct public narinfo misses use `no-store`, not negative edge caching.
-  Public CDN handoff remains a separate configured path.
-- **Backfill:** missing canonical NARs are repaired from the recorded blob
-  source before narinfo is written. Rust also writes private narinfo and
-  includes it in `written`; private metadata remains in the private bucket
-  and may be preserved during slug moves.
+  Only public NAR delivery uses the configured CDN handoff.
+- **Backfill:** `POST /_api/v1/admin/narinfo/backfill` repairs missing NARs
+  from the recorded source using an immutable destination and conditional SQL
+  adoption. It queues known legacy public/private metadata keys for cleanup,
+  rather than writing narinfo. `written` counts adopted NAR repairs, not
+  metadata writes. Follow `next` through all pages and review `skipped`.
 - **Accounting and maintenance:** origin downloads attempt immediate SQL
   bandwidth increments independently of optional telemetry; these count
   selected object bytes, not confirmed client receipt. The public importer
@@ -405,12 +468,11 @@ without an org are its tokens.
 
 - **Cache names are an org's own.** Each org has a slug, and its caches
   are served at `<host>/<slug>/<name>`, so every org can have a `main`.
-  The default org's caches stay at `<host>/<name>`. Public caches are
-  stored at their URL for the CDN to serve, so changing an org's slug
-  moves objects: `PUT /orgs/:org` readies the new paths, then
-  `POST /orgs/:org/move` moves the narinfo a page at a time. Until it's
-  done the org keeps its old slug, and the old URLs answer for paths not
-  moved yet; after, they're gone.
+  The default org's caches stay at `<host>/<name>`. `PUT /orgs/:org`
+  changes SQL routing immediately; Rust serves metadata at the new slug
+  and refuses the old slug. `POST /orgs/:org/move` queues known old
+  metadata keys for cleanup and clears `movingFrom`. It does not move
+  NARs or rewrite narinfo. Old raw CDN/client copies can remain stale.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
   org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
@@ -424,8 +486,12 @@ without an org are its tokens.
   anything: `ci-*` reaches every cache starting with `ci-`, including
   ones made later, and `*` reaches them all. A push names its cache within
   the token's org, so `snowstead push main` pushes to that org's `main`.
-- **Storage limits.** A push that would take an org's caches past its
-  limit is refused with 507 before anything uploads.
+- **Storage limits.** Verified Nix candidates do not reserve retained capacity.
+  A short SQL transaction admits current usage, evicts eligible LRU entries
+  across products, publishes pointers, and records completion together. Failed
+  preparation or publication does not evict existing content. Staging has its
+  own budget; retained admission can fail after uploads finish. A publication
+  needing more than 256 evictions must first delete retained paths explicitly.
 - **Admission.** Rust does not retain the Worker's per-minute request caps.
   Storage limits, staging safeguards, and bounded runtime resources still apply.
 - **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth` for the current UTC
@@ -575,10 +641,10 @@ are not fetched or silently assumed protected. More than 10000 distinct paths
 returns 413. Creation cost and stored membership scale with closure size;
 history storage scales with revisions and their closures. Candidate scans use
 indexed membership checks, not recursive traversal. Pin mutations serialize
-with publication and deletion under the existing org-then-cache transaction
-locks. Pinned roots and dependencies cannot be removed by capacity, retention,
-or the existing individual-path deletion endpoint. Whole-cache eviction and
-cache deletion explicitly override pins.
+with publication and deletion through short, fail-fast SQL decisions,
+not locks held across storage I/O. Pinned roots and dependencies cannot be
+removed by capacity, retention, or the existing individual-path deletion
+endpoint. Whole-cache eviction and cache deletion explicitly override pins.
 
 #### Empty a cache without deleting it
 
@@ -596,15 +662,13 @@ tokens, and signing keys. It invalidates old action generations and aborts Nix
 sessions, so pre-eviction uploads cannot publish later. A fresh upload after
 the operation can repopulate the cache.
 
-The operation follows org → upload-session fence → cache → entry lock order;
-SQL changes and eviction logs commit together after idempotent external deletes.
-Partial external failure leaves durable SQL retry records; retry the request.
-An already empty cache returns zero counts. External deletes cannot roll back,
-so some objects may already be unavailable after a failed attempt. NAR blobs
-remain for reference-aware GC so other caches sharing them are not damaged.
-Detached Go/sccache objects from earlier capacity eviction remain owned by GC.
-Large evictions use batches internally but hold transaction locks until the
-request finishes; they can delay uploads and should run outside peak CI load.
+SQL withdrawal, upload invalidation, eviction logs, and exact-key cleanup
+records commit together. No storage deletion runs under those locks.
+An already empty cache returns zero counts. Maintenance deletes retired
+objects asynchronously and retries failures; it does not roll back withdrawal.
+Shared NAR blobs remain for reference-aware GC. Detached Go/sccache objects
+from earlier capacity eviction remain owned by GC. Large SQL withdrawals
+can still contend with writers; fail-fast callers must retry.
 
 ### Cache signing key lifecycle
 
@@ -647,23 +711,19 @@ use this lifecycle GET to discover the complete trust set after rotations.
 Retired public keys are retained permanently, and cannot be reactivated or
 deleted through this API. Their sealed secrets are removed from history.
 
-Rotation is **trust overlap**, not indefinite dual signing: new publications
-use only the new key. Existing R2/CDN narinfo is untouched and keeps its old
-signature and URL. Keep historical public keys trusted for as long as those
-objects or client caches exist. An explicit narinfo backfill may replace old
-signatures; don't use one as an automatic rotation step. This API is not an
-emergency compromise-revocation mechanism: removing old trust safely would
-require a separate re-sign/backfill and R2/CDN/client invalidation plan.
-No CDN purge is needed for this additive rotation. Any future rewrite must
-purge the rewritten narinfo URLs after R2 writes; purge implementation is
-outside signing management.
+Rotation is **trust overlap**, not indefinite dual signing. Rust renders
+narinfo for existing and new publications with the current SQL signing key,
+including on public reads. Activation changes freshly rendered bytes and
+their ETags without an R2 rewrite or backfill. Publication validates current
+signing policy at commit; rotation does not cancel prepared candidates.
 
-Publication uses the current signing key from Postgres. There is no signing
-on public reads.
-A publish already in flight at activation may finish with the prior key,
-which is another reason to retain overlapping trust. Rotation does not
-rotate `SIGNING_MASTER_KEY`; retain that deployment secret to open active
-and staged keys.
+Keep historical public keys trusted while old CDN or client copies exist.
+Cached API narinfo can also retain the prior signature until revalidation.
+Rotation does not purge those copies. This API is not an emergency
+compromise-revocation mechanism; removing old trust needs a separate CDN/client
+invalidation and recovery plan. Backfill repairs NAR pointers, not signatures.
+Rotation does not rotate `SIGNING_MASTER_KEY`; retain that deployment secret
+to open active and staged keys.
 
 ### Signing-key backup and recovery
 

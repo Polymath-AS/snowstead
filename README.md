@@ -180,9 +180,15 @@ reservation, so retries reuse the same bytes without recompression.
 
 The server grants exact-size parts from a separate, bounded staging budget,
 then checks the final size, compressed hash, and receipts before publishing.
-Publication evicts least-recently-used entries across the org's Nix, Go and compiler
-caches when retained capacity is full. Public CDN reads bypass the service,
-so their access times are not observed; pushes and service reads update use.
+Publication owns a unique immutable NAR key before copying bytes, without a
+retained-byte reservation or a borrowed SQL connection. One short transaction
+then admits current capacity, evicts eligible least-recently-used entries
+across the org's products, adopts the pointer, and records completion. Failure
+rolls back eviction together with publication. Completed retries return their
+recorded result and cannot restore a deleted path. SQL decisions fail fast on
+contention; they are not literally lock-free. Cleanup of retired exact keys is
+asynchronous. Direct CDN downloads do not update access times; pushes and
+service reads update use.
 Each session uploads private staging bytes, even when the hash is already
 stored. Session creation overlaps transfers instead of delaying the first
 upload until every path has a session.
@@ -193,13 +199,17 @@ migrations and the Rust server before using the streaming CLI. It does not fall
 back to disk spooling on older servers. Config and credential writes still
 use atomic temporary files.
 
-Large canonical installations keep a durable source/destination pin. An
-ambiguous storage completion stays blocked rather than reopening on a timeout;
-an operator must reconcile its R2 upload before clearing that pin. Outstanding
-pre-upgrade canonical multipart grants still fence installation until drained
-or reconciled; removing their API routes does not revoke those grants. Staged
+Legacy canonical installations keep a durable source/destination pin that
+never expires automatically. An operator must reconcile an ambiguous R2
+operation before clearing that pin. Outstanding pre-upgrade canonical multipart
+grants keep their legacy objects protected; removing their API routes does not
+revoke those grants. New immutable publications do not wait for them. Staged
 session bytes are retained for retries and removed by garbage collection
 after expiry.
+
+Old raw CDN metadata and client caches can outlive SQL changes. Slug changes,
+deletion, and signing rotation do not erase those copies; see the
+[deployment caveats](docs.md#public-caches-on-a-custom-domain).
 
 For local CLI development, run `cargo build -p snowstead-cli` and
 `cargo test -p snowstead-cli` inside `nix develop`. `pnpm check` includes the

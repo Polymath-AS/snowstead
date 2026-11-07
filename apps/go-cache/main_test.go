@@ -432,6 +432,49 @@ func TestRemoteWritesAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestBusyUploadsRetryExactBytesWithinABoundedBudget(t *testing.T) {
+	a, o, body := artifact()
+	for _, scenario := range []struct {
+		name   string
+		busy   int
+		marked bool
+		calls  int64
+		errors int64
+	}{
+		{"recovers", 2, true, 3, 0},
+		{"exhausted", 4, true, 4, 1},
+		{"unmarked outage", 1, false, 1, 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var calls atomic.Int64
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, err := io.ReadAll(r.Body)
+				if err != nil || !bytes.Equal(got, body) || r.Header.Get("X-Snowstead-Output-ID") != hex.EncodeToString(o) || r.ContentLength != int64(len(body)) {
+					t.Error("retry changed upload bytes or receipt")
+				}
+				if calls.Add(1) <= int64(scenario.busy) {
+					if scenario.marked {
+						w.Header().Set("Retry-After", "1")
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+				} else {
+					w.WriteHeader(http.StatusCreated)
+				}
+			}))
+			defer s.Close()
+			c := setup(t, s.URL)
+			r, _ := exchange(t, c, []request{{ID: 1, Command: "put", ActionID: a, OutputID: o, BodySize: int64(len(body))}}, map[int64][]byte{1: body})
+			assertFile(t, r[0], body)
+			if calls.Load() != scenario.calls || c.stats.uploadErrors.Load() != scenario.errors || c.remoteDisabled.Load() != (scenario.errors != 0) {
+				t.Fatalf("calls=%d errors=%d disabled=%t", calls.Load(), c.stats.uploadErrors.Load(), c.remoteDisabled.Load())
+			}
+			if scenario.errors == 0 && (c.stats.uploads.Load() != 1 || c.stats.uploadedBytes.Load() != int64(len(body))) {
+				t.Fatal("retries must count one successful artifact")
+			}
+		})
+	}
+}
+
 func TestCorruptionAndNetworkFallback(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	s.Close()

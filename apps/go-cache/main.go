@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -270,7 +271,8 @@ func (c *cache) remote(method, action, output string, body io.Reader, size int64
 	} else {
 		progress.touch()
 		res.Body = progressBody{ReadCloser: res.Body, progress: progress}
-		if res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 429 || res.StatusCode >= 500 {
+		busy := method == http.MethodPut && res.StatusCode == http.StatusServiceUnavailable && res.Header.Get("Retry-After") == "1"
+		if !busy && (res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 429 || res.StatusCode >= 500) {
 			c.remoteDisabled.Store(true)
 		}
 	}
@@ -340,20 +342,32 @@ func (c *cache) put(req request, path string) response {
 		return r
 	}
 	defer f.Close()
-	res, err := c.remote(http.MethodPut, action, output, f, req.BodySize)
-	if err != nil {
-		c.stats.uploadErrors.Add(1)
+	for attempt := 0; attempt < 4; attempt++ {
+		// Independent offsets keep retries safe even if an early busy response
+		// arrives while the previous HTTP transport is closing its request body.
+		res, err := c.remote(http.MethodPut, action, output, io.NewSectionReader(f, 0, req.BodySize), req.BodySize)
+		if err != nil {
+			c.stats.uploadErrors.Add(1)
+			return r
+		}
+		res.Body.Close()
+		if res.StatusCode == http.StatusServiceUnavailable && res.Header.Get("Retry-After") == "1" {
+			if attempt < 3 {
+				time.Sleep(time.Duration(50+rand.IntN(100)) * time.Millisecond * time.Duration(1<<attempt))
+				continue
+			}
+			c.remoteDisabled.Store(true)
+		}
+		switch res.StatusCode {
+		case http.StatusCreated, http.StatusNoContent:
+			c.stats.uploads.Add(1)
+			c.stats.uploadedBytes.Add(req.BodySize)
+		case http.StatusConflict:
+			c.stats.conflicts.Add(1)
+		default:
+			c.stats.uploadErrors.Add(1)
+		}
 		return r
-	}
-	defer res.Body.Close()
-	switch res.StatusCode {
-	case http.StatusCreated, http.StatusNoContent:
-		c.stats.uploads.Add(1)
-		c.stats.uploadedBytes.Add(req.BodySize)
-	case http.StatusConflict:
-		c.stats.conflicts.Add(1)
-	default:
-		c.stats.uploadErrors.Add(1)
 	}
 	return r
 }

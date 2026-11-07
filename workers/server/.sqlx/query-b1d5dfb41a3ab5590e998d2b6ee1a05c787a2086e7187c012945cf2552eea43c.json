@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE NOWAIT\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "b1d5dfb41a3ab5590e998d2b6ee1a05c787a2086e7187c012945cf2552eea43c"
+}

@@ -861,12 +861,10 @@ mod tests {
                 20
             );
             storage
-                .delete_many(vec![
-                    (true, "private-storage-key/object".into()),
-                    (false, "private-copy-key".into()),
-                ])
+                .delete(true, "private-storage-key/object")
                 .await
                 .unwrap();
+            storage.delete(false, "private-copy-key").await.unwrap();
         }
         .instrument(tracing::info_span!(target: "snowstead_observability", "storage.contract"))
         .await;
@@ -1009,7 +1007,7 @@ mod tests {
                 "storage.list",
                 "storage.copy",
                 "storage.head",
-                "storage.delete_many",
+                "storage.delete",
             ] {
                 let span = spans
                     .iter()

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT moving_from\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE NOWAIT\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "moving_from",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "moving_from"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "03d78cf0f435bf1c3f40b04bb0f613242d630e3e5c385af7485d5f77c140cad4"
+}

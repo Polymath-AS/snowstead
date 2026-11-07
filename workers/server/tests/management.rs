@@ -377,44 +377,23 @@ async fn blocked_policy_update_does_not_block_another_org_slug_claim(pool: PgPoo
         .unwrap();
     let app = router(state(pool.clone()));
     let mut blocker = pool.begin().await.unwrap();
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *blocker)
-        .await
-        .unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:org_alpha',0))")
         .execute(&mut *blocker)
         .await
         .unwrap();
-    let policy_app = app.clone();
-    let policy = tokio::spawn(async move {
+    let (status, _, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
         call(
-            &policy_app,
+            &app,
             "PUT",
             "/_api/v1/orgs/org_alpha",
             json!({"storageLimit":123}),
             None,
-        )
-        .await
-    });
-    // Observe the request waiting on A's lock before trying B, rather than
-    // relying on scheduling or a sleep to establish the overlap.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
-            )
-            .bind(blocker_pid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if waiting {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
+        ),
+    )
     .await
-    .expect("policy update should wait on org A");
+    .expect("policy update must fail fast on org A");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let (status, _, claimed) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         call(
@@ -428,9 +407,15 @@ async fn blocked_policy_update_does_not_block_another_org_slug_claim(pool: PgPoo
     .await
     .expect("org B's slug claim must not wait for org A's policy update");
     assert_eq!(status, StatusCode::OK, "{claimed}");
-    assert!(!policy.is_finished());
     blocker.rollback().await.unwrap();
-    let (status, _, updated) = policy.await.unwrap();
+    let (status, _, updated) = call(
+        &app,
+        "PUT",
+        "/_api/v1/orgs/org_alpha",
+        json!({"storageLimit":123}),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{updated}");
     assert_eq!(updated["storageLimit"], 123);
     assert_eq!(updated["slug"], "alpha");
@@ -707,17 +692,37 @@ async fn metadata_backfill_repairs_recorded_nar_placement(pool: PgPool) {
     };
     let (status, _, result) = backfill().await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(result, json!({"written":2,"skipped":[],"next":null}));
+    assert_eq!(
+        result,
+        json!({"written":2,"processed":2,"skipped":[],"next":null})
+    );
     for private in [false, true] {
         let (name, hash, prefix) = if private {
             ("secret", "d".repeat(64), "nars/sha256")
         } else {
             ("public", "c".repeat(64), "nar")
         };
-        let object = storage
-            .open(private, &format!("{prefix}/{hash}/none.nar"))
-            .await
-            .unwrap();
+        let pointer: String = sqlx::query_scalar(if private {
+            "SELECT private_key FROM blob_objects WHERE file_hash=$1"
+        } else {
+            "SELECT public_key FROM blob_objects WHERE file_hash=$1"
+        })
+        .bind(&hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(pointer.starts_with(if private {
+            "nars/objects/"
+        } else {
+            "nar/objects/"
+        }));
+        assert!(
+            storage
+                .head(private, &format!("{prefix}/{hash}/none.nar"))
+                .await
+                .is_err()
+        );
+        let object = storage.open(private, &pointer).await.unwrap();
         let mut bytes = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut { object.reader }, &mut bytes)
             .await
@@ -728,9 +733,9 @@ async fn metadata_backfill_repairs_recorded_nar_placement(pool: PgPool) {
             if private { "narinfo/" } else { "" },
             "0".repeat(32)
         );
-        assert!(storage.head(private, &info_key).await.is_ok());
+        assert!(storage.head(private, &info_key).await.is_err());
         assert!(storage.head(!private, &info_key).await.is_err());
-        // Once placed, a missing recorded source must not prevent re-signing.
+        // Once placed, a missing recorded source must not prevent reuse.
         let source = format!(
             "{}/{hash}/none.nar",
             if private { "nar" } else { "nars/sha256" }
@@ -739,15 +744,18 @@ async fn metadata_backfill_repairs_recorded_nar_placement(pool: PgPool) {
     }
     assert_eq!(
         backfill().await.2,
-        json!({"written":2,"skipped":[],"next":null})
+        json!({"written":0,"processed":2,"skipped":[],"next":null})
     );
-    storage
-        .delete(false, &format!("nar/{}/none.nar", "c".repeat(64)))
-        .await
-        .unwrap();
+    let public_key: String =
+        sqlx::query_scalar("SELECT public_key FROM blob_objects WHERE file_hash=$1")
+            .bind("c".repeat(64))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    storage.delete(false, &public_key).await.unwrap();
     assert_eq!(
         backfill().await.2,
-        json!({"written":1,"skipped":[format!("repair/public/{}", "0".repeat(32))],"next":null})
+        json!({"written":0,"processed":1,"skipped":[format!("repair/public/{}", "0".repeat(32))],"next":null})
     );
 }
 
@@ -782,13 +790,16 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(written, json!({"written":2,"skipped":[],"next":null}));
+    assert_eq!(
+        written,
+        json!({"written":0,"processed":2,"skipped":[],"next":null})
+    );
     let hash = "0".repeat(32);
     assert!(
         storage
             .head(false, "alpha/public/nix-cache-info")
             .await
-            .is_ok()
+            .is_err()
     );
     assert!(
         storage
@@ -838,7 +849,7 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
         storage
             .head(false, "bravo/public/nix-cache-info")
             .await
-            .is_ok()
+            .is_err()
     );
     let fresh = format!("narinfo/bravo/secret/{hash}.narinfo");
     storage.put(true, &fresh, b"newer metadata").await.unwrap();
@@ -866,7 +877,7 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
         .0,
         StatusCode::CONFLICT
     );
-    let (_, _, mut moved) = call(
+    let (_, _, moved) = call(
         &app,
         "POST",
         "/_api/v1/orgs/org_alpha/move",
@@ -874,41 +885,25 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
         None,
     )
     .await;
-    assert_eq!(moved["next"]["phase"], "public");
-    assert!(moved["next"]["cursor"].as_str().unwrap().contains("alpha/"));
-    assert_eq!(moved["moved"], 0);
-    let (_, _, page) = call(
-        &app,
-        "POST",
-        "/_api/v1/orgs/org_alpha/move",
-        json!({"cursor":moved["next"]}),
-        None,
-    )
-    .await;
-    moved = page;
-    assert_eq!(
-        moved,
-        json!({"done":false,"next":{"phase":"private"},"moved":1})
-    );
-    let (_, _, done) = call(
-        &app,
-        "POST",
-        "/_api/v1/orgs/org_alpha/move",
-        json!({"cursor":moved["next"]}),
-        None,
-    )
-    .await;
-    assert_eq!(done, json!({"done":true}));
-    assert_eq!(
-        storage.list(false, "alpha", None, 1000).await.unwrap(),
-        [unrelated]
-    );
+    assert_eq!(moved, json!({"done":true}));
+    assert!(storage.head(false, &unrelated).await.is_ok());
     assert!(
         storage
-            .list(true, "narinfo/alpha", None, 1000)
+            .head(
+                false,
+                "alpha/deleted/00000000000000000000000000000000.narinfo"
+            )
             .await
-            .unwrap()
-            .is_empty()
+            .is_ok()
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE NOT is_private AND key=$1)"
+        )
+        .bind(format!("alpha/public/{hash}.narinfo"))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
     );
     assert_eq!(storage.head(true, &fresh).await.unwrap().size, 14);
     assert!(storage.head(false, &blob).await.is_ok());
@@ -971,6 +966,33 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
             None
         )
     );
+    let (a, b) = if a.0 == StatusCode::SERVICE_UNAVAILABLE {
+        (
+            call(
+                &app,
+                "PUT",
+                "/_api/v1/orgs/org_one",
+                json!({"slug":"winner"}),
+                None,
+            )
+            .await,
+            b,
+        )
+    } else if b.0 == StatusCode::SERVICE_UNAVAILABLE {
+        (
+            a,
+            call(
+                &app,
+                "PUT",
+                "/_api/v1/orgs/org_two",
+                json!({"slug":"winner"}),
+                None,
+            )
+            .await,
+        )
+    } else {
+        (a, b)
+    };
     assert!(matches!(
         (a.0, b.0),
         (StatusCode::OK, StatusCode::CONFLICT) | (StatusCode::CONFLICT, StatusCode::OK)
@@ -984,7 +1006,8 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
         None,
     )
     .await;
-    assert_eq!(skipped["written"], 1);
+    assert_eq!(skipped["written"], 0);
+    assert_eq!(skipped["processed"], 1);
     assert_eq!(skipped["skipped"], json!([format!("bravo/public/{hash}")]));
 }
 

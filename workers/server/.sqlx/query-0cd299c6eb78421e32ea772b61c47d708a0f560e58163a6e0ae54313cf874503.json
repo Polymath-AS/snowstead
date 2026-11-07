@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.store_path_hash FROM published_paths p JOIN caches c ON c.id = p.cache_id WHERE c.org_id = $1 AND c.name = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0cd299c6eb78421e32ea772b61c47d708a0f560e58163a6e0ae54313cf874503"
+}

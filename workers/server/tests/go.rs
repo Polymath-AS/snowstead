@@ -519,7 +519,7 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         .unwrap();
     assert_eq!(
         put(&app, &go, &credential, &[3; 26]).await,
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::PAYLOAD_TOO_LARGE
     );
     assert_eq!(
         send(&app, "GET", &go, Some(&credential), &[], &[]).await.2,
@@ -543,6 +543,80 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         .await
         .unwrap();
     assert_eq!(pins, 0);
+    let cleanup: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE is_private AND key = 'narinfo/alpha/compiler/' || repeat('0',32) || '.narinfo')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cleanup, "SQL eviction must enqueue legacy metadata cleanup");
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn compiler_capacity_ignores_pending_nix_attempts(pool: PgPool) {
+    let app = router(fixture(&pool).await);
+    let credential = token("org_a", "compiler", &["go:write", "go:read"]);
+    let first = path("compiler", '1');
+    let second = path("compiler", '2');
+    let third = path("compiler", '3');
+    assert_eq!(
+        put(&app, &first, &credential, &[1; 6]).await,
+        StatusCode::CREATED
+    );
+    sqlx::raw_sql(
+        "UPDATE orgs SET storage_limit=20 WHERE id='org_a';
+         INSERT INTO nar_installations(key,operation_id,source_key,file_hash,compression,is_private,file_size,cache_id,expires_at)
+         SELECT 'pending-' || c.org_id,'operation','staging',repeat('a',64),'zstd',true,10000,c.id,now()+interval '1 hour'
+         FROM caches c WHERE c.name='compiler';
+         INSERT INTO nar_installations(key,operation_id,source_key,file_hash,compression,is_private,file_size)
+         VALUES ('legacy','legacy','legacy',repeat('b',64),'zstd',true,10000);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Pending attempts own staging bytes, not retained capacity. Both
+    // publications fit despite large same-org, other-org, and legacy attempts.
+    assert_eq!(
+        put(&app, &second, &credential, &[2; 10]).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        send(&app, "GET", &second, Some(&credential), &[], &[])
+            .await
+            .2,
+        vec![2; 10]
+    );
+    assert_eq!(
+        send(&app, "GET", &first, Some(&credential), &[], &[])
+            .await
+            .2,
+        vec![1; 6]
+    );
+    // The real retained total is 31 bytes. LRU eviction must remove both
+    // existing entries to fit the new publication, without deleting attempts.
+    assert_eq!(
+        put(&app, &third, &credential, &[3; 15]).await,
+        StatusCode::CREATED
+    );
+    for url in [&first, &second] {
+        assert_eq!(
+            send(&app, "GET", url, Some(&credential), &[], &[]).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        send(&app, "GET", &third, Some(&credential), &[], &[])
+            .await
+            .2,
+        vec![3; 15]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        3
+    );
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -568,17 +642,22 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
         );
         let mut statuses = [first, second];
         statuses.sort();
-        assert_eq!(
-            statuses,
-            [
-                StatusCode::CREATED,
-                if product == "go" {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::NO_CONTENT
-                }
-            ]
+        assert_eq!(statuses[0], StatusCode::CREATED);
+        let replay_status = if product == "go" {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::NO_CONTENT
+        };
+        assert!(
+            statuses[1] == replay_status || statuses[1] == StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected competing writer result: {statuses:?}"
         );
+        if first == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(put(&app, &url, &credential, a).await, replay_status);
+        }
+        if second == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(put(&app, &url, &credential, b).await, replay_status);
+        }
         let winner = if first == StatusCode::CREATED { a } else { b };
         assert_eq!(
             send(&app, "GET", &url, Some(&credential), &[], &[]).await.2,
@@ -623,13 +702,7 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
                 .await
                 .unwrap();
         }
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let make = || {
-            let barrier = barrier.clone();
-            let body = Body::from_stream(futures_util::stream::once(async move {
-                barrier.wait().await;
-                Ok::<_, std::io::Error>(Bytes::copy_from_slice(winner))
-            }));
             app.clone().oneshot(
                 Request::builder()
                     .method("PUT")
@@ -637,13 +710,25 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
                     .header("authorization", format!("Bearer {credential}"))
                     .header("content-length", winner.len())
                     .header("x-snowstead-output-id", hex::encode(Sha256::digest(winner)))
-                    .body(body)
+                    .body(Body::from(Bytes::copy_from_slice(winner)))
                     .unwrap(),
             )
         };
         let (first, second) = tokio::join!(make(), make());
-        assert_eq!(first.unwrap().status(), StatusCode::NO_CONTENT);
-        assert_eq!(second.unwrap().status(), StatusCode::NO_CONTENT);
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert!(statuses.contains(&StatusCode::NO_CONTENT));
+        for status in statuses {
+            assert!(matches!(
+                status,
+                StatusCode::NO_CONTENT | StatusCode::SERVICE_UNAVAILABLE
+            ));
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                assert_eq!(
+                    put(&app, &url, &credential, winner).await,
+                    StatusCode::NO_CONTENT
+                );
+            }
+        }
         assert_eq!(
             send(&app, "GET", &url, Some(&credential), &[], &[]).await.2,
             winner

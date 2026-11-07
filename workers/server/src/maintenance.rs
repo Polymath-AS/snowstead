@@ -1,8 +1,7 @@
 //! Bounded, retryable control-plane maintenance over the existing R2 objects.
 //!
-//! SQL rows are retry records: external withdrawal finishes before their
-//! deletion commits. Never age out `nar_installations`: their leases protect
-//! transfers whose outcome cannot be inferred from elapsed wall-clock time.
+//! SQL withdrawal records exact keys in a durable cleanup queue. Storage I/O
+//! never holds a transaction. Legacy canonical installations do not expire.
 use std::collections::BTreeSet;
 
 use sqlx::{PgPool, Postgres, Transaction};
@@ -48,6 +47,12 @@ pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
         return Ok(Counts::default());
     };
     let mut counts = Counts::default();
+    record(
+        &mut counts.orphan_objects,
+        &mut counts.failed_stages,
+        "publication reservations",
+        expire_installations(state).await,
+    );
     for kind in ["go", "sccache"] {
         record(
             &mut counts.compiler_entries,
@@ -88,6 +93,20 @@ pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
         "canonical blobs",
         blobs(state).await,
     );
+    for (private, prefix) in [(false, "nar/objects/"), (true, "nars/objects/")] {
+        record(
+            &mut counts.orphan_objects,
+            &mut counts.failed_stages,
+            "NAR attempts",
+            orphan_nars(state, private, prefix).await,
+        );
+    }
+    record(
+        &mut counts.orphan_objects,
+        &mut counts.failed_stages,
+        "object cleanup",
+        cleanup_objects(state).await,
+    );
     for (table, destination) in [
         ("api_tokens", &mut counts.tokens),
         ("audit_logs", &mut counts.audit_logs),
@@ -121,7 +140,7 @@ async fn begin(pool: &PgPool) -> anyhow::Result<Transaction<'static, Postgres>> 
     let mut tx = crate::profile_future!(pool.begin(), label = "maintenance.pool_begin").await?;
     sqlx::query!(
         r#"
-        SET LOCAL lock_timeout = '2s'
+        SET LOCAL lock_timeout = '1ms'
         "#
     )
     .execute(&mut *tx)
@@ -344,7 +363,12 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                 _ => unreachable!("fixed compiler product"),
             };
             let Some(key) = key else { return Ok(false) };
-            state.storage.delete(true, &key).await?;
+            sqlx::query(
+                "INSERT INTO object_cleanup(is_private,key) VALUES(TRUE,$1) ON CONFLICT DO NOTHING",
+            )
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
             match kind {
                 "go" => {
                     sqlx::query!(
@@ -429,17 +453,8 @@ async fn orphan_page(
             continue;
         };
         let mut tx = begin(&state.pool).await?;
-        // Source leases are created under ROW EXCLUSIVE on this table. This
-        // stronger fence prevents a new pin appearing after our absence check.
-        if product.is_none() {
-            sqlx::query!(
-                r#"
-                LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE
-                "#
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        // These owner IDs are never reused. An absent session/reservation can
+        // never adopt this key later, even if a provider write completes late.
         let live = match product {
             Some("go") => {
                 sqlx::query_scalar!(
@@ -493,8 +508,13 @@ async fn orphan_page(
         // Reservation IDs are never reused. While a reservation exists, keep
         // *all* attempts, even a transfer not yet adopted by SQL.
         if !live {
-            state.storage.delete(true, key).await?;
-            count += 1;
+            count += sqlx::query(
+                "INSERT INTO object_cleanup(is_private,key) VALUES(TRUE,$1) ON CONFLICT DO NOTHING",
+            )
+            .bind(key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
         tx.commit().await?;
     }
@@ -647,7 +667,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
     lock(&mut tx, &format!("upload:{id}")).await?;
     sqlx::query!(
         r#"
-        LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE
+        LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE NOWAIT
         "#
     )
     .execute(&mut *tx)
@@ -672,7 +692,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
                 WHERE i.source_key = u.r2_upload_key
                     OR starts_with(i.source_key, 'staging/' || u.id || '/')
             )
-        FOR UPDATE OF u
+        FOR UPDATE OF u NOWAIT
         "#,
         id
     )
@@ -708,13 +728,13 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
         } else {
             // Rust stores immutable part objects; its upload ID equals the
             // session ID and is not an R2 MPU. TS rows carry real provider IDs.
-            if let Some(upload) = &s.r2_upload_id
-                && upload != &s.id
-                && s.status != "completed"
-            {
-                state.storage.abort_multipart(true, key, upload).await?;
-            }
-            state.storage.delete(true, key).await?;
+            let upload = s
+                .r2_upload_id
+                .as_ref()
+                .filter(|upload| *upload != &s.id && s.status != "completed");
+            sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) \
+                ON CONFLICT(is_private,key) DO UPDATE SET upload_id=COALESCE(object_cleanup.upload_id,EXCLUDED.upload_id)")
+                .bind(key).bind(upload).execute(&mut *tx).await?;
         }
     }
     sqlx::query!(
@@ -728,8 +748,8 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
     )
     .execute(&mut *tx)
     .await?;
-    // Bound even a session with 10,000 parts. Drop each page's receipts only
-    // after successful storage deletion; leave the session for the next pass.
+    // Bound receipt retirement. The cleanup queue owns these immutable keys
+    // after SQL deletion; a crash cannot lose the remaining physical work.
     let parts = sqlx::query!(
         r#"
         SELECT
@@ -745,15 +765,14 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
     )
     .fetch_all(&mut *tx)
     .await?;
-    state
-        .storage
-        .delete_many(
-            parts
-                .iter()
-                .filter_map(|part| part.storage_key.clone().map(|key| (true, key)))
-                .collect(),
+    for key in parts.iter().filter_map(|part| part.storage_key.as_ref()) {
+        sqlx::query(
+            "INSERT INTO object_cleanup(is_private,key) VALUES(TRUE,$1) ON CONFLICT DO NOTHING",
         )
+        .bind(key)
+        .execute(&mut *tx)
         .await?;
+    }
     let part_ids: Vec<i64> = parts.iter().map(|p| p.id).collect();
     sqlx::query!(
         r#"
@@ -764,15 +783,8 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
     )
     .execute(&mut *tx)
     .await?;
-    let prefix = format!("staging/{id}/");
-    let keys = state
-        .storage
-        .list(true, prefix.trim_end_matches('/'), None, BATCH as usize)
-        .await?;
-    state
-        .storage
-        .delete_many(keys.iter().map(|key| (true, key.clone())).collect())
-        .await?;
+    // Unreceipted parts and late writes are discovered by orphan_page after
+    // their session is gone. Listing them does not belong in this transaction.
     let remaining: bool = sqlx::query_scalar!(
         r#"
         SELECT EXISTS(
@@ -785,7 +797,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
     )
     .fetch_one(&mut *tx)
     .await?;
-    let removed = !remaining && keys.len() < BATCH as usize;
+    let removed = !remaining;
     if removed {
         sqlx::query!(
             r#"
@@ -876,7 +888,7 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
         WHERE c.id = $1
             AND c.org_id = $2
             AND c.retention_days IS NOT NULL
-        FOR UPDATE OF c
+        FOR UPDATE OF c NOWAIT
         "#,
         cache,
         org
@@ -921,7 +933,7 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
         metadata.moving_from.as_deref(),
         &metadata.name,
     )
-    .withdraw(state, &hashes)
+    .withdraw(&mut tx, &hashes)
     .await
     .map_err(|_| anyhow::anyhow!("Metadata withdrawal failed"))?;
     tx.commit().await?;
@@ -933,6 +945,8 @@ struct Blob {
     file_hash: String,
     compression: String,
     r2_key: String,
+    public_key: Option<String>,
+    private_key: Option<String>,
 }
 
 // Keep expired *canonical* MPUs as reservations too, unlike expiring staged
@@ -966,7 +980,7 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
     // fence, before taking any per-blob locks. Never acquire org locks here.
     sqlx::query!(
         r#"
-        LOCK TABLE upload_sessions IN SHARE MODE
+        LOCK TABLE upload_sessions IN SHARE MODE NOWAIT
         "#
     )
     .execute(&mut *tx)
@@ -978,7 +992,9 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
             b.id,
             b.file_hash,
             b.compression,
-            b.r2_key
+            b.r2_key,
+            b.public_key,
+            b.private_key
         FROM blob_objects b
         WHERE NOT EXISTS(
             SELECT 1
@@ -1071,7 +1087,7 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
         if !eligible {
             continue;
         }
-        let keys = BTreeSet::from([
+        let mut keys = BTreeSet::from([
             (
                 true,
                 format!("nars/sha256/{}/{}.nar", b.file_hash, b.compression),
@@ -1079,11 +1095,19 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
             (false, format!("nar/{}/{}.nar", b.file_hash, b.compression)),
             (!b.r2_key.starts_with("nar/"), b.r2_key),
         ]);
-        // delete_many drains rejected siblings before releasing the NAR fence.
-        state
-            .storage
-            .delete_many(keys.into_iter().collect())
+        keys.extend(b.public_key.map(|key| (false, key)));
+        keys.extend(b.private_key.map(|key| (true, key)));
+        // Retire the SQL identity before I/O. New uploads create a new physical
+        // incarnation, never one of these queued keys.
+        for (private, key) in keys {
+            sqlx::query(
+                "INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            )
+            .bind(private)
+            .bind(key)
+            .execute(&mut *tx)
             .await?;
+        }
         sqlx::query!(
             r#"
             DELETE FROM blob_objects
@@ -1096,6 +1120,129 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
         count += 1;
     }
     tx.commit().await?;
+    Ok(count)
+}
+
+/// Expiry revokes adoption, not provider execution. Late writes use unique keys
+/// and are rediscovered by orphan_nars. Legacy canonical work has no expiry.
+async fn expire_installations(state: &AppState) -> anyhow::Result<u64> {
+    let mut tx = begin(&state.pool).await?;
+    let result = sqlx::query(
+        r#"
+        WITH retired AS (
+            DELETE FROM nar_installations WHERE key IN (
+                SELECT i.key FROM nar_installations i
+                LEFT JOIN upload_sessions u ON u.id=i.session_id
+                LEFT JOIN caches c ON c.id=i.cache_id
+                WHERE i.expires_at IS NOT NULL AND (
+                    i.expires_at<=NOW() OR i.phase='revoked'
+                    OR (i.session_id IS NOT NULL AND (u.id IS NULL
+                        OR u.status NOT IN ('finalizing','completed') OR u.expires_at<=NOW()))
+                    OR c.id IS NULL
+                )
+                ORDER BY i.key LIMIT $1 FOR UPDATE OF i SKIP LOCKED
+            ) RETURNING key,is_private
+        ) INSERT INTO object_cleanup(is_private,key)
+        SELECT is_private,key FROM retired ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(BATCH)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected())
+}
+
+/// The database owns every adoptable immutable key before its first write.
+/// Publication swaps the reservation for a pointer in one SQL transaction.
+async fn orphan_nars(state: &AppState, private: bool, prefix: &str) -> anyhow::Result<u64> {
+    let cursor: Option<String> = sqlx::query_scalar(
+        "SELECT reason FROM gc_marks WHERE target_type='server-gc-cursor' AND target_id=$1",
+    )
+    .bind(prefix)
+    .fetch_optional(&state.pool)
+    .await?;
+    let keys = state
+        .storage
+        .list(
+            private,
+            prefix.trim_end_matches('/'),
+            cursor.as_deref(),
+            BATCH as usize,
+        )
+        .await?;
+    let mut count = 0;
+    for key in &keys {
+        let mut tx = begin(&state.pool).await?;
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM nar_installations WHERE key=$1) \
+             OR EXISTS(SELECT 1 FROM blob_objects WHERE r2_key=$1 OR public_key=$1 OR private_key=$1)",
+        ).bind(key).fetch_one(&mut *tx).await?;
+        if !live {
+            sqlx::query(
+                "INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            )
+            .bind(private)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+            count += 1;
+        }
+        tx.commit().await?;
+    }
+    if keys.len() == BATCH as usize {
+        sqlx::query("INSERT INTO gc_marks(target_type,target_id,reason) VALUES('server-gc-cursor',$1,$2) \
+            ON CONFLICT(target_type,target_id) DO UPDATE SET reason=EXCLUDED.reason,marked_at=NOW()")
+            .bind(prefix).bind(keys.last().unwrap()).execute(&state.pool).await?;
+    } else {
+        sqlx::query("DELETE FROM gc_marks WHERE target_type='server-gc-cursor' AND target_id=$1")
+            .bind(prefix)
+            .execute(&state.pool)
+            .await?;
+    }
+    Ok(count)
+}
+
+/// Retired keys are never adopted again. Duplicate deletion after a crash is
+/// safe, so no database transaction or worker lease spans storage I/O.
+async fn cleanup_objects(state: &AppState) -> anyhow::Result<u64> {
+    let mut count = 0;
+    let mut failed = false;
+    let mut after = 0i64;
+    for _ in 0..BATCHES {
+        let jobs: Vec<(i64, bool, String, Option<String>)> = sqlx::query_as(
+            "SELECT id,is_private,key,upload_id FROM object_cleanup WHERE id>$1 ORDER BY id LIMIT $2",
+        ).bind(after).bind(BATCH).fetch_all(&state.pool).await?;
+        if jobs.is_empty() {
+            break;
+        }
+        // Advance past failures too, so one broken key cannot starve others.
+        after = jobs.last().unwrap().0;
+        for (id, private, key, upload) in jobs {
+            let result: anyhow::Result<()> = async {
+                if let Some(upload) = upload {
+                    state
+                        .storage
+                        .abort_multipart(private, &key, &upload)
+                        .await?;
+                }
+                state.storage.delete(private, &key).await?;
+                sqlx::query("DELETE FROM object_cleanup WHERE id=$1")
+                    .bind(id)
+                    .execute(&state.pool)
+                    .await?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => count += 1,
+                Err(_) => failed = true,
+            }
+        }
+    }
+    if failed {
+        anyhow::bail!("Object cleanup incomplete")
+    }
     Ok(count)
 }
 
@@ -1441,6 +1588,7 @@ mod tests {
             .bind(cache).execute(&state.pool).await.unwrap();
         assert_eq!(retention(&state).await.unwrap(), 1);
         assert_eq!(blobs(&state).await.unwrap(), 0);
+        cleanup_objects(&state).await.unwrap();
         let hashes: Vec<String> =
             sqlx::query_scalar("SELECT store_path_hash FROM published_paths WHERE cache_id=$1")
                 .bind(cache)
@@ -1487,7 +1635,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
-    async fn failed_sql_commit_keeps_blob_retry_record_after_external_deletes(pool: PgPool) {
+    async fn failed_sql_commit_keeps_blob_and_rolls_back_cleanup_jobs(pool: PgPool) {
         let _run = RUN_TESTS.lock().await;
         let (state, _) = fixture(pool).await;
         blob(&state, "orphan").await;
@@ -1508,20 +1656,21 @@ mod tests {
                 .unwrap(),
             1
         );
-        // SQL rolls back, not R2. A retry must tolerate both copies missing.
+        // A failed retirement cannot delete bytes or leave a cleanup job.
+        assert_eq!(cleanup_objects(&state).await.unwrap(), 0);
         assert!(
             state
                 .storage
                 .head(false, "nar/orphan/zstd.nar")
                 .await
-                .is_err()
+                .is_ok()
         );
         assert!(
             state
                 .storage
                 .head(true, "nars/sha256/orphan/zstd.nar")
                 .await
-                .is_err()
+                .is_ok()
         );
         sqlx::query(
             "INSERT INTO api_tokens(jti,subject,perms_json,created_by,expires_at)
@@ -1542,6 +1691,93 @@ mod tests {
             .unwrap();
         assert_eq!(blob_batch(&state).await.unwrap(), 1);
         assert_eq!(blob_batch(&state).await.unwrap(), 0);
+        assert_eq!(cleanup_objects(&state).await.unwrap(), 2);
+        assert!(
+            state
+                .storage
+                .head(false, "nar/orphan/zstd.nar")
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .storage
+                .head(true, "nars/sha256/orphan/zstd.nar")
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn retired_incarnation_cleanup_survives_republication_and_late_provider_completion(
+        pool: PgPool,
+    ) {
+        let (state, cache) = fixture(pool).await;
+        let old = "nar/objects/old/hash/zstd.nar";
+        let new = "nar/objects/new/hash/zstd.nar";
+        sqlx::query(
+            "INSERT INTO blob_objects(file_hash,file_size,compression,r2_key,public_key)
+            VALUES('hash',4,'zstd',$1,$1)",
+        )
+        .bind(old)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.storage.put(false, old, b"old!").await.unwrap();
+        assert_eq!(blob_batch(&state).await.unwrap(), 1);
+        // Retirement committed without touching storage. A crash here leaves
+        // durable cleanup, while the same content can get a new incarnation.
+        assert!(state.storage.head(false, old).await.is_ok());
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO blob_objects(file_hash,file_size,compression,r2_key,public_key)
+            VALUES('hash',4,'zstd',$1,$1) RETURNING id",
+        )
+        .bind(new)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        path(&state, cache, id, "republished").await;
+        state.storage.put(false, new, b"new!").await.unwrap();
+        let restarted = AppState::new(
+            state.pool.clone(),
+            Config::default(),
+            state.storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 3);
+        assert!(state.storage.head(false, old).await.is_err());
+        assert!(state.storage.head(false, new).await.is_ok());
+        assert_eq!(blob_batch(&restarted).await.unwrap(), 0);
+        // A provider operation can finish even after cleanup. Discovery must
+        // retry that exact old key, without reclaiming the new publication.
+        state.storage.put(false, old, b"late").await.unwrap();
+        assert_eq!(
+            orphan_nars(&restarted, false, "nar/objects/")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 1);
+        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 0);
+        assert!(state.storage.head(false, old).await.is_err());
+        let mut object = state.storage.open(false, new).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut object.reader, &mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"new!");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT blob_object_id FROM published_paths WHERE cache_id=$1"
+            )
+            .bind(cache)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            id
+        );
     }
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
@@ -1652,6 +1888,8 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(sessions(&state).await.unwrap(), 2);
+        orphan_page(&state, "staging/", None).await.unwrap();
+        cleanup_objects(&state).await.unwrap();
         assert!(
             state
                 .storage
@@ -1668,6 +1906,7 @@ mod tests {
         );
         assert!(state.storage.head(true, "staging/pinned").await.is_ok());
         assert_eq!(blobs(&state).await.unwrap(), 1);
+        cleanup_objects(&state).await.unwrap();
         assert!(
             state
                 .storage
@@ -1692,7 +1931,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
-    async fn legacy_staging_multipart_is_aborted_before_session_cleanup(pool: PgPool) {
+    async fn legacy_staging_multipart_cleanup_retains_original_provider_id(pool: PgPool) {
         use axum::body::Bytes;
         use object_store::{aws::AmazonS3Builder, multipart::MultipartStore, path::Path};
 
@@ -1743,6 +1982,14 @@ mod tests {
                 provider.abort_multipart(&path, &upload).await.unwrap();
             }
             assert!(expire_session(&state, &id, "default").await.unwrap());
+            let retained: Option<String> =
+                sqlx::query_scalar("SELECT upload_id FROM object_cleanup WHERE key=$1")
+                    .bind(&key)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(retained.as_deref(), Some(upload.as_str()));
+            cleanup_objects(&state).await.unwrap();
             assert!(
                 provider
                     .complete_multipart(&path, &upload, vec![part])
@@ -1789,6 +2036,7 @@ mod tests {
                     .unwrap(),
                 1
             );
+            cleanup_objects(&state).await.unwrap();
             assert!(
                 state
                     .storage

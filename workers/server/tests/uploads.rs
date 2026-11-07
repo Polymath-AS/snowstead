@@ -272,9 +272,23 @@ async fn inline_private_publication_and_read_isolation(pool: PgPool) {
         "UPDATE caches SET is_public=true WHERE org_id='org_a' AND name='vault'",
     )
     .await;
-    // Leftover private narinfos cannot be read through the new public address.
+    // SQL membership renders metadata under the current visibility policy.
+    // Changing visibility alone must not expose bytes from the private bucket.
     assert_eq!(
         send(&app, "GET", &path, None, &[], vec![]).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/alpha/vault/nar/{file_hash}/zstd.nar"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
         StatusCode::NOT_FOUND
     );
     state.finish_background().await;
@@ -607,23 +621,28 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
         std::io::ErrorKind::NotFound
     );
     for hash in [&pinned_hash, &new_hash] {
-        assert!(
-            storage
-                .head(false, &format!("main/{hash}.narinfo"))
-                .await
-                .is_ok()
-        );
-    }
-    // Capacity removes discovery metadata, not the shared canonical NAR.
-    assert!(
-        storage
-            .head(
-                false,
-                &format!("nar/{}/zstd.nar", hex::encode(sha2::Sha256::digest(&evict)))
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                &format!("/main/{hash}.narinfo"),
+                None,
+                &[],
+                vec![]
             )
             .await
-            .is_ok()
-    );
+            .0,
+            StatusCode::OK
+        );
+    }
+    // Capacity withdraws SQL membership, not the committed immutable NAR.
+    let evicted_key: String =
+        sqlx::query_scalar("SELECT public_key FROM blob_objects WHERE file_hash=$1")
+            .bind(hex::encode(Sha256::digest(&evict)))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(storage.head(false, &evicted_key).await.is_ok());
     assert_eq!(
         send(
             &app,
@@ -652,7 +671,7 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
     )
     .await;
     assert_eq!(denied["published"], false);
-    assert_eq!(denied["status"], 503);
+    assert_eq!(denied["status"], 413);
     let mut corrupt = path_input(&"6".repeat(32), &raw_new, true);
     corrupt["narHash"] = json!(format!("sha256:{}", "0".repeat(64)));
     let denied = upload_inline(&app, "main", corrupt, &new).await;
@@ -725,6 +744,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let config = Config {
         auth_token: "legacy".into(),
+        admin_secret: "admin".into(),
         public_url: "https://cache.example.test".into(),
         ..Default::default()
     };
@@ -886,7 +906,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         .lines()
         .find_map(|line| line.strip_prefix("URL: "))
         .unwrap();
-    assert!(url.starts_with("../nar/"));
+    assert!(url.starts_with("nar/"));
     let download = reqwest::Url::parse("http://backend.local/main/")
         .unwrap()
         .join(url)
@@ -899,6 +919,56 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         .await
         .unwrap();
     assert_eq!(count, 1);
+    let (_, completed) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipt.clone()]}),
+    )
+    .await;
+    let (status, _) = post(
+        &app,
+        "/_api/v1/orgs/default/caches/main/paths/delete",
+        "admin",
+        json!({"storePathHashes":[hash]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A completed result survives withdrawal and a later quota change. It
+    // reports the original outcome, not a new publication or capacity charge.
+    pool_execute(&pool, "UPDATE orgs SET storage_limit=0 WHERE id='default'").await;
+    let (status, replay) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipt.clone()]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay, completed);
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/main/{hash}.narinfo"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut changed = receipt;
+    changed["fileHash"] = json!("f".repeat(64));
+    let (_, rejected) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[changed]}),
+    )
+    .await;
+    assert_eq!(rejected["results"][0]["status"], 409);
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -1004,7 +1074,7 @@ async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_bounda
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn unresolved_canonical_writers_block_publication_until_reconciled(pool: PgPool) {
+async fn unresolved_canonical_writers_do_not_block_immutable_publication(pool: PgPool) {
     let storage = common::storage();
     let app = router(
         AppState::new(
@@ -1054,9 +1124,8 @@ async fn unresolved_canonical_writers_block_publication_until_reconciled(pool: P
             }
             let store_hash = if tombstone { "a" } else { "b" }.repeat(32);
             let input = path_input(&store_hash, &raw, true);
-            let blocked = upload_inline(&app, name, input.clone(), &compressed).await;
-            assert_eq!(blocked["published"], false, "{blocked}");
-            assert_eq!(blocked["status"], 503, "{blocked}");
+            let published = upload_inline(&app, name, input.clone(), &compressed).await;
+            assert_eq!(published["published"], true, "{published}");
             let mut bytes = Vec::new();
             use tokio::io::AsyncReadExt;
             storage
@@ -1079,27 +1148,40 @@ async fn unresolved_canonical_writers_block_publication_until_reconciled(pool: P
                 )
                 .await
                 .0,
-                StatusCode::NOT_FOUND
+                StatusCode::OK
             );
-            // Explicit reconciliation, not wall-clock expiry, releases ownership.
-            sqlx::query("DELETE FROM nar_installations WHERE key=$1")
+            // Immutable publication must not reconcile or retire legacy ownership.
+            let retained: i64 = if tombstone {
+                sqlx::query_scalar("SELECT count(*) FROM nar_installations WHERE key=$1 AND operation_id='old' AND phase='legacy-unresolved'")
                 .bind(&key)
-                .execute(&pool)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM upload_sessions WHERE id=$1")
+                .fetch_one(&pool).await.unwrap()
+            } else {
+                sqlx::query_scalar("SELECT count(*) FROM upload_sessions WHERE id=$1 AND status='aborted' AND r2_upload_id='provider-upload'")
                 .bind(&hash)
-                .execute(&pool)
-                .await
-                .unwrap();
-            let published = upload_inline(&app, name, input, &compressed).await;
-            assert_eq!(published["published"], true, "{published}");
+                .fetch_one(&pool).await.unwrap()
+            };
+            assert_eq!(retained, 1);
+            let committed: String = sqlx::query_scalar(if private {
+                "SELECT private_key FROM blob_objects WHERE file_hash=$1"
+            } else {
+                "SELECT public_key FROM blob_objects WHERE file_hash=$1"
+            })
+            .bind(&hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_ne!(committed, key);
+            assert!(committed.starts_with(if private {
+                "nars/objects/"
+            } else {
+                "nar/objects/"
+            }));
         }
     }
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(pool: PgPool) {
+async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgPool) {
     let storage = common::storage();
     let state = AppState::new(
         pool.clone(),
@@ -1121,10 +1203,6 @@ async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(p
         let raw = nar(format!("failed canonical publication {private}").as_bytes());
         let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
         let hash = hex::encode(Sha256::digest(&compressed));
-        let key = format!(
-            "{}/{hash}/zstd.nar",
-            if private { "nars/sha256" } else { "nar" }
-        );
         let result = upload_inline(
             &app,
             if private { "secret" } else { "main" },
@@ -1134,6 +1212,19 @@ async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(p
         .await;
         assert_eq!(result["published"], false, "{result}");
         assert_eq!(result["status"], 500, "{result}");
+        let key: String = sqlx::query_scalar(
+            "SELECT key FROM object_cleanup WHERE is_private=$1 AND key LIKE $2",
+        )
+        .bind(private)
+        .bind(format!("%/{hash}/zstd.nar"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(key.starts_with(if private {
+            "nars/objects/"
+        } else {
+            "nar/objects/"
+        }));
         assert!(storage.head(private, &key).await.is_ok());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blob_objects WHERE file_hash=$1")
@@ -1141,7 +1232,7 @@ async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(p
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            1
+            0
         );
         // A confirmed completed copy needs GC ownership, not a permanent pin.
         assert_eq!(
@@ -1169,7 +1260,7 @@ async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(p
     }));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blob_objects")
+            if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup")
                 .fetch_one(&pool)
                 .await
                 .unwrap()
@@ -1194,7 +1285,7 @@ async fn failed_publication_leaves_canonical_bytes_discoverable_by_maintenance(p
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 #[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
-async fn uncertain_canonical_completion_keeps_ownership_and_source_across_restart(pool: PgPool) {
+async fn uncertain_immutable_completion_does_not_poison_retries_across_restart(pool: PgPool) {
     use axum::{extract::Request as AxumRequest, response::IntoResponse, routing::any};
     use snowstead_server::storage::Storage;
     let r2 = Config::from_env();
@@ -1212,7 +1303,7 @@ async fn uncertain_canonical_completion_keeps_ownership_and_source_across_restar
         let upstream = upstream.clone();
         async move {
             let (parts, body) = request.into_parts();
-            let canonical = parts.uri.path().contains("/nar/");
+            let canonical = parts.uri.path().contains("/nar/objects/");
             let completion = parts.method == "POST"
                 && parts.uri.query().is_some_and(|q| q.contains("uploadId="));
             let response = reqwest::Client::new()
@@ -1259,28 +1350,106 @@ async fn uncertain_canonical_completion_keeps_ownership_and_source_across_restar
     );
     let raw = nar(b"ambiguous completion must remain protected");
     let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    let healthy = router(
+        AppState::new(
+            pool.clone(),
+            config.clone(),
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let retained_raw = nar(b"keep this published path if the next storage copy fails");
+    let retained = zstd::stream::encode_all(retained_raw.as_slice(), 3).unwrap();
+    let retained_hash = "a".repeat(32);
+    assert_eq!(
+        upload_inline(
+            &healthy,
+            "main",
+            path_input(&retained_hash, &retained_raw, true),
+            &retained
+        )
+        .await["published"],
+        true
+    );
+    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
+        .bind(compressed.len() as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
     let hash = hex::encode(Sha256::digest(&compressed));
     let input = path_input(&"d".repeat(32), &raw, true);
     let failed = upload_inline(&app, "main", input.clone(), &compressed).await;
     assert_eq!(failed["published"], false, "{failed}");
     assert_eq!(failed["status"], 500, "{failed}");
-    assert!(
-        storage
-            .head(false, &format!("nar/{hash}/zstd.nar"))
-            .await
-            .is_ok()
+    // Preparing bytes admits no retained capacity. Even an ambiguous provider
+    // completion cannot withdraw an existing path before SQL publication.
+    assert_eq!(
+        send(
+            &healthy,
+            "GET",
+            &format!("/main/{retained_hash}.narinfo"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::OK
     );
-    let source: String =
-        sqlx::query_scalar("SELECT source_key FROM nar_installations WHERE file_hash=$1")
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM eviction_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let uncertain: String = sqlx::query_scalar("SELECT key FROM object_cleanup WHERE key LIKE $1")
+        .bind(format!("nar/objects/%/{hash}/zstd.nar"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(storage.head(false, &uncertain).await.is_ok());
+    let source: String = sqlx::query_scalar(
+        "SELECT storage_key FROM upload_parts WHERE session_id=$1 AND part_number=1",
+    )
+    .bind(failed["sessionId"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(storage.head(true, &source).await.is_ok());
+    let restarted = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let retry = upload_inline(&restarted, "main", input, &compressed).await;
+    assert_eq!(retry["published"], true, "{retry}");
+    let committed: String =
+        sqlx::query_scalar("SELECT public_key FROM blob_objects WHERE file_hash=$1")
             .bind(&hash)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(storage.head(true, &source).await.is_ok());
-    let restarted = router(AppState::new(pool, config, storage, reqwest::Client::new()).unwrap());
-    let retry = upload_inline(&restarted, "main", input, &compressed).await;
-    assert_eq!(retry["published"], false, "{retry}");
-    assert_eq!(retry["status"], 503, "{retry}");
+    assert_ne!(committed, uncertain);
+    assert!(storage.head(false, &uncertain).await.is_ok());
+    assert_eq!(
+        send(
+            &restarted,
+            "GET",
+            &format!("/nar/{hash}/zstd.nar"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .2,
+        compressed
+    );
     stop.send(()).unwrap();
     proxy_task.await.unwrap();
 }
@@ -1506,5 +1675,267 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         stop.send(()).unwrap();
         proxy_task.await.unwrap();
     }
+    single.close().await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
+async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishing_stale_data(
+    pool: PgPool,
+) {
+    use axum::{extract::Request as AxumRequest, response::IntoResponse, routing::any};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
+    let old_raw = nar(b"paused older immutable upload");
+    let new_raw = nar(b"newer publication must survive the late old copy");
+    let old = zstd::stream::encode_all(old_raw.as_slice(), 3).unwrap();
+    let new = zstd::stream::encode_all(new_raw.as_slice(), 3).unwrap();
+    pool_execute(&pool, "INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
+    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
+        .bind((old.len() + new.len() - 1) as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let upstream = std::env::var("SNOWSTEAD_TEST_R2_ENDPOINT").unwrap();
+    assert!(upstream.starts_with("http://127.0.0.1:"));
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let paused = Arc::new(AtomicBool::new(false));
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::from_env();
+    config.r2_endpoint = format!("http://{}", proxy.local_addr().unwrap());
+    config.auth_token = "legacy".into();
+    config.admin_secret = "admin".into();
+    let proxy_app = Router::new().fallback(any({
+        let reached = reached.clone();
+        let release = release.clone();
+        let paused = paused.clone();
+        move |request: AxumRequest| {
+            let upstream = upstream.clone();
+            let reached = reached.clone();
+            let release = release.clone();
+            let paused = paused.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                if parts.method == "POST"
+                    && parts.uri.path().contains("/nar/objects/")
+                    && !paused.swap(true, Ordering::SeqCst)
+                {
+                    reached.notify_one();
+                    release.notified().await;
+                }
+                let response = reqwest::Client::new()
+                    .request(parts.method, format!("{upstream}{}", parts.uri))
+                    .headers(parts.headers)
+                    .body(to_bytes(body, 32 * 1024 * 1024).await.unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+                (
+                    response.status(),
+                    response.headers().clone(),
+                    response.bytes().await.unwrap(),
+                )
+                    .into_response()
+            }
+        }
+    }));
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let proxy_task = tokio::spawn(async {
+        axum::serve(proxy, proxy_app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let storage = snowstead_server::storage::Storage::new(&config).unwrap();
+    let app = router(
+        AppState::new(
+            single.clone(),
+            config,
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let hash = "a".repeat(32);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let input = path_input(&hash, &old_raw, true);
+        let old = old.clone();
+        async move { upload_inline(&app, "main", input, &old).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .expect("immutable copy must reach barrier");
+    // Every operation below uses the same one-slot application pool, with the
+    // storage barrier still closed. No sleep or scheduler ordering is required.
+    let stale_key = tokio::time::timeout(Duration::from_secs(10), async {
+        let key: String =
+            sqlx::query_scalar("SELECT key FROM nar_installations WHERE session_id IS NOT NULL")
+                .fetch_one(&single)
+                .await
+                .unwrap();
+        assert!(key.starts_with("nar/objects/"));
+        assert_eq!(
+            send(&app, "GET", "/main/nix-cache-info", None, &[], vec![])
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let independent = upload_inline(
+            &app,
+            "main",
+            path_input(&"f".repeat(32), &new_raw, true),
+            &new,
+        )
+        .await;
+        assert_eq!(independent["published"], true, "{independent}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+                .fetch_one(&single)
+                .await
+                .unwrap(),
+            1
+        );
+        // Even deletion of an absent path invalidates its in-flight admission.
+        let (status, deleted) = post(
+            &app,
+            "/_api/v1/orgs/default/caches/main/paths/delete",
+            "admin",
+            json!({"storePathHashes":[hash]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        let (status, _, body) = send(
+            &app,
+            "PUT",
+            "/_api/v1/orgs/default",
+            Some("admin"),
+            &[("content-type", "application/json")],
+            serde_json::to_vec(&json!({"storageLimit":2*new.len()})).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let newer = upload_inline(&app, "main", path_input(&hash, &new_raw, true), &new).await;
+        assert_eq!(newer["published"], true, "{newer}");
+        key
+    })
+    .await
+    .expect("SQL, management and independent uploads must progress while copy is paused");
+    release.notify_one();
+    let stale = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale["published"], false, "{stale}");
+    assert_eq!(stale["status"], 409, "{stale}");
+    assert!(storage.head(false, &stale_key).await.is_ok());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM object_cleanup WHERE key=$1 AND NOT is_private"
+        )
+        .bind(&stale_key)
+        .fetch_one(&single)
+        .await
+        .unwrap(),
+        1
+    );
+    let new_hash = hex::encode(Sha256::digest(&new));
+    let (status, _, bytes) = send(
+        &app,
+        "GET",
+        &format!("/nar/{new_hash}/zstd.nar"),
+        None,
+        &[],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, new);
+    let (status, _, metadata) = send(
+        &app,
+        "GET",
+        &format!("/main/{hash}.narinfo"),
+        None,
+        &[],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8(metadata)
+            .unwrap()
+            .contains(&format!("FileHash: sha256:{new_hash}"))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+            .fetch_one(&single)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM nar_installations WHERE session_id IS NOT NULL"
+        )
+        .fetch_one(&single)
+        .await
+        .unwrap(),
+        0
+    );
+    // A transient org conflict after copying must retire the failed attempt
+    // while the competing writer still holds its fence. Otherwise the session's
+    // unique ownership pins every retry until expiry.
+    paused.store(false, Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let input = path_input(&"b".repeat(32), &new_raw, true);
+        let new = new.clone();
+        async move { upload_inline(&app, "main", input, &new).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .unwrap();
+    let mut competing = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default', 0))")
+        .execute(&mut *competing)
+        .await
+        .unwrap();
+    release.notify_one();
+    let busy = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(busy["status"], 503, "{busy}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations WHERE session_id=$1")
+            .bind(busy["sessionId"].as_str().unwrap())
+            .fetch_one(&single)
+            .await
+            .unwrap(),
+        0
+    );
+    competing.rollback().await.unwrap();
+    let uploads = json!([{
+        "sessionId": busy["sessionId"],
+        "fileHash": new_hash,
+        "fileSize": new.len()
+    }]);
+    let (status, replay) = send_inline_batch(&app, inline_frame(&uploads, &[new])).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["results"][0]["published"], true, "{replay}");
+    stop.send(()).unwrap();
+    proxy_task.await.unwrap();
     single.close().await;
 }

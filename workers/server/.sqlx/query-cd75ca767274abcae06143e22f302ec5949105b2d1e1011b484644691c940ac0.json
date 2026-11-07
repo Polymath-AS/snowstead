@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.id,\n            c.is_public,\n            o.private_caches,\n            o.storage_limit\n        FROM caches c\n        JOIN orgs o ON o.id = c.org_id\n        WHERE c.org_id = $1\n            AND c.name = $2\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        FOR SHARE OF c, o NOWAIT\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "is_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "private_caches",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "private_caches"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "storage_limit",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "storage_limit"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "cd75ca767274abcae06143e22f302ec5949105b2d1e1011b484644691c940ac0"
+}

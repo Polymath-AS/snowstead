@@ -98,23 +98,11 @@ fn public_delivery(
     request: &axum::http::request::Parts,
     key: &str,
 ) -> Option<Response> {
-    if request
-        .headers
-        .get("x-snowstead-cdn-read")
-        .is_some_and(|v| v == "1")
-    {
-        return Some(
-            (
-                StatusCode::NO_CONTENT,
-                [("x-snowstead-cdn-read", "1"), ("cache-control", "no-store")],
-            )
-                .into_response(),
-        );
-    }
     if state.config.public_cache_origin.is_empty() {
         return None;
     }
-    // Only validated key components enter the URL. Never forward a token,
+    // Only committed bucket pointers or validated legacy keys enter the URL.
+    // Never forward a token,
     // request query, or caller-controlled authority to the public bucket.
     let location = format!(
         "{}/{key}",
@@ -196,10 +184,10 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
         }
         // A public object left behind by a withdrawal never becomes an
         // unscoped way to read a private cache's content.
-        let public = sqlx::query_scalar!(
+        let key = sqlx::query_scalar::<_, Option<String>>(
             r#"
-            SELECT EXISTS (
-                SELECT 1
+                SELECT COALESCE(b.public_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
+                    THEN 'nar/' || b.file_hash || '/' || b.compression || '.nar' END)
                 FROM published_paths p
                 JOIN blob_objects b ON b.id = p.blob_object_id
                 JOIN caches c ON c.id = p.cache_id
@@ -212,22 +200,21 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
                         WHERE cp.cache_id = c.id
                             AND cp.protocol = 'nix'
                     )
-            ) AS "exists!"
+                LIMIT 1
             "#,
-            hash,
-            compression,
         )
-        .fetch_one(&state.pool)
-        .await?;
-        if !public {
+        .bind(hash)
+        .bind(compression)
+        .fetch_optional(&state.pool)
+        .await?
+        .flatten();
+        let Some(key) = key else {
             return Ok(missing(false));
-        }
-        if let Some(response) =
-            public_delivery(&state, &request, &format!("nar/{hash}/{compression}.nar"))
-        {
+        };
+        if let Some(response) = public_delivery(&state, &request, &key) {
             return Ok(response);
         }
-        return nar(&state, &request, hash, compression, None).await;
+        return nar(&state, &request, &key, None).await;
     }
     if segments.len() < 2 {
         return Ok(missing(false));
@@ -318,13 +305,6 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
     } else {
         format!("{slug}/{name}")
     };
-    if !private
-        && rest == ["nix-cache-info"]
-        && let Some(response) =
-            public_delivery(&state, &request, &format!("{cache_path}/nix-cache-info"))
-    {
-        return Ok(response);
-    }
     match rest {
         ["nix-cache-info"] => Ok((
             [
@@ -347,48 +327,7 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             if hash.len() != 32 || !hash.bytes().all(|b| NIX32.contains(&b)) {
                 return Ok(missing(private));
             }
-            // CDN owns object existence, negative caching, and validators for
-            // public narinfo; SQL only admits the cache, not each store path.
-            if !private
-                && alias.is_none()
-                && let Some(response) =
-                    public_delivery(&state, &request, &format!("{cache_path}/{hash}.narinfo"))
-            {
-                if response.status().is_success() || response.status().is_redirection() {
-                    record_access(&state, id, hash);
-                }
-                return Ok(response);
-            }
-            if private || alias.is_some() {
-                // Render from authoritative publication with a cache-relative
-                // URL. Fingerprint signatures do not include transport URLs.
-                // Never redirect alias metadata to a differently based CDN URL.
-                let response =
-                    scoped_narinfo(&state, &request, id, &cache_path, hash, private).await?;
-                if response.status().is_success() {
-                    record_access(&state, id, hash);
-                }
-                return Ok(response);
-            }
-            let published = sqlx::query_scalar!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM published_paths
-                    WHERE cache_id = $1
-                        AND store_path_hash = $2
-                ) AS "exists!"
-                "#,
-                id,
-                hash,
-            )
-            .fetch_one(&state.pool)
-            .await?;
-            if !published {
-                return Ok(missing(private));
-            }
-            let key = format!("{cache_path}/{hash}.narinfo");
-            let response = narinfo(&state, &request, &key, false).await?;
+            let response = scoped_narinfo(&state, &request, id, &cache_path, hash, private).await?;
             if response.status().is_success() {
                 record_access(&state, id, hash);
             }
@@ -399,37 +338,40 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             if !valid_blob(hash, compression) {
                 return Ok(missing(private));
             }
-            let member = sqlx::query_scalar!(
+            let key = sqlx::query_scalar::<_, Option<String>>(
                 r#"
-                SELECT EXISTS (
-                    SELECT 1
+                    SELECT CASE WHEN $4 THEN
+                        COALESCE(b.private_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
+                            THEN 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar' END)
+                    ELSE
+                        COALESCE(b.public_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
+                            THEN 'nar/' || b.file_hash || '/' || b.compression || '.nar' END)
+                    END
                     FROM published_paths p
                     JOIN blob_objects b ON b.id = p.blob_object_id
                     WHERE p.cache_id = $1
                         AND b.file_hash = $2
                         AND b.compression = $3
-                ) AS "exists!"
+                    LIMIT 1
                 "#,
-                id,
-                hash,
-                compression,
             )
-            .fetch_one(&state.pool)
-            .await?;
-            if !member {
+            .bind(id)
+            .bind(hash)
+            .bind(compression)
+            .bind(private)
+            .fetch_optional(&state.pool)
+            .await?
+            .flatten();
+            let Some(key) = key else {
                 return Ok(missing(private));
-            }
-            if !private
-                && let Some(response) =
-                    public_delivery(&state, &request, &format!("nar/{hash}/{compression}.nar"))
-            {
+            };
+            if !private && let Some(response) = public_delivery(&state, &request, &key) {
                 return Ok(response);
             }
             nar(
                 &state,
                 &request,
-                hash,
-                compression,
+                &key,
                 if private { Some((id, &org)) } else { None },
             )
             .await
@@ -442,26 +384,20 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
 async fn nar(
     state: &AppState,
     request: &axum::http::request::Parts,
-    hash: &str,
-    compression: &str,
+    key: &str,
     scope: Option<(i32, &str)>,
 ) -> Result<Response, ApiError> {
     let private = scope.is_some();
-    let key = if private {
-        format!("nars/sha256/{hash}/{compression}.nar")
-    } else {
-        format!("nar/{hash}/{compression}.nar")
-    };
     let object = match if request.method == Method::HEAD {
         state
             .storage
-            .head(private, &key)
+            .head(private, key)
             .await
             .map(|metadata| (metadata, None))
     } else {
         state
             .storage
-            .open(private, &key)
+            .open(private, key)
             .await
             .map(|object| (object.metadata, Some(object.reader)))
     } {
@@ -516,7 +452,7 @@ async fn nar(
         .into_response())
 }
 
-struct PrivateNarinfo {
+struct ScopedNarinfo {
     store_path: String,
     nar_hash: String,
     nar_size: i64,
@@ -541,11 +477,11 @@ async fn scoped_narinfo(
     hash: &str,
     private: bool,
 ) -> Result<Response, ApiError> {
-    // SQL publication is authoritative. Never consult old private metadata
-    // objects: new publications no longer write them, and old ones may be stale.
+    // SQL publication is authoritative. Never consult mutable metadata objects:
+    // new publications no longer write them, and old ones may be stale.
     // Read signing columns in the same fresh statement snapshot as publication.
     let published = sqlx::query_as!(
-        PrivateNarinfo,
+        ScopedNarinfo,
         r#"
         SELECT
             p.store_path,
@@ -645,78 +581,6 @@ async fn scoped_narinfo(
             ("etag", &etag),
         ],
         body,
-    )
-        .into_response();
-    if status == StatusCode::OK {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_LENGTH, size.into());
-    }
-    Ok(response)
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn narinfo(
-    state: &AppState,
-    request: &axum::http::request::Parts,
-    key: &str,
-    private: bool,
-) -> Result<Response, ApiError> {
-    let object = match if request.method == Method::HEAD {
-        state
-            .storage
-            .head(private, key)
-            .await
-            .map(|metadata| (metadata, None))
-    } else {
-        state
-            .storage
-            .open(private, key)
-            .await
-            .map(|object| (object.metadata, Some(object.reader)))
-    } {
-        Ok(object) => object,
-        Err(error) => return storage_error(error, private),
-    };
-    let (metadata, reader) = object;
-    let etag = metadata
-        .e_tag
-        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
-    let etag = format!("\"{}\"", etag.trim_matches('"'));
-    let modified = httpdate::fmt_http_date(metadata.last_modified.into());
-    let status = precondition(&request.headers, &etag, Some(&modified));
-    let size = metadata.size;
-    let mut response = (
-        status,
-        [
-            ("content-type", "text/x-nix-narinfo"),
-            (
-                "cache-control",
-                if private {
-                    "private, no-cache"
-                } else {
-                    "public, max-age=300"
-                },
-            ),
-            ("etag", &etag),
-            ("last-modified", &modified),
-        ],
-        if status == StatusCode::OK {
-            reader.map_or_else(Body::empty, |reader| {
-                Body::from_stream(crate::profile_stream!(
-                    ReaderStream::new(reader),
-                    label = "reads.narinfo_body"
-                ))
-            })
-        } else if status == StatusCode::NOT_MODIFIED {
-            // An exact-size empty body makes Axum insert Content-Length: 0,
-            // which incorrectly describes the stored representation on a 304.
-            Body::from_stream(futures_util::stream::empty::<
-                Result<axum::body::Bytes, io::Error>,
-            >())
-        } else {
-            Body::empty()
-        },
     )
         .into_response();
     if status == StatusCode::OK {

@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.is_public,\n            o.slug,\n            o.moving_from,\n            c.name\n        FROM caches c\n        JOIN orgs o ON o.id = c.org_id\n        WHERE c.id = $1\n            AND c.org_id = $2\n            AND c.retention_days IS NOT NULL\n        FOR UPDATE OF c NOWAIT\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "moving_from",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "moving_from"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "31a24df5370de24ee26360a917a8bf60d2baa53698f04bd331b43c4088d808ca"
+}

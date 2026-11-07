@@ -30,6 +30,14 @@ impl ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if matches!(error, sqlx::Error::PoolTimedOut)
+            || matches!(&error, sqlx::Error::Database(e) if matches!(e.code().as_deref(), Some("55P03" | "40P01" | "40001")))
+        {
+            return Self::new(StatusCode::SERVICE_UNAVAILABLE, "Database busy; retry").header(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+        }
         // Do not log connection URLs, SQL parameters, or database messages.
         tracing::error!(
             kind = match error {

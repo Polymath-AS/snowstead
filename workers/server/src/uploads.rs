@@ -1,10 +1,11 @@
 //! PostgreSQL owns grants, immutable receipts, seals, and abort exclusion.
-//! No connection is held while reading an HTTP body, assembling, or verifying.
+//! No connection is held during HTTP bodies, verification, or storage I/O.
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
 };
 
+use crate::db::Transaction;
 use axum::{
     Extension, Router,
     body::{Body, to_bytes},
@@ -18,7 +19,6 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
 use tokio::io::AsyncReadExt;
 
 use crate::{
@@ -179,6 +179,7 @@ struct Session {
     slug: String,
     is_public: bool,
     private_caches: bool,
+    publication_result: Option<Value>,
 }
 fn authorize(s: &Session, identity: &Identity) -> Result<(), ApiError> {
     match identity {
@@ -220,7 +221,8 @@ async fn load(
             c.name,
             c.is_public,
             o.slug,
-            o.private_caches
+            o.private_caches,
+            u.publication_result
         FROM upload_sessions u
         JOIN caches c ON c.id = u.cache_id
         JOIN orgs o ON o.id = c.org_id
@@ -242,7 +244,7 @@ async fn load(
     Ok(s)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn lock(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result<(), ApiError> {
+async fn lock(tx: &mut Transaction, key: &str) -> Result<(), ApiError> {
     crate::profile_future!(
         crate::db::advisory_lock(tx, key),
         label = "uploads.advisory_lock_wait"
@@ -255,9 +257,12 @@ async fn locked(
     state: &AppState,
     s: &Session,
     identity: &Identity,
-) -> Result<(Transaction<'static, Postgres>, Session), ApiError> {
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "uploads.session_pool_begin").await?;
+) -> Result<(Transaction, Session), ApiError> {
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, &s.org_id),
+        label = "uploads.session_pool_begin"
+    )
+    .await?;
     lock(&mut tx, &format!("org:{}", s.org_id)).await?;
     lock(&mut tx, &format!("upload:{}", s.id)).await?;
     // Re-read and reauthorize after the fences, using the same query as preflight.
@@ -296,8 +301,11 @@ async fn create(
     let identity = &identity;
     let cache = cache.as_str();
     batch(&body.paths)?;
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "uploads.create_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, identity.org()),
+        label = "uploads.create_pool_begin"
+    )
+    .await?;
     lock(&mut tx, &format!("org:{}", identity.org())).await?;
     struct CachePolicy {
         id: i32,
@@ -328,7 +336,7 @@ async fn create(
                 WHERE p.cache_id = c.id
                     AND p.protocol = 'nix'
             )
-        FOR SHARE OF c, o
+        FOR SHARE OF c, o NOWAIT
         "#,
         identity.org(),
         cache,
@@ -495,7 +503,7 @@ struct Part {
     storage_key: Option<String>,
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn parts(tx: &mut Transaction<'_, Postgres>, id: &str) -> Result<Vec<Part>, ApiError> {
+async fn parts(tx: &mut Transaction, id: &str) -> Result<Vec<Part>, ApiError> {
     Ok(sqlx::query_as!(
         Part,
         r#"
@@ -515,7 +523,7 @@ async fn parts(tx: &mut Transaction<'_, Postgres>, id: &str) -> Result<Vec<Part>
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn reserve_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     s: &Session,
     requested: &[Reservation],
 ) -> Result<(), ApiError> {
@@ -992,115 +1000,53 @@ fn nar(s: &Session) -> Result<signing::Narinfo, ApiError> {
     })
 }
 
-#[derive(PartialEq)]
-struct Published {
-    store_path: String,
-    nar_hash: String,
-    nar_size: i64,
-    references_json: String,
-    deriver: Option<String>,
-    system: Option<String>,
-    signatures_json: String,
-    file_hash: String,
-    file_size: i64,
-    compression: String,
-}
-impl Published {
-    fn nar(&self, hash: &str) -> Result<signing::Narinfo, ApiError> {
-        Ok(signing::Narinfo {
-            store_path: self.store_path.clone(),
-            store_path_hash: hash.to_owned(),
-            nar_hash: self.nar_hash.clone(),
-            nar_size: self.nar_size,
-            references: serde_json::from_str(&self.references_json)
-                .map_err(|_| error(500, "Invalid stored references"))?,
-            deriver: self.deriver.clone(),
-            system: self.system.clone(),
-            signatures: serde_json::from_str(&self.signatures_json)
-                .map_err(|_| error(500, "Invalid stored signatures"))?,
-            file_hash: self.file_hash.clone(),
-            file_size: self.file_size,
-            compression: self.compression.clone(),
-        })
-    }
-}
-
-/// Commit ownership before any canonical write. A later publication rollback
-/// must not erase GC discovery or protection from an uncertain provider copy.
+/// Own an immutable destination before I/O. This does not admit retained bytes
+/// or evict anything: both decisions belong to the publication transaction.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn reserve_canonical(
+async fn allocate_candidate(
     state: &AppState,
     identity: &Identity,
     s: &Session,
     staged: &str,
 ) -> Result<(String, String), ApiError> {
     let (mut tx, current) = locked(state, s, identity).await?;
-    if !matches!(current.status.as_str(), "finalizing" | "completed")
-        || current.file_hash != s.file_hash
-    {
+    if current.status == "completed" {
+        return Err(error(503, "Publication completed; retry for its result"));
+    }
+    if current.status != "finalizing" || current.file_hash != s.file_hash {
         return Err(error(409, "Conflict"));
     }
-    sqlx::query!(
-        r#"
-        LOCK TABLE upload_sessions IN ROW EXCLUSIVE MODE
-        "#
-    )
-    .execute(&mut *tx)
-    .await?;
-    let hash = s.file_hash.as_deref().unwrap();
-    let key = if s.is_public {
-        format!("nar/{hash}/zstd.nar")
-    } else {
-        format!("nars/sha256/{hash}/zstd.nar")
-    };
-    lock(&mut tx, &format!("nar:{hash}:zstd")).await?;
-    // An expired legacy MPU can still complete. Neither TTL nor our SQL lock
-    // fences a provider request that is already outstanding.
-    let reserved = sqlx::query_scalar!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM upload_sessions
-            WHERE r2_upload_key = $1
-                AND status <> 'completed'
-                AND (r2_upload_id IS NOT NULL OR expires_at > NOW())
-        ) AS "exists!"
-        "#,
-        &key,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if reserved {
-        return Err(error(503, "NAR installation busy; retry"));
+    if !current.is_public && !current.private_caches {
+        return Err(error(403, PRIVATE_CACHES_REFUSED));
     }
-    sqlx::query!(
-        r#"
-        INSERT INTO blob_objects (file_hash, file_size, compression, r2_key)
-        VALUES ($1, $2, 'zstd', $3)
-        ON CONFLICT (file_hash, compression) DO NOTHING
-        "#,
-        hash,
-        s.file_size,
-        &key,
-    )
-    .execute(&mut *tx)
-    .await?;
+    if current.is_public != s.is_public {
+        return Err(error(503, "Cache policy changed; retry"));
+    }
+    let hash = s.file_hash.as_deref().unwrap();
     let operation = uuid::Uuid::now_v7().to_string();
-    let claimed = sqlx::query!(
+    let key = if s.is_public {
+        format!("nar/objects/{operation}/{hash}/zstd.nar")
+    } else {
+        format!("nars/objects/{operation}/{hash}/zstd.nar")
+    };
+    let claimed = sqlx::query(
         r#"
         INSERT INTO nar_installations (
-            key, operation_id, source_key, file_hash, compression, is_private, file_size
+            key, operation_id, source_key, file_hash, compression, is_private, file_size,
+            cache_id, session_id, expires_at
         )
-        VALUES ($1, $2, $3, $4, 'zstd', $5, $6)
+        SELECT $1, $2, $3, $4, 'zstd', $5, $6, cache_id, id, expires_at
+        FROM upload_sessions WHERE id=$7
         ON CONFLICT DO NOTHING
         "#,
-        &key,
-        &operation,
-        staged,
-        hash,
-        !s.is_public,
-        s.file_size,
     )
+    .bind(&key)
+    .bind(&operation)
+    .bind(staged)
+    .bind(hash)
+    .bind(!s.is_public)
+    .bind(s.file_size)
+    .bind(&s.id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -1119,11 +1065,13 @@ async fn publish(
     staged: &str,
     protect: &[(i32, String)],
 ) -> Result<Value, ApiError> {
-    let (key, operation) = reserve_canonical(state, identity, s, staged).await?;
-    let mut uncertain_copy = false;
+    let (key, operation) = allocate_candidate(state, identity, s, staged).await?;
     let result = async {
+        // This destination belongs only to this attempt. A late copy cannot
+        // change any previously published bytes, even after its lease expires.
+        state.storage.copy(true, staged, !s.is_public, &key).await.map_err(io_error)?;
         let (mut tx, current) = locked(state, s, identity).await?;
-        if !matches!(current.status.as_str(), "finalizing" | "completed")
+        if current.status != "finalizing"
             || current.file_hash != s.file_hash
         {
             return Err(error(409, "Conflict"));
@@ -1131,131 +1079,67 @@ async fn publish(
         if !current.is_public && !current.private_caches {
             return Err(error(403, PRIVATE_CACHES_REFUSED));
         }
-        if current.slug != s.slug || current.name != s.name || current.is_public != s.is_public {
+        // Hold policy rows only for this SQL-only commit. A rotation or policy
+        // change must either precede this comparison or follow publication.
+        sqlx::query("SELECT id FROM caches WHERE id=$1 FOR SHARE NOWAIT")
+            .bind(s.cache_id).fetch_one(&mut *tx).await?;
+        sqlx::query("SELECT id FROM orgs WHERE id=$1 FOR SHARE NOWAIT")
+            .bind(&s.org_id).fetch_one(&mut *tx).await?;
+        let current = load(&mut *tx, &s.id, identity).await?;
+        if current.is_public != s.is_public {
             return Err(error(503, "Cache policy changed; retry"));
         }
-        // Activation takes this cache row FOR UPDATE. Select the active signing
-        // key inside the publication fence so an old render cannot publish after
-        // a completed rotation. Reuse this connection, including with a pool of one.
-        struct SigningKeys {
-            signing_key_name: Option<String>,
-            signing_public_key: Option<String>,
-            signing_key_sealed: Option<String>,
+        if !current.is_public && !current.private_caches {
+            return Err(error(403, PRIVATE_CACHES_REFUSED));
         }
-        let keys = crate::profile_future!(
-            sqlx::query_as!(
-                SigningKeys,
-                r#"
-                SELECT
-                    signing_key_name,
-                    signing_public_key,
-                    signing_key_sealed
-                FROM caches
-                WHERE id = $1
-                FOR SHARE
-                "#,
-                s.cache_id,
-            )
-            .fetch_one(&mut *tx),
-            label = "uploads.signing_row_lock"
-        )
-        .await?;
-        // Match the canonical deletion fence used by the shared SQL repository.
-        crate::profile_future!(
-            sqlx::query!(
-                r#"
-                LOCK TABLE upload_sessions IN ROW EXCLUSIVE MODE
-                "#
-            )
-            .execute(&mut *tx),
-            label = "uploads.gc_table_lock"
-        )
-        .await?;
+        let owned = sqlx::query(
+            "DELETE FROM nar_installations WHERE key=$1 AND operation_id=$2 \
+             AND phase='preparing' \
+             AND expires_at>NOW() RETURNING key",
+        ).bind(&key).bind(&operation)
+            .fetch_optional(&mut *tx).await?;
+        if owned.is_none() {
+            return Err(error(503, "Publication attempt expired or cancelled; retry"));
+        }
         let hash = s.file_hash.as_deref().unwrap();
         lock(&mut tx, &format!("nar:{hash}:zstd")).await?;
-        let existing = sqlx::query_as!(
-            Published,
-            r#"
-            SELECT
-                p.store_path,
-                p.nar_hash,
-                p.nar_size,
-                p.references_json,
-                p.deriver,
-                p.system,
-                p.signatures_json,
-                b.file_hash,
-                b.file_size,
-                b.compression
-            FROM published_paths p
-            JOIN blob_objects b ON b.id = p.blob_object_id
-            WHERE p.cache_id = $1
-                AND p.store_path_hash = $2
-            "#,
-            s.cache_id,
-            &s.store_path_hash,
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        let metadata = match &existing {
-            Some(p) => p.nar(&s.store_path_hash)?,
-            None => nar(s)?,
-        };
-        let signing_key = signing::select_key(
-            &state.config,
-            s.cache_id,
-            keys.signing_key_name.as_deref(),
-            keys.signing_public_key.as_deref(),
-            keys.signing_key_sealed.as_deref(),
-        )?;
-        let rendered = signing::render_with_key(
-            &cache_path(s),
-            !s.is_public,
-            &metadata,
-            signing_key.as_ref().map(|(name, key)| (name.as_str(), key)),
-        )?;
-        let capacity: Option<i64> = sqlx::query_scalar!(
-            r#"
-            SELECT storage_limit
-            FROM orgs
-            WHERE id = $1
-            FOR SHARE
-            "#,
-            &s.org_id,
-        )
+        let existing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM published_paths WHERE cache_id=$1 AND store_path_hash=$2)",
+        ).bind(s.cache_id).bind(&s.store_path_hash)
         .fetch_one(&mut *tx)
         .await?;
+        // Validate signing before adoption, but never write mutable metadata.
+        signing::render(&mut *tx, &state.config, s.cache_id, &cache_path(&current),
+            !current.is_public, &nar(s)?).await?;
+        let capacity: Option<i64> = sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1")
+            .bind(&s.org_id).fetch_one(&mut *tx).await?;
         if let Some(limit) = capacity {
             crate::capacity::admit(
                 &mut tx,
-                state,
                 &s.org_id,
                 limit,
-                if existing.is_none() { s.file_size } else { 0 },
+                if existing { 0 } else { s.file_size },
                 protect,
             )
             .await?;
         }
-        // Every caller has independently proven possession. Copy under the
-        // content-addressed transaction fence; no request body is involved here.
-        uncertain_copy = true;
-        state
-            .storage
-            .copy(true, staged, !s.is_public, &key)
-            .await
-            .map_err(io_error)?;
-        uncertain_copy = false;
-        let blob_id = sqlx::query_scalar!(
+        let (blob_id, adopted): (i64, Option<String>) = sqlx::query_as(
             r#"
-            SELECT id
-            FROM blob_objects
-            WHERE file_hash = $1
-                AND compression = 'zstd'
-            "#,
-            hash,
+            INSERT INTO blob_objects(file_hash, file_size, compression, r2_key, public_key, private_key)
+            VALUES ($1, $2, 'zstd', $3, CASE WHEN $4 THEN $3 END, CASE WHEN NOT $4 THEN $3 END)
+            ON CONFLICT (file_hash, compression) DO UPDATE SET
+                public_key = CASE WHEN $4 THEN COALESCE(blob_objects.public_key, $3) ELSE blob_objects.public_key END,
+                private_key = CASE WHEN NOT $4 THEN COALESCE(blob_objects.private_key, $3) ELSE blob_objects.private_key END
+            RETURNING id, CASE WHEN $4 THEN public_key ELSE private_key END
+            "#
         )
+        .bind(hash).bind(s.file_size).bind(&key).bind(s.is_public)
         .fetch_one(&mut *tx)
         .await?;
+        if adopted.as_deref() != Some(&key) {
+            sqlx::query("INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                .bind(!s.is_public).bind(&key).execute(&mut *tx).await?;
+        }
         sqlx::query!(
             r#"
             INSERT INTO published_paths (
@@ -1278,81 +1162,34 @@ async fn publish(
         )
         .execute(&mut *tx)
         .await?;
-        let info = if s.is_public {
-            format!("{}/{}.narinfo", cache_path(s), s.store_path_hash)
-        } else {
-            format!("narinfo/{}/{}.narinfo", cache_path(s), s.store_path_hash)
-        };
-        state
-            .storage
-            .put(!s.is_public, &info, rendered.as_bytes())
-            .await
-            .map_err(io_error)?;
-        if s.is_public {
-            state
-                .storage
-                .put(
-                    false,
-                    &format!("{}/nix-cache-info", cache_path(s)),
-                    crate::reads::INFO.as_bytes(),
-                )
-                .await
-                .map_err(io_error)?;
-            crate::cdn::schedule_narinfo(
-                state,
-                &cache_path(s),
-                std::slice::from_ref(&s.store_path_hash),
-            )
-            .await?;
-            crate::cdn::schedule_files(state, &[format!("{}/nix-cache-info", cache_path(s))])
-                .await?;
-        }
-        sqlx::query!(
-            r#"
-            UPDATE upload_sessions
-            SET status = 'completed'
-            WHERE id = $1
-            "#,
-            &s.id,
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"
-            DELETE FROM nar_installations
-            WHERE key = $1
-                AND operation_id = $2
-            "#,
-            &key,
-            &operation,
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         let mut result =
             json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true});
-        if existing.is_some() {
+        if existing {
             result["alreadyExisted"] = json!(true);
         }
+        sqlx::query("UPDATE upload_sessions SET status='completed', publication_result=$2 WHERE id=$1")
+            .bind(&s.id).bind(&result).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result)
     }
     .await;
-    if result.is_err() && !uncertain_copy {
-        // The publication transaction has rolled back, but the copy either
-        // never started or confirmed completion. Release its pin; the durable
-        // blob row remains available to GC. An uncertain copy stays pinned,
-        // including across restarts, until explicitly reconciled.
-        sqlx::query!(
-            r#"
-            DELETE FROM nar_installations
-            WHERE key = $1
-                AND operation_id = $2
-            "#,
-            &key,
-            &operation,
+    if result.is_err() {
+        // Conditional retirement also handles a lost COMMIT acknowledgement:
+        // a committed adoption already consumed this attempt. The conditional
+        // DELETE serializes with adoption without reacquiring the busy org fence.
+        // Otherwise a transient conflict can leave this session pinned until expiry.
+        let retirement = sqlx::query(
+            "WITH retired AS (DELETE FROM nar_installations WHERE key=$1 AND operation_id=$2 \
+             RETURNING key,is_private) INSERT INTO object_cleanup(is_private,key) \
+             SELECT is_private,key FROM retired ON CONFLICT DO NOTHING",
         )
+        .bind(&key)
+        .bind(&operation)
         .execute(&state.pool)
-        .await?;
+        .await;
+        if retirement.is_err() {
+            tracing::warn!("Publication retirement deferred to maintenance");
+        }
     }
     result
 }
@@ -1370,6 +1207,21 @@ async fn prepare(
     inline: Option<&str>,
 ) -> Result<Prepared, ApiError> {
     let (s, parts) = seal(state, identity, &receipt, inline).await?;
+    prepare_sealed(state, s, parts).await
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn prepare_sealed(
+    state: &AppState,
+    s: Session,
+    parts: Vec<Part>,
+) -> Result<Prepared, ApiError> {
+    if s.status == "completed" {
+        return Ok(Prepared {
+            session: s,
+            assembled: String::new(),
+        });
+    }
     let assembled = format!("staging/{}/assembled-{}", s.id, uuid::Uuid::now_v7());
     let verified = async {
         assemble(state, &s, &parts, &assembled).await?;
@@ -1393,9 +1245,12 @@ async fn publish_prepared(
     ready: Prepared,
     protect: Vec<(i32, String)>,
 ) -> Result<Value, ApiError> {
-    // Once external publication starts, caller cancellation must not release
-    // its PostgreSQL fence before the last R2 operation settles.
-    // TaskTracker also makes orderly shutdown wait for this critical section.
+    if ready.session.status == "completed" {
+        return Ok(ready.session.publication_result.unwrap_or_else(||
+            json!({"sessionId":ready.session.id,"storePathHash":ready.session.store_path_hash,"published":true})));
+    }
+    // Caller cancellation must not abandon a publication. Durable reservations
+    // survive a crash; TaskTracker lets orderly shutdown finish active work.
     let owned = state.clone();
     let identity = identity.clone();
     state
@@ -1453,15 +1308,18 @@ async fn finalize_one(
 /// sessions count, and duplicate store paths count once, as SQL insertion does.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn preflight(state: &AppState, org: &str, ready: &[&Prepared]) -> Result<(), ApiError> {
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "uploads.preflight_pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, org),
+        label = "uploads.preflight_pool_begin"
+    )
+    .await?;
     lock(&mut tx, &format!("org:{org}")).await?;
     let limit: Option<i64> = sqlx::query_scalar!(
         r#"
         SELECT storage_limit
         FROM orgs
         WHERE id = $1
-        FOR SHARE
+        FOR SHARE NOWAIT
         "#,
         org,
     )
@@ -1522,12 +1380,19 @@ async fn preflight(state: &AppState, org: &str, ready: &[&Prepared]) -> Result<(
 async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Receipt>) -> Vec<Value> {
     let mut results = vec![Value::Null; inputs.len()];
     let mut ready = Vec::with_capacity(inputs.len());
-    // Overlap preparation only. Ordered buffering preserves the first input's
-    // metadata when distinct sessions publish the same store path.
-    let preparations = stream::iter(inputs.into_iter().enumerate().map(
-        |(index, input)| async move {
-            let id = input.session_id.clone();
-            (index, id, prepare(state, identity, input, None).await)
+    let mut sealed = Vec::with_capacity(inputs.len());
+    // Serialize SQL decisions within this request, not storage I/O. Otherwise
+    // this batch could reject its own items on the fail-fast org fence.
+    for (index, input) in inputs.into_iter().enumerate() {
+        let id = input.session_id.clone();
+        match seal(state, identity, &input, None).await {
+            Ok((session, parts)) => sealed.push((index, id, session, parts)),
+            Err(e) => results[index] = result_value(&id, Err(e), true),
+        }
+    }
+    let preparations = stream::iter(sealed.into_iter().map(
+        |(index, id, session, parts)| async move {
+            (index, id, prepare_sealed(state, session, parts).await)
         },
     ))
     .buffered(4);
@@ -1548,6 +1413,20 @@ async fn publish_batch(
     ready: Vec<(usize, Prepared)>,
     mut results: Vec<Value>,
 ) -> Vec<Value> {
+    let mut pending = Vec::with_capacity(ready.len());
+    for (index, p) in ready {
+        if p.session.status == "completed" {
+            let id = p.session.id.clone();
+            results[index] = result_value(
+                &id,
+                publish_prepared(state, identity, p, vec![]).await,
+                true,
+            );
+        } else {
+            pending.push((index, p));
+        }
+    }
+    let ready = pending;
     let orgs: HashSet<_> = ready
         .iter()
         .map(|(_, p)| p.session.org_id.clone())
@@ -1619,12 +1498,12 @@ struct InlineBatch {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn prepare_inline(
+async fn seal_inline(
     state: &AppState,
     identity: &Identity,
     input: &InlineInput,
     bytes: axum::body::Bytes,
-) -> Result<Prepared, ApiError> {
+) -> Result<(Session, Vec<Part>), ApiError> {
     let id = &input.session_id;
     let s = load(&state.pool, id, identity).await?;
     if s.r2_upload_id.is_some() || s.part_size != Some(MIB as i32) || s.nar_size > MIB {
@@ -1646,7 +1525,7 @@ async fn prepare_inline(
             etag: input.file_hash.clone(),
         }],
     };
-    let result = prepare(state, identity, receipt, Some(&key)).await;
+    let result = seal(state, identity, &receipt, Some(&key)).await;
     discard_unretained_inline(state, id, &key).await?;
     result
 }
@@ -1739,16 +1618,22 @@ async fn inline_batch(
     }
     let mut results = vec![Value::Null; body.uploads.len()];
     let mut ready = Vec::with_capacity(body.uploads.len());
+    let mut sealed = Vec::with_capacity(body.uploads.len());
     offset = 4 + manifest_size;
-    // Keep ready in input order and drain all item errors before publication.
-    let preparations = stream::iter(body.uploads.into_iter().enumerate().map(|(index, input)| {
+    // As with streamed batches, do not race this request's own SQL admissions.
+    for (index, input) in body.uploads.into_iter().enumerate() {
         let bytes = frame.slice(offset..offset + input.file_size);
         offset += input.file_size;
-        async move {
-            let result = prepare_inline(state, identity, &input, bytes).await;
-            (index, input.session_id, result)
+        match seal_inline(state, identity, &input, bytes).await {
+            Ok((session, parts)) => sealed.push((index, input.session_id, session, parts)),
+            Err(e) => results[index] = result_value(&input.session_id, Err(e), true),
         }
-    }))
+    }
+    let preparations = stream::iter(sealed.into_iter().map(
+        |(index, id, session, parts)| async move {
+            (index, id, prepare_sealed(state, session, parts).await)
+        },
+    ))
     .buffered(4);
     tokio::pin!(preparations);
     while let Some((index, id, result)) = preparations.next().await {
@@ -2020,6 +1905,7 @@ mod tests {
             slug: String::new(),
             is_public: false,
             private_caches: false,
+            publication_result: None,
         };
         let permit = state
             .verification_slots

@@ -45,7 +45,7 @@ async fn fixture_with_storage(pool: PgPool, origin: &str, storage: Storage) -> A
         INSERT INTO blob_objects (file_hash,file_size,compression,r2_key)
         VALUES (repeat('a',64),32,'zstd','nar/public'),(repeat('b',64),32,'zstd','nar/private');
         INSERT INTO published_paths (cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
-        SELECT c.id,repeat('0',32),'/nix/store/test','sha256:test',32,b.id
+        SELECT c.id,repeat('0',32),'/nix/store/test','sha256:' || repeat('0',64),32,b.id
         FROM caches c JOIN blob_objects b ON b.file_hash=CASE WHEN c.name='secret' THEN repeat('b',64) ELSE repeat('a',64) END
         WHERE c.org_id='org_alpha' AND c.name IN ('main','secret');")
         .execute(&pool).await.unwrap();
@@ -88,10 +88,16 @@ fn redirect(response: &Response, location: &str) {
     assert!(!response.headers().contains_key("x-snowstead-cdn-read"));
 }
 
+fn metadata(response: &Response) {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::LOCATION));
+    assert!(!response.headers().contains_key("x-snowstead-cdn-read"));
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn public_redirects_without_objects_or_published_narinfo(pool: PgPool) {
+async fn sql_metadata_and_public_nar_redirects_without_stored_objects(pool: PgPool) {
     // A GET or HEAD would wait forever for a zero-permit store. Successful
-    // redirects/handoffs therefore prove storage is not on the delivery path.
+    // SQL metadata and NAR redirects prove storage is not on the delivery path.
     let storage = Storage::from_stores(
         Arc::new(LimitStore::new(InMemory::new(), 0)),
         Arc::new(LimitStore::new(InMemory::new(), 0)),
@@ -100,24 +106,67 @@ async fn public_redirects_without_objects_or_published_narinfo(pool: PgPool) {
     let app = router(state.clone());
     let hash = "1".repeat(32); // Deliberately absent from SQL and object storage.
     let blob = "a".repeat(64);
+    let private_blob = "b".repeat(64);
+    let credential = format!("Bearer {}", token("org_alpha", "secret"));
     for method in ["GET", "HEAD"] {
+        for path in [
+            "/alpha/main/nix-cache-info".to_owned(),
+            "/local/nix-cache-info".to_owned(),
+            format!("/alpha/main/{}.narinfo", "0".repeat(32)),
+            format!("/private/alpha/main/{}.narinfo", "0".repeat(32)),
+            "/alpha/secret/nix-cache-info".to_owned(),
+            format!("/alpha/secret/{}.narinfo", "0".repeat(32)),
+        ] {
+            let (authorization, file_hash) = if path.starts_with("/alpha/secret/") {
+                (credential.as_str(), &private_blob)
+            } else {
+                ("Bearer do-not-copy", &blob)
+            };
+            for handoff in [false, true] {
+                let mut headers = vec![
+                    ("authorization", authorization),
+                    ("cookie", "session=do-not-copy"),
+                    ("if-none-match", "\"cached\""),
+                    ("range", "bytes=0-7"),
+                ];
+                if handoff {
+                    headers.push(("x-snowstead-cdn-read", "1"));
+                }
+                let response = read(
+                    &app,
+                    method,
+                    &format!("{path}?token=secret&download=1"),
+                    &headers,
+                )
+                .await;
+                metadata(&response);
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                if method == "HEAD" {
+                    assert!(body.is_empty());
+                } else if path.ends_with(".narinfo") {
+                    let text = std::str::from_utf8(&body).unwrap();
+                    assert!(text.contains(&format!("URL: nar/{file_hash}/zstd.nar\n")));
+                    assert!(text.contains("StorePath: /nix/store/test\n"));
+                } else {
+                    assert_eq!(
+                        body.as_ref(),
+                        b"StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n"
+                    );
+                }
+            }
+        }
+        for path in [
+            format!("/alpha/main/{hash}.narinfo"),
+            format!("/private/alpha/main/{hash}.narinfo"),
+        ] {
+            for headers in [&[][..], &[("x-snowstead-cdn-read", "1")][..]] {
+                let response = read(&app, method, &path, headers).await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert!(!response.headers().contains_key(header::LOCATION));
+                assert!(!response.headers().contains_key("x-snowstead-cdn-read"));
+            }
+        }
         for (path, key) in [
-            (
-                "/alpha/main/nix-cache-info".to_owned(),
-                "alpha/main/nix-cache-info".to_owned(),
-            ),
-            (
-                "/local/nix-cache-info".to_owned(),
-                "local/nix-cache-info".to_owned(),
-            ),
-            (
-                format!("/alpha/main/{hash}.narinfo"),
-                format!("alpha/main/{hash}.narinfo"),
-            ),
-            (
-                format!("/private/alpha/main/{hash}.narinfo"),
-                format!("alpha/main/{hash}.narinfo"),
-            ),
             (
                 format!("/alpha/main/nar/{blob}/zstd.nar"),
                 format!("nar/{blob}/zstd.nar"),
@@ -147,30 +196,18 @@ async fn public_redirects_without_objects_or_published_narinfo(pool: PgPool) {
                     .is_empty()
             );
             let response = read(&app, method, &path, &[("x-snowstead-cdn-read", "1")]).await;
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            assert_eq!(response.headers()["x-snowstead-cdn-read"], "1");
-            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            redirect(&response, &format!("{CDN}/{key}"));
         }
     }
-    redirect(
-        &read(
-            &app,
-            "GET",
-            &format!("/alpha/main/{}.narinfo", "0".repeat(32)),
-            &[],
-        )
-        .await,
-        &format!("{CDN}/alpha/main/{}.narinfo", "0".repeat(32)),
-    );
     state.finish_background().await;
     let accessed: Vec<String> = sqlx::query_scalar("SELECT c.name FROM published_paths p JOIN caches c ON c.id=p.cache_id WHERE p.last_accessed_at IS NOT NULL ORDER BY c.name")
         .fetch_all(&pool).await.unwrap();
-    assert_eq!(accessed, ["main"]);
+    assert_eq!(accessed, ["main", "secret"]);
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn gateway_handoff_and_security_guards(pool: PgPool) {
-    // The admission-only gateway contract is independent of redirect config.
+async fn legacy_nar_redirects_and_sql_metadata_security_guards(pool: PgPool) {
+    // The legacy handoff header cannot change the standard redirect contract.
     let state = fixture(pool.clone(), "").await;
     let app = router(state.clone());
     let cdn_state = AppState::new(
@@ -185,17 +222,20 @@ async fn gateway_handoff_and_security_guards(pool: PgPool) {
     let hash = "1".repeat(32);
     let handoff = [("x-snowstead-cdn-read", "1")];
     for method in ["GET", "HEAD"] {
+        for app in [&app, &cdn_app] {
+            for path in [
+                "/alpha/main/nix-cache-info".to_owned(),
+                format!("/alpha/main/{}.narinfo", "0".repeat(32)),
+            ] {
+                metadata(&read(app, method, &path, &handoff).await);
+            }
+        }
         for path in [
-            "/alpha/main/nix-cache-info".to_owned(),
-            format!("/alpha/main/{hash}.narinfo"),
             format!("/alpha/main/nar/{blob}/zstd.nar"),
             format!("/nar/{blob}/zstd.nar"),
         ] {
-            let response = read(&app, method, &path, &handoff).await;
-            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
-            assert_eq!(response.headers()["x-snowstead-cdn-read"], "1");
-            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            assert!(!response.headers().contains_key(header::LOCATION));
+            let response = read(&cdn_app, method, &path, &handoff).await;
+            redirect(&response, &format!("{CDN}/nar/{blob}/zstd.nar"));
         }
     }
     for path in [
@@ -204,6 +244,7 @@ async fn gateway_handoff_and_security_guards(pool: PgPool) {
         "/alpha/main/invalid.narinfo".to_owned(),
         "/alpha/main/%2e%2e.narinfo".to_owned(),
         "/alpha/main/nix-cache-info/extra".to_owned(),
+        format!("/alpha/main/{hash}.narinfo"),
         format!("/beta/main/nar/{blob}/zstd.nar"),
         format!("/alpha/main/nar/{blob}/invalid.nar"),
         format!("/nar/{}/zstd.nar", "b".repeat(64)),
@@ -598,16 +639,26 @@ async fn redirect_loop_is_rejected_without_trusting_forwarded_headers(pool: PgPo
     let app = router(state.clone());
     for path in [
         "/alpha/main/nix-cache-info".to_owned(),
+        format!("/alpha/main/{}.narinfo", "0".repeat(32)),
         format!("/nar/{}/zstd.nar", "a".repeat(64)),
     ] {
+        let is_metadata = !path.starts_with("/nar/");
         for host in ["cdn.example.test", "CDN.EXAMPLE.TEST:443"] {
             let response = read(&app, "GET", &path, &[("host", host)]).await;
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            assert!(!response.headers().contains_key(header::LOCATION));
+            if is_metadata {
+                metadata(&response);
+            } else {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert!(!response.headers().contains_key(header::LOCATION));
+            }
         }
         let response = read(&app, "GET", &format!("{CDN}{path}"), &[]).await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        if is_metadata {
+            metadata(&response);
+        } else {
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
         let response = read(
             &app,
             "GET",
@@ -620,7 +671,11 @@ async fn redirect_loop_is_rejected_without_trusting_forwarded_headers(pool: PgPo
             ],
         )
         .await;
-        redirect(&response, &format!("{CDN}{path}"));
+        if is_metadata {
+            metadata(&response);
+        } else {
+            redirect(&response, &format!("{CDN}{path}"));
+        }
     }
     let mut config = config(CDN);
     config.public_url = CDN.into();
@@ -887,7 +942,7 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
                 .status(),
                 StatusCode::OK
             );
-            redirect(
+            metadata(
                 &read(
                     &app,
                     method,
@@ -895,18 +950,19 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
                     &[("host", host)],
                 )
                 .await,
-                &format!("{CDN}/alpha/main/nix-cache-info"),
             );
         }
-        redirect(
+        metadata(
             &read(
                 &app,
                 method,
                 "/main/nix-cache-info",
-                &[("host", "ALPHA.SNOWSTEAD.COM:443")],
+                &[
+                    ("host", "ALPHA.SNOWSTEAD.COM:443"),
+                    ("x-snowstead-cdn-read", "1"),
+                ],
             )
             .await,
-            &format!("{CDN}/alpha/main/nix-cache-info"),
         );
         assert_eq!(
             read(
@@ -1028,7 +1084,7 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
             .status(),
         StatusCode::NOT_FOUND
     );
-    redirect(
+    metadata(
         &read(
             &app,
             "GET",
@@ -1036,7 +1092,6 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
             &[("host", "renamed.snowstead.com")],
         )
         .await,
-        &format!("{CDN}/renamed/main/nix-cache-info"),
     );
     state.finish_background().await;
 }

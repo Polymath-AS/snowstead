@@ -1,6 +1,7 @@
 //! Management policy uses the same org -> cache -> entry fence as publication.
-//! Withdraw R2 metadata before SQL commits, so a failed delete remains retryable.
-//! Shared canonical NARs belong to GC, never to cache/path withdrawal.
+//! SQL withdraws metadata atomically; known legacy objects are queued for GC.
+//! Shared NARs belong to GC, never to cache/path withdrawal.
+use crate::db::Transaction;
 use crate::{
     AppState,
     auth::Identity,
@@ -20,7 +21,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{Postgres, Transaction};
 
 fn bad(message: &str) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
@@ -103,7 +103,7 @@ fn page_limit(params: &[(String, String)], default: i64) -> Result<i64, ApiError
     Ok(n as i64)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn fence(tx: &mut Transaction<'_, Postgres>, org: &str) -> Result<(), ApiError> {
+async fn fence(tx: &mut Transaction, org: &str) -> Result<(), ApiError> {
     let key = format!("org:{org}");
     crate::profile_future!(
         crate::db::advisory_lock(tx, &key),
@@ -114,13 +114,12 @@ async fn fence(tx: &mut Transaction<'_, Postgres>, org: &str) -> Result<(), ApiE
 }
 
 pub(crate) struct MetadataTarget {
-    private: bool,
     paths: Vec<String>,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure_all)]
 impl MetadataTarget {
-    pub(crate) fn new(public: bool, slug: &str, moving_from: Option<&str>, name: &str) -> Self {
+    pub(crate) fn new(_public: bool, slug: &str, moving_from: Option<&str>, name: &str) -> Self {
         let mut paths = Vec::new();
         for slug in std::iter::once(slug).chain(moving_from) {
             let path = if slug == "default" {
@@ -132,115 +131,38 @@ impl MetadataTarget {
                 paths.push(path);
             }
         }
-        Self {
-            private: !public,
-            paths,
-        }
+        Self { paths }
     }
 
     pub(crate) async fn withdraw(
         &self,
-        state: &AppState,
+        tx: &mut impl std::ops::DerefMut<Target = sqlx::PgConnection>,
         hashes: &[String],
     ) -> Result<(), ApiError> {
-        state
-            .storage
-            .delete_many(
-                self.paths
-                    .iter()
-                    .flat_map(|path| {
-                        hashes.iter().map(move |hash| {
-                            let key = if self.private {
-                                format!("narinfo/{path}/{hash}.narinfo")
-                            } else {
-                                format!("{path}/{hash}.narinfo")
-                            };
-                            (self.private, key)
-                        })
-                    })
-                    .collect(),
-            )
-            .await
-            .map_err(storage_error)?;
         for path in &self.paths {
-            if !self.private {
-                crate::cdn::schedule_narinfo(state, path, hashes).await?;
+            for hash in hashes {
+                // Both placements can survive an earlier visibility change.
+                for (private, key) in [
+                    (false, format!("{path}/{hash}.narinfo")),
+                    (true, format!("narinfo/{path}/{hash}.narinfo")),
+                ] {
+                    sqlx::query("INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                        .bind(private).bind(key).execute(&mut **tx).await?;
+                }
             }
         }
         Ok(())
     }
 
-    async fn withdraw_cache_info(&self, state: &AppState) -> Result<(), ApiError> {
+    async fn withdraw_cache_info(&self, tx: &mut Transaction) -> Result<(), ApiError> {
         // cache-info lives in the public bucket, including stale cache-info
         // left by an interrupted visibility change to private.
-        state
-            .storage
-            .delete_many(
-                self.paths
-                    .iter()
-                    .map(|path| (false, format!("{path}/nix-cache-info")))
-                    .collect(),
-            )
-            .await
-            .map_err(storage_error)?;
         for path in &self.paths {
-            crate::cdn::schedule_files(state, &[format!("{path}/nix-cache-info")]).await?;
+            sqlx::query("INSERT INTO object_cleanup (is_private, key) VALUES (FALSE, $1) ON CONFLICT DO NOTHING")
+                .bind(format!("{path}/nix-cache-info")).execute(&mut **tx).await?;
         }
         Ok(())
     }
-
-    async fn withdraw_orphan_narinfo(&self, state: &AppState) -> Result<(), ApiError> {
-        // Whole-cache withdrawal must include metadata written by a publication
-        // whose SQL transaction failed. Those objects have no published row.
-        for path in &self.paths {
-            let prefix = if self.private {
-                format!("narinfo/{path}")
-            } else {
-                path.clone()
-            };
-            let child_prefix = format!("{prefix}/");
-            let mut after = None;
-            loop {
-                let keys = state
-                    .storage
-                    .list(self.private, &prefix, after.as_deref(), 500)
-                    .await
-                    .map_err(storage_error)?;
-                let mut withdrawn = Vec::new();
-                for key in &keys {
-                    if key
-                        .strip_prefix(&child_prefix)
-                        .and_then(|file| file.strip_suffix(".narinfo"))
-                        .is_some_and(hash_valid)
-                    {
-                        withdrawn.push(key.clone());
-                    }
-                }
-                state
-                    .storage
-                    .delete_many(
-                        withdrawn
-                            .iter()
-                            .map(|key| (self.private, key.clone()))
-                            .collect(),
-                    )
-                    .await
-                    .map_err(storage_error)?;
-                if !self.private {
-                    crate::cdn::schedule_files(state, &withdrawn).await?;
-                }
-                if keys.len() < 500 {
-                    break;
-                }
-                after = keys.last().cloned();
-            }
-        }
-        Ok(())
-    }
-}
-
-fn storage_error(_: std::io::Error) -> ApiError {
-    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
 }
 
 pub(crate) fn org_router() -> Router<AppState> {
@@ -295,7 +217,7 @@ fn authorize(identity: &Identity, org: &str, pin_write: bool) -> Result<(), ApiE
 }
 
 struct FencedCache {
-    tx: Transaction<'static, Postgres>,
+    tx: Transaction,
     id: i32,
     public: bool,
     metadata: MetadataTarget,
@@ -308,8 +230,11 @@ async fn load_cache(
     name: &str,
     identity: &Identity,
 ) -> Result<FencedCache, ApiError> {
-    let mut tx =
-        crate::profile_future!(state.pool.begin(), label = "management_policy.pool_begin").await?;
+    let mut tx = crate::profile_future!(
+        crate::db::begin(state, org),
+        label = "management_policy.pool_begin"
+    )
+    .await?;
     // Reads use the fence as well so multi-statement pin/stats responses are
     // coherent with resets, cache deletion, and publication.
     fence(&mut tx, org).await?;
@@ -324,7 +249,7 @@ async fn load_cache(
         JOIN orgs o ON o.id = c.org_id
         WHERE c.org_id = $1
             AND c.name = $2
-        FOR UPDATE OF c
+        FOR UPDATE OF c NOWAIT
         "#,
         org,
         name
@@ -389,13 +314,13 @@ async fn purge_cache(
     if state.config.cdn_zone_id.is_empty() {
         return Err(bad("no CDN is configured to purge"));
     }
+    let input = body(request).await?;
     let FencedCache {
         tx,
         public,
         metadata,
         ..
     } = load_cache(&state, org, &path.cache, &context.identity).await?;
-    let input = body(request).await?;
     strict(&input, &["storePathHashes"])?;
     let hashes = input
         .get("storePathHashes")
@@ -452,10 +377,11 @@ async fn create_pin(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     authorize_cache(&context, &path.cache, true)?;
+    let input = body(request).await?;
     let FencedCache { mut tx, id, .. } =
         load_cache(&state, org, &path.cache, &context.identity).await?;
     protocol(&mut tx, id, "nix").await?;
-    let response = put_pin(&mut tx, id, body(request).await?).await?;
+    let response = put_pin(&mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
 }
@@ -490,7 +416,7 @@ async fn remove_pin(
 }
 
 async fn reset_compiler_generation(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     id: i32,
     kind: &str,
 ) -> Result<(), ApiError> {
@@ -645,13 +571,14 @@ async fn remove_paths(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     authorize_cache(&context, &path.cache, false)?;
+    let input = body(request).await?;
     let FencedCache {
         mut tx,
         id,
         metadata,
         ..
     } = load_cache(&state, org, &path.cache, &context.identity).await?;
-    let response = delete_paths(&state, &metadata, &mut tx, id, body(request).await?).await?;
+    let response = delete_paths(&metadata, &mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
 }
@@ -712,15 +639,13 @@ async fn withdraw_cache(
         // canonical uploads, matching publication and GC's table fence.
         sqlx::query!(
             r#"
-                    LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE
+                    LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE NOWAIT
                     "#
         )
         .execute(&mut *tx)
         .await?;
-        // Drop a legacy staging session only after its provider MPU
-        // is gone. Keep the original key/ID and SQL retry record on
-        // uncertain failures. Pinned MPUs must retain their sessions
-        // as the owner of their original provider IDs until resolved.
+        // Transfer ownership of legacy staging MPUs to the cleanup queue.
+        // Pinned MPUs must retain their sessions until their consumer resolves.
         // Rust receipt markers and completed outcomes are not MPUs
         // that this withdrawal may abort.
         let uploads = sqlx::query!(
@@ -752,11 +677,8 @@ async fn withdraw_cache(
             ));
         }
         for upload in uploads {
-            state
-                .storage
-                .abort_multipart(true, &upload.r2_upload_key, &upload.r2_upload_id)
-                .await
-                .map_err(storage_error)?;
+            sqlx::query("INSERT INTO object_cleanup (is_private, key, upload_id) VALUES (TRUE, $1, $2) ON CONFLICT (is_private, key) DO UPDATE SET upload_id = EXCLUDED.upload_id")
+                .bind(&upload.r2_upload_key).bind(&upload.r2_upload_id).execute(&mut *tx).await?;
         }
     }
     // Expire every session, but preserve completed outcomes: cleanup
@@ -791,13 +713,12 @@ async fn withdraw_cache(
         )
         .fetch_all(&mut *tx)
         .await?;
-        metadata.withdraw(&state, &hashes).await?;
+        metadata.withdraw(&mut tx, &hashes).await?;
         nix += hashes.len();
         if hashes.len() < 500 {
             break;
         }
     }
-    metadata.withdraw_orphan_narinfo(&state).await?;
     let mut removed = json!({"nix":nix});
     for kind in ["go", "sccache"] {
         // Cache deletion detaches compiler entries through the foreign
@@ -823,7 +744,7 @@ async fn withdraw_cache(
                             WHERE cache_id = $1
                             ORDER BY id
                             LIMIT 500
-                            FOR UPDATE
+                            FOR UPDATE NOWAIT
                             "#,
                     id
                 )
@@ -840,18 +761,17 @@ async fn withdraw_cache(
                             WHERE cache_id = $1
                             ORDER BY id
                             LIMIT 500
-                            FOR UPDATE
+                            FOR UPDATE NOWAIT
                             "#,
                     id
                 )
                 .fetch_all(&mut *tx)
                 .await?
             };
-            state
-                .storage
-                .delete_many(entries.iter().map(|e| (true, e.r2_key.clone())).collect())
-                .await
-                .map_err(storage_error)?;
+            for entry in &entries {
+                sqlx::query("INSERT INTO object_cleanup (is_private, key) VALUES (TRUE, $1) ON CONFLICT DO NOTHING")
+                    .bind(&entry.r2_key).execute(&mut *tx).await?;
+            }
             let ids: Vec<_> = entries.iter().map(|e| e.id.clone()).collect();
             if kind == "go" {
                 sqlx::query!(
@@ -883,7 +803,7 @@ async fn withdraw_cache(
         reset_compiler_generation(&mut tx, id, kind).await?;
     }
     let response = if delete {
-        metadata.withdraw_cache_info(&state).await?;
+        metadata.withdraw_cache_info(&mut tx).await?;
         // A late legacy canonical MPU completion can outlive its
         // cache. Preserve the reservation independently of that cache,
         // and adopt canonical objects so SQL-driven GC can find them.
@@ -983,21 +903,21 @@ async fn withdraw_cache(
         )
         .execute(&mut *tx)
         .await?;
-        if public {
-            for path in &metadata.paths {
-                crate::cdn::schedule_cache(&state, path).await?;
-            }
-        }
         ok(json!({"deleted":true,"name":name,"paths":nix}))
     } else {
         ok(json!({"evicted":true,"name":name,"removed":removed,"pinsDeleted":pins}))
     };
     tx.commit().await?;
+    if delete && public {
+        for path in &metadata.paths {
+            crate::cdn::schedule_cache(&state, path).await?;
+        }
+    }
     Ok(response)
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn protocol(tx: &mut Transaction<'_, Postgres>, id: i32, kind: &str) -> Result<(), ApiError> {
+async fn protocol(tx: &mut Transaction, id: i32, kind: &str) -> Result<(), ApiError> {
     let exists = sqlx::query_scalar!(
         r#"
         SELECT EXISTS (
@@ -1019,7 +939,7 @@ async fn protocol(tx: &mut Transaction<'_, Postgres>, id: i32, kind: &str) -> Re
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn list_pins(tx: &mut Transaction<'_, Postgres>, id: i32) -> Result<Vec<Value>, ApiError> {
+async fn list_pins(tx: &mut Transaction, id: i32) -> Result<Vec<Value>, ApiError> {
     let rows = sqlx::query!(
         r#"
         SELECT
@@ -1065,11 +985,7 @@ async fn list_pins(tx: &mut Transaction<'_, Postgres>, id: i32) -> Result<Vec<Va
     Ok(pins)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn put_pin(
-    tx: &mut Transaction<'_, Postgres>,
-    cache: i32,
-    value: Value,
-) -> Result<Response, ApiError> {
+async fn put_pin(tx: &mut Transaction, cache: i32, value: Value) -> Result<Response, ApiError> {
     strict(&value, &["name", "storePath", "keep"])?;
     let name = value["name"]
         .as_str()
@@ -1292,7 +1208,7 @@ async fn put_pin(
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn list_paths(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     cache: i32,
     p: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -1349,9 +1265,8 @@ async fn list_paths(
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn delete_paths(
-    state: &AppState,
     metadata: &MetadataTarget,
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut Transaction,
     cache: i32,
     value: Value,
 ) -> Result<Response, ApiError> {
@@ -1454,9 +1369,25 @@ async fn delete_paths(
             withdrawn.push(hash.clone());
         }
     }
-    // Still inside the org/cache publication fence and transaction: partial R2
-    // failure rolls SQL back; retry finds the same rows and repeats safe deletes.
-    metadata.withdraw(state, &withdrawn).await?;
+    // Fence only the withdrawn paths, including absent named paths. Unrelated
+    // uploads remain valid; completed outcomes may replay but never republish.
+    sqlx::query(
+        "UPDATE upload_sessions SET status='aborted' WHERE cache_id=$1 \
+        AND store_path_hash=ANY($2) AND status<>'completed'",
+    )
+    .bind(cache)
+    .bind(&withdrawn)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE nar_installations SET phase='revoked' WHERE session_id IN ( \
+        SELECT id FROM upload_sessions WHERE cache_id=$1 AND store_path_hash=ANY($2))",
+    )
+    .bind(cache)
+    .bind(&withdrawn)
+    .execute(&mut **tx)
+    .await?;
+    metadata.withdraw(tx, &withdrawn).await?;
     let gone = if before.is_some() {
         deleted.clone()
     } else {
