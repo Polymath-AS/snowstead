@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            u.id,\n            u.cache_id,\n            u.store_path_hash,\n            u.store_path,\n            u.nar_hash,\n            u.nar_size,\n            u.file_hash,\n            u.file_size,\n            u.references_json,\n            u.deriver,\n            u.system,\n            u.status,\n            u.r2_upload_id,\n            u.part_size,\n            u.staging_capacity,\n            c.org_id,\n            c.name,\n            c.is_public,\n            o.slug,\n            o.private_caches,\n            u.publication_result\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        JOIN orgs o ON o.id = c.org_id\n        WHERE u.id = ANY($1)\n            AND u.expires_at > NOW()\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        ",
+  "query": "\n        SELECT\n            u.id,\n            u.cache_id,\n            u.store_path_hash,\n            u.store_path,\n            u.nar_hash,\n            u.nar_size,\n            u.file_hash,\n            u.file_size,\n            u.references_json,\n            u.deriver,\n            u.system,\n            u.status,\n            u.r2_upload_id,\n            u.part_size,\n            u.staging_capacity,\n            c.org_id,\n            c.name,\n            c.is_public,\n            o.slug,\n            o.private_caches,\n            u.publication_result,\n            u.push_job_id,\n            (u.push_job_id IS NULL OR EXISTS (\n                SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti\n                WHERE j.id=u.push_job_id AND j.cache_id=u.cache_id AND j.creator=$2 AND $3\n                    AND (j.state='sealed' OR (j.state='completed' AND u.status='completed'))\n                    AND j.idle_expires_at>NOW()\n                    AND j.hard_expires_at>NOW() AND j.authorization_expires_at>NOW()\n                    AND t.revoked_at IS NULL\n            )) AS \"job_authorized!\"\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        JOIN orgs o ON o.id = c.org_id\n        WHERE u.id = ANY($1)\n            AND u.expires_at > NOW()\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        ",
   "describe": {
     "columns": [
       {
@@ -233,11 +233,30 @@
             "name": "publication_result"
           }
         }
+      },
+      {
+        "ordinal": 21,
+        "name": "push_job_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "push_job_id"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "job_authorized!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "TextArray"
+        "TextArray",
+        "Text",
+        "Bool"
       ]
     },
     "nullable": [
@@ -261,8 +280,10 @@
       false,
       false,
       false,
-      true
+      true,
+      true,
+      null
     ]
   },
-  "hash": "04dd6f46146bb8357e76f4496e4d86084fc47ea255a9fc1420692b0ad359ce7a"
+  "hash": "1b01cdf3d5c7ae31844c8ebdc44344767afa43dace3c741c411b7ce339952da7"
 }

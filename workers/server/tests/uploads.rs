@@ -18,6 +18,10 @@ use tower::ServiceExt;
 
 fn token(org: &str, cache: &str) -> String {
     let claims = json!({"jti":format!("{org}-{cache}"),"sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":["push","pull"]});
+    signed_token(claims)
+}
+
+fn signed_token(claims: Value) -> String {
     let input = format!(
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -116,6 +120,3331 @@ async fn create(app: &Router, cache: &str, credential: &str, input: Value) -> Va
     .await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
     result["sessions"][0].clone()
+}
+
+async fn put_manifest(
+    app: &Router,
+    job: &str,
+    index: usize,
+    credential: &str,
+    members: Value,
+) -> StatusCode {
+    send(
+        app,
+        "PUT",
+        &format!("{job}/manifest/{index}"),
+        Some(credential),
+        &[("content-type", "application/json")],
+        serde_json::to_vec(&json!({"members":members})).unwrap(),
+    )
+    .await
+    .0
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn durable_manifest_replay_normalization_and_pagination(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true),('other',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let mut config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    config.push_jobs.members = 3;
+    config.push_jobs.chunk_members = 2;
+    let storage = common::storage();
+    let fresh = || {
+        router(
+            AppState::new(
+                pool.clone(),
+                config.clone(),
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        )
+    };
+    let app = fresh();
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let raw = nar(b"manifest bytes are not an upload");
+    let mut x = path_input(&"0".repeat(32), &raw, false);
+    let y = path_input(&"1".repeat(32), &raw, false);
+    let z = path_input(&"2".repeat(32), &raw, false);
+    let x_name = x["storePath"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/nix/store/")
+        .unwrap()
+        .to_owned();
+    let y_name = y["storePath"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/nix/store/")
+        .unwrap()
+        .to_owned();
+    x["references"] = json!([y_name, x_name, y_name]);
+    let identity = json!({"idempotencyKey":"build-1","mode":"closure","roots":[z["storePath"],x["storePath"]]});
+    let (status, created) = post(&app, base, &auth, identity.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created["capabilities"],
+        json!(["manifest", "prepareOnly", "completion", "readiness"])
+    );
+    let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([y, x])).await,
+        StatusCode::OK
+    );
+    // Another process reconstructs the builder entirely from durable rows.
+    let app = fresh();
+    let (_, replay) = post(&app, base, &auth, identity.clone()).await;
+    assert_eq!(replay["job"]["id"], created["job"]["id"]);
+    assert_eq!(replay["job"]["revision"], 1);
+    let mut normalized = x.clone();
+    normalized["references"] = json!([x_name, y_name]);
+    normalized["inline"] = json!(true);
+    normalized["narHash"] = json!(format!("sha256:{}", hex::encode(Sha256::digest(&raw))));
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([normalized, y])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([z])).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 1, &auth, json!([z])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 2, &auth, json!([x, y])).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let (status, sealed) = post(&app, &format!("{job}/seal"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{sealed}");
+    assert_eq!(sealed["job"]["state"], "sealed");
+    assert_eq!(sealed["job"]["revision"], 2);
+    assert_eq!(sealed["job"]["manifestDigest"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        put_manifest(&app, &job, 2, &auth, json!([x])).await,
+        StatusCode::CONFLICT
+    );
+    let app = fresh();
+    let (status, replay) = post(&app, &format!("{job}/seal"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["job"], sealed["job"]);
+    let (status, _, bytes) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page["chunks"], json!([0, 1]));
+    assert_eq!(page["members"].as_array().unwrap().len(), 2);
+    assert_eq!(page["members"][0]["storePath"], x["storePath"]);
+    assert_eq!(page["members"][1]["storePath"], y["storePath"]);
+    let (status, _, bytes) = send(
+        &app,
+        "GET",
+        &format!("{job}?after={}", page["next"].as_str().unwrap()),
+        Some(&auth),
+        &[],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page["members"].as_array().unwrap().len(), 1);
+    assert_eq!(page["members"][0]["storePath"], z["storePath"]);
+    assert!(page["next"].is_null());
+    // Chunk partition and arrival order do not change the sealed identity.
+    let mut identity2 = identity.clone();
+    identity2["idempotencyKey"] = json!("build-2");
+    identity2["roots"] = json!([x["storePath"], z["storePath"], x["storePath"]]);
+    let (_, second) = post(&app, base, &auth, identity2).await;
+    let second = format!("{base}/{}", second["job"]["id"].as_str().unwrap());
+    assert_eq!(
+        put_manifest(&app, &second, 1, &auth, json!([x, z])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{second}/seal"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put_manifest(&app, &second, 0, &auth, json!([y])).await,
+        StatusCode::OK
+    );
+    let (status, second) = post(&app, &format!("{second}/seal"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["job"]["manifestDigest"],
+        sealed["job"]["manifestDigest"]
+    );
+    let mut conflict = identity;
+    conflict["mode"] = json!("selected");
+    assert_eq!(
+        post(&app, base, &auth, conflict).await.0,
+        StatusCode::CONFLICT
+    );
+    // A sealed manifest is not an upload, does not reserve quota, and cannot
+    // expose private or other-cache manifests to a different token actor.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &job,
+            Some(&token("default", "manifest")),
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &job.replace("caches/manifest", "caches/other"),
+            Some(&auth),
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM upload_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_authorization_is_bounded_and_cancellation_is_terminal(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let mut config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    config.push_jobs.active_per_org = 1;
+    let fresh = || {
+        router(
+            AppState::new(
+                pool.clone(),
+                config.clone(),
+                common::storage(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        )
+    };
+    let app = fresh();
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let input = path_input(&"0".repeat(32), &nar(b"authorization"), false);
+    let identity = json!({"idempotencyKey":"lease","mode":"selected","roots":[input["storePath"]]});
+    let (_, created) = post(&app, base, &auth, identity.clone()).await;
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([input])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+        StatusCode::OK
+    );
+    // Signed but unregistered JWTs retain legacy upload access, not delegation.
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    pool_execute(
+        &pool,
+        "INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');",
+    )
+    .await;
+    let now: i64 = sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM NOW()))::bigint")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let short = signed_token(
+        json!({"jti":"default-*","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,
+        "exp":now+120,"org":"default","caches":["*"],"perms":["push"]}),
+    );
+    let (status, leased) = post(&app, &format!("{job}/resume"), &short, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{leased}");
+    assert_eq!(leased["job"]["authorizationExpiresAt"], now + 120);
+    assert_eq!(leased["job"]["grantGeneration"], 1);
+    assert_eq!(
+        leased["capabilities"],
+        json!(["manifest", "prepareOnly", "completion", "readiness"])
+    );
+    // Request authentication tolerates clock skew; delegation does not extend
+    // an already expired credential into a fresh background lease.
+    let expired = signed_token(
+        json!({"jti":"default-*","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,
+        "exp":now-1,"org":"default","caches":["*"],"perms":["push"]}),
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &expired, json!({}))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, idle) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{idle}");
+    assert_eq!(
+        idle["job"]["authorizationExpiresAt"],
+        idle["job"]["expiresAt"]
+    );
+    assert!(
+        idle["job"]["authorizationExpiresAt"].as_i64().unwrap()
+            < idle["job"]["hardExpiresAt"].as_i64().unwrap()
+    );
+    sqlx::query("UPDATE push_jobs SET hard_expires_at=to_timestamp($2::bigint::double precision) WHERE id=$1")
+        .bind(id).bind(now+600).execute(&pool).await.unwrap();
+    let restarted = fresh();
+    let (status, renewed) = post(&restarted, &format!("{job}/resume"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    assert_eq!(renewed["job"]["authorizationExpiresAt"], now + 600);
+    assert_eq!(renewed["job"]["grantGeneration"], 3);
+    // Cancellation remains possible after policy removes permission to upload.
+    pool_execute(&pool,"UPDATE caches SET is_public=false; UPDATE orgs SET private_caches=false WHERE id='default'; DELETE FROM cache_protocols;").await;
+    assert_eq!(
+        post(&restarted, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, cancelled) = post(&restarted, &format!("{job}/cancel"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["job"]["state"], "cancelled");
+    assert_eq!(cancelled["job"]["grantGeneration"], 4);
+    assert!(cancelled["job"]["authorizationExpiresAt"].is_null());
+    assert_eq!(
+        post(&fresh(), &format!("{job}/cancel"), &auth, json!({}))
+            .await
+            .1,
+        cancelled
+    );
+    pool_execute(&pool,"UPDATE caches SET is_public=true; INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
+    for action in ["resume", "seal"] {
+        assert_eq!(
+            post(&app, &format!("{job}/{action}"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([input])).await,
+        StatusCode::CONFLICT
+    );
+    let replay = post(&app, base, &auth, identity).await;
+    assert_eq!(replay.0, StatusCode::OK);
+    assert_eq!(replay.1["job"]["state"], "cancelled");
+    let (_, next) = post(
+        &app,
+        base,
+        &auth,
+        json!({"idempotencyKey":"next","mode":"selected","roots":[input["storePath"]]}),
+    )
+    .await;
+    let next_id = next["job"]["id"].as_str().unwrap();
+    sqlx::query("UPDATE push_jobs SET idle_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(next_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        post(&app, &format!("{base}/{next_id}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::GONE
+    );
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');",
+    )
+    .await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let input = path_input(&"0".repeat(32), &nar(b"revocation"), false);
+    let (_, created) = post(
+        &app,
+        base,
+        &auth,
+        json!({"idempotencyKey":"revoke","mode":"selected","roots":[input["storePath"]]}),
+    )
+    .await;
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([input])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let revoke = "/_api/v1/orgs/default/tokens/default-*/revoke";
+    let mut fence = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default',0))")
+        .execute(&mut *fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        post(
+            &app,
+            revoke,
+            "operator-secret",
+            json!({"reason":"test revocation"})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    fence.rollback().await.unwrap();
+    let resume = format!("{job}/resume");
+    let (revoked, renewed) = tokio::join!(
+        post(
+            &app,
+            revoke,
+            "operator-secret",
+            json!({"reason":"test revocation"})
+        ),
+        post(&app, &resume, &auth, json!({}))
+    );
+    let revoked = if revoked.0 == StatusCode::SERVICE_UNAVAILABLE {
+        post(
+            &app,
+            revoke,
+            "operator-secret",
+            json!({"reason":"test revocation"}),
+        )
+        .await
+    } else {
+        revoked
+    };
+    assert_eq!(revoked.0, StatusCode::OK, "{revoked:?}");
+    assert!(
+        matches!(
+            renewed.0,
+            StatusCode::OK | StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "{renewed:?}"
+    );
+    assert_eq!(
+        post(&app, &resume, &auth, json!({})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let revoked:bool=sqlx::query_scalar("SELECT authorization_jti IS NULL AND authorization_expires_at IS NULL AND grant_generation>=2 FROM push_jobs WHERE id=$1")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    assert!(
+        revoked,
+        "revocation must invalidate the durable grant, regardless of the race winner"
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping_jobs(
+    pool: PgPool,
+) {
+    pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true),('other',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let raw = nar(b"protected");
+    let mut x = path_input(&"0".repeat(32), &raw, false);
+    let y = path_input(&"1".repeat(32), &raw, false);
+    let z = path_input(&"2".repeat(32), &raw, false);
+    x["references"] = json!([
+        format!("{}-fixture", "2".repeat(32)),
+        format!("{}-fixture", "1".repeat(32))
+    ]);
+    let mut jobs = Vec::new();
+    for (index, member) in [x.clone(), x.clone(), y.clone(), z.clone()]
+        .iter()
+        .enumerate()
+    {
+        let (status,created)=post(&app,base,&auth,json!({"idempotencyKey":format!("protect-{index}"),"mode":"selected","roots":[member["storePath"]]})).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, json!([member])).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&app, &format!("{job}/resume"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        jobs.push(job);
+    }
+    // A member published later by a legacy writer also inherits protection.
+    // Its reference order/duplicates do not alter content identity.
+    sqlx::query("WITH b AS (INSERT INTO blob_objects(file_hash,compression,r2_key,file_size) VALUES('protected','zstd','protected',12) RETURNING id)
+        INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,references_json)
+        SELECT j.cache_id,m.store_path_hash,m.metadata->>'storePath',m.metadata->>'narHash',(m.metadata->>'narSize')::bigint,b.id,$1
+        FROM push_jobs j JOIN push_job_members m ON m.job_id=j.id CROSS JOIN b WHERE j.idempotency_key='protect-0'")
+        .bind(json!([x["references"][0],x["references"][1],x["references"][0]]).to_string()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,references_json)
+        SELECT c.id,p.store_path_hash,p.store_path,p.nar_hash,p.nar_size,p.blob_object_id,p.references_json
+        FROM published_paths p CROSS JOIN caches c WHERE c.name='other'").execute(&pool).await.unwrap();
+    let eviction = "/_api/v1/orgs/default/eviction";
+    let inventory = || send(&app, "GET", eviction, Some("operator-secret"), &[], vec![]);
+    let (status, _, bytes) = inventory().await;
+    assert_eq!(status, StatusCode::OK);
+    let visible = serde_json::from_slice::<Value>(&bytes).unwrap();
+    assert_eq!(visible["next"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        visible["next"]["items"][0]["cache"], "other",
+        "protection must not cross cache boundaries even for shared bytes"
+    );
+    sqlx::query("UPDATE published_paths SET nar_size=nar_size+1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, _, bytes) = inventory().await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["next"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "a hash match alone must not protect conflicting metadata"
+    );
+    sqlx::query("UPDATE published_paths SET nar_size=nar_size-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // One cancelled job cannot release another job's overlapping protection.
+    assert_eq!(
+        post(&app, &format!("{}/cancel", jobs[0]), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, _, bytes) = inventory().await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["next"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Explicit deletion wins over temporary protection, including absent names.
+    let (status, result) = post(
+        &app,
+        "/_api/v1/orgs/default/caches/manifest/paths/delete",
+        "operator-secret",
+        json!({"storePathHashes":[x["storePathHash"],z["storePathHash"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    for index in [0, 1, 3] {
+        assert_eq!(
+            post(&app, &format!("{}/resume", jobs[index]), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        post(&app, &format!("{}/resume", jobs[2]), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(
+            &app,
+            "/_api/v1/orgs/default/caches/manifest/evict",
+            "operator-secret",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{}/resume", jobs[2]), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_completion_checks_current_members_and_preserves_history(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) \
+        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+    )
+    .await;
+    let mut config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    config.push_jobs.active_per_org = 1;
+    config.push_jobs.members = 1;
+    config.push_jobs.chunk_members = 1;
+    config.push_jobs.protected_members_per_org = 130;
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let raw = nar(b"already cached completion");
+    let mut member = path_input(&"0".repeat(32), &raw, false);
+    // Selected mode does not require an external reference to be present.
+    member["references"] = json!([format!("{}-external", "1".repeat(32))]);
+    let identity =
+        json!({"idempotencyKey":"completion","mode":"selected","roots":[member["storePath"]]});
+    let (status, created) = post(&app, base, &auth, identity.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        post(&app, &format!("{job}/complete"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([member])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let missing = post(&app, &format!("{job}/complete"), &auth, json!({})).await;
+    assert_eq!(missing.0, StatusCode::CONFLICT, "{}", missing.1);
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    sqlx::query("WITH b AS (INSERT INTO blob_objects(file_hash,compression,r2_key,file_size) VALUES($2,'zstd','completion',$3) RETURNING id) \
+        INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,references_json) \
+        SELECT j.cache_id,m.store_path_hash,m.metadata->>'storePath',m.metadata->>'narHash', \
+        (m.metadata->>'narSize')::bigint+1,b.id,(m.metadata->'references')::text \
+        FROM push_jobs j JOIN push_job_members m ON m.job_id=j.id CROSS JOIN b WHERE j.id=$1")
+        .bind(id).bind(hex::encode(Sha256::digest(&compressed))).bind(compressed.len() as i64)
+        .execute(&pool).await.unwrap();
+    assert_eq!(
+        post(&app, &format!("{job}/complete"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "a conflicting cached entry is not completion"
+    );
+    let (status, _, summary) = send(
+        &app,
+        "GET",
+        &format!("{job}?summary=true"),
+        Some(&auth),
+        &[],
+        vec![],
+    )
+    .await;
+    let summary: Value = serde_json::from_slice(&summary).unwrap();
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(
+        summary["available"], false,
+        "metadata must match, not merely exist"
+    );
+    assert_eq!(summary["blocked"], false);
+    assert_eq!(summary["members"], json!([]));
+    assert!(summary["next"].is_null());
+    sqlx::query("UPDATE published_paths SET nar_size=nar_size-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, summary) = send(
+        &app,
+        "GET",
+        &format!("{job}?summary=true"),
+        Some(&auth),
+        &[],
+        vec![],
+    )
+    .await;
+    let summary: Value = serde_json::from_slice(&summary).unwrap();
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["available"], true);
+    assert_eq!(
+        summary["job"]["state"], "sealed",
+        "readiness must not complete the job"
+    );
+    // No linked upload session is needed when the complete set already exists.
+    let (status, completed) = post(&app, &format!("{job}/complete"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(completed["job"]["state"], "completed");
+    let receipt = completed["job"].clone();
+    assert_eq!(
+        receipt["protectionExpiresAt"].as_i64().unwrap() - receipt["completedAt"].as_i64().unwrap(),
+        300
+    );
+    for operation in ["complete", "cancel", "seal"] {
+        let (status, replay) = post(&app, &format!("{job}/{operation}"), &auth, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(
+            replay["job"], receipt,
+            "{operation} must not mutate a completed receipt"
+        );
+    }
+    let (status, replay) = post(&app, base, &auth, identity).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["job"], receipt);
+    let (status, resumed) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["job"], receipt);
+    assert_eq!(resumed["available"], true);
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(
+            &app,
+            "/_api/v1/caches/manifest/upload-streams/batch",
+            &auth,
+            json!({"jobId":id,"paths":[member]})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT,
+        "completion must not issue more upload grants"
+    );
+    let inventory = || {
+        send(
+            &app,
+            "GET",
+            "/_api/v1/orgs/default/eviction",
+            Some("operator-secret"),
+            &[],
+            vec![],
+        )
+    };
+    let (_, _, bytes) = inventory().await;
+    assert!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["next"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let next = json!({"idempotencyKey":"next","mode":"selected","roots":[member["storePath"]]});
+    let mut completed_ids = vec![id.to_owned()];
+    // Cross the former 128-job cap without expiring or revoking any grace.
+    for index in 0..129 {
+        let during_grace = json!({"idempotencyKey":format!("during-grace-{index}"),"mode":"selected","roots":[member["storePath"]]});
+        let (status, additional) = post(&app, base, &auth, during_grace.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "completion frees the active slot: {additional}"
+        );
+        assert_eq!(
+            post(&app, base, &auth, next.clone()).await.0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "unfinished jobs still consume the active slot"
+        );
+        let additional_id = additional["job"]["id"].as_str().unwrap();
+        let additional_job = format!("{base}/{additional_id}");
+        assert_eq!(
+            put_manifest(&app, &additional_job, 0, &auth, json!([member])).await,
+            StatusCode::OK
+        );
+        for operation in ["seal", "resume", "complete"] {
+            let (status, result) = post(
+                &app,
+                &format!("{additional_job}/{operation}"),
+                &auth,
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+        }
+        assert_eq!(
+            post(&app, base, &auth, during_grace).await.0,
+            StatusCode::OK,
+            "replay needs no new budget"
+        );
+        completed_ids.push(additional_id.to_owned());
+    }
+    assert_eq!(
+        post(&app, base, &auth, next.clone()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "completion protection has a separate bounded budget"
+    );
+    // No maintenance run: the query alone releases grace and its budget.
+    sqlx::query(
+        "UPDATE push_jobs SET protection_expires_at=NOW()-INTERVAL '1 second' WHERE id=ANY($1)",
+    )
+    .bind(&completed_ids[..completed_ids.len() - 1])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (_, _, bytes) = inventory().await;
+    assert!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["next"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the last completed job still protects the shared path"
+    );
+    sqlx::query("UPDATE push_jobs SET protection_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(completed_ids.last().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, _, bytes) = inventory().await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["next"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (status, next) = post(&app, base, &auth, next).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let next_id = next["job"]["id"].as_str().unwrap();
+    let next_job = format!("{base}/{next_id}");
+    assert_eq!(
+        put_manifest(&app, &next_job, 0, &auth, json!([member])).await,
+        StatusCode::OK
+    );
+    for operation in ["seal", "resume"] {
+        assert_eq!(
+            post(&app, &format!("{next_job}/{operation}"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let mut pending_member = member.clone();
+    pending_member["inline"] = json!(true);
+    let (status, pending) = post(
+        &app,
+        "/_api/v1/caches/manifest/upload-streams/batch",
+        &auth,
+        json!({"jobId":next_id,"paths":[pending_member]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pending}");
+    let session = pending["sessions"][0]["sessionId"].as_str().unwrap();
+    assert_eq!(
+        post(&app, &format!("{next_job}/complete"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, replay) = post(&app, &format!("{next_job}/resume"), &auth, json!({})).await;
+    assert_eq!(replay["available"], true);
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!(
+                "/_api/v1/uploads/{session}/inline?fileHash={}",
+                "0".repeat(64)
+            ),
+            Some(&auth),
+            &[("content-length", "0")],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "completion must expire unfinished grants even when another writer supplied the path"
+    );
+    let (status, deleted) = post(
+        &app,
+        "/_api/v1/orgs/default/caches/manifest/paths/delete",
+        "operator-secret",
+        json!({"storePathHashes":[member["storePathHash"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (status, resumed) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["job"]["state"], "completed");
+    assert_eq!(resumed["job"]["completedAt"], receipt["completedAt"]);
+    assert_eq!(resumed["available"], false);
+    assert_eq!(
+        post(&app, &format!("{job}/complete"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "historical completion must not recreate a withdrawn path"
+    );
+    // A reclaimed manifest has unknown availability, not a vacuous success.
+    sqlx::query("WITH expired AS (UPDATE push_jobs SET manifest_bytes=0,idle_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1 RETURNING id), \
+        chunks AS (DELETE FROM push_manifest_chunks WHERE job_id IN (SELECT id FROM expired)) \
+        DELETE FROM push_job_members WHERE job_id IN (SELECT id FROM expired)")
+        .bind(id).execute(&pool).await.unwrap();
+    let (status, resumed) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["job"]["state"], "completed");
+    assert_eq!(resumed["job"]["completedAt"], receipt["completedAt"]);
+    assert!(resumed["available"].is_null());
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: PgPool) {
+    pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    let storage = common::storage();
+    let fresh = || {
+        router(
+            AppState::new(
+                pool.clone(),
+                config.clone(),
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        )
+    };
+    let app = fresh();
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
+    let raw = nar(b"parent bytes");
+    let child_raw = nar(b"different prerequisite bytes");
+    let mut parent = path_input(&"0".repeat(32), &raw, false);
+    let child = path_input(&"1".repeat(32), &child_raw, true);
+    let spare = path_input(&"2".repeat(32), &raw, true);
+    parent["references"] = json!([
+        format!("{}-fixture", "1".repeat(32)),
+        format!("{}-fixture", "0".repeat(32)),
+        format!("{}-fixture", "1".repeat(32))
+    ]);
+    let (status, created) = post(
+        &app,
+        base,
+        &auth,
+        json!({"idempotencyKey":"uploads","mode":"closure","roots":[parent["storePath"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([parent, child, spare])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+        StatusCode::OK
+    );
+    let request = json!({"jobId":id,"paths":[parent,child,spare]});
+    assert_eq!(
+        post(&app, allocate, &auth, request.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut wrong = child.clone();
+    wrong["narSize"] = json!(child_raw.len() + 1);
+    for paths in [
+        json!([parent, wrong]),
+        json!([path_input(&"3".repeat(32), &raw, true)]),
+        json!([child, child]),
+    ] {
+        assert_ne!(
+            post(&app, allocate, &auth, json!({"jobId":id,"paths":paths}))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+    let (status, allocated) = post(&app, allocate, &auth, request.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{allocated}");
+    let parent_id = allocated["sessions"][0]["sessionId"].as_str().unwrap();
+    let child_id = allocated["sessions"][1]["sessionId"].as_str().unwrap();
+    let spare_id = allocated["sessions"][2]["sessionId"].as_str().unwrap();
+    // A restarted server returns the same sessions in the new request order.
+    // Inline is a hint on first allocation, not permission to replace a receipt.
+    let mut changed_hint = child.clone();
+    changed_hint["inline"] = json!(false);
+    let restarted = fresh();
+    let (status, replay) = post(
+        &restarted,
+        allocate,
+        &auth,
+        json!({"jobId":id,"paths":[changed_hint,parent]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{replay}");
+    assert_eq!(replay["sessions"][0]["sessionId"], child_id);
+    assert_eq!(replay["sessions"][0]["inline"], true);
+    assert_eq!(replay["sessions"][1]["sessionId"], parent_id);
+    assert_eq!(
+        post(
+            &app,
+            allocate,
+            &token("default", "manifest"),
+            request.clone()
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(
+            &app,
+            &format!("/_api/v1/uploads/{parent_id}/parts"),
+            &token("default", "manifest"),
+            json!({"parts":[{"partNumber":1,"size":1}]})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    let file_hash = hex::encode(Sha256::digest(&compressed));
+    assert_eq!(
+        post(
+            &app,
+            &format!("/_api/v1/uploads/{parent_id}/parts"),
+            &auth,
+            json!({"parts":[{"partNumber":1,"size":compressed.len()}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, _, uploaded) = send(
+        &app,
+        "PUT",
+        &format!("/_api/v1/uploads/{parent_id}/part/1"),
+        Some(&auth),
+        &[("content-length", &compressed.len().to_string())],
+        compressed.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&uploaded)
+    );
+    let receipt = json!({"uploads":[{"sessionId":parent_id,"narHash":parent["narHash"],"narSize":raw.len(),"fileHash":file_hash,"fileSize":compressed.len(),"parts":[{"partNumber":1,"etag":serde_json::from_slice::<Value>(&uploaded).unwrap()["etag"]}]}]});
+    // Interrupt after the immutable receipt commits, before a candidate can
+    // start. A restarted caller must recover without rewriting sealed parts.
+    pool_execute(&pool, "CREATE FUNCTION reject_preparation_start() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        RAISE EXCEPTION 'injected preparation startup failure'; END $$;
+        CREATE TRIGGER reject_preparation_start BEFORE INSERT ON nar_installations FOR EACH ROW EXECUTE FUNCTION reject_preparation_start();").await;
+    let (_, interrupted) = post(
+        &app,
+        "/_api/v1/uploads/finalize?prepareOnly=true",
+        &auth,
+        receipt.clone(),
+    )
+    .await;
+    assert_eq!(
+        interrupted["results"][0]["published"], false,
+        "{interrupted}"
+    );
+    assert_eq!(interrupted["results"][0]["status"], 500);
+    pool_execute(&pool, "DROP TRIGGER reject_preparation_start ON nar_installations; DROP FUNCTION reject_preparation_start();").await;
+    let (_, recovery) = post(&fresh(), allocate, &auth, request.clone()).await;
+    assert_eq!(recovery["sessions"][0]["status"], "finalizing");
+    assert_eq!(recovery["sessions"][0]["prepared"], false);
+    let mut recovered_receipt = recovery["sessions"][0]["receipt"].clone();
+    // The server canonicalizes equivalent NAR hash encodings. Successful
+    // finalization below also checks that the returned hash is equivalent.
+    recovered_receipt["narHash"] = parent["narHash"].clone();
+    assert_eq!(recovered_receipt, receipt["uploads"][0]);
+    assert!(recovery["sessions"][1]["receipt"].is_null());
+    let (status, prepared) = post(
+        &app,
+        "/_api/v1/uploads/finalize?prepareOnly=true",
+        &auth,
+        json!({"uploads":[recovery["sessions"][0]["receipt"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    assert_eq!(prepared["results"][0]["prepared"], true, "{prepared}");
+    assert_eq!(prepared["results"][0]["published"], false);
+    assert_eq!(prepared["results"][0]["status"], 202);
+    let (_, reused) = post(&fresh(), allocate, &auth, request.clone()).await;
+    assert_eq!(reused["sessions"][0]["sessionId"], parent_id);
+    assert_eq!(reused["sessions"][0]["prepared"], true, "{reused}");
+    assert_eq!(reused["sessions"][1]["prepared"], false, "{reused}");
+    let (status, _, progress) = send(&fresh(), "GET", &job, Some(&auth), &[], vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    let progress: Value = serde_json::from_slice(&progress).unwrap();
+    assert_eq!(
+        progress["members"][0]["session"]["prepared"], true,
+        "{progress}"
+    );
+    assert_eq!(progress["members"][0]["available"], false);
+    let (status, blocked) = post(&app, "/_api/v1/uploads/finalize", &auth, receipt.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{blocked}");
+    assert_eq!(blocked["results"][0]["status"], 409, "{blocked}");
+    assert!(
+        blocked["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("prerequisites missing"),
+        "{blocked}"
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+
+    sqlx::query(
+        "UPDATE push_jobs SET authorization_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (_, expired) = post(&app, "/_api/v1/uploads/finalize", &auth, receipt.clone()).await;
+    assert_eq!(expired["results"][0]["status"], 409, "{expired}");
+    assert_eq!(
+        post(&app, allocate, &auth, request.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let child_compressed = zstd::stream::encode_all(child_raw.as_slice(), 3).unwrap();
+    let child_hash = hex::encode(Sha256::digest(&child_compressed));
+    let frame = inline_frame(
+        &json!([{"sessionId":child_id,"fileHash":child_hash,"fileSize":child_compressed.len()}]),
+        &[child_compressed],
+    );
+    let (status, _, prepared) = send(
+        &app,
+        "POST",
+        "/_api/v1/uploads/inline/batch?prepareOnly=true",
+        Some(&auth),
+        &[
+            ("content-type", "application/octet-stream"),
+            ("content-length", &frame.len().to_string()),
+        ],
+        frame,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: Value = serde_json::from_slice(&prepared).unwrap();
+    assert_eq!(prepared["results"][0]["published"], false, "{prepared}");
+    assert_eq!(prepared["results"][0]["prepared"], true, "{prepared}");
+    // Two restarted processes recover prepared work without a client finalize
+    // retry. A crashed worker's live claim must not be stolen before expiry.
+    sqlx::query("UPDATE push_jobs SET work_id='crashed-worker',work_expires_at=NOW()+INTERVAL '1 minute' WHERE id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    let mut workers = Vec::new();
+    let mut stops = Vec::new();
+    for _ in 0..2 {
+        let worker_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let mut worker_config = config.clone();
+        worker_config.push_jobs.publication_workers = 1;
+        let worker = AppState::new(
+            worker_pool,
+            worker_config,
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        stops.push(stop);
+        workers.push(tokio::spawn(snowstead_server::serve(
+            listener,
+            worker,
+            async move {
+                let _ = stopped.await;
+            },
+        )));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // Reclaiming execution is not renewed publication authority.
+    sqlx::query("UPDATE push_jobs SET work_expires_at=NOW()-INTERVAL '1 second',authorization_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if send(
+                &app,
+                "GET",
+                &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+                None,
+                &[],
+                vec![],
+            )
+            .await
+            .0 == StatusCode::OK
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restarted workers must publish the prepared root without another client request");
+    for stop in stops {
+        stop.send(()).unwrap();
+    }
+    for worker in workers {
+        worker.await.unwrap().unwrap();
+    }
+    // Receipt replay observes background publication, without another byte upload.
+    let restarted = fresh();
+    let (_, completed) = post(
+        &restarted,
+        "/_api/v1/uploads/finalize?prepareOnly=true",
+        &auth,
+        receipt,
+    )
+    .await;
+    assert_eq!(completed["results"][0]["published"], true, "{completed}");
+    let (_, _, progress) = send(&restarted, "GET", &job, Some(&auth), &[], vec![]).await;
+    let progress: Value = serde_json::from_slice(&progress).unwrap();
+    assert_eq!(progress["members"][0]["available"], true, "{progress}");
+    assert_eq!(progress["members"][0]["session"]["status"], "completed");
+    let (_, replay) = post(&restarted, allocate, &auth, request.clone()).await;
+    assert_eq!(replay["sessions"][0]["sessionId"], parent_id);
+    assert_eq!(replay["sessions"][0]["status"], "completed");
+    assert_eq!(
+        replay["sessions"][0]["publicationResult"]["published"],
+        true
+    );
+    let (status, _, downloaded) = send(
+        &restarted,
+        "GET",
+        &format!("/default/manifest/nar/{file_hash}/zstd.nar"),
+        None,
+        &[],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(downloaded, compressed);
+
+    // A legacy writer can win a path first, but different metadata is not a
+    // successful job skip. Keep its bytes and report the conflict explicitly.
+    let other_raw = nar(b"legacy won with other content");
+    let other = create(
+        &app,
+        "manifest",
+        &auth,
+        path_input(&"2".repeat(32), &other_raw, true),
+    )
+    .await;
+    let other_compressed = zstd::stream::encode_all(other_raw.as_slice(), 3).unwrap();
+    let other_hash = hex::encode(Sha256::digest(&other_compressed));
+    let (_, _, published) = send(
+        &app,
+        "POST",
+        &format!(
+            "/_api/v1/uploads/{}/inline?fileHash={other_hash}",
+            other["sessionId"].as_str().unwrap()
+        ),
+        Some(&auth),
+        &[("content-length", &other_compressed.len().to_string())],
+        other_compressed,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&published).unwrap()["published"],
+        true
+    );
+    let (_, _, conflict) = send(
+        &app,
+        "POST",
+        &format!("/_api/v1/uploads/{spare_id}/inline?fileHash={file_hash}"),
+        Some(&auth),
+        &[("content-length", &compressed.len().to_string())],
+        compressed.clone(),
+    )
+    .await;
+    let conflict: Value = serde_json::from_slice(&conflict).unwrap();
+    assert_eq!(conflict["published"], false, "{conflict}");
+    assert_eq!(conflict["status"], 409, "{conflict}");
+    assert!(
+        conflict["error"]
+            .as_str()
+            .unwrap()
+            .contains("metadata conflict")
+    );
+    assert_eq!(
+        post(&app, &format!("{job}/cancel"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, allocate, &auth, request).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!("/_api/v1/uploads/{spare_id}/inline?fileHash={file_hash}"),
+            Some(&auth),
+            &[("content-length", &compressed.len().to_string())],
+            compressed
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPool) {
+    pool_execute(&pool,"INSERT INTO orgs(id,slug) VALUES('org_z','zeta'); \
+        INSERT INTO caches(name,is_public,org_id) VALUES('manifest',true,'default'),('manifest',true,'org_z'); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES \
+        ('default-*','cli','default','[\"push\"]','fixture'),('org_z-*','cli','org_z','[\"push\"]','fixture');").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let storage = common::storage();
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config.clone(),
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    // Incompressible enough to exceed the entire default org's retained quota.
+    let mut random = 7u32;
+    let large: Vec<u8> = (0..4096)
+        .map(|_| {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            (random >> 24) as u8
+        })
+        .collect();
+    let raw = [
+        nar(&large),
+        nar(b"first small member"),
+        nar(b"second small member"),
+        nar(b"prerequisite"),
+    ];
+    let bytes: Vec<_> = raw
+        .iter()
+        .map(|n| zstd::stream::encode_all(n.as_slice(), 3).unwrap())
+        .collect();
+    let limit = bytes[3].len() + bytes[1].len().max(bytes[2].len());
+    assert!(bytes[0].len() > limit);
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
+    let mut jobs = Vec::new();
+    for org in ["default", "org_z"] {
+        let auth = token(org, "*");
+        let indices: Vec<usize> = if org == "default" {
+            vec![0, 1, 2, 3]
+        } else {
+            vec![2, 3]
+        };
+        let members: Vec<_> = indices
+            .iter()
+            .map(|&i| {
+                let mut member = path_input(&i.to_string().repeat(32), &raw[i], true);
+                if i != 3 {
+                    member["references"] = json!([format!("{}-fixture", "3".repeat(32))]);
+                }
+                member
+            })
+            .collect();
+        let (_,created)=post(&app,base,&auth,json!({"idempotencyKey":"capacity-worker","mode":"closure","roots":[members[0]["storePath"]]})).await;
+        let id = created["job"]["id"].as_str().unwrap().to_owned();
+        let job = format!("{base}/{id}");
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, json!(members)).await,
+            StatusCode::OK
+        );
+        for action in ["seal", "resume"] {
+            assert_eq!(
+                post(&app, &format!("{job}/{action}"), &auth, json!({}))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let (status, sessions) =
+            post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
+        assert_eq!(status, StatusCode::CREATED, "{sessions}");
+        // Prepare every parent before publishing the leaf. No parent can be
+        // published by request-driven fallback; only the worker can finish it.
+        for (ordinal, &index) in indices.iter().enumerate() {
+            let session = sessions["sessions"][ordinal]["sessionId"].as_str().unwrap();
+            let hash = hex::encode(Sha256::digest(&bytes[index]));
+            let (status, _, out) = send(
+                &app,
+                "POST",
+                &format!("/_api/v1/uploads/{session}/inline?fileHash={hash}"),
+                Some(&auth),
+                &[("content-length", &bytes[index].len().to_string())],
+                bytes[index].clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let out: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(out["published"], index == 3, "{out}");
+            if index != 3 {
+                assert_eq!(out["status"], 409, "{out}");
+            }
+        }
+        jobs.push((org, id, members));
+    }
+    // A downgrade after preparation tests publication admission, not the
+    // earlier per-object transfer size check.
+    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
+        .bind(limit as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let worker_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let mut worker_config = config;
+    worker_config.push_jobs.publication_workers = 1;
+    let worker =
+        AppState::new(worker_pool, worker_config, storage, reqwest::Client::new()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(snowstead_server::serve(listener, worker, async move {
+        let _ = stopped.await;
+    }));
+    let (org, id, members) = &jobs[0];
+    let auth = token(org, "*");
+    let job = format!("{base}/{id}");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+            let progress: Value = serde_json::from_slice(&out).unwrap();
+            let blocked = progress["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["publicationError"] == "capacity_blocked")
+                .count();
+            let other = send(
+                &app,
+                "GET",
+                &format!("/zeta/manifest/{}.narinfo", "2".repeat(32)),
+                None,
+                &[],
+                vec![],
+            )
+            .await
+            .0;
+            if blocked == 2 && other == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an oversized member must not stop smaller members or another org");
+    for (i, expected) in [
+        (0, StatusCode::NOT_FOUND),
+        (1, StatusCode::OK),
+        (2, StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                &format!("/default/manifest/{}.narinfo", i.to_string().repeat(32)),
+                None,
+                &[],
+                vec![]
+            )
+            .await
+            .0,
+            expected
+        );
+    }
+    // A direct client retry must also clear its blocked status, without a new
+    // authorization generation. The oversized member stays prepared for resume.
+    pool_execute(
+        &pool,
+        "UPDATE orgs SET storage_limit=NULL WHERE id='default'",
+    )
+    .await;
+    let (status, pending) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
+    assert_eq!(status, StatusCode::CREATED, "{pending}");
+    let session = pending["sessions"][2]["sessionId"].as_str().unwrap();
+    let hash = hex::encode(Sha256::digest(&bytes[2]));
+    let (status, _, out) = send(
+        &app,
+        "POST",
+        &format!("/_api/v1/uploads/{session}/inline?fileHash={hash}"),
+        Some(&auth),
+        &[("content-length", &bytes[2].len().to_string())],
+        bytes[2].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["published"],
+        true
+    );
+    let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+    let progress: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        progress["members"][0]["publicationError"],
+        "capacity_blocked"
+    );
+    assert!(progress["members"][2].get("publicationError").is_none());
+    let (status, _, summary) = send(
+        &app,
+        "GET",
+        &format!("{job}?summary=true"),
+        Some(&auth),
+        &[],
+        vec![],
+    )
+    .await;
+    let summary: Value = serde_json::from_slice(&summary).unwrap();
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["available"], false);
+    assert_eq!(summary["blocked"], true);
+    assert_eq!(summary["members"], json!([]));
+    // Resume now publishes the retained oversized candidate without another
+    // client upload or finalize request for that object.
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut visible = true;
+            for index in 0..4 {
+                visible &= send(
+                    &app,
+                    "GET",
+                    &format!("/default/manifest/{}.narinfo", index.to_string().repeat(32)),
+                    None,
+                    &[],
+                    vec![],
+                )
+                .await
+                .0 == StatusCode::OK;
+            }
+            if visible {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resume must publish retained candidates without another upload");
+    let (status, replay) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
+    assert_eq!(status, StatusCode::CREATED, "{replay}");
+    assert!(
+        replay["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["status"] == "completed")
+    );
+    let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+    let progress: Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        progress["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("publicationError").is_none())
+    );
+    for data in &bytes {
+        let hash = hex::encode(Sha256::digest(data));
+        let (status, _, download) = send(
+            &app,
+            "GET",
+            &format!("/default/manifest/nar/{hash}/zstd.nar"),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&download, data);
+    }
+    stop.send(()).unwrap();
+    serving.await.unwrap().unwrap();
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_worker_batches_dependencies_without_adopting_unprepared_members(pool: PgPool) {
+    check_manifest_worker_dependencies(pool, 0).await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_worker_progresses_beyond_a_blocked_candidate_window(pool: PgPool) {
+    check_manifest_worker_dependencies(pool, 20).await;
+}
+
+async fn check_manifest_worker_dependencies(pool: PgPool, blocked: usize) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true);
+        INSERT INTO cache_protocols SELECT id,'nix' FROM caches;
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by)
+        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+    )
+    .await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let storage = common::storage();
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config.clone(),
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let mut raw: Vec<_> = [
+        b"root".as_slice(),
+        b"middle bytes",
+        b"leaf",
+        b"blocked branch",
+        b"not uploaded",
+    ]
+    .into_iter()
+    .map(nar)
+    .collect();
+    raw.extend(std::iter::repeat_n(raw[3].clone(), blocked));
+    let bytes: Vec<_> = raw
+        .iter()
+        .map(|r| zstd::stream::encode_all(r.as_slice(), 3).unwrap())
+        .collect();
+    let mut members: Vec<_> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let hash = if i < 5 {
+                i.to_string().repeat(32)
+            } else {
+                format!("5{:031}", i - 5)
+            };
+            path_input(&hash, r, true)
+        })
+        .collect();
+    members[0]["references"] = json!([
+        format!("{}-fixture", "1".repeat(32)),
+        format!("{}-external", "9".repeat(32))
+    ]);
+    members[1]["references"] = json!([
+        format!("{}-fixture", "2".repeat(32)),
+        format!("{}-fixture", "1".repeat(32))
+    ]);
+    members[3]["references"] = json!([format!("{}-fixture", "4".repeat(32))]);
+    for member in &mut members[5..] {
+        member["references"] = json!([format!("{}-fixture", "4".repeat(32))]);
+    }
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let (status, created) = post(
+        &app,
+        base,
+        &auth,
+        json!({"idempotencyKey":"closed-batch","mode":"selected","roots":[members[0]["storePath"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!(members)).await,
+        StatusCode::OK
+    );
+    for action in ["seal", "resume"] {
+        assert_eq!(
+            post(&app, &format!("{job}/{action}"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
+    let (status, sessions) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
+    assert_eq!(status, StatusCode::CREATED, "{sessions}");
+    // A valid compressed checksum is not proof of the declared NAR content.
+    // This member must remain unavailable and must not unblock its dependents.
+    let invalid_session = sessions["sessions"][4]["sessionId"].as_str().unwrap();
+    let wrong_hash = hex::encode(Sha256::digest(&bytes[0]));
+    let (status, _, rejected) = send(
+        &app,
+        "POST",
+        &format!(
+            "/_api/v1/uploads/{invalid_session}/inline?fileHash={wrong_hash}&prepareOnly=true"
+        ),
+        Some(&auth),
+        &[("content-length", &bytes[0].len().to_string())],
+        bytes[0].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rejected: Value = serde_json::from_slice(&rejected).unwrap();
+    assert_eq!(rejected["status"], 400, "{rejected}");
+    assert_eq!(rejected["published"], false);
+    assert_ne!(rejected["prepared"], true);
+    for i in [0, 1, 3].into_iter().chain(5..members.len()).chain([2]) {
+        let session = sessions["sessions"][i]["sessionId"].as_str().unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes[i]));
+        let prepare_only = i != 2;
+        let (status, _, result) = send(
+            &app,
+            "POST",
+            &format!(
+                "/_api/v1/uploads/{session}/inline?fileHash={hash}&prepareOnly={prepare_only}"
+            ),
+            Some(&auth),
+            &[("content-length", &bytes[i].len().to_string())],
+            bytes[i].clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(result["published"], i == 2, "{result}");
+        if prepare_only {
+            assert_eq!(result["prepared"], true, "{result}");
+            assert_eq!(result["status"], 202, "{result}");
+        }
+    }
+    // Observe real publication statements, not a helper or a fallback path.
+    pool_execute(&pool,"CREATE TABLE closed_batches (members integer NOT NULL);
+        CREATE FUNCTION closed_batches() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+            INSERT INTO closed_batches SELECT count(*) FROM inserted HAVING count(*)>0;
+            RETURN NULL; END $$;
+        CREATE TRIGGER closed_batches AFTER INSERT ON published_paths REFERENCING NEW TABLE AS inserted
+            FOR EACH STATEMENT EXECUTE FUNCTION closed_batches();").await;
+    let worker_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let mut config = config;
+    config.push_jobs.publication_workers = 1;
+    let state = AppState::new(worker_pool, config, storage, reqwest::Client::new()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(snowstead_server::serve(listener, state, async move {
+        let _ = stopped.await;
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if send(
+                &app,
+                "GET",
+                &format!("/default/manifest/{}.narinfo", "0".repeat(32)),
+                None,
+                &[],
+                vec![],
+            )
+            .await
+            .0 == StatusCode::OK
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    serving.await.unwrap().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT members FROM closed_batches")
+            .fetch_all(&pool)
+            .await
+            .unwrap(),
+        if blocked == 0 { vec![2] } else { vec![1, 1] }
+    );
+    for i in 0..5 {
+        let (status, _, info) = send(
+            &app,
+            "GET",
+            &format!("/default/manifest/{}.narinfo", i.to_string().repeat(32)),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            status,
+            if i < 3 {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+        if i < 3 {
+            assert!(
+                String::from_utf8(info)
+                    .unwrap()
+                    .contains(&format!("NarSize: {}", raw[i].len()))
+            );
+            let hash = hex::encode(Sha256::digest(&bytes[i]));
+            let (status, _, download) = send(
+                &app,
+                "GET",
+                &format!("/default/manifest/nar/{hash}/zstd.nar"),
+                None,
+                &[],
+                vec![],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(download, bytes[i]);
+        }
+    }
+    let (count, size): (i64, i64) =
+        sqlx::query_as("SELECT path_count,size FROM caches WHERE name='manifest'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(size, bytes[..3].iter().map(|b| b.len() as i64).sum::<i64>());
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgPool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Hold the first live claim's COMMIT response, after PostgreSQL releases
+    // its locks. Each server has one connection, so this is its claim commit.
+    let paused_worker = async |job: String| {
+        let observer = pool.clone();
+        let upstream = format!(
+            "{}:{}",
+            pool.connect_options().get_host(),
+            pool.connect_options().get_port()
+        );
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (seen, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (busy, refused) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            let backend = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            client.set_nodelay(true).unwrap();
+            backend.set_nodelay(true).unwrap();
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut backend_read, mut backend_write) = backend.into_split();
+            let responses = async move {
+                let mut barrier = Some((seen, released));
+                let mut busy = Some(busy);
+                let mut refusals = 0;
+                loop {
+                    let mut header = [0u8; 5];
+                    if backend_read.read_exact(&mut header).await.is_err() {
+                        break;
+                    }
+                    let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+                    let mut body = vec![0u8; length - 4];
+                    backend_read.read_exact(&mut body).await.unwrap();
+                    if barrier.is_some() && header[0] == b'C' && body == b"COMMIT\0" {
+                        let claim: Option<String> = sqlx::query_scalar(
+                            "SELECT work_id FROM push_jobs WHERE id=$1 AND work_expires_at>clock_timestamp()",
+                        ).bind(&job).fetch_optional(&observer).await.unwrap();
+                        if let Some(claim) = claim {
+                            let (seen, released) = barrier.take().unwrap();
+                            seen.send(claim).unwrap();
+                            released.await.unwrap();
+                        }
+                    }
+                    // After claim acknowledgement, two failed boolean lock
+                    // results identify publication and its first release.
+                    if barrier.is_none()
+                        && header[0] == b'D'
+                        && body.len() == 7
+                        && body[..6] == [0, 1, 0, 0, 0, 1]
+                        && matches!(body[6], 0 | b'f')
+                    {
+                        refusals += 1;
+                        if refusals == 2 {
+                            let _ = busy.take().unwrap().send(());
+                        }
+                    }
+                    if client_write.write_all(&header).await.is_err()
+                        || client_write.write_all(&body).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::join!(
+                tokio::io::copy(&mut client_read, &mut backend_write),
+                responses
+            );
+        });
+        let worker_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .host("127.0.0.1")
+                    .port(port)
+                    .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+            )
+            .await
+            .unwrap();
+        (worker_pool, observed, release, refused)
+    };
+    pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let storage = common::storage();
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config.clone(),
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    // Change grants, lifetimes, and policy after the claim commits but before
+    // publication. No product-only barrier or shorter lease is required.
+    for scenario in 0..10 {
+        let resume = scenario == 1;
+        let raw = nar(if resume { b"new grant" } else { b"same grant" });
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+        let file_hash = hex::encode(Sha256::digest(&compressed));
+        let parent_hash = format!("{:032}", scenario * 2);
+        let child_hash = format!("{:032}", scenario * 2 + 1);
+        let mut parent = path_input(&parent_hash, &raw, true);
+        let child = path_input(&child_hash, &raw, true);
+        parent["references"] = json!([format!("{child_hash}-fixture")]);
+        let (status, created) = post(&app,base,&auth,json!({"idempotencyKey":format!("stale-{scenario}"),"mode":"closure","roots":[parent["storePath"]]})).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["job"]["id"].as_str().unwrap();
+        let job = format!("{base}/{id}");
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, json!([parent, child])).await,
+            StatusCode::OK
+        );
+        for action in ["seal", "resume"] {
+            assert_eq!(
+                post(&app, &format!("{job}/{action}"), &auth, json!({}))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let (status, sessions) = post(
+            &app,
+            "/_api/v1/caches/manifest/upload-streams/batch",
+            &auth,
+            json!({"jobId":id,"paths":[parent,child]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{sessions}");
+        for (index, session) in sessions["sessions"].as_array().unwrap().iter().enumerate() {
+            let session = session["sessionId"].as_str().unwrap();
+            let (status, _, result) = send(
+                &app,
+                "POST",
+                &format!("/_api/v1/uploads/{session}/inline?fileHash={file_hash}"),
+                Some(&auth),
+                &[("content-length", &compressed.len().to_string())],
+                compressed.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let result: Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(result["published"], index == 1, "{result}");
+        }
+        let session = sessions["sessions"][0]["sessionId"].as_str().unwrap();
+        let candidate: (String, String) =
+            sqlx::query_as("SELECT key,phase FROM nar_installations WHERE session_id=$1")
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut worker_config = config.clone();
+        worker_config.push_jobs.publication_workers = 1;
+        let start = async |worker_pool: PgPool| {
+            let state = AppState::new(
+                worker_pool,
+                worker_config.clone(),
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(snowstead_server::serve(listener, state, async move {
+                let _ = stopped.await;
+            }));
+            (stop, serving)
+        };
+        let (old_pool, old_seen, old_release, old_refused) = paused_worker(id.into()).await;
+        let (old_stop, old_server) = start(old_pool).await;
+        let old_id = tokio::time::timeout(std::time::Duration::from_secs(5), old_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        if (3..=8).contains(&scenario) {
+            match scenario {
+                3..=5 => {
+                    let change = [
+                        "UPDATE push_jobs SET idle_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1",
+                        "UPDATE push_jobs SET hard_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1",
+                        "UPDATE push_jobs SET authorization_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1",
+                    ][scenario - 3];
+                    sqlx::query(change).bind(id).execute(&pool).await.unwrap();
+                }
+                6 => pool_execute(&pool, "DELETE FROM cache_protocols WHERE protocol='nix'").await,
+                7 => pool_execute(&pool, "UPDATE caches SET is_public=false").await,
+                8 => {
+                    pool_execute(&pool, "UPDATE orgs SET storage_limit=0 WHERE id='default'").await
+                }
+                _ => unreachable!(),
+            }
+            old_release.send(()).unwrap();
+            old_stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), old_server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if scenario == 8 {
+                let (status, _, bytes) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+                assert_eq!(status, StatusCode::OK);
+                let progress: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(
+                    progress["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["storePathHash"] == parent_hash
+                            && m["publicationError"] == "capacity_blocked")
+                );
+            } else {
+                let failures: i32 =
+                    sqlx::query_scalar("SELECT work_failures FROM push_jobs WHERE id=$1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert!(
+                    failures > 0,
+                    "scenario {scenario} must exercise a rejected publication turn"
+                );
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM published_paths WHERE store_path_hash=$1",
+                )
+                .bind(&parent_hash)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0,
+                "scenario {scenario}"
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT key,phase FROM nar_installations WHERE session_id=$1",
+                )
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                candidate,
+                "scenario {scenario}"
+            );
+            if scenario <= 5 {
+                let protected: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM nix_job_protected_paths('default',clock_timestamp()) WHERE store_path_hash=$1)",
+                ).bind(&child_hash).fetch_one(&pool).await.unwrap();
+                assert!(
+                    !protected,
+                    "scenario {scenario}: expiry must release protection without maintenance"
+                );
+            }
+            // Policy denial must not prevent cancellation. Expired jobs need
+            // no renewal: discovery must continue to exclude them.
+            if scenario >= 6 {
+                assert_eq!(
+                    post(&app, &format!("{job}/cancel"), &auth, json!({}))
+                        .await
+                        .0,
+                    StatusCode::OK
+                );
+            }
+            pool_execute(&pool, "INSERT INTO cache_protocols SELECT id,'nix' FROM caches ON CONFLICT DO NOTHING;
+                UPDATE caches SET is_public=true; UPDATE orgs SET storage_limit=NULL WHERE id='default';").await;
+            assert_eq!(
+                send(
+                    &app,
+                    "GET",
+                    &format!("/default/manifest/{parent_hash}.narinfo"),
+                    None,
+                    &[],
+                    vec![]
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND,
+                "scenario {scenario}"
+            );
+            continue;
+        }
+        if scenario == 9 {
+            // An ordinary, non-job client wins the same path while the job's
+            // claim acknowledgement is delayed. The worker must reuse that
+            // publication, complete its receipt, and avoid a second charge.
+            let legacy = create(&app, "manifest", &auth, parent.clone()).await;
+            let legacy = legacy["sessionId"].as_str().unwrap();
+            let (status, _, result) = send(
+                &app,
+                "POST",
+                &format!("/_api/v1/uploads/{legacy}/inline?fileHash={file_hash}"),
+                Some(&auth),
+                &[("content-length", &compressed.len().to_string())],
+                compressed.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&result).unwrap()["published"],
+                true
+            );
+            let totals: (i64, i64) =
+                sqlx::query_as("SELECT path_count,size FROM caches WHERE name='manifest'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            old_release.send(()).unwrap();
+            old_stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), old_server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT path_count,size FROM caches WHERE name='manifest'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                totals
+            );
+            let outcome: Value =
+                sqlx::query_scalar("SELECT publication_result FROM upload_sessions WHERE id=$1")
+                    .bind(session)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(outcome["alreadyExisted"], true, "{outcome}");
+        } else if scenario == 2 {
+            let mut blocker = pool.begin().await.unwrap();
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default',0))")
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            old_release.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), old_refused)
+                .await
+                .unwrap()
+                .unwrap();
+            blocker.rollback().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if send(
+                        &app,
+                        "GET",
+                        &format!("/default/manifest/{parent_hash}.narinfo"),
+                        None,
+                        &[],
+                        vec![],
+                    )
+                    .await
+                    .0 == StatusCode::OK
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a busy release must not strand the job until its execution lease expires");
+            old_stop.send(()).unwrap();
+            old_server.await.unwrap().unwrap();
+        } else {
+            if resume {
+                assert_eq!(
+                    post(&app, &format!("{job}/resume"), &auth, json!({}))
+                        .await
+                        .0,
+                    StatusCode::OK
+                );
+            } else {
+                sqlx::query("UPDATE push_jobs SET work_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1").bind(id).execute(&pool).await.unwrap();
+            }
+            let (new_pool, new_seen, new_release, _new_refused) = paused_worker(id.into()).await;
+            let (new_stop, new_server) = start(new_pool).await;
+            let new_id = tokio::time::timeout(std::time::Duration::from_secs(5), new_seen)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(old_id, new_id);
+            old_release.send(()).unwrap();
+            old_stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), old_server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT work_id FROM push_jobs WHERE id=$1"
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                Some(new_id),
+                "scenario {scenario}, old claim {old_id}"
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT key,phase FROM nar_installations WHERE session_id=$1"
+                )
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                candidate
+            );
+            assert_eq!(
+                send(
+                    &app,
+                    "GET",
+                    &format!("/default/manifest/{parent_hash}.narinfo"),
+                    None,
+                    &[],
+                    vec![]
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            new_release.send(()).unwrap();
+            new_stop.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), new_server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                &format!("/default/manifest/{parent_hash}.narinfo"),
+                None,
+                &[],
+                vec![]
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (status, replay) = post(
+            &app,
+            "/_api/v1/caches/manifest/upload-streams/batch",
+            &auth,
+            json!({"jobId":id,"paths":[parent,child]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{replay}");
+        assert!(
+            replay["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["status"] == "completed")
+        );
+        let (status, _, bytes) = send(
+            &app,
+            "GET",
+            &format!("/default/manifest/nar/{file_hash}/zstd.nar"),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, compressed);
+        assert_eq!(
+            post(&app, &format!("{job}/cancel"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgPool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Make a dropped transaction retain its server-side locks long enough
+    // to expose a fallback that starts before ROLLBACK has finished.
+    let options = pool.connect_options();
+    let upstream = format!("{}:{}", options.get_host(), options.get_port());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut proxy = tokio::task::JoinSet::new();
+    proxy.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            let server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+            client.set_nodelay(true).unwrap();
+            server.set_nodelay(true).unwrap();
+            connections.spawn(async move {
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut server_read, mut server_write) = server.into_split();
+                let requests = async {
+                    // SSL is disabled below. The startup packet has no type byte.
+                    let length = client_read.read_u32().await?;
+                    let mut body = vec![0; length as usize - 4];
+                    client_read.read_exact(&mut body).await?;
+                    server_write.write_u32(length).await?;
+                    server_write.write_all(&body).await?;
+                    while let Ok(kind) = client_read.read_u8().await {
+                        let length = client_read.read_u32().await?;
+                        let mut body = vec![0; length as usize - 4];
+                        client_read.read_exact(&mut body).await?;
+                        if kind == b'Q' && body.starts_with(b"ROLLBACK") {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        server_write.write_u8(kind).await?;
+                        server_write.write_u32(length).await?;
+                        server_write.write_all(&body).await?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                };
+                let _ = tokio::join!(
+                    requests,
+                    tokio::io::copy(&mut server_read, &mut client_write)
+                );
+            });
+        }
+    });
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(
+            (*options)
+                .clone()
+                .host("127.0.0.1")
+                .port(port)
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+        )
+        .await
+        .unwrap();
+    pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let raws = [nar(b"batch root"), nar(b"batch dependency")];
+    let payloads: Vec<_> = raws
+        .iter()
+        .map(|raw| zstd::stream::encode_all(raw.as_slice(), 3).unwrap())
+        .collect();
+    for case in [4, 0, 1, 2, 3] {
+        let root_hash = (case * 2).to_string().repeat(32);
+        let child_hash = (case * 2 + 1).to_string().repeat(32);
+        let mut root = path_input(&root_hash, &raws[0], true);
+        root["references"] = json!([format!("{child_hash}-fixture")]);
+        let child = path_input(&child_hash, &raws[1], true);
+        let (_, created) = post(&app, base, &auth, json!({"idempotencyKey":format!("batch-{case}"),"mode":"closure","roots":[root["storePath"]]})).await;
+        let id = created["job"]["id"].as_str().unwrap();
+        let job = format!("{base}/{id}");
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, json!([root, child])).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&app, &format!("{job}/resume"), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, sessions) = post(
+            &app,
+            "/_api/v1/caches/manifest/upload-streams/batch",
+            &auth,
+            json!({"jobId":id,"paths":[root,child]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{sessions}");
+        let uploads: Vec<_> = payloads.iter().enumerate().map(|(i, bytes)| json!({"sessionId":sessions["sessions"][i]["sessionId"],"fileHash":hex::encode(Sha256::digest(bytes)),"fileSize":bytes.len()})).collect();
+        if case == 4 {
+            // An ordinary path wins before a conflicting job member. The
+            // losing member must not satisfy its job's dependent publication.
+            let ordinary = create(
+                &app,
+                "manifest",
+                &auth,
+                path_input(&child_hash, &raws[0], true),
+            )
+            .await;
+            let mut mixed = vec![json!({"sessionId":ordinary["sessionId"],
+                "fileHash":hex::encode(Sha256::digest(&payloads[0])),"fileSize":payloads[0].len()})];
+            mixed.extend(uploads);
+            let frame = inline_frame(
+                &json!(mixed),
+                &[
+                    payloads[0].clone(),
+                    payloads[0].clone(),
+                    payloads[1].clone(),
+                ],
+            );
+            let (status, _, result) = send(
+                &app,
+                "POST",
+                "/_api/v1/uploads/inline/batch",
+                Some(&auth),
+                &[
+                    ("content-type", "application/octet-stream"),
+                    ("content-length", &frame.len().to_string()),
+                ],
+                frame,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let result: Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(result["results"][0]["published"], true, "{result}");
+            for item in &result["results"].as_array().unwrap()[1..] {
+                assert_eq!(item["published"], false, "{result}");
+                assert_eq!(item["status"], 409, "{result}");
+            }
+            assert_eq!(
+                send(
+                    &app,
+                    "GET",
+                    &format!("/default/manifest/{root_hash}.narinfo"),
+                    None,
+                    &[],
+                    vec![]
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            let (_, _, progress) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+            let progress: Value = serde_json::from_slice(&progress).unwrap();
+            for member in progress["members"].as_array().unwrap() {
+                assert_ne!(member["session"]["status"], "completed", "{progress}");
+            }
+            continue;
+        }
+        let frame = inline_frame(&json!(uploads), &payloads);
+        // A root-first batch cannot pass solely through singleton fallback:
+        // its prerequisite is absent until the dependency-closed group commits.
+        if case == 0 {
+            let (status, _, result) = send(
+                &app,
+                "POST",
+                "/_api/v1/uploads/inline/batch",
+                Some(&auth),
+                &[
+                    ("content-type", "application/octet-stream"),
+                    ("content-length", &frame.len().to_string()),
+                ],
+                frame.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let result: Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(result["results"].as_array().unwrap().len(), 2);
+            for item in result["results"].as_array().unwrap() {
+                assert_eq!(item["published"], true, "{result}");
+            }
+            for hash in [&root_hash, &child_hash] {
+                assert_eq!(
+                    send(
+                        &app,
+                        "GET",
+                        &format!("/default/manifest/{hash}.narinfo"),
+                        None,
+                        &[],
+                        vec![]
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+            }
+        }
+        match case {
+            0 | 1 => {
+                // Case 1 withdraws an absent root, cancelling its whole job.
+                assert_eq!(
+                    post(
+                        &app,
+                        "/_api/v1/orgs/default/caches/manifest/paths/delete",
+                        "operator-secret",
+                        json!({"storePathHashes":[root_hash]})
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+            }
+            2 => {
+                // A reclaimed job identity cannot leave unrestricted sessions.
+                sqlx::query("DELETE FROM push_jobs WHERE id=$1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                assert_eq!(
+                    post(
+                        &app,
+                        "/_api/v1/orgs/default/tokens/default-*/revoke",
+                        "operator-secret",
+                        json!({"reason":"job upload fence test"})
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+            }
+        }
+        let (status, _, result) = send(
+            &app,
+            "POST",
+            "/_api/v1/uploads/inline/batch",
+            Some(&auth),
+            &[
+                ("content-type", "application/octet-stream"),
+                ("content-length", &frame.len().to_string()),
+            ],
+            frame,
+        )
+        .await;
+        if case == 3 {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            let result: Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(result["results"].as_array().unwrap().len(), 2);
+            for item in result["results"].as_array().unwrap() {
+                assert_eq!(item["published"], false, "{result}");
+                assert_eq!(item["status"], 409, "{result}");
+            }
+        }
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                &format!("/default/manifest/{root_hash}.narinfo"),
+                None,
+                &[],
+                vec![]
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_graph_boundaries_and_identity_conflicts(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let mut config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    config.push_jobs.active_per_org = 16;
+    let app =
+        router(AppState::new(pool, config, common::storage(), reqwest::Client::new()).unwrap());
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let raw = nar(b"graph");
+    let mut x = path_input(&"0".repeat(32), &raw, false);
+    let mut y = path_input(&"1".repeat(32), &raw, false);
+    let z = path_input(&"2".repeat(32), &raw, false);
+    x["references"] = json!([format!("{}-fixture", "1".repeat(32))]);
+    y["references"] = json!([format!("{}-fixture", "0".repeat(32))]);
+    let mut self_edge = x.clone();
+    self_edge["references"] = json!([format!("{}-fixture", "0".repeat(32))]);
+    let mut conflict = self_edge.clone();
+    conflict["narSize"] = json!(raw.len() + 8);
+    let cases = [
+        (
+            "closure",
+            x["storePath"].clone(),
+            json!([x]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "selected",
+            x["storePath"].clone(),
+            json!([x]),
+            StatusCode::OK,
+        ),
+        (
+            "closure",
+            x["storePath"].clone(),
+            json!([x, y]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "selected",
+            x["storePath"].clone(),
+            json!([x, y]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "closure",
+            x["storePath"].clone(),
+            json!([self_edge, self_edge]),
+            StatusCode::OK,
+        ),
+        (
+            "closure",
+            x["storePath"].clone(),
+            json!([self_edge, conflict]),
+            StatusCode::CONFLICT,
+        ),
+        (
+            "selected",
+            z["storePath"].clone(),
+            json!([self_edge]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (i, (mode, root, members, expected)) in cases.into_iter().enumerate() {
+        let (status, created) = post(
+            &app,
+            base,
+            &auth,
+            json!({"idempotencyKey":format!("graph-{i}"),"mode":mode,"roots":[root]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, members).await,
+            StatusCode::OK
+        );
+        let (status, result) = post(&app, &format!("{job}/seal"), &auth, json!({})).await;
+        assert_eq!(status, expected, "case {i}: {result}");
+        if expected == StatusCode::OK {
+            let (_, _, bytes) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(page["members"].as_array().unwrap().len(), 1);
+        }
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_admission_bounds_bodies_without_blocking_uploads(pool: PgPool) {
+    use std::{sync::Arc, task::Poll, time::Duration};
+    use tokio::sync::Notify;
+
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            single.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        let reached = Arc::new(Notify::new());
+        let signal = reached.clone();
+        let stream = futures_util::stream::poll_fn(move |_| {
+            signal.notify_one();
+            Poll::<Option<Result<axum::body::Bytes, std::io::Error>>>::Pending
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri(base)
+            .header("authorization", format!("Bearer {auth}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        pending.push(tokio::spawn(app.clone().oneshot(request)));
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        send(&app, "POST", base, None, &[], b"not JSON".to_vec())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, headers, _) =
+        send(&app, "POST", base, Some(&auth), &[], b"not JSON".to_vec()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+    let raw = nar(b"uploads have independent admission");
+    let session = tokio::time::timeout(
+        Duration::from_secs(5),
+        create(
+            &app,
+            "manifest",
+            &auth,
+            path_input(&"0".repeat(32), &raw, false),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(session["sessionId"].is_string());
+    for task in pending {
+        let response = tokio::time::timeout(Duration::from_secs(35), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+    let (status,created) = post(&app,base,&auth,json!({"idempotencyKey":"after-timeout","mode":"selected","roots":[format!("/nix/store/{}-fixture","0".repeat(32))]})).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    single.close().await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_default_limit_accepts_a_deep_closure_without_recursion(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) \
+        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+    )
+    .await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let root = format!("/nix/store/{:032b}-fixture", 9999);
+    let (status, created) = post(
+        &app,
+        base,
+        &auth,
+        json!({"idempotencyKey":"deep","mode":"closure","roots":[root]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+    let raw = nar(b"deep manifest");
+    for ordinal in 0..100 {
+        let members: Vec<_> = (ordinal * 100..(ordinal + 1) * 100)
+            .map(|n| {
+                let mut member = path_input(&format!("{n:032b}"), &raw, false);
+                if n > 0 {
+                    member["references"] = json!([format!("{:032b}-fixture", n - 1)]);
+                }
+                member
+            })
+            .collect();
+        assert_eq!(
+            put_manifest(&app, &job, ordinal, &auth, json!(members)).await,
+            StatusCode::OK
+        );
+    }
+    let (status, sealed) = post(&app, &format!("{job}/seal"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{sealed}");
+    assert_eq!(sealed["job"]["inputMembers"], 10_000);
+    assert_eq!(sealed["job"]["state"], "sealed");
+    let mut count = 0;
+    let mut cursor = String::new();
+    loop {
+        let (status, _, bytes) = send(
+            &app,
+            "GET",
+            &format!("{job}?after={cursor}"),
+            Some(&auth),
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let members = page["members"].as_array().unwrap();
+        assert!(members.len() <= 100);
+        for member in members {
+            assert_eq!(member["storePathHash"], format!("{count:032b}"));
+            count += 1;
+        }
+        match page["next"].as_str() {
+            Some(next) => cursor = next.to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(count, 10_000);
+    let id = sealed["job"]["id"].as_str().unwrap();
+    assert_eq!(
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    sqlx::query("WITH b AS (INSERT INTO blob_objects(file_hash,compression,r2_key,file_size) VALUES('deep','zstd','deep',12) RETURNING id) \
+        INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,references_json) \
+        SELECT j.cache_id,m.store_path_hash,m.metadata->>'storePath',m.metadata->>'narHash', \
+        (m.metadata->>'narSize')::bigint,b.id,(m.metadata->'references')::text \
+        FROM push_jobs j JOIN push_job_members m ON m.job_id=j.id CROSS JOIN b WHERE j.id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE published_paths SET nar_size=nar_size+1 WHERE store_path_hash=$1")
+        .bind(format!("{:032b}", 9999))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        post(&app, &format!("{job}/complete"), &auth, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "a matching prefix cannot complete a 10,000-member manifest"
+    );
+    sqlx::query("UPDATE published_paths SET nar_size=nar_size-1 WHERE store_path_hash=$1")
+        .bind(format!("{:032b}", 9999))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE push_jobs SET hard_expires_at=NOW()+INTERVAL '1 minute' WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let (status, completed) = post(&app, &format!("{job}/complete"), &auth, json!({})).await;
+    eprintln!(
+        "10,000-member completion HTTP elapsed: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(completed["job"]["state"], "completed");
+    assert_eq!(
+        completed["job"]["protectionExpiresAt"], completed["job"]["hardExpiresAt"],
+        "grace cannot extend the hard deadline"
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_limits_auth_policy_and_expiry(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO orgs(id,slug) VALUES('org_b','beta'); \
+        INSERT INTO caches(name,is_public) VALUES('manifest',true),('other',true); \
+        INSERT INTO caches(name,is_public,org_id) VALUES('manifest',true,'org_b'); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let mut config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    config.push_jobs.members = 2;
+    config.push_jobs.chunk_members = 1;
+    config.push_jobs.active_per_org = 1;
+    config.push_jobs.manifest_bytes = 1024;
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token("default", "*");
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    assert_eq!(
+        send(&app, "POST", base, None, &[], b"not JSON".to_vec())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let raw = nar(b"limits");
+    let x = path_input(&"0".repeat(32), &raw, false);
+    let y = path_input(&"1".repeat(32), &raw, false);
+    let create = json!({"idempotencyKey":"limited","mode":"selected","roots":[x["storePath"]]});
+    assert_eq!(
+        post(&app, base, &token("default", "other"), create.clone())
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, created) = post(&app, base, &auth, create.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["job"]["id"].as_str().unwrap();
+    let job = format!("{base}/{id}");
+    assert_eq!(
+        send(&app, "GET", &job, Some(&token("org_b", "*")), &[], vec![])
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([x, y])).await,
+        StatusCode::BAD_REQUEST
+    );
+    let mut invalid = x.clone();
+    invalid["storePathHash"] = json!("invalid");
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([invalid])).await,
+        StatusCode::BAD_REQUEST
+    );
+    let mut oversized = x.clone();
+    oversized["deriver"] = json!("a".repeat(1200));
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([oversized])).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 0, &auth, json!([x])).await,
+        StatusCode::OK
+    );
+    // This chunk fits the request limit but not the remaining job budget.
+    let mut too_much = y.clone();
+    too_much["deriver"] = json!("a".repeat(450));
+    assert_eq!(
+        put_manifest(&app, &job, 1, &auth, json!([too_much])).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 1, &auth, json!([y])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_manifest(&app, &job, 2, &auth, json!([x])).await,
+        StatusCode::BAD_REQUEST
+    );
+    let mut another = create.clone();
+    another["idempotencyKey"] = json!("second");
+    assert_eq!(
+        post(
+            &app,
+            "/_api/v1/caches/other/push-jobs",
+            &auth,
+            another.clone()
+        )
+        .await
+        .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Replays do not consume another job slot or extend the hard lifetime.
+    assert_eq!(
+        post(&app, base, &auth, create.clone()).await.0,
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE orgs SET private_caches=false WHERE id='default'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE caches SET is_public=false WHERE org_id='default' AND name='manifest'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query("UPDATE caches SET is_public=true WHERE org_id='default'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cache_protocols WHERE cache_id=(SELECT id FROM caches WHERE org_id='default' AND name='manifest')").execute(&pool).await.unwrap();
+    assert_eq!(
+        send(&app, "GET", &job, Some(&auth), &[], vec![]).await.0,
+        StatusCode::NOT_FOUND
+    );
+    sqlx::query("INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches WHERE org_id='default' AND name='manifest'").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE push_jobs SET hard_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        send(&app, "GET", &job, Some(&auth), &[], vec![]).await.0,
+        StatusCode::GONE
+    );
+    assert_eq!(post(&app, base, &auth, create).await.0, StatusCode::GONE);
+    assert_eq!(
+        post(&app, base, &auth, another).await.0,
+        StatusCode::CREATED
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_protection_budget_bounds_chunks_across_caches(pool: PgPool) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true),('other',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let auth = token("default", "*");
+    let raw = nar(b"aggregate protection budgets");
+    let x = path_input(&"0".repeat(32), &raw, false);
+    let y = path_input(&"1".repeat(32), &raw, false);
+    for (case, members, bytes) in [("members", 2, 4096), ("bytes", 4, 1024)] {
+        let mut y = y.clone();
+        if case == "bytes" {
+            y["deriver"] = json!("a".repeat(250));
+        }
+        let mut config = Config {
+            jwt_secret: "test-jwt".into(),
+            ..Default::default()
+        };
+        config.push_jobs.members = 2;
+        config.push_jobs.chunk_members = 1;
+        config.push_jobs.manifest_bytes = 1024;
+        config.push_jobs.active_per_org = 4;
+        config.push_jobs.protected_members_per_org = members;
+        config.push_jobs.protected_manifest_bytes_per_org = bytes;
+        let app = router(
+            AppState::new(
+                pool.clone(),
+                config,
+                common::storage(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        );
+        let mut jobs = vec![];
+        for cache in ["manifest", "other"] {
+            let base = format!("/_api/v1/caches/{cache}/push-jobs");
+            let (status, created) = post(
+                &app,
+                &base,
+                &auth,
+                json!({"idempotencyKey":case,"mode":"selected","roots":[x["storePath"]]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{case}: {created}");
+            let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+            jobs.push(job);
+        }
+        if case == "members" {
+            assert_eq!(post(&app, "/_api/v1/caches/manifest/push-jobs", &auth,
+                json!({"idempotencyKey":"empty-third","mode":"selected","roots":[x["storePath"]]})).await.0,
+                StatusCode::TOO_MANY_REQUESTS,
+                "empty builders reserve members before their first chunk");
+        }
+        for job in &jobs {
+            assert_eq!(
+                put_manifest(&app, job, 0, &auth, json!([x])).await,
+                StatusCode::OK,
+                "{case}"
+            );
+        }
+        assert_eq!(
+            put_manifest(&app, &jobs[1], 1, &auth, json!([y])).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{case}: aggregate, not per-job, limit"
+        );
+        assert_eq!(
+            put_manifest(&app, &jobs[1], 0, &auth, json!([x])).await,
+            StatusCode::OK,
+            "{case}: replay does not reserve twice"
+        );
+        let (_, _, body) = send(&app, "GET", &jobs[1], Some(&auth), &[], vec![]).await;
+        let progress: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            progress["job"]["revision"], 1,
+            "rejected chunk must not change progress"
+        );
+        assert_eq!(
+            post(&app, &format!("{}/cancel", jobs[0]), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_manifest(&app, &jobs[1], 1, &auth, json!([y])).await,
+            StatusCode::OK,
+            "{case}: cancellation releases budget without maintenance"
+        );
+        assert_eq!(
+            post(&app, &format!("{}/cancel", jobs[1]), &auth, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -359,6 +3688,32 @@ async fn inline_batch_cli_contract_validates_before_work_and_protects_capacity(p
     }
     let uploads = json!(uploads);
     let frame = inline_frame(&uploads, &payloads);
+    // Preparation-only is job-scoped. Reject it before mutating legacy sessions.
+    let (status, _, rejected) = send(
+        &app,
+        "POST",
+        "/_api/v1/uploads/inline/batch?prepareOnly=true",
+        Some("legacy"),
+        &[
+            ("content-type", "application/octet-stream"),
+            ("content-length", &frame.len().to_string()),
+        ],
+        frame.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rejected: Value = serde_json::from_slice(&rejected).unwrap();
+    for row in rejected["results"].as_array().unwrap() {
+        assert_eq!(row["status"], 409, "{rejected}");
+        assert_eq!(row["published"], false);
+    }
+    let changed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM upload_sessions WHERE status<>'streaming' OR file_size<>0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(changed, 0);
     for (headers, expected) in [
         (vec![], StatusCode::UNSUPPORTED_MEDIA_TYPE),
         (
@@ -846,7 +4201,21 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         StatusCode::CONFLICT
     );
     let receipt = json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),"fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),"parts":receipts});
-    let app = router(AppState::new(pool.clone(), config, storage, reqwest::Client::new()).unwrap());
+    let staging_keys: Vec<String> =
+        sqlx::query_scalar("SELECT storage_key FROM upload_parts WHERE session_id=$1")
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
     let envelope = json!({"uploads":[receipt.clone()]});
     // A failed ownership insert must not poison the connection or lose parts.
     // The same immutable receipt must still finalize after the fault clears.
@@ -866,6 +4235,36 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         "DROP TRIGGER fail_candidate ON nar_installations; DROP FUNCTION fail_candidate();",
     )
     .await;
+    // Publication and staging retirement must commit together. A cleanup
+    // queue failure cannot publish the path or discard its reusable sources.
+    pool_execute(&pool, "CREATE FUNCTION fail_staging_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF starts_with(NEW.key,'staging/') THEN RAISE EXCEPTION 'injected staging retirement failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER fail_staging_retirement BEFORE INSERT ON object_cleanup FOR EACH ROW EXECUTE FUNCTION fail_staging_retirement();").await;
+    let (_, failed) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        envelope.clone(),
+    )
+    .await;
+    assert_eq!(failed["results"][0]["published"], false, "{failed}");
+    assert_eq!(failed["results"][0]["status"], 500, "{failed}");
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/main/{hash}.narinfo"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for key in &staging_keys {
+        assert!(storage.head(true, key).await.is_ok());
+    }
+    pool_execute(&pool, "DROP TRIGGER fail_staging_retirement ON object_cleanup; DROP FUNCTION fail_staging_retirement();").await;
     let (first, second) = tokio::join!(
         post(
             &app,
@@ -886,6 +4285,22 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         assert!(
             result["published"] == true || result["status"] == 503,
             "{result}"
+        );
+    }
+    let retired: Vec<String> =
+        sqlx::query_scalar("SELECT key FROM object_cleanup WHERE is_private AND key=ANY($1)")
+            .bind(&staging_keys)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retired.len(), staging_keys.len());
+    // Run the queued deletes without relying on global maintenance timing.
+    // Replays below must still validate receipts and serve the final object.
+    for key in retired {
+        storage.delete(true, &key).await.unwrap();
+        assert_eq!(
+            storage.head(true, &key).await.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
     }
     for _ in 0..2 {

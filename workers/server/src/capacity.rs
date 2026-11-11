@@ -147,6 +147,10 @@ pub async fn admit(
             WHERE c.org_id = $1
                 AND NOT nix_path_pinned(e.cache_id, e.store_path_hash, NOW())
                 AND NOT EXISTS (
+                    SELECT 1 FROM nix_job_protected_paths($1, NOW()) j
+                    WHERE j.cache_id=e.cache_id AND j.store_path_hash=e.store_path_hash
+                )
+                AND NOT EXISTS (
                     SELECT 1
                     FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
                     WHERE p.cache = e.cache_id
@@ -226,6 +230,10 @@ pub async fn admit(
             WHERE e.id = ANY($1)
                 AND c.org_id = $2
                 AND NOT nix_path_pinned(e.cache_id, e.store_path_hash, NOW())
+                AND NOT EXISTS (
+                    SELECT 1 FROM nix_job_protected_paths($2, NOW()) j
+                    WHERE j.cache_id=e.cache_id AND j.store_path_hash=e.store_path_hash
+                )
                 AND NOT EXISTS (
                     SELECT 1
                     FROM upload_sessions u
