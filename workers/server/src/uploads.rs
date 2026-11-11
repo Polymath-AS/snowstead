@@ -28,6 +28,7 @@ use crate::{
     AppState,
     auth::Identity,
     error::{ApiError, json_response},
+    lifecycle::UploadStatus,
     native, signing,
 };
 
@@ -173,7 +174,7 @@ struct Session {
     references_json: String,
     deriver: Option<String>,
     system: Option<String>,
-    status: String,
+    status: UploadStatus,
     r2_upload_id: Option<String>,
     part_size: Option<i32>,
     staging_capacity: Option<i64>,
@@ -231,7 +232,7 @@ async fn load_sessions(
             u.references_json,
             u.deriver,
             u.system,
-            u.status,
+            u.status AS "status: UploadStatus",
             u.r2_upload_id,
             u.part_size,
             u.staging_capacity,
@@ -628,7 +629,7 @@ async fn reserve_tx(
     s: &Session,
     requested: &[Reservation],
 ) -> Result<(), ApiError> {
-    if s.status != "streaming" {
+    if s.status != UploadStatus::Streaming {
         return Err(error(409, "Conflict"));
     }
     batch(requested)?;
@@ -748,7 +749,7 @@ async fn put_part(
     let identity = &identity;
     let id = id.as_str();
     let s = load(&state.pool, id, identity).await?;
-    if s.status != "streaming" || s.r2_upload_id.is_none() {
+    if s.status != UploadStatus::Streaming || s.r2_upload_id.is_none() {
         return Err(error(409, "Conflict"));
     }
     let grant = sqlx::query_scalar!(
@@ -789,7 +790,7 @@ async fn put_part(
     let admitted = async {
         let tx = crate::db::begin_queued(state, &s.org_id).await?;
         let (mut tx, s) = lock_session(tx, &s, identity).await?;
-        if s.status != "streaming" {
+        if s.status != UploadStatus::Streaming {
             return Err(error(409, "Conflict"));
         }
         let old = parts(&mut tx, id)
@@ -911,7 +912,10 @@ async fn seal(
     if (s.r2_upload_id.is_none()) != inline {
         return Err(error(409, "Conflict"));
     }
-    if !matches!(s.status.as_str(), "streaming" | "finalizing" | "completed") {
+    if !matches!(
+        s.status,
+        UploadStatus::Streaming | UploadStatus::Finalizing | UploadStatus::Completed
+    ) {
         return Err(error(409, "Conflict"));
     }
     if inline && (s.nar_size > MIB || receipt.file_size > MIB || s.part_size != Some(MIB as i32)) {
@@ -923,7 +927,7 @@ async fn seal(
             "Stream metadata or parts do not match reservations",
         ));
     }
-    if inline && s.status == "streaming" {
+    if inline && s.status == UploadStatus::Streaming {
         reserve_tx(
             &mut tx,
             &s,
@@ -965,18 +969,22 @@ async fn seal(
             "Stream metadata or parts do not match reservations",
         ));
     }
-    if s.status != "streaming" && s.file_hash.as_deref() != Some(&receipt.file_hash) {
+    if s.status != UploadStatus::Streaming && s.file_hash.as_deref() != Some(&receipt.file_hash) {
         return Err(error(409, "Sealed stream cannot change"));
     }
     if stored.iter().zip(&input).any(|(p, i)| {
         p.etag.as_deref() != Some(i.etag.as_str()) || (!inline && p.storage_key.is_none())
     }) {
         return Err(error(
-            if s.status == "streaming" { 400 } else { 409 },
+            if s.status == UploadStatus::Streaming {
+                400
+            } else {
+                409
+            },
             "Part receipts do not match uploaded bytes",
         ));
     }
-    if s.status == "streaming" {
+    if s.status == UploadStatus::Streaming {
         sqlx::query!(
             r#"
             UPDATE upload_sessions
@@ -989,7 +997,7 @@ async fn seal(
         .execute(&mut *tx)
         .await?;
         s.file_hash = Some(receipt.file_hash.clone());
-        s.status = "finalizing".into();
+        s.status = UploadStatus::Finalizing;
     }
     let prepared = prepare_sealed(&mut tx, s, stored, bytes).await?;
     tx.commit().await?;
@@ -1153,10 +1161,10 @@ async fn allocate_candidate(
     s: &Session,
 ) -> Result<(String, String), ApiError> {
     let (mut tx, current) = lock_session(tx, s, identity).await?;
-    if current.status == "completed" {
+    if current.status == UploadStatus::Completed {
         return Err(error(503, "Publication completed; retry for its result"));
     }
-    if current.status != "finalizing" || current.file_hash != s.file_hash {
+    if current.status != UploadStatus::Finalizing || current.file_hash != s.file_hash {
         return Err(error(409, "Conflict"));
     }
     if !current.is_public && !current.private_caches {
@@ -1301,13 +1309,13 @@ async fn publish_group(
     for p in ready {
         let s = &p.session;
         let current = sessions.get(&s.id).ok_or_else(|| error(404, "Not found"))?;
-        if current.status == "completed" {
+        if current.status == UploadStatus::Completed {
             results.push(current.publication_result.clone().unwrap_or_else(
                 || json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true}),
             ));
             continue;
         }
-        if current.status != "finalizing" || current.file_hash != s.file_hash {
+        if current.status != UploadStatus::Finalizing || current.file_hash != s.file_hash {
             return Err(error(409, "Conflict"));
         }
         if current.is_public != s.is_public {
@@ -1659,7 +1667,7 @@ pub(crate) async fn publish_job(
         .into_iter()
         .filter_map(|session| {
             // A member may have been replaced or completed after discovery.
-            if session.status != "finalizing"
+            if session.status != UploadStatus::Finalizing
                 || session.push_job_id.as_deref() != Some(&claim.job)
                 || session.org_id != claim.org
             {
@@ -1704,7 +1712,7 @@ async fn prepare_sealed(
     parts: Vec<Part>,
     inline: Option<axum::body::Bytes>,
 ) -> Result<Prepared, ApiError> {
-    if s.status == "completed" {
+    if s.status == UploadStatus::Completed {
         return Ok(Prepared {
             session: s,
             source: PreparedSource::Ready,
@@ -1933,7 +1941,7 @@ async fn publish_prepared(
     ready: Prepared,
     protect: Vec<(i32, String)>,
 ) -> Result<Value, ApiError> {
-    if ready.session.status == "completed" {
+    if ready.session.status == UploadStatus::Completed {
         return Ok(ready.session.publication_result.unwrap_or_else(||
             json!({"sessionId":ready.session.id,"storePathHash":ready.session.store_path_hash,"published":true})));
     }
@@ -2112,7 +2120,7 @@ async fn publish_batch(
 ) -> Vec<Value> {
     let mut pending = Vec::with_capacity(ready.len());
     for (index, p) in ready {
-        if p.session.status == "completed" {
+        if p.session.status == UploadStatus::Completed {
             let id = p.session.id.clone();
             results[index] = result_value(
                 &id,
@@ -2428,7 +2436,7 @@ async fn inline(
     let result = async {
         let ready = seal_inline(state, identity, &input, bytes, &options).await?;
         let ready = prepare(state, identity, ready).await?;
-        if options.prepare_only && ready.session.status != "completed" {
+        if options.prepare_only && ready.session.status != UploadStatus::Completed {
             let owned = state.clone();
             let identity = identity.clone();
             return state
@@ -2467,7 +2475,18 @@ async fn abort(
     let id = id.as_str();
     let s = load(&state.pool, id, identity).await?;
     let (mut tx, s) = locked(state, &s, identity).await?;
-    if !matches!(s.status.as_str(), "streaming" | "aborted") {
+    // A sealed session is abortable too: after a failed verification or
+    // publication it could otherwise only wait out its lease. Completed is
+    // terminal. Publication re-reads this status under the same org and upload
+    // fences before it adopts anything, so exactly one of the two commits.
+    // A push job owns its members: cancelling the job is how they stop, so a
+    // sealed member is not aborted from under its publication worker.
+    let abortable = match s.status {
+        UploadStatus::Streaming | UploadStatus::Aborted => true,
+        UploadStatus::Finalizing => s.push_job_id.is_none(),
+        _ => false,
+    };
+    if !abortable {
         return Err(error(409, "Conflict"));
     }
     sqlx::query!(
@@ -2478,6 +2497,16 @@ async fn abort(
         "#,
         id,
     )
+    .execute(&mut *tx)
+    .await?;
+    // Release an in-flight attempt's reservation as expiry does. Its key can
+    // never be adopted now; a copy which lands late is found by the orphan sweep.
+    sqlx::query(
+        "WITH retired AS (DELETE FROM nar_installations WHERE session_id=$1 \
+         RETURNING key,is_private) INSERT INTO object_cleanup(is_private,key) \
+         SELECT is_private,key FROM retired ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
     .execute(&mut *tx)
     .await?;
     let old = parts(&mut tx, id).await?;
@@ -2822,7 +2851,7 @@ mod tests {
             references_json: String::new(),
             deriver: None,
             system: None,
-            status: String::new(),
+            status: UploadStatus::Streaming,
             r2_upload_id: None,
             part_size: None,
             staging_capacity: None,

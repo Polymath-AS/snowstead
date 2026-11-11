@@ -59,6 +59,15 @@ receipts, and the exact-key cleanup queue without removing legacy objects.
 Drain old writers and maintenance before cutover. Legacy canonical ownership
 records never expire automatically; reconcile ambiguous provider operations
 before an operator releases their source/destination pins.
+
+The additive `0014_lifecycle_constraints.sql` migration names the persisted
+state machines documented in `workers/server/src/lifecycle.rs`. Its CHECK
+constraints are `NOT VALID`, so rows written by retired releases are not
+scanned and cannot fail the deployment; new and updated rows are checked. It
+also indexes upload sessions by cache and path, and enforces one active
+signing key per cache unless the database already holds a cache with several,
+which it reports with a warning instead.
+
 After publishing immutable pointers, do not roll back to a server that cannot
 read them. Use a compatible reader release or a forward fix.
 

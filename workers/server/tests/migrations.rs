@@ -291,3 +291,135 @@ async fn concurrent_rebaselines_are_idempotent() -> Result<()> {
     })
     .await
 }
+
+/// A deployed database at 0001: the schema and ledger the next deploy finds.
+async fn deployed_before_lifecycle_constraints(pool: &PgPool) -> Result<()> {
+    for sql in [
+        include_str!("../migrations/0000_baseline.sql"),
+        include_str!("../migrations/0001_optimistic_publication.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(pool).await?;
+    }
+    let mut conn = pool.acquire().await?;
+    conn.ensure_migrations_table(&migrations::MIGRATOR.table_name)
+        .await?;
+    drop(conn);
+    for migration in migrations::MIGRATOR.iter().take(2) {
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ($1, $2, true, $3, 17)")
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(pool).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_constraints_spare_legacy_rows_and_check_new_ones() -> Result<()> {
+    isolated(|pool| async move {
+        deployed_before_lifecycle_constraints(&pool).await?;
+        // Rows no current writer produces: a retired release's states, values
+        // nobody can account for, and two active signing keys on one cache.
+        pool.execute(
+            "INSERT INTO caches (name) VALUES ('main');
+            INSERT INTO upload_sessions (id, cache_id, store_path_hash, store_path, nar_hash, nar_size, file_size, compression, status, expires_at)
+            SELECT s, id, s, '/nix/store/' || s, 'sha256:test', 1, 1, 'zstd', s, now() FROM caches, unnest(ARRAY['uploading', 'completing', 'unknown']) s;
+            INSERT INTO nar_installations (key, operation_id, source_key, file_hash, compression, is_private, file_size, phase)
+            SELECT p, p, p, p, 'zstd', false, 1, p FROM unnest(ARRAY['copying', 'unknown']) p;
+            INSERT INTO cache_signing_keys (id, cache_id, signing_key_name, signing_public_key, state)
+            SELECT s, id, s, s, left(s, 6) FROM caches, unnest(ARRAY['active', 'active-2', 'unknown']) s;
+            INSERT INTO pins (id, cache_id, name, keep_kind, keep_value, current_revision)
+            SELECT 'legacy', id, 'legacy', 'days', NULL, 1 FROM caches",
+        )
+        .await?;
+        migrations::run(&pool).await?;
+        assert_eq!(count(&pool).await?, migrations::MIGRATOR.iter().len() as i64);
+        let kept: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM upload_sessions), (SELECT count(*) FROM nar_installations),
+                (SELECT count(*) FROM cache_signing_keys), (SELECT count(*) FROM pins)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(kept, (3, 2, 3, 1));
+
+        // A retired release's state survives an unrelated update; an unknown
+        // one can still leave for a state the machine has.
+        pool.execute("UPDATE upload_sessions SET file_size = 2 WHERE status = 'uploading'")
+            .await?;
+        pool.execute("UPDATE upload_sessions SET status = 'expired' WHERE status = 'unknown'")
+            .await?;
+        pool.execute("UPDATE nar_installations SET phase = 'revoked' WHERE phase = 'unknown'")
+            .await?;
+        for rejected in [
+            "UPDATE upload_sessions SET status = 'unknown' WHERE status = 'expired'",
+            "INSERT INTO upload_sessions (id, cache_id, store_path_hash, store_path, nar_hash, nar_size, file_size, compression, status, expires_at)
+                SELECT 'new', id, 'new', '/nix/store/new', 'sha256:test', 1, 1, 'zstd', 'Streaming', now() FROM caches",
+            "UPDATE nar_installations SET phase = 'prepared'",
+            "UPDATE cache_signing_keys SET state = 'revoked'",
+            "UPDATE pins SET keep_kind = 'weeks', keep_value = 1",
+            "UPDATE pins SET keep_kind = 'revisions', keep_value = 0",
+            "UPDATE pins SET keep_kind = 'forever', keep_value = 1",
+        ] {
+            let error = pool.execute(rejected).await.expect_err(rejected);
+            assert_eq!(
+                error.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("23514"),
+                "{rejected}"
+            );
+        }
+        pool.execute("UPDATE pins SET keep_kind = 'forever', keep_value = NULL")
+            .await?;
+
+        // Path lookups have their index. The one-active-key index is left out
+        // rather than failing the deployment on rows which already break it.
+        let indexes: (bool, bool) = sqlx::query_as(
+            "SELECT to_regclass('upload_sessions_cache_path') IS NOT NULL,
+                to_regclass('cache_signing_keys_one_active') IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(indexes, (true, false));
+        let definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'upload_sessions_cache_path'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            definition.ends_with("(cache_id, store_path_hash)"),
+            "{definition}"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_cache_has_at_most_one_active_signing_key() -> Result<()> {
+    isolated(|pool| async move {
+        migrations::run(&pool).await?;
+        pool.execute(
+            "INSERT INTO caches (name) VALUES ('main'), ('other');
+            INSERT INTO cache_signing_keys (id, cache_id, signing_key_name, signing_public_key, state)
+            SELECT c.name || k.state, c.id, k.state, k.state, k.state
+            FROM caches c, (VALUES ('staged'), ('active'), ('retired')) k(state)",
+        )
+        .await?;
+        let error = pool
+            .execute("UPDATE cache_signing_keys SET state = 'active' WHERE id = 'mainstaged'")
+            .await
+            .expect_err("two active keys");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("23505")
+        );
+        // Activation's order: retire the active key, then activate its target.
+        let mut tx = pool.begin().await?;
+        tx.execute("UPDATE cache_signing_keys SET state = 'retired' WHERE id = 'mainactive'")
+            .await?;
+        tx.execute("UPDATE cache_signing_keys SET state = 'active' WHERE id = 'mainstaged'")
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}

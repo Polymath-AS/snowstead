@@ -134,7 +134,7 @@ async fn set_cache_info(tx: &mut crate::db::Transaction, path: &str) -> Result<(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Org {
     id: String,
@@ -191,6 +191,10 @@ async fn body(request: Request) -> Result<Value, ApiError> {
 pub(crate) struct ManagementContext {
     pub(crate) identity: Identity,
     pub(crate) org: Option<String>,
+    /// The scoped org as authorization read it, so a handler which only
+    /// reports it need not read it again. Absent for admin routes and for
+    /// `PUT /orgs/{org}`, which may create the org.
+    row: Option<Org>,
 }
 
 #[derive(Deserialize)]
@@ -308,15 +312,14 @@ async fn authorize_and_audit(
         state.management_limits.check(identity.actor())?;
     }
     let root_put = request.method() == Method::PUT && matches!(endpoint, "" | "/");
-    if let Some(scope) = &scope
-        && !root_put
-        && org(&state.pool, scope).await?.is_none()
-    {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("no org {scope}"),
-        ));
-    }
+    let row = match &scope {
+        Some(scope) if !root_put => Some(
+            org(&state.pool, scope)
+                .await?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no org {scope}")))?,
+        ),
+        _ => None,
+    };
     let method = request.method().clone();
     let action = audit_action(&method, endpoint, admin);
     let ip = crate::app::client_ip(&state, &request);
@@ -342,6 +345,7 @@ async fn authorize_and_audit(
     request.extensions_mut().insert(ManagementContext {
         identity: identity.clone(),
         org: scope.clone(),
+        row,
     });
     let response = next.run(request).await;
     if let Some(action) = action {
@@ -473,14 +477,14 @@ async fn get_org(
     State(state): State<AppState>,
     Extension(context): Extension<ManagementContext>,
 ) -> Result<Response, ApiError> {
-    org_response(&state, context.org.as_deref().unwrap(), false).await
+    org_response(&state, context.org.as_deref().unwrap(), context.row, false).await
 }
 
 async fn org_overview(
     State(state): State<AppState>,
     Extension(context): Extension<ManagementContext>,
 ) -> Result<Response, ApiError> {
-    org_response(&state, context.org.as_deref().unwrap(), true).await
+    org_response(&state, context.org.as_deref().unwrap(), context.row, true).await
 }
 
 async fn list_caches(
@@ -682,18 +686,28 @@ async fn bandwidth(
 async fn org_response(
     state: &AppState,
     id: &str,
+    row: Option<Org>,
     include_caches: bool,
 ) -> Result<Response, ApiError> {
-    let row = org(&state.pool, id)
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no org {id}")))?;
+    let row = match row {
+        Some(row) => row,
+        None => org(&state.pool, id)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no org {id}")))?,
+    };
     let mut result = serde_json::to_value(row).map_err(|_| internal())?;
+    // Independent read-only reports: one round trip of latency, not one each.
+    // The bandwidth import time rides along with usage as a scalar subquery.
     let usage = crate::profile_future!(
         sqlx::query!(
             r#"
         SELECT
             COALESCE(SUM(used), 0)::bigint AS "used!",
-            COALESCE(SUM(pending), 0)::bigint AS "pending!"
+            COALESCE(SUM(pending), 0)::bigint AS "pending!",
+            (
+                SELECT MAX(imported_at)
+                FROM bandwidth_daily
+            ) AS "updated?"
         FROM (
             SELECT
                 SUM(size) AS used,
@@ -733,32 +747,30 @@ async fn org_response(
         )
         .fetch_one(&state.pool),
         label = "management.org_usage_sql"
-    )
-    .await?;
+    );
+    let caches = async {
+        Ok(if include_caches {
+            Some(cache_summaries(state, Some(id), None).await?)
+        } else {
+            None
+        })
+    };
+    let (usage, served, caches) = tokio::try_join!(
+        async { usage.await.map_err(ApiError::from) },
+        bandwidth(&state.pool, Some(id), None),
+        caches,
+    )?;
     result["used"] = json!(usage.used);
     result["pending"] = json!(usage.pending);
-    result.as_object_mut().unwrap().extend(
-        bandwidth(&state.pool, Some(id), None)
-            .await?
-            .as_object()
-            .unwrap()
-            .clone(),
-    );
-    let updated: Option<DateTime<Utc>> = crate::profile_future!(
-        sqlx::query_scalar!(
-            r#"
-        SELECT MAX(imported_at)
-        FROM bandwidth_daily
-        "#
-        )
-        .fetch_one(&state.pool),
-        label = "management.bandwidth_updated_sql"
-    )
-    .await?;
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(served.as_object().unwrap().clone());
+    let updated: Option<DateTime<Utc>> = usage.updated;
     result["bandwidthUpdatedAt"] =
         json!(updated.map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)));
-    if include_caches {
-        result["caches"] = json!(cache_summaries(state, Some(id), None).await?);
+    if let Some(caches) = caches {
+        result["caches"] = json!(caches);
     }
     Ok(ok(result))
 }
@@ -1079,7 +1091,8 @@ async fn put_org(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    org_response(state, id, false).await
+    // Report the row this request just wrote, not the one read before it.
+    org_response(state, id, None, false).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]

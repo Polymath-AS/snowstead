@@ -58,6 +58,7 @@ pub mod config;
 mod db;
 pub mod error;
 mod go;
+mod lifecycle;
 mod maintenance;
 mod management;
 mod management_auth;
