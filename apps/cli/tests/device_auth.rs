@@ -42,13 +42,25 @@ fn device_server(
     replies: Vec<(u16, Value)>,
     expires: u64,
 ) -> (String, thread::JoinHandle<Vec<Instant>>) {
+    scripted_device(200, replies, expires)
+}
+
+/// Status 0 closes the connection without a response.
+fn scripted_device(
+    start_status: u16,
+    replies: Vec<(u16, Value)>,
+    expires: u64,
+) -> (String, thread::JoinHandle<Vec<Instant>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let origin = url.clone();
     let handle = thread::spawn(move || {
         let start = json!({"deviceCode":DEVICE, "userCode":"ABCD-2345", "verificationUri":format!("{origin}/auth/device"), "expiresIn":expires, "interval":1});
         let mut times = vec![];
-        for (i, (status, body)) in std::iter::once((200, start)).chain(replies).enumerate() {
+        for (i, (status, body)) in std::iter::once((start_status, start))
+            .chain(replies)
+            .enumerate()
+        {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
@@ -89,6 +101,9 @@ fn device_server(
             }
             assert!(!headers.to_lowercase().contains("authorization:"));
             times.push(Instant::now());
+            if status == 0 {
+                continue;
+            }
             let body = body.to_string();
             write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
@@ -308,5 +323,117 @@ fn browser_opener_is_attempted_and_failure_keeps_manual_instructions() {
             exit != 0
         );
         assert_no_secrets(&result, &url);
+    }
+}
+
+#[test]
+fn transient_poll_failures_do_not_abort_an_approved_login() {
+    let home = tempfile::tempdir().unwrap();
+    let (url, server) = device_server(
+        vec![
+            (0, Value::Null),
+            (503, json!({"error":"unavailable"})),
+            (200, success()),
+        ],
+        600,
+    );
+    let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let times = server.join().unwrap();
+    assert!(
+        times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_secs(1)),
+        "transient failures keep the polling interval"
+    );
+    assert_no_secrets(&result, &url);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("Signed in to Example organization."));
+    assert!(stdout.contains("Token expires 2027-01-01T00:00:00Z."));
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(config_path(home.path())).unwrap()).unwrap();
+    assert_eq!(config["servers"]["org-slug"]["token"], TOKEN);
+}
+
+#[test]
+fn repeated_transient_failures_end_the_login() {
+    let home = tempfile::tempdir().unwrap();
+    let before = seed(home.path());
+    let (url, server) = device_server(vec![(503, json!({})); 6], 600);
+    let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
+    assert!(!result.status.success());
+    assert_eq!(server.join().unwrap().len(), 7);
+    assert!(String::from_utf8_lossy(&result.stderr).contains("failed repeatedly"));
+    assert_eq!(std::fs::read(config_path(home.path())).unwrap(), before);
+}
+
+#[test]
+fn final_poll_at_the_deadline_completes_a_late_approval() {
+    let home = tempfile::tempdir().unwrap();
+    let mut authorized = success();
+    authorized["expiresAt"] = Value::Null;
+    let (url, server) = device_server(
+        vec![
+            (400, json!({"error":"authorization_pending"})),
+            (200, authorized),
+        ],
+        2,
+    );
+    let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let times = server.join().unwrap();
+    assert!(times[2].duration_since(times[0]) >= Duration::from_millis(1900));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Token does not expire."));
+}
+
+#[test]
+fn rate_limited_start_explains_itself() {
+    let home = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_device(429, vec![], 600);
+    let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
+    assert!(!result.status.success());
+    server.join().unwrap();
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Too many login attempts"));
+    assert_no_secrets(&result, &url);
+}
+
+#[test]
+fn unusable_config_fails_before_a_device_code_is_requested() {
+    for corrupt in [true, false] {
+        let home = tempfile::tempdir().unwrap();
+        if corrupt {
+            seed(home.path());
+            std::fs::write(config_path(home.path()), b"not json").unwrap();
+        } else {
+            // Neither the config nor its directory can exist under a regular file.
+            std::fs::write(home.path().join(".config"), b"").unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let result = run(home.path(), &["login", "--no-browser", "--url", &url]);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(if corrupt {
+                "Invalid Snowstead config JSON"
+            } else {
+                "Could not read Snowstead config"
+            }),
+            "{stderr}"
+        );
+        // No token can have been minted: the server was never contacted.
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
