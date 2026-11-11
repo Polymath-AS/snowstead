@@ -38,6 +38,7 @@ pub struct AppState {
     pub(crate) management_limits: Arc<management::ApiLimits>,
     pub(crate) protocol_limits: Arc<protocol_policy::ProtocolLimits>,
     pub(crate) verification_slots: Arc<Semaphore>,
+    pub(crate) preparation_slots: Arc<Semaphore>,
     pub(crate) sql_waiters: Arc<Semaphore>,
     pub(crate) sql_writers: Arc<crate::db::Writers>,
     proxy_ips: Arc<[IpAddr]>,
@@ -78,6 +79,8 @@ impl AppState {
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),
+            // Allow one eight-member inline batch to queue per verifier.
+            preparation_slots: Arc::new(Semaphore::new(config.resources.verifications * 8)),
             config: Arc::new(config),
             http,
             tasks: TaskTracker::new(),
