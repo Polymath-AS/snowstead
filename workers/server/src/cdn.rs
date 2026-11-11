@@ -19,6 +19,11 @@ const PREFIX: &str = "cdn-purges/";
 const MAX_HASHES: usize = 10_000;
 const MAX_JOB_BYTES: u64 = 1024 * 1024;
 const INTERVAL: Duration = Duration::from_millis(125);
+// One sweep reads at most this many queued jobs, and stops early once the
+// provider itself has failed this many of them.
+const SWEEP_PAGE: usize = 100;
+const SWEEP_PAGES: usize = 10;
+const SWEEP_PROVIDER_FAILURES: usize = 3;
 static DISPATCH: Semaphore = Semaphore::const_new(4);
 static SWEEP: Mutex<()> = Mutex::const_new(());
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::const_new(None);
@@ -268,62 +273,111 @@ async fn retry_at_endpoint(state: &AppState, endpoint: &str) -> Result<usize, Ap
     let Ok(_guard) = SWEEP.try_lock() else {
         return Ok(0);
     };
-    let keys = state
-        .storage
-        .list(true, PREFIX.trim_end_matches('/'), None, 100)
-        .await
-        .map_err(|_| storage_error())?;
     let mut completed = 0;
     let mut budget = MAX_HASHES;
-    for key in keys {
-        if !key.starts_with(PREFIX) {
-            continue;
-        }
-        let object = match state.storage.open(true, &key).await {
-            Ok(object) => object,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(storage_error()),
-        };
-        let mut bytes = Vec::new();
-        object
-            .reader
-            .take(MAX_JOB_BYTES + 1)
-            .read_to_end(&mut bytes)
+    // A job which cannot be read, parsed, or purged stays queued and fails the
+    // sweep, but does not end it: the oldest key must never decide whether
+    // newer purges run at all.
+    let mut failure = None;
+    let mut unhealthy = 0;
+    let mut cursor: Option<String> = None;
+    'sweep: for _ in 0..SWEEP_PAGES {
+        let keys = state
+            .storage
+            .list(
+                true,
+                PREFIX.trim_end_matches('/'),
+                cursor.as_deref(),
+                SWEEP_PAGE,
+            )
             .await
             .map_err(|_| storage_error())?;
-        if bytes.len() as u64 > MAX_JOB_BYTES {
-            return Err(storage_error());
+        // Stuck jobs sort first. Read past a full page of them.
+        let full = keys.len() == SWEEP_PAGE;
+        cursor = keys.last().cloned();
+        for key in keys {
+            if !key.starts_with(PREFIX) {
+                continue;
+            }
+            let valid = match pending(state, &key).await {
+                Ok(Some(valid)) => valid,
+                Ok(None) => continue,
+                Err(error) => {
+                    failure = Some(error);
+                    continue;
+                }
+            };
+            let cost = valid
+                .files
+                .as_ref()
+                .map_or(valid.hashes.len(), Vec::len)
+                .max(1);
+            if cost > budget {
+                break 'sweep;
+            }
+            budget -= cost;
+            match dispatch(state, &key, valid, endpoint).await {
+                Ok(()) => completed += 1,
+                Err((error, retryable)) => {
+                    failure = Some(error);
+                    // A refused job stopped at its first refused request. Do
+                    // not let it spend the budget of the jobs behind it.
+                    budget += cost - cost.min(100);
+                    // Rate limits and provider errors are not about one job:
+                    // leave the rest of the backlog for the next sweep.
+                    unhealthy += usize::from(retryable);
+                    if unhealthy == SWEEP_PROVIDER_FAILURES {
+                        break 'sweep;
+                    }
+                }
+            }
         }
-        let pending: Job = serde_json::from_slice(&bytes).map_err(|_| storage_error())?;
-        if pending.retry_at.is_some_and(|at| at > now()) {
-            continue;
-        }
-        let mut valid = match &pending.files {
-            Some(files) if !pending.whole_cache && pending.hashes.is_empty() => files_job(files)?,
-            Some(_) => return Err(invalid_job()),
-            None => job(
-                &pending.cache_path,
-                if pending.whole_cache {
-                    None
-                } else {
-                    Some(&pending.hashes)
-                },
-            )?,
-        };
-        valid.retry_at = pending.retry_at;
-        let cost = valid
-            .files
-            .as_ref()
-            .map_or(valid.hashes.len(), Vec::len)
-            .max(1);
-        if cost > budget {
+        if !full {
             break;
         }
-        budget -= cost;
-        finish(state, &key, valid, endpoint).await?;
-        completed += 1;
     }
-    Ok(completed)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(completed),
+    }
+}
+
+/// A due, well-formed job; `None` when it is gone or not due yet.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn pending(state: &AppState, key: &str) -> Result<Option<Job>, ApiError> {
+    let object = match state.storage.open(true, key).await {
+        Ok(object) => object,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(storage_error()),
+    };
+    let mut bytes = Vec::new();
+    object
+        .reader
+        .take(MAX_JOB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| storage_error())?;
+    if bytes.len() as u64 > MAX_JOB_BYTES {
+        return Err(storage_error());
+    }
+    let pending: Job = serde_json::from_slice(&bytes).map_err(|_| storage_error())?;
+    if pending.retry_at.is_some_and(|at| at > now()) {
+        return Ok(None);
+    }
+    let mut valid = match &pending.files {
+        Some(files) if !pending.whole_cache && pending.hashes.is_empty() => files_job(files)?,
+        Some(_) => return Err(invalid_job()),
+        None => job(
+            &pending.cache_path,
+            if pending.whole_cache {
+                None
+            } else {
+                Some(&pending.hashes)
+            },
+        )?,
+    };
+    valid.retry_at = pending.retry_at;
+    Ok(Some(valid))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -337,19 +391,36 @@ async fn save(state: &AppState, key: &str, job: &Job) -> Result<(), ApiError> {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn finish(state: &AppState, key: &str, mut job: Job, endpoint: &str) -> Result<(), ApiError> {
+async fn finish(state: &AppState, key: &str, job: Job, endpoint: &str) -> Result<(), ApiError> {
+    dispatch(state, key, job, endpoint)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// Purge and retire one durable job. The flag tells a failure the provider may
+/// recover from (a rate limit, a server error, a timeout) from a refusal.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn dispatch(
+    state: &AppState,
+    key: &str,
+    mut job: Job,
+    endpoint: &str,
+) -> Result<(), (ApiError, bool)> {
     match execute(state, &job, endpoint).await {
         Ok(()) => state
             .storage
             .delete(true, key)
             .await
-            .map_err(|_| storage_error()),
+            .map_err(|_| storage_error())
+            .map_err(|error| (error, false)),
         Err(failure) => {
             if let Some(at) = failure.retry_at {
                 job.retry_at = Some(at);
-                save(state, key, &job).await?;
+                save(state, key, &job)
+                    .await
+                    .map_err(|error| (error, false))?;
             }
-            Err(provider_error())
+            Err((provider_error(), failure.retry_at.is_some()))
         }
     }
 }
@@ -703,9 +774,12 @@ mod tests {
         );
     }
 
-    // One async test keeps process-wide pacing and sweep admission deterministic.
+    // Pacing and sweep admission are process-wide: these tests take turns.
+    static SERIAL: Mutex<()> = Mutex::const_new(());
+
     #[tokio::test]
     async fn durable_backlog_batches_retries_and_restart() {
+        let _serial = SERIAL.lock().await;
         let server = Server::new().await;
         let storage = storage();
         let state = state(storage.clone());
@@ -838,7 +912,8 @@ mod tests {
         assert_eq!(server.mock.requests.lock().await.len(), 3);
         assert!(state.storage.head(true, key).await.is_err());
 
-        // Failed purges never delete the current or following durable record.
+        // A failed purge never deletes its durable record, and never keeps the
+        // record behind it from being purged.
         save(&state, key, &ready).await.unwrap();
         let next = "cdn-purges/0000000000000002-next";
         save(&state, next, &ready).await.unwrap();
@@ -846,9 +921,9 @@ mod tests {
             .replies([Reply::status(StatusCode::FORBIDDEN, None)])
             .await;
         assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
-        assert_eq!(server.mock.requests.lock().await.len(), 1);
+        assert_eq!(server.mock.requests.lock().await.len(), 2);
         assert!(state.storage.head(true, key).await.is_ok());
-        assert!(state.storage.head(true, next).await.is_ok());
+        assert!(state.storage.head(true, next).await.is_err());
         server
             .replies(vec![
                 Reply::status(
@@ -864,7 +939,7 @@ mod tests {
         server.replies([]).await;
         assert_eq!(
             retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            2
+            1
         );
 
         // A stalled response and a transport error are retried, without
@@ -908,6 +983,96 @@ mod tests {
             error.message,
             "the CDN refused the purge; try again shortly"
         );
+        state.tasks.close();
+        state.tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn failing_jobs_do_not_block_later_jobs() {
+        let _serial = SERIAL.lock().await;
+        let server = Server::new().await;
+        let state = state(storage());
+        let one = job("cache", Some(&[hash(1)])).unwrap();
+        // The oldest keys: unreadable, not a valid job, and refused for good.
+        let malformed = "cdn-purges/0000000000000001-malformed";
+        let invalid = "cdn-purges/0000000000000002-invalid";
+        let refused = "cdn-purges/0000000000000003-refused";
+        let later = "cdn-purges/0000000000000004-later";
+        state.storage.put(true, malformed, b"{").await.unwrap();
+        state
+            .storage
+            .put(true, invalid, br#"{"cachePath":"../escape","hashes":[]}"#)
+            .await
+            .unwrap();
+        save(&state, refused, &one).await.unwrap();
+        save(&state, later, &one).await.unwrap();
+        server
+            .replies([Reply::status(StatusCode::FORBIDDEN, None)])
+            .await;
+        // The sweep still reports the failure, but only after the later job ran.
+        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert_eq!(server.mock.requests.lock().await.len(), 2);
+        assert!(state.storage.head(true, later).await.is_err());
+        for kept in [malformed, invalid, refused] {
+            assert!(state.storage.head(true, kept).await.is_ok(), "{kept}");
+        }
+        state.storage.delete(true, invalid).await.unwrap();
+        state.storage.delete(true, refused).await.unwrap();
+
+        // More stuck jobs than one listing page cannot hide the jobs after them.
+        for i in 0..SWEEP_PAGE {
+            let key = format!("cdn-purges/00000000000000010-stuck-{i:03}");
+            state.storage.put(true, &key, b"{").await.unwrap();
+        }
+        let last = "cdn-purges/0000000000000002-last";
+        save(&state, last, &one).await.unwrap();
+        server.replies([]).await;
+        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert_eq!(server.mock.requests.lock().await.len(), 1);
+        assert!(state.storage.head(true, last).await.is_err());
+        for key in state
+            .storage
+            .list(true, "cdn-purges", None, 1000)
+            .await
+            .unwrap()
+        {
+            state.storage.delete(true, &key).await.unwrap();
+        }
+
+        // A failing provider is not asked about the whole backlog: the sweep
+        // stops, and each job waits out its own Retry-After.
+        let keys: Vec<_> = (0..5)
+            .map(|i| format!("cdn-purges/000000000000000{i}-limited"))
+            .collect();
+        for key in &keys {
+            save(&state, key, &one).await.unwrap();
+        }
+        server
+            .replies(vec![
+                Reply::status(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some("3600")
+                );
+                SWEEP_PROVIDER_FAILURES
+            ])
+            .await;
+        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert_eq!(
+            server.mock.requests.lock().await.len(),
+            SWEEP_PROVIDER_FAILURES
+        );
+        server.replies([]).await;
+        assert_eq!(
+            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
+            keys.len() - SWEEP_PROVIDER_FAILURES
+        );
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                state.storage.head(true, key).await.is_ok(),
+                i < SWEEP_PROVIDER_FAILURES,
+                "{key}"
+            );
+        }
         state.tasks.close();
         state.tasks.wait().await;
     }
