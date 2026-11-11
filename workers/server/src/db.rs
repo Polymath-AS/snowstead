@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit};
 
 use crate::error::ApiError;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -67,6 +67,30 @@ pub(crate) async fn begin(state: &crate::AppState, org: &str) -> Result<Transact
         .clone()
         .try_acquire_owned()
         .map_err(|_| busy("SQL admission busy; retry"))?;
+    begin_admitted(state, org, admission).await
+}
+
+/// Callers must bound their queued work before waiting here. Part transfers
+/// hold a preparation slot so completed writes can wait without retransmission.
+pub(crate) async fn begin_queued(
+    state: &crate::AppState,
+    org: &str,
+) -> Result<Transaction, ApiError> {
+    let admission = tokio::time::timeout(
+        state.pool.options().get_acquire_timeout(),
+        state.sql_waiters.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| busy("SQL admission busy; retry"))?
+    .map_err(|_| busy("SQL admission busy; retry"))?;
+    begin_admitted(state, org, admission).await
+}
+
+async fn begin_admitted(
+    state: &crate::AppState,
+    org: &str,
+    admission: OwnedSemaphorePermit,
+) -> Result<Transaction, ApiError> {
     let writer = tokio::time::timeout(
         state.pool.options().get_acquire_timeout(),
         state.sql_writers.org(org).lock_owned(),

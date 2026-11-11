@@ -2,7 +2,9 @@
 //! No connection is held during HTTP bodies, verification, or storage I/O.
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     io::Read,
+    time::Duration,
 };
 
 use crate::db::Transaction;
@@ -157,7 +159,7 @@ async fn json_body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T
     serde_json::from_slice(&bytes).map_err(|_| error(400, "Invalid JSON in request body"))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 struct Session {
     id: String,
     cache_id: i32,
@@ -198,7 +200,18 @@ async fn load(
     id: &str,
     identity: &Identity,
 ) -> Result<Session, ApiError> {
-    let s = sqlx::query_as!(
+    load_sessions(executor, &[id.to_owned()], identity)
+        .await?
+        .pop()
+        .ok_or_else(|| error(404, "Not found"))
+}
+
+async fn load_sessions(
+    executor: impl sqlx::PgExecutor<'_>,
+    ids: &[String],
+    identity: &Identity,
+) -> Result<Vec<Session>, ApiError> {
+    let sessions = sqlx::query_as!(
         Session,
         r#"
         SELECT
@@ -226,7 +239,7 @@ async fn load(
         FROM upload_sessions u
         JOIN caches c ON c.id = u.cache_id
         JOIN orgs o ON o.id = c.org_id
-        WHERE u.id = $1
+        WHERE u.id = ANY($1)
             AND u.expires_at > NOW()
             AND EXISTS (
                 SELECT 1
@@ -235,13 +248,14 @@ async fn load(
                     AND p.protocol = 'nix'
             )
         "#,
-        id,
+        ids,
     )
-    .fetch_optional(executor)
-    .await?
-    .ok_or_else(|| error(404, "Not found"))?;
-    authorize(&s, identity)?;
-    Ok(s)
+    .fetch_all(executor)
+    .await?;
+    for session in &sessions {
+        authorize(session, identity)?;
+    }
+    Ok(sessions)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn lock(tx: &mut Transaction, key: &str) -> Result<(), ApiError> {
@@ -258,11 +272,19 @@ async fn locked(
     s: &Session,
     identity: &Identity,
 ) -> Result<(Transaction, Session), ApiError> {
-    let mut tx = crate::profile_future!(
+    let tx = crate::profile_future!(
         crate::db::begin(state, &s.org_id),
         label = "uploads.session_pool_begin"
     )
     .await?;
+    lock_session(tx, s, identity).await
+}
+
+async fn lock_session(
+    mut tx: Transaction,
+    s: &Session,
+    identity: &Identity,
+) -> Result<(Transaction, Session), ApiError> {
     lock(&mut tx, &format!("org:{}", s.org_id)).await?;
     lock(&mut tx, &format!("upload:{}", s.id)).await?;
     // Re-read and reauthorize after the fences, using the same query as preflight.
@@ -671,6 +693,13 @@ async fn put_part(
     {
         return Err(error(400, "Part must match its reserved content-length"));
     }
+    // Bound transfers and completed writes waiting for receipt admission.
+    // This permit is not a database connection or an organization fence.
+    let _admission = state
+        .preparation_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error(503, "Preparation queue full; retry"))?;
     // The unique key belongs only to this transfer until its receipt commits.
     let key = format!("staging/{id}/{}", uuid::Uuid::now_v7());
     let etag = state
@@ -679,7 +708,8 @@ async fn put_part(
         .await?;
     let mut commit_attempted = false;
     let admitted = async {
-        let (mut tx, s) = locked(state, &s, identity).await?;
+        let tx = crate::db::begin_queued(state, &s.org_id).await?;
+        let (mut tx, s) = lock_session(tx, &s, identity).await?;
         if s.status != "streaming" {
             return Err(error(409, "Conflict"));
         }
@@ -754,6 +784,19 @@ struct Receipt {
     file_size: i64,
     parts: Vec<ReceiptPart>,
 }
+impl Receipt {
+    fn validate(&self) -> Result<String, ApiError> {
+        if !bounded(self.file_size)
+            || !bounded(self.nar_size)
+            || !hash_valid(&self.file_hash)
+            || self.parts.is_empty()
+            || self.parts.len() > 10_000
+        {
+            return Err(error(400, "Invalid stream receipt"));
+        }
+        canonical_hash(&self.nar_hash)
+    }
+}
 #[derive(Deserialize)]
 struct Finalize {
     uploads: Vec<Receipt>,
@@ -762,20 +805,13 @@ struct Finalize {
 async fn seal(
     state: &AppState,
     identity: &Identity,
+    session: &Session,
     receipt: &Receipt,
-    inline: bool,
-) -> Result<(Session, Vec<Part>), ApiError> {
-    if !bounded(receipt.file_size)
-        || !bounded(receipt.nar_size)
-        || !hash_valid(&receipt.file_hash)
-        || receipt.parts.is_empty()
-        || receipt.parts.len() > 10_000
-    {
-        return Err(error(400, "Invalid stream receipt"));
-    }
-    let nar_hash = canonical_hash(&receipt.nar_hash)?;
-    let s = load(&state.pool, &receipt.session_id, identity).await?;
-    let (mut tx, mut s) = locked(state, &s, identity).await?;
+    bytes: Option<axum::body::Bytes>,
+) -> Result<Prepared, ApiError> {
+    let inline = bytes.is_some();
+    let nar_hash = receipt.validate()?;
+    let (mut tx, mut s) = locked(state, session, identity).await?;
     if (s.r2_upload_id.is_none()) != inline {
         return Err(error(409, "Conflict"));
     }
@@ -844,24 +880,24 @@ async fn seal(
             "Part receipts do not match uploaded bytes",
         ));
     }
-    sqlx::query!(
-        r#"
-        UPDATE upload_sessions
-        SET status = CASE WHEN status = 'streaming' THEN 'finalizing' ELSE status END,
-            file_hash = $2
-        WHERE id = $1
-        "#,
-        &s.id,
-        &receipt.file_hash,
-    )
-    .execute(&mut *tx)
-    .await?;
-    s.file_hash = Some(receipt.file_hash.clone());
     if s.status == "streaming" {
+        sqlx::query!(
+            r#"
+            UPDATE upload_sessions
+            SET status = 'finalizing', file_hash = $2
+            WHERE id = $1
+            "#,
+            &s.id,
+            &receipt.file_hash,
+        )
+        .execute(&mut *tx)
+        .await?;
+        s.file_hash = Some(receipt.file_hash.clone());
         s.status = "finalizing".into();
     }
+    let prepared = prepare_sealed(&mut tx, s, stored, bytes).await?;
     tx.commit().await?;
-    Ok((s, stored))
+    Ok(prepared)
 }
 
 /// Read sealed parts in order, without materializing an assembled object.
@@ -1016,11 +1052,11 @@ fn nar(s: &Session) -> Result<signing::Narinfo, ApiError> {
 /// or evict anything: both decisions belong to the publication transaction.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn allocate_candidate(
-    state: &AppState,
+    tx: Transaction,
     identity: &Identity,
     s: &Session,
 ) -> Result<(String, String), ApiError> {
-    let (mut tx, current) = locked(state, s, identity).await?;
+    let (mut tx, current) = lock_session(tx, s, identity).await?;
     if current.status == "completed" {
         return Err(error(503, "Publication completed; retry for its result"));
     }
@@ -1033,6 +1069,16 @@ async fn allocate_candidate(
     if current.is_public != s.is_public {
         return Err(error(503, "Cache policy changed; retry"));
     }
+    let candidate = claim_candidate(&mut tx, &current).await?;
+    tx.commit().await?;
+    Ok(candidate)
+}
+
+/// The caller holds the org and session fences and has validated the seal.
+async fn claim_candidate(tx: &mut Transaction, s: &Session) -> Result<(String, String), ApiError> {
+    if !s.is_public && !s.private_caches {
+        return Err(error(403, PRIVATE_CACHES_REFUSED));
+    }
     let hash = s.file_hash.as_deref().unwrap();
     let operation = uuid::Uuid::now_v7().to_string();
     let key = if s.is_public {
@@ -1044,9 +1090,10 @@ async fn allocate_candidate(
         r#"
         INSERT INTO nar_installations (
             key, operation_id, file_hash, compression, is_private, file_size,
-            cache_id, session_id, expires_at
+            cache_id, session_id, expires_at, lease_expires_at
         )
-        SELECT $1, $2, $3, 'zstd', $4, $5, cache_id, id, expires_at
+        SELECT $1, $2, $3, 'zstd', $4, $5, cache_id, id, expires_at,
+            LEAST(expires_at, NOW() + INTERVAL '60 seconds')
         FROM upload_sessions WHERE id=$6
         ON CONFLICT DO NOTHING
         "#,
@@ -1057,13 +1104,12 @@ async fn allocate_candidate(
     .bind(!s.is_public)
     .bind(s.file_size)
     .bind(&s.id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if claimed == 0 {
         return Err(error(503, "NAR installation busy; retry"));
     }
-    tx.commit().await?;
     Ok((key, operation))
 }
 
@@ -1074,136 +1120,236 @@ async fn publish(
     ready: &Prepared,
     protect: &[(i32, String)],
 ) -> Result<Value, ApiError> {
-    let s = &ready.session;
-    let key = &ready.key;
-    let operation = &ready.operation;
-    let (mut tx, current) = locked(state, s, identity).await?;
-    if current.status != "finalizing" || current.file_hash != s.file_hash {
-        return Err(error(409, "Conflict"));
-    }
-    if !current.is_public && !current.private_caches {
-        return Err(error(403, PRIVATE_CACHES_REFUSED));
-    }
-    // Hold policy rows only for this SQL-only commit. A rotation or policy
-    // change must either precede this comparison or follow publication.
-    sqlx::query("SELECT id FROM caches WHERE id=$1 FOR SHARE NOWAIT")
-        .bind(s.cache_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    sqlx::query("SELECT id FROM orgs WHERE id=$1 FOR SHARE NOWAIT")
-        .bind(&s.org_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let current = load(&mut *tx, &s.id, identity).await?;
-    if current.is_public != s.is_public {
-        return Err(error(503, "Cache policy changed; retry"));
-    }
-    if !current.is_public && !current.private_caches {
-        return Err(error(403, PRIVATE_CACHES_REFUSED));
-    }
-    let owned = sqlx::query(
-        "DELETE FROM nar_installations WHERE key=$1 AND operation_id=$2 \
-             AND phase='ready' \
-             AND expires_at>NOW() RETURNING key",
+    Ok(publish_group(state, identity, &[ready], protect)
+        .await?
+        .remove(0))
+}
+
+/// Lock ordering is independent of request order, which decides path winners.
+async fn lock_set(tx: &mut Transaction, keys: Vec<String>) -> Result<(), ApiError> {
+    let acquired: Vec<bool> = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(key,0)) FROM \
+         (SELECT DISTINCT UNNEST($1::text[]) AS key ORDER BY key OFFSET 0) ordered",
     )
-    .bind(key)
-    .bind(operation)
-    .fetch_optional(&mut *tx)
+    .bind(keys)
+    .fetch_all(&mut **tx)
     .await?;
-    if owned.is_none() {
+    if acquired.contains(&false) {
+        return Err(error(503, "Concurrent write; retry"));
+    }
+    Ok(())
+}
+
+/// A bounded, single-org, SQL-only commit. On failure the caller can retry each
+/// member independently; rollback leaves every confirmed candidate reusable.
+async fn publish_group(
+    state: &AppState,
+    identity: &Identity,
+    ready: &[&Prepared],
+    protect: &[(i32, String)],
+) -> Result<Vec<Value>, ApiError> {
+    let org = &ready[0].session.org_id;
+    let mut tx = crate::db::begin(state, org).await?;
+    lock(&mut tx, &format!("org:{org}")).await?;
+    lock_set(
+        &mut tx,
+        ready
+            .iter()
+            .map(|p| format!("upload:{}", p.session.id))
+            .collect(),
+    )
+    .await?;
+    // Cache rows precede the org row, as in the single-item writer. Keys and
+    // policy stay locked until all pointers and outcomes commit together.
+    #[derive(sqlx::FromRow)]
+    struct CacheKeys {
+        id: i32,
+        signing_key_name: Option<String>,
+        signing_public_key: Option<String>,
+        signing_key_sealed: Option<String>,
+    }
+    let cache_ids: Vec<_> = ready.iter().map(|p| p.session.cache_id).collect();
+    let keys: Vec<CacheKeys> = sqlx::query_as(
+        "SELECT id,signing_key_name,signing_public_key,signing_key_sealed \
+         FROM caches WHERE id=ANY($1) ORDER BY id FOR SHARE NOWAIT",
+    )
+    .bind(&cache_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let limit: Option<i64> =
+        sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1 FOR SHARE NOWAIT")
+            .bind(org)
+            .fetch_one(&mut *tx)
+            .await?;
+    let ids: Vec<_> = ready.iter().map(|p| p.session.id.clone()).collect();
+    let sessions: HashMap<_, _> = load_sessions(&mut *tx, &ids, identity)
+        .await?
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    #[derive(Serialize)]
+    struct Publication<'a> {
+        ordinal: usize,
+        #[serde(flatten)]
+        session: &'a Session,
+        key: &'a str,
+        operation_id: &'a str,
+    }
+    let mut results = Vec::with_capacity(ready.len());
+    let mut incoming = Vec::new();
+    for p in ready {
+        let s = &p.session;
+        let current = sessions.get(&s.id).ok_or_else(|| error(404, "Not found"))?;
+        if current.status == "completed" {
+            results.push(current.publication_result.clone().unwrap_or_else(
+                || json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true}),
+            ));
+            continue;
+        }
+        if current.status != "finalizing" || current.file_hash != s.file_hash {
+            return Err(error(409, "Conflict"));
+        }
+        if current.is_public != s.is_public {
+            return Err(error(503, "Cache policy changed; retry"));
+        }
+        if !current.is_public && !current.private_caches {
+            return Err(error(403, PRIVATE_CACHES_REFUSED));
+        }
+        let keys = keys
+            .iter()
+            .find(|k| k.id == s.cache_id)
+            .ok_or_else(|| error(404, "Not found"))?;
+        let key = signing::select_key(
+            &state.config,
+            s.cache_id,
+            keys.signing_key_name.as_deref(),
+            keys.signing_public_key.as_deref(),
+            keys.signing_key_sealed.as_deref(),
+        )?;
+        signing::render_with_key(
+            &cache_path(current),
+            !current.is_public,
+            &nar(s)?,
+            key.as_ref().map(|(name, key)| (name.as_str(), key)),
+        )?;
+        let ordinal = results.len();
+        results.push(json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true}));
+        incoming.push(Publication {
+            ordinal,
+            session: s,
+            key: &p.key,
+            operation_id: &p.operation,
+        });
+    }
+    if incoming.is_empty() {
+        tx.commit().await?;
+        return Ok(results);
+    }
+    // GC takes this table fence before NAR locks. Obtain it before admission
+    // too: eviction can update sessions through invalidation triggers.
+    sqlx::query("LOCK TABLE upload_sessions IN ROW EXCLUSIVE MODE NOWAIT")
+        .execute(&mut *tx)
+        .await?;
+    lock_set(
+        &mut tx,
+        incoming
+            .iter()
+            .map(|p| format!("nar:{}:zstd", p.session.file_hash.as_deref().unwrap()))
+            .collect(),
+    )
+    .await?;
+    let input = sqlx::types::Json(&incoming);
+    let owned = sqlx::query(
+        "DELETE FROM nar_installations n USING jsonb_to_recordset($1) \
+         AS i(key text, operation_id text, id text) \
+         WHERE n.key=i.key AND n.operation_id=i.operation_id AND n.session_id=i.id \
+         AND n.phase='ready' AND n.expires_at>NOW()",
+    )
+    .bind(input)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if owned != incoming.len() as u64 {
         return Err(error(
             503,
             "Publication attempt expired or cancelled; retry",
         ));
     }
-    let hash = s.file_hash.as_deref().unwrap();
-    lock(&mut tx, &format!("nar:{hash}:zstd")).await?;
-    let existing: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM published_paths WHERE cache_id=$1 AND store_path_hash=$2)",
+    let existing: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT p.cache_id,p.store_path_hash FROM published_paths p \
+         JOIN jsonb_to_recordset($1) AS i(cache_id integer, store_path_hash text) \
+         ON p.cache_id=i.cache_id AND p.store_path_hash=i.store_path_hash",
     )
-    .bind(s.cache_id)
-    .bind(&s.store_path_hash)
-    .fetch_one(&mut *tx)
+    .bind(input)
+    .fetch_all(&mut *tx)
     .await?;
-    // Validate signing before adoption, but never write mutable metadata.
-    signing::render(
-        &mut *tx,
-        &state.config,
-        s.cache_id,
-        &cache_path(&current),
-        !current.is_public,
-        &nar(s)?,
-    )
-    .await?;
-    let capacity: Option<i64> = sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1")
-        .bind(&s.org_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if let Some(limit) = capacity {
-        crate::capacity::admit(
-            &mut tx,
-            &s.org_id,
-            limit,
-            if existing { 0 } else { s.file_size },
-            protect,
-        )
-        .await?;
+    let mut seen: HashSet<_> = existing.into_iter().collect();
+    let mut bytes = 0i64;
+    for item in &incoming {
+        let s = item.session;
+        let path = (s.cache_id, s.store_path_hash.clone());
+        if seen.insert(path) {
+            bytes = bytes.saturating_add(s.file_size);
+        } else {
+            results[item.ordinal]["alreadyExisted"] = json!(true);
+        }
     }
-    let (blob_id, adopted): (i64, Option<String>) = sqlx::query_as(
-            r#"
-            INSERT INTO blob_objects(file_hash, file_size, compression, r2_key, public_key, private_key)
-            VALUES ($1, $2, 'zstd', $3, CASE WHEN $4 THEN $3 END, CASE WHEN NOT $4 THEN $3 END)
-            ON CONFLICT (file_hash, compression) DO UPDATE SET
-                public_key = CASE WHEN $4 THEN COALESCE(blob_objects.public_key, $3) ELSE blob_objects.public_key END,
-                private_key = CASE WHEN NOT $4 THEN COALESCE(blob_objects.private_key, $3) ELSE blob_objects.private_key END
-            RETURNING id, CASE WHEN $4 THEN public_key ELSE private_key END
-            "#
-        )
-        .bind(hash).bind(s.file_size).bind(key).bind(s.is_public)
-        .fetch_one(&mut *tx)
-        .await?;
-    if adopted.as_deref() != Some(key) {
-        sqlx::query(
-            "INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING",
-        )
-        .bind(!s.is_public)
-        .bind(key)
-        .execute(&mut *tx)
-        .await?;
+    if let Some(limit) = limit {
+        crate::capacity::admit(&mut tx, org, limit, bytes, protect).await?;
     }
-    sqlx::query!(
+    // Deduplicate blobs separately from paths: multiple paths may share bytes,
+    // and one batch may need both public and private pointers to those bytes.
+    sqlx::query(
         r#"
-            INSERT INTO published_paths (
-                cache_id, store_path_hash, store_path, nar_hash, nar_size,
-                blob_object_id, references_json, deriver, system
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (cache_id, store_path_hash)
-            DO UPDATE SET last_pushed_at = NOW()
-            "#,
-        s.cache_id,
-        &s.store_path_hash,
-        &s.store_path,
-        &s.nar_hash,
-        s.nar_size,
-        blob_id,
-        &s.references_json,
-        s.deriver.as_deref(),
-        s.system.as_deref(),
+        WITH incoming AS (
+            SELECT * FROM jsonb_to_recordset($1) AS i(
+                ordinal integer, cache_id integer, store_path_hash text, store_path text,
+                nar_hash text, nar_size bigint, file_hash text, file_size bigint,
+                references_json text, deriver text, system text, is_public boolean, key text)
+        ), candidates AS (
+            SELECT file_hash, MAX(file_size) AS file_size,
+                MIN(key) FILTER (WHERE is_public) AS public_key,
+                MIN(key) FILTER (WHERE NOT is_public) AS private_key
+            FROM incoming GROUP BY file_hash
+        ), blobs AS (
+            INSERT INTO blob_objects(file_hash,file_size,compression,r2_key,public_key,private_key)
+            SELECT file_hash,file_size,'zstd',COALESCE(public_key,private_key),public_key,private_key
+            FROM candidates ORDER BY file_hash
+            ON CONFLICT (file_hash,compression) DO UPDATE SET
+                public_key=COALESCE(blob_objects.public_key,EXCLUDED.public_key),
+                private_key=COALESCE(blob_objects.private_key,EXCLUDED.private_key)
+            RETURNING id,file_hash,public_key,private_key
+        ), cleanup AS (
+            INSERT INTO object_cleanup(is_private,key)
+            SELECT NOT i.is_public,i.key FROM incoming i JOIN blobs b USING(file_hash)
+            WHERE i.key IS DISTINCT FROM CASE WHEN i.is_public THEN b.public_key ELSE b.private_key END
+            ON CONFLICT DO NOTHING
+        ), winners AS (
+            SELECT DISTINCT ON (cache_id,store_path_hash) * FROM incoming
+            ORDER BY cache_id,store_path_hash,ordinal
+        )
+        INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,
+            blob_object_id,references_json,deriver,system)
+        SELECT i.cache_id,i.store_path_hash,i.store_path,i.nar_hash,i.nar_size,
+            b.id,i.references_json,i.deriver,i.system FROM winners i JOIN blobs b USING(file_hash)
+        ORDER BY i.cache_id,i.store_path_hash
+        ON CONFLICT (cache_id,store_path_hash) DO UPDATE SET last_pushed_at=NOW()
+        "#,
+    ).bind(input).execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE upload_sessions u SET status='completed',publication_result=i.result \
+         FROM jsonb_to_recordset($1) AS i(session_id text,result jsonb) WHERE u.id=i.session_id",
     )
+    .bind(json!(
+        incoming
+            .iter()
+            .map(|i| json!({"session_id":i.session.id,"result":results[i.ordinal]}))
+            .collect::<Vec<_>>()
+    ))
     .execute(&mut *tx)
     .await?;
-    let mut result = json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true});
-    if existing {
-        result["alreadyExisted"] = json!(true);
-    }
-    sqlx::query("UPDATE upload_sessions SET status='completed', publication_result=$2 WHERE id=$1")
-        .bind(&s.id)
-        .bind(&result)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
-    Ok(result)
+    Ok(results)
 }
 
 struct Prepared {
@@ -1221,8 +1367,7 @@ enum PreparedSource {
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn prepare_sealed(
-    state: &AppState,
-    identity: &Identity,
+    tx: &mut Transaction,
     s: Session,
     parts: Vec<Part>,
     inline: Option<axum::body::Bytes>,
@@ -1238,11 +1383,15 @@ async fn prepare_sealed(
     // The seal authenticated this session and checked its immutable receipt.
     // Reuse only an unexpired, fully verified destination in the right bucket.
     let saved: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT key,operation_id,is_private FROM nar_installations \
+        "WITH retired AS (DELETE FROM nar_installations WHERE session_id=$1 \
+         AND phase='preparing' AND lease_expires_at<=NOW() RETURNING key,is_private), \
+         cleanup AS (INSERT INTO object_cleanup(is_private,key) \
+         SELECT is_private,key FROM retired ON CONFLICT DO NOTHING) \
+         SELECT key,operation_id,is_private FROM nar_installations \
          WHERE session_id=$1 AND phase='ready' AND expires_at>NOW()",
     )
     .bind(&s.id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some((key, operation, private)) = saved {
         if private == s.is_public {
@@ -1255,25 +1404,19 @@ async fn prepare_sealed(
             operation,
         });
     }
-    let mut prepared = Prepared {
+    Ok(Prepared {
         session: s,
         source: inline.map_or(PreparedSource::Parts(parts), PreparedSource::Inline),
         key: String::new(),
         operation: String::new(),
-    };
-    if matches!(prepared.source, PreparedSource::Parts(_)) {
-        // Batch callers perform these SQL decisions sequentially, then stream
-        // preparation concurrently without retaining a connection.
-        (prepared.key, prepared.operation) =
-            allocate_candidate(state, identity, &prepared.session).await?;
-    }
-    Ok(prepared)
+    })
 }
 
 async fn confirm_candidate(state: &AppState, ready: &Prepared) -> Result<(), ApiError> {
     let changed = sqlx::query(
-        "UPDATE nar_installations SET phase='ready' WHERE key=$1 AND operation_id=$2 \
-         AND phase='preparing' AND expires_at>NOW() AND EXISTS (SELECT 1 FROM \
+        "UPDATE nar_installations SET phase='ready',lease_expires_at=NULL \
+         WHERE key=$1 AND operation_id=$2 AND phase='preparing' \
+         AND lease_expires_at>NOW() AND expires_at>NOW() AND EXISTS (SELECT 1 FROM \
          upload_sessions WHERE id=$3 AND status='finalizing' AND expires_at>NOW())",
     )
     .bind(&ready.key)
@@ -1286,6 +1429,42 @@ async fn confirm_candidate(state: &AppState, ready: &Prepared) -> Result<(), Api
         return Err(error(409, "Preparation expired or cancelled"));
     }
     Ok(())
+}
+
+/// Long preparations renew ownership, not retained quota. Short preparations
+/// add no heartbeat queries. A replaced worker can neither renew nor confirm.
+async fn with_preparation_lease(
+    state: &AppState,
+    ready: &Prepared,
+    work: impl Future<Output = Result<(), ApiError>>,
+) -> Result<(), ApiError> {
+    let period = Duration::from_secs(20);
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => {
+                result?;
+                return confirm_candidate(state, ready).await;
+            }
+            _ = heartbeat.tick() => {
+                let changed = sqlx::query(
+                    "UPDATE nar_installations SET lease_expires_at=LEAST(expires_at, \
+                     NOW()+INTERVAL '60 seconds') WHERE key=$1 AND operation_id=$2 \
+                     AND phase='preparing' AND lease_expires_at>NOW() AND expires_at>NOW()",
+                )
+                .bind(&ready.key)
+                .bind(&ready.operation)
+                .execute(&state.pool)
+                .await?
+                .rows_affected();
+                if changed != 1 {
+                    return Err(error(409, "Preparation expired or cancelled"));
+                }
+            }
+        }
+    }
 }
 
 async fn retire_candidate(state: &AppState, ready: &Prepared) {
@@ -1304,7 +1483,11 @@ async fn retire_candidate(state: &AppState, ready: &Prepared) {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn prepare(state: &AppState, mut ready: Prepared) -> Result<Prepared, ApiError> {
+async fn prepare(
+    state: &AppState,
+    identity: &Identity,
+    mut ready: Prepared,
+) -> Result<Prepared, ApiError> {
     if !matches!(
         ready.source,
         PreparedSource::Parts(_) | PreparedSource::Inline(_)
@@ -1323,10 +1506,18 @@ async fn prepare(state: &AppState, mut ready: Prepared) -> Result<Prepared, ApiE
         }
     };
     let owned = state.clone();
+    let identity = identity.clone();
     state
         .tasks
         .spawn(async move {
             let _admission = admission;
+            if matches!(ready.source, PreparedSource::Parts(_)) {
+                // Queued batch members have no execution lease to expire.
+                // Revalidate and own the destination only when work starts.
+                let tx = crate::db::begin_queued(&owned, &ready.session.org_id).await?;
+                (ready.key, ready.operation) =
+                    allocate_candidate(tx, &identity, &ready.session).await?;
+            }
             let result = async {
                 match &ready.source {
                     PreparedSource::Inline(bytes) => {
@@ -1354,32 +1545,35 @@ async fn prepare(state: &AppState, mut ready: Prepared) -> Result<Prepared, ApiE
                                 .map(|()| axum::body::Bytes::new())
                                 .map_err(|_| std::io::Error::other("Verification failed"))
                         }));
-                        let (verified, written) = tokio::join!(
-                            verify(
-                                &owned,
-                                &ready.session,
-                                Box::new(tokio_util::io::SyncIoBridge::new(reader)),
-                                Some((send, complete))
-                            ),
-                            owned.storage.write_body(
-                                !ready.session.is_public,
-                                &ready.key,
-                                Body::from_stream(bytes),
-                                ready.session.file_size as u64
-                            )
-                        );
-                        if let Err(written) = written {
-                            // Preserve destination admission errors rather than
-                            // reporting the verifier's resulting broken pipe.
-                            return Err(match verified {
-                                Err(verified) if verified.status == StatusCode::BAD_REQUEST => {
-                                    verified
-                                }
-                                _ => written,
-                            });
-                        }
-                        verified?;
-                        confirm_candidate(&owned, &ready).await
+                        with_preparation_lease(&owned, &ready, async {
+                            let (verified, written) = tokio::join!(
+                                verify(
+                                    &owned,
+                                    &ready.session,
+                                    Box::new(tokio_util::io::SyncIoBridge::new(reader)),
+                                    Some((send, complete))
+                                ),
+                                owned.storage.write_body(
+                                    !ready.session.is_public,
+                                    &ready.key,
+                                    Body::from_stream(bytes),
+                                    ready.session.file_size as u64
+                                )
+                            );
+                            if let Err(written) = written {
+                                // Preserve destination admission errors rather than
+                                // reporting the verifier's resulting broken pipe.
+                                return Err(match verified {
+                                    Err(verified) if verified.status == StatusCode::BAD_REQUEST => {
+                                        verified
+                                    }
+                                    _ => written,
+                                });
+                            }
+                            verified?;
+                            Ok(())
+                        })
+                        .await
                     }
                     _ => unreachable!("only fresh sources need preparation"),
                 }
@@ -1404,7 +1598,7 @@ async fn prepare(state: &AppState, mut ready: Prepared) -> Result<Prepared, ApiE
 async fn publish_prepared(
     state: &AppState,
     identity: &Identity,
-    mut ready: Prepared,
+    ready: Prepared,
     protect: Vec<(i32, String)>,
 ) -> Result<Value, ApiError> {
     if ready.session.status == "completed" {
@@ -1419,44 +1613,49 @@ async fn publish_prepared(
         .tasks
         .spawn(crate::profile_future!(
             async move {
-                let mut durable = !ready.key.is_empty();
-                let result = async {
-                    if !durable {
-                        (ready.key, ready.operation) =
-                            allocate_candidate(&owned, &identity, &ready.session).await?;
-                        match &ready.source {
-                            PreparedSource::Inline(bytes) => {
-                                owned
-                                    .storage
-                                    .write_body(
-                                        !ready.session.is_public,
-                                        &ready.key,
-                                        Body::from(bytes.clone()),
-                                        ready.session.file_size as u64,
-                                    )
-                                    .await?;
-                            }
-                            PreparedSource::Ready | PreparedSource::Parts(_) => {
-                                unreachable!("ready candidate has ownership")
-                            }
-                        }
-                        confirm_candidate(&owned, &ready).await?;
-                        durable = true;
-                    }
-                    publish(&owned, &identity, &ready, &protect).await
-                }
-                .await;
-                if result.is_err() && !durable && !ready.key.is_empty() {
-                    // Unconfirmed provider writes cannot be adopted. Verified,
-                    // confirmed candidates survive SQL errors and lost replies.
-                    retire_candidate(&owned, &ready).await;
-                }
-                result
+                let ready = finish_preparation(&owned, &identity, ready).await?;
+                publish(&owned, &identity, &ready, &protect).await
             },
             label = "uploads.publication"
         ))
         .await
         .map_err(|_| error(500, "Publication failed"))?
+}
+
+/// Called only inside an owned finalization task. Inline verification has
+/// finished; write and confirm its destination without holding a SQL fence.
+async fn finish_preparation(
+    state: &AppState,
+    identity: &Identity,
+    mut ready: Prepared,
+) -> Result<Prepared, ApiError> {
+    if !ready.key.is_empty() {
+        return Ok(ready);
+    }
+    let tx = crate::db::begin(state, &ready.session.org_id).await?;
+    (ready.key, ready.operation) = allocate_candidate(tx, identity, &ready.session).await?;
+    let PreparedSource::Inline(bytes) = &ready.source else {
+        unreachable!("ready candidate has ownership")
+    };
+    let result = with_preparation_lease(state, &ready, async {
+        state
+            .storage
+            .write_body(
+                !ready.session.is_public,
+                &ready.key,
+                Body::from(bytes.clone()),
+                ready.session.file_size as u64,
+            )
+            .await?;
+        Ok(())
+    })
+    .await;
+    if let Err(error) = result {
+        retire_candidate(state, &ready).await;
+        return Err(error);
+    }
+    ready.source = PreparedSource::Ready;
+    Ok(ready)
 }
 
 /// Reject an oversized incoming set before publishing any member. Only verified
@@ -1541,8 +1740,9 @@ async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Recei
     for (index, input) in inputs.into_iter().enumerate() {
         let id = input.session_id.clone();
         let reserved = async {
-            let (session, parts) = seal(state, identity, &input, false).await?;
-            prepare_sealed(state, identity, session, parts, None).await
+            input.validate()?;
+            let session = load(&state.pool, &id, identity).await?;
+            seal(state, identity, &session, &input, None).await
         }
         .await;
         match reserved {
@@ -1550,11 +1750,10 @@ async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Recei
             Err(e) => results[index] = result_value(&id, Err(e), true),
         }
     }
-    let preparations =
-        stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
-            (index, id, prepare(state, prepared).await)
-        }))
-        .buffered(4);
+    let preparations = stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
+        (index, id, prepare(state, identity, prepared).await)
+    }))
+    .buffered(4);
     tokio::pin!(preparations);
     while let Some((index, id, result)) = preparations.next().await {
         match result {
@@ -1612,18 +1811,70 @@ async fn publish_batch(
         .iter()
         .map(|(_, p)| (p.session.cache_id, p.session.store_path_hash.clone()))
         .collect();
-    for (index, p) in ready {
-        if !results[index].is_null() {
-            continue;
+    let owned = state.clone();
+    let identity = identity.clone();
+    // Own inline allocation through publication too, including later groups
+    // when a caller disconnects. Storage never runs inside publish_group.
+    let mut failed = results.clone();
+    for (index, p) in &ready {
+        if failed[*index].is_null() {
+            failed[*index] =
+                result_value(&p.session.id, Err(error(500, "Publication failed")), true);
         }
-        let id = p.session.id.clone();
-        results[index] = result_value(
-            &id,
-            publish_prepared(state, identity, p, protect.clone()).await,
-            true,
-        );
     }
-    results
+    let publication = state
+        .tasks
+        .spawn(async move {
+            let mut pending = Vec::new();
+            for (index, p) in ready {
+                if !results[index].is_null() {
+                    continue;
+                }
+                let id = p.session.id.clone();
+                match finish_preparation(&owned, &identity, p).await {
+                    Ok(p) => pending.push((index, p)),
+                    Err(e) => results[index] = result_value(&id, Err(e), true),
+                }
+            }
+            let orgs: HashSet<_> = pending
+                .iter()
+                .map(|(_, p)| p.session.org_id.clone())
+                .collect();
+            for org in orgs {
+                let group: Vec<_> = pending
+                    .iter()
+                    .filter(|(_, p)| p.session.org_id == org)
+                    .collect();
+                for chunk in group.chunks(16) {
+                    let members: Vec<_> = chunk.iter().map(|(_, p)| p).collect();
+                    match publish_group(&owned, &identity, &members, &protect).await {
+                        Ok(outcomes) => {
+                            for ((index, _), result) in chunk.iter().zip(outcomes) {
+                                results[*index] = result;
+                            }
+                        }
+                        Err(_) => {
+                            // A shared SQL failure rolls the entire group back.
+                            // Preserve independent progress and first-success order
+                            // using the same publication implementation, one at a time.
+                            for (index, p) in chunk {
+                                results[*index] = result_value(
+                                    &p.session.id,
+                                    publish(&owned, &identity, p, &protect).await,
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            results
+        })
+        .await;
+    match publication {
+        Ok(results) => results,
+        Err(_) => failed,
+    }
 }
 
 fn result_value(id: &str, result: Result<Value, ApiError>, finalize: bool) -> Value {
@@ -1660,7 +1911,8 @@ async fn seal_inline(
     state: &AppState,
     identity: &Identity,
     input: &InlineInput,
-) -> Result<(Session, Vec<Part>), ApiError> {
+    bytes: axum::body::Bytes,
+) -> Result<Prepared, ApiError> {
     let id = &input.session_id;
     let s = load(&state.pool, id, identity).await?;
     if s.r2_upload_id.is_some() || s.part_size != Some(MIB as i32) || s.nar_size > MIB {
@@ -1668,7 +1920,7 @@ async fn seal_inline(
     }
     let receipt = Receipt {
         session_id: id.clone(),
-        nar_hash: s.nar_hash,
+        nar_hash: s.nar_hash.clone(),
         nar_size: s.nar_size,
         file_hash: input.file_hash.clone(),
         file_size: input.file_size as i64,
@@ -1677,7 +1929,7 @@ async fn seal_inline(
             etag: input.file_hash.clone(),
         }],
     };
-    seal(state, identity, &receipt, true).await
+    seal(state, identity, &s, &receipt, Some(bytes)).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1752,25 +2004,14 @@ async fn inline_batch(
     for (index, input) in body.uploads.into_iter().enumerate() {
         let bytes = frame.slice(offset..offset + input.file_size);
         offset += input.file_size;
-        match seal_inline(state, identity, &input).await {
-            Ok((session, parts)) => sealed.push((index, input.session_id, session, parts, bytes)),
+        match seal_inline(state, identity, &input, bytes).await {
+            Ok(prepared) => sealed.push((index, input.session_id, prepared)),
             Err(e) => results[index] = result_value(&input.session_id, Err(e), true),
         }
     }
-    let preparations = stream::iter(sealed.into_iter().map(
-        |(index, id, session, parts, bytes)| async move {
-            (
-                index,
-                id,
-                async {
-                    let prepared =
-                        prepare_sealed(state, identity, session, parts, Some(bytes)).await?;
-                    prepare(state, prepared).await
-                }
-                .await,
-            )
-        },
-    ))
+    let preparations = stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
+        (index, id, prepare(state, identity, prepared).await)
+    }))
     .buffered(4);
     tokio::pin!(preparations);
     while let Some((index, id, result)) = preparations.next().await {
@@ -1834,9 +2075,8 @@ async fn inline(
         file_size: length as usize,
     };
     let result = async {
-        let (session, parts) = seal_inline(state, identity, &input).await?;
-        let ready = prepare_sealed(state, identity, session, parts, Some(bytes)).await?;
-        let ready = prepare(state, ready).await?;
+        let ready = seal_inline(state, identity, &input, bytes).await?;
+        let ready = prepare(state, identity, ready).await?;
         let protect = vec![(
             ready.session.cache_id,
             ready.session.store_path_hash.clone(),
@@ -2012,6 +2252,181 @@ async fn reserve_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn part_receipts_wait_without_retransfer_and_recheck_withdrawal(pool: sqlx::PgPool) {
+        use object_store::memory::InMemory;
+        use std::{sync::Arc, time::Duration};
+        use tower::ServiceExt;
+
+        sqlx::raw_sql(
+            "INSERT INTO caches(name) VALUES ('main');
+             INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let config = crate::config::Config {
+            auth_token: "legacy".into(),
+            ..Default::default()
+        };
+        let storage = crate::storage::Storage::from_stores(
+            Arc::new(InMemory::new()),
+            Arc::new(InMemory::new()),
+        );
+        let state = AppState::new(
+            single,
+            config.clone(),
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let app = crate::router(state.clone());
+        let other = crate::router(
+            AppState::new(
+                pool.clone(),
+                config,
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        );
+        for id in ["waiting", "withdrawn", "disconnected"] {
+            sqlx::query(
+                "INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,
+                    nar_size,file_size,compression,status,r2_upload_id,part_size,expires_at)
+                 SELECT $1,id,repeat('1',32),'/nix/store/'||repeat('1',32)||'-part',
+                    'sha256:test',4,4,'zstd','streaming','parts',8388608,now()+interval '1 hour'
+                 FROM caches WHERE name='main'",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO upload_parts(session_id,part_number,size) VALUES($1,1,4)")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let admission = state.sql_waiters.clone().acquire_owned().await.unwrap();
+            let request = Request::builder()
+                .method("PUT")
+                .uri(format!("/_api/v1/uploads/{id}/part/1"))
+                .header("host", "backend.local")
+                .header("authorization", "Bearer legacy")
+                .header("content-length", "4")
+                .body(Body::from("part"))
+                .unwrap();
+            let mut pending = tokio::spawn(app.clone().oneshot(request));
+            let prefix = format!("staging/{id}");
+            let keys = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let keys = storage.list(true, &prefix, None, 10).await.unwrap();
+                    if !keys.is_empty() {
+                        break keys;
+                    }
+                    assert!(
+                        !pending.is_finished(),
+                        "Part failed instead of waiting for SQL"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(keys.len(), 1);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut pending)
+                    .await
+                    .is_err()
+            );
+            // Waiting for admission cannot borrow even the only pool connection.
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                sqlx::query("SELECT 1").execute(&state.pool),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if id == "withdrawn" {
+                let response = other
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/_api/v1/uploads/{id}/abort"))
+                            .header("host", "backend.local")
+                            .header("authorization", "Bearer legacy")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            if id == "disconnected" {
+                pending.abort();
+                assert!(pending.await.unwrap_err().is_cancelled());
+                drop(admission);
+                state.finish_background().await;
+                continue;
+            }
+            drop(admission);
+            let response = pending.await.unwrap().unwrap();
+            assert_eq!(
+                response.status(),
+                if id == "waiting" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+            if id == "waiting" {
+                assert!(response.headers().contains_key(header::ETAG));
+                assert_eq!(storage.list(true, &prefix, None, 10).await.unwrap(), keys);
+            } else {
+                assert!(
+                    storage
+                        .list(true, &prefix, None, 10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        // Exhausted preparation capacity rejects before inspecting another body.
+        let _full = state
+            .preparation_slots
+            .clone()
+            .acquire_many_owned(state.preparation_slots.available_permits() as u32)
+            .await
+            .unwrap();
+        let unread = stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
+                panic!("An unadmitted part must not consume its body")
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/_api/v1/uploads/disconnected/part/1")
+                    .header("host", "backend.local")
+                    .header("authorization", "Bearer legacy")
+                    .header("content-length", "4")
+                    .body(Body::from_stream(unread))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[tokio::test]
     async fn verification_waits_before_inspecting_input() {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            u.id,\n            u.cache_id,\n            u.store_path_hash,\n            u.store_path,\n            u.nar_hash,\n            u.nar_size,\n            u.file_hash,\n            u.file_size,\n            u.references_json,\n            u.deriver,\n            u.system,\n            u.status,\n            u.r2_upload_id,\n            u.part_size,\n            u.staging_capacity,\n            c.org_id,\n            c.name,\n            c.is_public,\n            o.slug,\n            o.private_caches,\n            u.publication_result\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        JOIN orgs o ON o.id = c.org_id\n        WHERE u.id = $1\n            AND u.expires_at > NOW()\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        ",
+  "query": "\n        SELECT\n            u.id,\n            u.cache_id,\n            u.store_path_hash,\n            u.store_path,\n            u.nar_hash,\n            u.nar_size,\n            u.file_hash,\n            u.file_size,\n            u.references_json,\n            u.deriver,\n            u.system,\n            u.status,\n            u.r2_upload_id,\n            u.part_size,\n            u.staging_capacity,\n            c.org_id,\n            c.name,\n            c.is_public,\n            o.slug,\n            o.private_caches,\n            u.publication_result\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        JOIN orgs o ON o.id = c.org_id\n        WHERE u.id = ANY($1)\n            AND u.expires_at > NOW()\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        ",
   "describe": {
     "columns": [
       {
@@ -237,7 +237,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "TextArray"
       ]
     },
     "nullable": [
@@ -264,5 +264,5 @@
       true
     ]
   },
-  "hash": "399bcad2e8923de45780941ca6b1f0939414da38002637e5bff8bf44503972aa"
+  "hash": "04dd6f46146bb8357e76f4496e4d86084fc47ea255a9fc1420692b0ad359ce7a"
 }

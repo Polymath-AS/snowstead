@@ -848,6 +848,24 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     let receipt = json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),"fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),"parts":receipts});
     let app = router(AppState::new(pool.clone(), config, storage, reqwest::Client::new()).unwrap());
     let envelope = json!({"uploads":[receipt.clone()]});
+    // A failed ownership insert must not poison the connection or lose parts.
+    // The same immutable receipt must still finalize after the fault clears.
+    pool_execute(&pool, "CREATE FUNCTION fail_candidate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected candidate allocation failure'; END $$;
+        CREATE TRIGGER fail_candidate BEFORE INSERT ON nar_installations FOR EACH ROW EXECUTE FUNCTION fail_candidate();").await;
+    let (_, failed) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        envelope.clone(),
+    )
+    .await;
+    assert_eq!(failed["results"][0]["published"], false, "{failed}");
+    assert_eq!(failed["results"][0]["status"], 500, "{failed}");
+    pool_execute(
+        &pool,
+        "DROP TRIGGER fail_candidate ON nar_installations; DROP FUNCTION fail_candidate();",
+    )
+    .await;
     let (first, second) = tokio::join!(
         post(
             &app,
@@ -1295,6 +1313,438 @@ async fn unresolved_canonical_writers_do_not_block_immutable_publication(pool: P
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cleanup(
+    pool: PgPool,
+) {
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name,is_public) VALUES('main',true),('secret',false);
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let storage = common::storage();
+    let state = AppState::new(
+        pool.clone(),
+        Config {
+            auth_token: "legacy".into(),
+            admin_secret: "admin".into(),
+            jwt_secret: "test-jwt".into(),
+            ..Default::default()
+        },
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let app = router(state.clone());
+    let raw = nar(b"shared bytes in two independently authorized buckets");
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    let hash = hex::encode(Sha256::digest(&compressed));
+    let mut uploads = Vec::new();
+    for (index, cache) in ["main", "secret", "main", "secret"].iter().enumerate() {
+        let session = create(
+            &app,
+            cache,
+            "legacy",
+            path_input(&index.to_string().repeat(32), &raw, true),
+        )
+        .await;
+        uploads.push(
+            json!({"sessionId":session["sessionId"],"fileHash":hash,"fileSize":compressed.len()}),
+        );
+    }
+    let (_, result) = send_inline_batch(
+        &app,
+        inline_frame(&json!(uploads), &vec![compressed.clone(); 4]),
+    )
+    .await;
+    assert!(
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["published"] == true),
+        "{result}"
+    );
+    let (status, deleted) = post(
+        &app,
+        "/_api/v1/orgs/default/caches/main/paths/delete",
+        "admin",
+        json!({"storePathHashes":["0".repeat(32)]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    // Execute every queued deletion, including the unadopted group candidates.
+    // Do not depend on the process-global maintenance scheduler in parallel tests.
+    let retired: Vec<(bool, String)> = sqlx::query_as("SELECT is_private,key FROM object_cleanup")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    for (private, key) in retired {
+        storage.delete(private, &key).await.unwrap();
+    }
+    let credential = token("default", "*");
+    for url in [
+        format!("/nar/{hash}/zstd.nar"),
+        format!("/private/secret/nar/{hash}/zstd.nar"),
+    ] {
+        let (status, _, bytes) = send(&app, "GET", &url, Some(&credential), &[], vec![]).await;
+        assert_eq!(status, StatusCode::OK, "{url}");
+        assert_eq!(bytes, compressed);
+    }
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/private/secret/nar/{hash}/zstd.nar"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    state.finish_background().await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollback(pool: PgPool) {
+    use std::time::Duration;
+
+    pool_execute(
+        &pool,
+        "INSERT INTO caches(name) VALUES('main'),('other');
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
+    )
+    .await;
+    let storage = common::storage();
+    let mut apps = Vec::new();
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        let independent = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        apps.push(router(
+            AppState::new(
+                independent.clone(),
+                Config {
+                    auth_token: "legacy".into(),
+                    admin_secret: "admin".into(),
+                    ..Default::default()
+                },
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        ));
+        pools.push(independent);
+    }
+    let mut receipts = Vec::new();
+    let mut files = Vec::new();
+    for (index, contents) in [
+        b"first independent publisher".as_slice(),
+        b"second independent publisher with asymmetric content and size".as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let raw = nar(contents);
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+        let input = path_input(&if index == 0 { "a" } else { "b" }.repeat(32), &raw, false);
+        let cache = if index == 0 { "main" } else { "other" };
+        let session = create(&apps[index], cache, "legacy", input.clone()).await;
+        let id = session["sessionId"].as_str().unwrap();
+        let (status, result) = post(
+            &apps[index],
+            &format!("/_api/v1/uploads/{id}/parts"),
+            "legacy",
+            json!({"parts":[{"partNumber":1,"size":compressed.len()}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let (status, _, bytes) = send(
+            &apps[index],
+            "PUT",
+            &format!("/_api/v1/uploads/{id}/part/1"),
+            Some("legacy"),
+            &[("content-length", &compressed.len().to_string())],
+            compressed.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let part: Value = serde_json::from_slice(&bytes).unwrap();
+        receipts.push(
+            json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),
+            "fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),
+            "parts":[{"partNumber":1,"etag":part["etag"]}]}),
+        );
+        files.push(compressed);
+    }
+    let limit = files.iter().map(Vec::len).max().unwrap() as i64;
+    let total = files.iter().map(|file| file.len() as i64).sum::<i64>();
+    assert!(total > limit);
+    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
+        .bind(limit)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // NAR fences reject publication, but permit both servers to finish storage
+    // preparation. Each server has its own pool and local admission gates.
+    let mut blocked = pool.begin().await.unwrap();
+    for receipt in &receipts {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!(
+                "nar:{}:zstd",
+                receipt["fileHash"].as_str().unwrap()
+            ))
+            .execute(&mut *blocked)
+            .await
+            .unwrap();
+    }
+    for (app, receipt) in apps.iter().zip(&receipts) {
+        let (status, result) = post(
+            app,
+            "/_api/v1/uploads/finalize",
+            "legacy",
+            json!({"uploads":[receipt]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["results"][0]["status"], 503, "{result}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations WHERE phase='ready'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    // A repeated preparation would now fail: its original byte sources are gone.
+    let sources: Vec<String> = sqlx::query_scalar("SELECT storage_key FROM upload_parts")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sources.len(), 2);
+    for key in sources {
+        storage.delete(true, &key).await.unwrap();
+        assert!(storage.head(true, &key).await.is_err());
+    }
+    blocked.rollback().await.unwrap();
+
+    // Pause A after capacity admission, while it still owns the org fence.
+    // Disable only this test trigger's lock timeout, so the barrier does not
+    // depend on the host completing an assertion within the production timeout.
+    pool_execute(
+        &pool,
+        "CREATE FUNCTION pause_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.store_path_hash=repeat('a',32) THEN
+            PERFORM set_config('lock_timeout','0',true);
+            PERFORM pg_advisory_xact_lock(78431::bigint);
+        END IF; RETURN NEW; END $$;
+        CREATE TRIGGER pause_publication BEFORE INSERT ON published_paths
+        FOR EACH ROW EXECUTE FUNCTION pause_publication();",
+    )
+    .await;
+    let mut barrier = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(78431::bigint)")
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    let mut first = tokio::spawn({
+        let app = apps[0].clone();
+        let receipt = receipts[0].clone();
+        async move {
+            post(
+                &app,
+                "/_api/v1/uploads/finalize",
+                "legacy",
+                json!({"uploads":[receipt]}),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if first.is_finished() {
+                panic!(
+                    "publisher returned before the barrier: {:?}",
+                    (&mut first).await.unwrap()
+                );
+            }
+            if sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT FROM pg_locks
+                WHERE locktype='advisory' AND classid=0 AND objid=78431 AND NOT granted)",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first publisher must reach the SQL barrier");
+    let (status, result) = post(
+        &apps[1],
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipts[1]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["status"], 503, "{result}");
+    barrier.rollback().await.unwrap();
+    let (status, result) = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["published"], true, "{result}");
+
+    // B needs to evict A. A later SQL error must roll back that eviction and
+    // preserve B's ready candidate, not merely return a failed item result.
+    pool_execute(
+        &pool,
+        "DROP TRIGGER pause_publication ON published_paths;
+        CREATE FUNCTION fail_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected publication failure'; END $$;
+        CREATE TRIGGER fail_publication BEFORE INSERT ON published_paths
+        FOR EACH ROW EXECUTE FUNCTION fail_publication();",
+    )
+    .await;
+    let (status, result) = post(
+        &apps[1],
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipts[1]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["status"], 500, "{result}");
+    assert_eq!(
+        send(
+            &apps[0],
+            "GET",
+            &format!("/main/{}.narinfo", "a".repeat(32)),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let retained: (i64, i64) =
+        sqlx::query_as("SELECT sum(path_count)::bigint,sum(size)::bigint FROM caches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, (1, files[0].len() as i64));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations WHERE phase='ready'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    pool_execute(&pool, "DROP TRIGGER fail_publication ON published_paths;").await;
+
+    // Pinning A makes B inadmissible. Raising the limit to the exact combined
+    // size then admits B, still without its deleted staging bytes.
+    let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", "admin",
+        json!({"name":"release","storePath":format!("/nix/store/{}-fixture", "a".repeat(32)),"keep":"forever"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    let (status, result) = post(
+        &apps[1],
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipts[1]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["status"], 413, "{result}");
+    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
+        .bind(total)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, result) = post(
+        &apps[1],
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[receipts[1]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["published"], true, "{result}");
+    for (index, receipt) in receipts.iter().enumerate() {
+        // Replay through the other instance must not charge or prepare again.
+        let (status, result) = post(
+            &apps[1 - index],
+            "/_api/v1/uploads/finalize",
+            "legacy",
+            json!({"uploads":[receipt]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["results"][0]["published"], true, "{result}");
+        let cache = if index == 0 { "main" } else { "other" };
+        let hash = if index == 0 { "a" } else { "b" }.repeat(32);
+        let (status, _, metadata) = send(
+            &apps[index],
+            "GET",
+            &format!("/{cache}/{hash}.narinfo"),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8(metadata).unwrap().contains(&format!(
+            "FileHash: sha256:{}",
+            receipt["fileHash"].as_str().unwrap()
+        )));
+        let (status, _, bytes) = send(
+            &apps[index],
+            "GET",
+            &format!("/nar/{}/zstd.nar", receipt["fileHash"].as_str().unwrap()),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, files[index]);
+    }
+    let retained: (i64, i64) =
+        sqlx::query_as("SELECT sum(path_count)::bigint,sum(size)::bigint FROM caches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, (2, total));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    for independent in pools {
+        independent.close().await;
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn failed_publication_retains_candidate_until_session_expiry(pool: PgPool) {
     let storage = common::storage();
     let state = AppState::new(
@@ -1709,15 +2159,22 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         });
         let storage = snowstead_server::storage::Storage::new(&config).unwrap();
         config.auth_token = "legacy".into();
+        config.admin_secret = "admin".into();
         let state = AppState::new(single.clone(), config, storage, reqwest::Client::new()).unwrap();
         let app = router(state.clone());
         let cache = if inline { "inline" } else { "multipart" };
         let mut inputs = Vec::new();
         let mut payloads = Vec::new();
-        // The first two distinct sessions intentionally target the same path
-        // with different NARs, references, and derivers. First input must win.
+        // The first two sessions target the same path with different metadata.
+        // A third path shares the winner's bytes: blob and path deduplication
+        // must remain independent, including within one SQL statement.
         for index in 0..8 {
-            let raw = nar(format!("{cache} different content {index}").as_bytes());
+            let contents = if index == 2 {
+                if inline { 0 } else { 1 }
+            } else {
+                index
+            };
+            let raw = nar(format!("{cache} different content {contents}").as_bytes());
             let mut input = path_input(
                 &format!("{:032}", if index == 1 { 0 } else { index }),
                 &raw,
@@ -1782,6 +2239,12 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
             let mut missing = uploads[7].clone();
             missing["sessionId"] = json!("missing");
             uploads.insert(3, missing);
+            // A SQL failure in one member must roll back the group, then let
+            // independent members publish in input order without new byte I/O.
+            pool_execute(&pool, "CREATE FUNCTION reject_batch_member() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                IF NEW.store_path_hash=repeat('0',31)||'6' THEN RAISE EXCEPTION 'injected member failure'; END IF;
+                RETURN NEW; END $$;
+                CREATE TRIGGER reject_batch_member BEFORE INSERT ON published_paths FOR EACH ROW EXECUTE FUNCTION reject_batch_member();").await;
         }
         *ids.lock().unwrap() = (
             uploads[0]["sessionId"].as_str().unwrap().to_owned(),
@@ -1807,6 +2270,13 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                 tokio::time::timeout(Duration::from_secs(10), reached.notified())
                     .await
                     .unwrap();
+                // Simulate expiration of execution leases while the ordered
+                // buffer is held by its first member. Queued work has not
+                // started and must not lose a lease before it runs.
+                let queued: Vec<_> = uploads[5..].iter()
+                    .map(|item| item["sessionId"].as_str().unwrap()).collect();
+                sqlx::query("UPDATE nar_installations SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE session_id=ANY($1)")
+                    .bind(&queued).execute(&pool).await.unwrap();
                 // Disconnect with some batch members not yet streamed. The
                 // owned batch must finish every reservation, not strand them.
                 pending.abort();
@@ -1858,6 +2328,9 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                 assert_eq!(row["status"], 400, "{result}");
             } else if !inline && index == 3 {
                 assert_eq!(row["status"], 404, "{result}");
+            } else if !inline && index == 7 {
+                assert_eq!(row["status"], 500, "{result}");
+                assert_eq!(row["published"], false, "{result}");
             } else {
                 assert_eq!(row["published"], true, "{result}");
             }
@@ -1886,6 +2359,85 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         let rendered = String::from_utf8(rendered).unwrap();
         assert!(rendered.contains(&format!("FileHash: sha256:{stored_hash}")));
         assert!(rendered.contains(&format!("Deriver: derivation-{winner}.drv")));
+        let (status, _, detail) = send(
+            &app,
+            "GET",
+            &format!("/_api/v1/orgs/default/caches/{cache}"),
+            Some("admin"),
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let detail: Value = serde_json::from_slice(&detail).unwrap();
+        let expected_bytes: usize = payloads
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1 - winner && *index != if inline { 7 } else { 6 })
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        assert_eq!(detail["paths"], 6);
+        assert_eq!(
+            detail["size"], expected_bytes,
+            "logical bytes count shared blobs once per path"
+        );
+        // A completed replay must not resurrect a withdrawn duplicate path,
+        // and withdrawing it must not remove the other path's shared bytes.
+        let (status, deleted) = post(
+            &app,
+            &format!("/_api/v1/orgs/default/caches/{cache}/paths/delete"),
+            "admin",
+            json!({"storePathHashes":["0".repeat(32)]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        let (status, replay) = if inline {
+            send_inline_batch(&app, inline_frame(&json!(uploads), &payloads)).await
+        } else {
+            post(
+                &app,
+                "/_api/v1/uploads/finalize",
+                "legacy",
+                json!({"uploads":uploads}),
+            )
+            .await
+        };
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["results"][0], result["results"][0]);
+        assert_eq!(replay["results"][1], result["results"][1]);
+        for (hash, expected) in [
+            ("0".repeat(32), StatusCode::NOT_FOUND),
+            (format!("{:032}", 2), StatusCode::OK),
+        ] {
+            let (status, _, body) = send(
+                &app,
+                "GET",
+                &format!("/{cache}/{hash}.narinfo"),
+                Some("legacy"),
+                &[],
+                vec![],
+            )
+            .await;
+            assert_eq!(status, expected);
+            if status == StatusCode::OK {
+                assert!(
+                    String::from_utf8(body)
+                        .unwrap()
+                        .contains(&format!("FileHash: sha256:{stored_hash}"))
+                );
+            }
+        }
+        let (status, _, bytes) = send(
+            &app,
+            "GET",
+            &format!("/nar/{stored_hash}/zstd.nar"),
+            None,
+            &[],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, payloads[winner]);
         stop.send(()).unwrap();
         proxy_task.await.unwrap();
     }
