@@ -233,9 +233,9 @@ mod tests {
             assert_eq!(result.failed, if failed_dependency { 2 } else { 0 });
             assert_eq!(result.skipped, 0);
             if failed_dependency {
-                assert!(result.errors.iter().any(|e| e.contains(&paths[0])));
-                assert!(result.errors.iter().any(|e| e.contains(&paths[1])));
-                assert!(!result.errors.iter().any(|e| e.contains(&paths[2])));
+                assert!(result.errors.iter().any(|e| e.path.contains(&paths[0])));
+                assert!(result.errors.iter().any(|e| e.path.contains(&paths[1])));
+                assert!(!result.errors.iter().any(|e| e.path.contains(&paths[2])));
             }
             server.await.unwrap();
         }
@@ -521,6 +521,7 @@ pub async fn push(
             upstream: 0,
             failed: 0,
             errors: vec![],
+            cancelled: false,
         });
     }
     let pending: Vec<_> = initial
@@ -529,7 +530,9 @@ pub async fn push(
         .map(|m| info(&m.input))
         .collect();
     let job_client = client.for_job(&id)?;
-    let transfer = push::transfer(&job_client, cache, pending, jobs, level);
+    // A job reports through its manifest, not a partial transfer summary.
+    let mut unreported = None;
+    let transfer = push::transfer(&job_client, cache, pending, jobs, level, &mut unreported);
     tokio::pin!(transfer);
     let mut renew = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(300),
@@ -562,6 +565,7 @@ pub async fn push(
                 upstream: 0,
                 failed: 0,
                 errors: vec![],
+                cancelled: false,
             });
         }
         if readiness
@@ -586,22 +590,22 @@ pub async fn push(
                         .iter()
                         .filter(|m| !m.available)
                         .take(20usize.saturating_sub(errors.len()))
-                        .map(|m| {
-                            format!(
-                                "{}: {}",
-                                m.input.store_path,
+                        .map(|m| push::PathError {
+                            path: m.input.store_path.clone(),
+                            message:
                                 if m.publication_error.as_deref() == Some("capacity_blocked") {
                                     "retained capacity blocked; resume after freeing capacity"
                                 } else {
                                     "preparation or prerequisite incomplete; resume the push job"
                                 }
-                            )
+                                .into(),
                         }),
                 );
                 if remaining > errors.len() {
-                    errors.push(format!(
-                        "{remaining} members remain unavailable; resume push job {id}"
-                    ));
+                    errors.push(push::PathError {
+                        path: format!("push job {id}"),
+                        message: format!("{remaining} members remain unavailable; resume it"),
+                    });
                 }
                 return Ok(push::Summary {
                     pushed: current
@@ -612,6 +616,7 @@ pub async fn push(
                     upstream: 0,
                     failed: remaining,
                     errors,
+                    cancelled: false,
                 });
             }
         }

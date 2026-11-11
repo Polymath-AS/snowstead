@@ -186,6 +186,34 @@ request status/retries. Credentials and signed upload URLs are not logged.
 snowstead push main /run/current-system --verbose
 ```
 
+For scripts and agents, `snowstead push --json` prints the result as one JSON
+object on stdout instead of the `Done:` line. Progress and errors stay on
+stderr.
+
+```json
+{"pushed":12,"skipped":340,"upstream":25,"failed":1,"errors":[{"path":"/nix/store/…-app","message":"publication failed (status 507)"}],"cancelled":false}
+```
+
+A push that stops early (a fatal error, Ctrl-C, or SIGTERM) still prints this
+summary, or the `Done:` line, for the paths it finished, and aborts its open
+upload sessions. If the push fails before any upload starts, nothing is printed
+on stdout; use the exit code. `--json` affects only `push`.
+
+Exit codes are stable:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Any other failure |
+| 2 | Usage error (invalid arguments) |
+| 3 | The push finished, but some store paths failed to upload |
+| 4 | The server answered 401 or 403; run `snowstead login` or check `SNOWSTEAD_TOKEN` |
+| 130 | Cancelled by Ctrl-C or SIGTERM |
+
+A push that stops on a fatal error exits with that error's code (1 or 4), even
+when some paths had already failed. Code 4 means a whole request was refused;
+a 403 for a single store path is reported in `errors` and exits with 3.
+
 Compression defaults to zstd level 3; use `--compression-level <1-19>` to change
 it. Independent paths use a bounded native worker pool. NARs of at least
 64 MiB use up to four additional zstd workers; the producer and codec workers

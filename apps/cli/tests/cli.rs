@@ -65,32 +65,49 @@ fn push_reads_stdin_and_includes_each_paths_closure() {
     )
     .unwrap();
     std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (url, request) = mock(200, json!({"missing": []}));
-    login(home.path(), &url);
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snowstead"))
-        .env("HOME", home.path())
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .args(["push", "main"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(child.stdin.take().unwrap(), "{root}").unwrap();
-    let result = child.wait_with_output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let mut hashes = vec![root[11..43].to_owned(), "a".repeat(32)];
-    hashes.sort();
-    assert_eq!(
-        request.join().unwrap().1,
-        json!({"cache":"main", "storePathHashes":hashes})
-    );
+    let paths = std::env::join_paths(paths).unwrap();
+    for json in [false, true] {
+        let (url, request) = mock(200, json!({"missing": []}));
+        login(home.path(), &url);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+            .env("HOME", home.path())
+            .env("PATH", &paths)
+            .args(["push", "main"])
+            .args(json.then_some("--json"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{root}").unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut hashes = vec![root[11..43].to_owned(), "a".repeat(32)];
+        hashes.sort();
+        assert_eq!(
+            request.join().unwrap().1,
+            json!({"cache":"main", "storePathHashes":hashes})
+        );
+        // With --json, stdout is the result object alone; progress moves to stderr.
+        let stdout = String::from_utf8(result.stdout).unwrap();
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        if json {
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout).unwrap(),
+                json!({"pushed":0,"skipped":2,"upstream":0,"failed":0,"errors":[],"cancelled":false})
+            );
+            assert!(stderr.contains("Found 2 paths in closure"));
+        } else {
+            assert!(stdout.contains("Found 2 paths in closure"));
+            assert!(stdout.contains("Done: 0 pushed, 2 skipped (0 served upstream), 0 failed"));
+        }
+    }
 }
 
 /// A single-use local server also checks the exact hosted v1 request and body.
@@ -445,6 +462,40 @@ fn ci_credentials_require_a_pair_and_do_not_write_local_config() {
 
 #[test]
 fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
+    let result = encoder_failure(false, false);
+    assert_eq!(result.status.code(), Some(3), "some paths failed");
+    assert!(String::from_utf8_lossy(&result.stdout).contains("1 failed"));
+}
+
+#[test]
+fn inline_encoder_failure_reports_the_encoder_error() {
+    let result = encoder_failure(true, false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("inline encoder produced no bytes"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn push_json_reports_failed_paths_as_one_object_and_exits_3() {
+    let result = encoder_failure(false, true);
+    assert_eq!(result.status.code(), Some(3));
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let summary: Value = serde_json::from_str(&stdout).unwrap();
+    let message = summary["errors"][0]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("NAR encoding failed") || message.contains("nix-store --dump failed"));
+    assert_eq!(
+        summary,
+        json!({"pushed":0,"skipped":0,"upstream":0,"failed":1,"cancelled":false,"errors":[{
+            "path":"/nix/store/00000000000000000000000000000000-snowstead-missing-stream-fixture",
+            "message":message
+        }]})
+    );
+}
+
+fn encoder_failure(inline: bool, json: bool) -> Output {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let bin = home.path().join("bin");
@@ -468,7 +519,7 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
             ),
             (
                 "/_api/v1/caches/main/upload-streams/batch",
-                json!({"sessions":[{"sessionId":"s1","partSize":8388608,"inline":false}]}),
+                json!({"sessions":[{"sessionId":"s1","partSize":if inline { 1048576 } else { 8388608 },"inline":inline}]}),
             ),
             ("/_api/v1/uploads/s1/abort", json!({})),
         ] {
@@ -512,6 +563,7 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
         .env("SNOWSTEAD_URL", url)
         .env("SNOWSTEAD_TOKEN", TOKEN)
         .args(["push", "main", path, "--no-deps", "--jobs", "1"])
+        .args(json.then_some("--json"))
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -520,6 +572,7 @@ fn streaming_encoder_failure_aborts_before_exit_without_a_spool_directory() {
     assert!(!stderr.contains(TOKEN));
     server.join().unwrap();
     assert!(!home.path().join("no-spooling-here").exists());
+    result
 }
 
 #[test]
@@ -941,6 +994,13 @@ fn streamed_session_creation(late_failure: bool) {
     );
     if late_failure {
         assert!(String::from_utf8_lossy(&result.stderr).contains("invalid multipart part size"));
+        // The fatal error still reports what the push had already finished.
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            stdout.contains("Done: 1 pushed, 0 skipped (0 served upstream), 99 failed"),
+            "{stdout}"
+        );
+        assert_eq!(result.status.code(), Some(1));
     } else {
         let stdout = String::from_utf8_lossy(&result.stdout);
         assert!(
@@ -956,4 +1016,173 @@ fn streamed_session_creation(late_failure: bool) {
         live.lock().unwrap().is_empty(),
         "CLI exit left live upload reservations"
     );
+}
+
+#[test]
+fn exit_codes_distinguish_usage_authentication_and_other_failures() {
+    let home = tempfile::tempdir().unwrap();
+    // Usage errors are clap's.
+    let usage = run(home.path(), &["push", "main", "/anything", "--jobs", "0"]);
+    assert_eq!(usage.status.code(), Some(2));
+    for (status, code) in [(401, 4), (403, 4), (500, 1), (404, 1)] {
+        let (url, request) = mock(status, json!({"error": TOKEN}));
+        login(home.path(), &url);
+        let result = run(home.path(), &["token", "list"]);
+        request.join().unwrap();
+        assert_eq!(result.status.code(), Some(code), "HTTP {status}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(&status.to_string()));
+        assert_eq!(stderr.contains("snowstead login"), code == 4, "{stderr}");
+        assert!(!stderr.contains(TOKEN));
+    }
+    // A push refused before it starts is an authentication failure, not a partial push.
+    let (url, request) = mock(403, json!({"error": TOKEN}));
+    login(home.path(), &url);
+    let path = "/nix/store/00000000000000000000000000000000-snowstead-missing-local-fixture";
+    let result = run(home.path(), &["push", "main", path, "--no-deps", "--json"]);
+    request.join().unwrap();
+    assert_eq!(result.status.code(), Some(4));
+    assert!(result.stdout.is_empty());
+}
+
+#[test]
+fn sigterm_aborts_live_sessions_reports_the_summary_and_exits_130() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+    let path = std::fs::read_dir("/nix/store")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| !path.to_string_lossy().ends_with(".drv"))
+        .find(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() < 4096))
+        .expect("Nix shell must contain a small file output");
+    let path = path.to_str().unwrap().to_owned();
+    let raw = Command::new("nix-store")
+        .args(["--dump", &path])
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let metadata = json!({&path:{
+        "narHash":format!("sha256:{}", hex::encode(Sha256::digest(&raw.stdout))),
+        "narSize":raw.stdout.len(),
+        "references":[]
+    }});
+    let nix = bin.join("nix");
+    std::fs::write(
+        &nix,
+        format!("#!/bin/sh\ncat <<'METADATA'\n{metadata}\nMETADATA\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (stalled, uploading) = mpsc::channel();
+    let hash = path[11..43].to_owned();
+    let server = thread::spawn({
+        let stop = stop.clone();
+        move || {
+            // The publication request never gets an answer: hold its socket open.
+            let mut held = Vec::new();
+            let mut aborts = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let response = if headers.starts_with("POST /_api/v1/get-missing-paths ") {
+                    json!({"missing":[hash]})
+                } else if headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch ") {
+                    json!({"sessions":[{"sessionId":"s1","partSize":1048576,"inline":true}]})
+                } else if headers.starts_with("POST /_api/v1/uploads/inline/batch ") {
+                    stalled.send(()).unwrap();
+                    held.push(socket);
+                    continue;
+                } else {
+                    assert!(headers.starts_with("POST /_api/v1/uploads/s1/abort "));
+                    aborts += 1;
+                    json!({})
+                }
+                .to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+            }
+            aborts
+        }
+    });
+    let mut search = vec![bin];
+    search.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let child = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+        .env("HOME", home.path())
+        .env("PATH", std::env::join_paths(search).unwrap())
+        .env("SNOWSTEAD_URL", &url)
+        .env("SNOWSTEAD_TOKEN", TOKEN)
+        .args(["push", "main", &path, "--no-deps", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    uploading
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the push must reach publication");
+    // CI cancels jobs with SIGTERM, not Ctrl-C.
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = child.wait_with_output().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let aborts = server.join().unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap(),
+        json!({"pushed":0,"skipped":0,"upstream":0,"failed":0,"errors":[],"cancelled":true})
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("upload cancelled"));
+    assert!(aborts >= 1, "the live session must be aborted before exit");
 }

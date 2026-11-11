@@ -16,12 +16,51 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tracing::Instrument;
 
+#[derive(serde::Serialize)]
 pub struct Summary {
     pub pushed: usize,
     pub skipped: usize,
     pub upstream: usize,
     pub failed: usize,
-    pub errors: Vec<String>,
+    pub errors: Vec<PathError>,
+    pub cancelled: bool,
+}
+#[derive(Clone, serde::Serialize)]
+pub struct PathError {
+    pub path: String,
+    pub message: String,
+}
+
+/// A push that ended early. `partial` counts what finished before it stopped,
+/// once uploads had begun.
+pub struct Stopped {
+    pub partial: Option<Summary>,
+    pub error: anyhow::Error,
+}
+
+/// The push was interrupted by Ctrl-C or SIGTERM.
+#[derive(Debug)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upload cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+/// Resolves on Ctrl-C, and on unix also on SIGTERM, which CI uses to cancel.
+async fn cancelled() {
+    #[cfg(unix)]
+    if let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => (),
+            _ = terminate.recv() => (),
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg_attr(snowstead_hotpath, hotpath::measure)]
@@ -31,6 +70,19 @@ pub async fn push(
     paths: Vec<String>,
     jobs: usize,
     level: i32,
+) -> Result<Summary, Stopped> {
+    let mut partial = None;
+    let result = upload(client, cache, paths, jobs, level, &mut partial).await;
+    result.map_err(|error| Stopped { partial, error })
+}
+
+async fn upload(
+    client: &Client,
+    cache: &str,
+    paths: Vec<String>,
+    jobs: usize,
+    level: i32,
+    partial: &mut Option<Summary>,
 ) -> anyhow::Result<Summary> {
     if jobs == 0 {
         bail!("--jobs must be positive")
@@ -111,6 +163,7 @@ pub async fn push(
         upstream: upstream.len(),
         failed: 0,
         errors: Vec::new(),
+        cancelled: false,
     };
     tracing::debug!(
         paths = unique.len(),
@@ -130,7 +183,17 @@ pub async fn push(
                 .with_context(|| format!("missing path info for {path}"))?,
         );
     }
-    let transferred = transfer(client, cache, ordered, jobs, level).await?;
+    let transferred = match transfer(client, cache, ordered, jobs, level, partial).await {
+        Ok(transferred) => transferred,
+        Err(error) => {
+            // What stopped early still counts the paths this push never had to send.
+            if let Some(partial) = partial {
+                partial.skipped = summary.skipped;
+                partial.upstream = summary.upstream;
+            }
+            return Err(error);
+        }
+    };
     summary.pushed = transferred.pushed;
     summary.failed = transferred.failed;
     summary.errors = transferred.errors;
@@ -144,6 +207,7 @@ pub(crate) async fn transfer(
     ordered: Vec<nix::PathInfo>,
     jobs: usize,
     level: i32,
+    partial: &mut Option<Summary>,
 ) -> anyhow::Result<Summary> {
     let mut summary = Summary {
         pushed: 0,
@@ -151,6 +215,7 @@ pub(crate) async fn transfer(
         upstream: 0,
         failed: 0,
         errors: Vec::new(),
+        cancelled: false,
     };
     if ordered.is_empty() {
         return Ok(summary);
@@ -335,14 +400,9 @@ pub(crate) async fn transfer(
                         if receipt.session_id != session.session_id {
                             bail!("sealed upload receipt has a different session");
                         }
-                        let result = large_commits.request(receipt).await?;
-                        if result.session_id != session.session_id
-                            || !(result.published
-                                || result.prepared
-                                    && result.status == Some(202)
-                                    && result.error.is_none())
-                        {
-                            bail!("sealed upload recovery failed: {:?}", result.error);
+                        match large_commits.request(receipt).await? {
+                            api::RowOutcome::Published | api::RowOutcome::Prepared => (),
+                            other => bail!("sealed upload recovery failed: {other:?}"),
                         }
                         guard.disarm();
                         return Ok(());
@@ -410,8 +470,15 @@ pub(crate) async fn transfer(
                     // upload_parts drops its receiver on error, waking a blocked
                     // producer before we join it. Cancellation does the same.
                     let digest = producer.await?;
-                    let uploaded = uploaded?;
-                    let digest = digest?;
+                    // An inline receiver fails only because its encoder did, so
+                    // the encoder's error is the cause. A multipart encoder
+                    // that fails after an upload error only saw the closed channel.
+                    let (uploaded, digest) = if session.inline {
+                        let digest = digest?;
+                        (uploaded?, digest)
+                    } else {
+                        (uploaded?, digest?)
+                    };
                     drop(preparation);
                     let upload_elapsed_ms = start.elapsed().as_millis();
                     if !session.inline && !client.prepares_only() {
@@ -445,21 +512,16 @@ pub(crate) async fn transfer(
                             })
                             .await?
                     };
-                    let prepared = client.prepares_only()
-                        && published.prepared
-                        && published.status == Some(202)
-                        && published.error.is_none();
-                    if published.session_id != session.session_id
-                        || !(published.published || prepared)
-                    {
-                        tracing::debug!(
-                            has_error = published.error.is_some(),
-                            "publication rejected"
-                        );
-                        bail!(
-                            "publication failed (status {})",
-                            published.status.unwrap_or(500)
-                        )
+                    let prepared = published == api::RowOutcome::Prepared;
+                    match published {
+                        api::RowOutcome::Published | api::RowOutcome::Prepared => (),
+                        api::RowOutcome::Rejected { status } => {
+                            bail!("publication failed (status {status})")
+                        }
+                        api::RowOutcome::TransientExhausted => {
+                            bail!("publication failed: server still busy after retries")
+                        }
+                        api::RowOutcome::Failed(message) => bail!("{message}"),
                     }
                     guard.disarm();
                     tracing::debug!(
@@ -484,12 +546,12 @@ pub(crate) async fn transfer(
         })
         .try_buffer_unordered(outstanding);
     let mut work = Box::pin(work);
-    let interrupt = tokio::signal::ctrl_c();
+    let interrupt = cancelled();
     tokio::pin!(interrupt);
     loop {
         let next = tokio::select! {
             next = work.next() => next,
-            _ = &mut interrupt => Some(Err(anyhow::anyhow!("upload cancelled"))),
+            _ = &mut interrupt => Some(Err(Cancelled.into())),
         };
         let (path, result) = match next {
             None => break,
@@ -512,6 +574,8 @@ pub(crate) async fn transfer(
                         .await;
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
+                summary.cancelled = error.is::<Cancelled>();
+                *partial = Some(summary);
                 return Err(error);
             }
         };
@@ -519,7 +583,10 @@ pub(crate) async fn transfer(
             Ok(()) => summary.pushed += 1,
             Err(error) => {
                 summary.failed += 1;
-                summary.errors.push(format!("{path}: {error:#}"));
+                summary.errors.push(PathError {
+                    path,
+                    message: format!("{error:#}"),
+                });
             }
         }
     }
@@ -882,7 +949,9 @@ mod tests {
             }
         });
         let summary = tokio::time::timeout(Duration::from_secs(10), async {
-            let result = transfer(&client, "main", infos, 1, 3).await.unwrap();
+            let result = transfer(&client, "main", infos, 1, 3, &mut None)
+                .await
+                .unwrap();
             server.await.unwrap();
             result
         })
@@ -891,7 +960,7 @@ mod tests {
         assert_eq!(summary.pushed, 8);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.errors.len(), 1);
-        assert!(summary.errors[0].contains("4-data"));
+        assert!(summary.errors[0].path.contains("4-data"));
     }
 
     #[tokio::test]

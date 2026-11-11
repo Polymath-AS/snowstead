@@ -26,6 +26,9 @@ struct Cli {
     server: Option<String>,
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+    /// Print the push result as one JSON object on stdout; diagnostics stay on stderr.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -179,6 +182,55 @@ fn expiry(value: &Value) -> &str {
     value["expiresAt"].as_str().unwrap_or("never")
 }
 
+/// Why a command failed, as far as typed errors can tell. Each class has a
+/// stable exit code; clap exits with 2 for usage errors on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Failure {
+    Generic,
+    /// The push finished, but some store paths failed to upload.
+    PartialPush,
+    /// The server answered 401 or 403.
+    Auth,
+    /// Interrupted by Ctrl-C or SIGTERM.
+    Cancelled,
+}
+impl Failure {
+    fn of(error: &anyhow::Error) -> Self {
+        for cause in error.chain() {
+            if cause.is::<push::Cancelled>() {
+                return Self::Cancelled;
+            }
+            if cause.is::<PartialPush>() {
+                return Self::PartialPush;
+            }
+            if cause
+                .downcast_ref::<api::HttpError>()
+                .is_some_and(|http| matches!(http.status, 401 | 403))
+            {
+                return Self::Auth;
+            }
+        }
+        Self::Generic
+    }
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Generic => 1,
+            Self::PartialPush => 3,
+            Self::Auth => 4,
+            Self::Cancelled => 130,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PartialPush;
+impl std::fmt::Display for PartialPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Some store paths failed to upload")
+    }
+}
+impl std::error::Error for PartialPush {}
+
 fn main() {
     #[cfg(snowstead_hotpath)]
     let profile = hotpath::HotpathGuardBuilder::new("snowstead").build();
@@ -201,7 +253,22 @@ fn main() {
             error.to_string()
         };
         eprintln!("Error: {message}");
-        std::process::exit(1);
+        let failure = Failure::of(&error);
+        if failure == Failure::Auth {
+            eprintln!(
+                "Hint: the token was rejected or lacks permission. Run `snowstead login`, or check SNOWSTEAD_TOKEN."
+            );
+        }
+        std::process::exit(failure.exit_code());
+    }
+}
+
+/// Progress lines leave stdout to the JSON object when one was requested.
+fn progress(json: bool, line: &str) {
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
     }
 }
 
@@ -301,6 +368,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         } => return auth::status(cli.server.as_deref()),
         _ => (),
     }
+    let json = cli.json;
     let server = config::server(cli.server.as_deref())?;
     let client = api::Client::new(&server)?;
     tracing::debug!(target: "snowstead", "Starting authenticated command");
@@ -318,8 +386,9 @@ async fn run(mut cli: Cli) -> Result<()> {
             jobs,
             compression_level,
         } => {
-            let summary = if resumable || resume.is_some() {
-                push_job::push(
+            // A push that stops early still reports what it had published.
+            let (summary, stopped) = if resumable || resume.is_some() {
+                let summary = push_job::push(
                     &client,
                     &cache,
                     paths,
@@ -328,28 +397,46 @@ async fn run(mut cli: Cli) -> Result<()> {
                     jobs,
                     compression_level,
                 )
-                .await?
+                .await?;
+                (summary, None)
             } else {
                 let paths = if no_deps {
                     paths
                 } else {
-                    println!("Resolving closure...");
+                    progress(json, "Resolving closure...");
                     let paths = nix::closure(&paths).await?;
-                    println!("Found {} paths in closure", paths.len());
+                    progress(json, &format!("Found {} paths in closure", paths.len()));
                     paths
                 };
                 tracing::debug!(target: "snowstead", paths = paths.len(), jobs, compression_level, "Starting push");
-                push::push(&client, &cache, paths, jobs, compression_level).await?
-            };
-            println!(
-                "Done: {} pushed, {} skipped ({} served upstream), {} failed",
-                summary.pushed, summary.skipped, summary.upstream, summary.failed
-            );
-            if summary.failed > 0 {
-                for error in &summary.errors {
-                    eprintln!("Error: {error}");
+                match push::push(&client, &cache, paths, jobs, compression_level).await {
+                    Ok(summary) => (summary, None),
+                    Err(push::Stopped {
+                        partial: Some(summary),
+                        error,
+                    }) => (summary, Some(error)),
+                    Err(push::Stopped {
+                        partial: None,
+                        error,
+                    }) => return Err(error),
                 }
-                bail!("Some store paths failed to upload");
+            };
+            if json {
+                println!("{}", serde_json::to_string(&summary)?);
+            } else {
+                println!(
+                    "Done: {} pushed, {} skipped ({} served upstream), {} failed",
+                    summary.pushed, summary.skipped, summary.upstream, summary.failed
+                );
+            }
+            for error in &summary.errors {
+                eprintln!("Error: {}: {}", error.path, error.message);
+            }
+            if let Some(error) = stopped {
+                return Err(error);
+            }
+            if summary.failed > 0 {
+                return Err(PartialPush.into());
             }
         }
         Command::Cache { command } => match command {

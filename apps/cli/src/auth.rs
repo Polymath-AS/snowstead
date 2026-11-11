@@ -8,7 +8,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 
 #[derive(Args)]
 pub struct Login {
@@ -100,13 +100,100 @@ pub async fn login(options: &Login) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()?;
-    // This outer deadline covers start, the browser opener, all polling, and response reads.
+    // Fail on an unreadable config or unwritable directory now: once the
+    // server mints a token, a failed save would orphan it.
+    config::preflight()?;
+    // A backstop over start, the browser opener, all polling, and the final
+    // poll's response read; the device code's own deadline ends the login first.
     timeout(
-        Duration::from_secs(600),
+        Duration::from_secs(660),
         device_login(&client, origin, options),
     )
     .await
     .context("Device login expired. Run snowstead login again")?
+}
+
+/// What one request to the device token endpoint means for the login.
+enum Poll {
+    Pending,
+    SlowDown,
+    Denied,
+    Expired,
+    Invalid,
+    /// The server or network failed; the approval itself is unaffected.
+    Transient,
+    /// An answer this client cannot act on.
+    Unexpected,
+    Authorized(Authorized),
+}
+
+/// `body` is `None` when the response was not JSON.
+fn classify(status: reqwest::StatusCode, body: Option<serde_json::Value>) -> Poll {
+    use reqwest::StatusCode;
+    if status.is_server_error() {
+        return Poll::Transient;
+    }
+    let Some(body) = body else {
+        // A bare 429 comes from a rate limiter in front of the service.
+        return if status == StatusCode::TOO_MANY_REQUESTS {
+            Poll::SlowDown
+        } else {
+            Poll::Transient
+        };
+    };
+    if status == StatusCode::OK {
+        return match serde_json::from_value::<Authorized>(body) {
+            Ok(authorized)
+                if !authorized.org_name.is_empty()
+                    && authorized
+                        .expires_at
+                        .as_ref()
+                        .is_none_or(|value| !value.is_empty()) =>
+            {
+                Poll::Authorized(authorized)
+            }
+            _ => Poll::Unexpected,
+        };
+    }
+    if status != StatusCode::BAD_REQUEST && status != StatusCode::TOO_MANY_REQUESTS {
+        return Poll::Unexpected;
+    }
+    match body["error"].as_str() {
+        Some("authorization_pending") if status == StatusCode::BAD_REQUEST => Poll::Pending,
+        Some("slow_down") => Poll::SlowDown,
+        Some("access_denied") => Poll::Denied,
+        Some("expired_token") => Poll::Expired,
+        Some("invalid_grant") => Poll::Invalid,
+        _ => Poll::Unexpected,
+    }
+}
+
+// Each poll gets its own short deadline, so a stalled request counts as one
+// transient failure and the final poll can outlive the device code's deadline.
+const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+// Consecutive transient polls tolerated before giving up on the login.
+const TRANSIENT_LIMIT: u32 = 5;
+
+async fn poll(client: &reqwest::Client, origin: &str, device_code: &str) -> Poll {
+    let exchange = async {
+        let response = client
+            .post(format!("{origin}/auth/device/token"))
+            .json(&json!({"deviceCode": device_code}))
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, serde_json::from_slice(&bytes).ok()))
+    };
+    match timeout(POLL_TIMEOUT, exchange).await {
+        Ok(Ok((status, body))) => classify(status, body),
+        Ok(Err(_)) | Err(_) => Poll::Transient,
+    }
+}
+
+/// Server-supplied text is shown without control characters.
+fn printable(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
 }
 
 async fn device_login(client: &reqwest::Client, origin: &str, options: &Login) -> Result<()> {
@@ -116,6 +203,9 @@ async fn device_login(client: &reqwest::Client, origin: &str, options: &Login) -
         .json(&json!({}))
         .send()
         .await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        bail!("Too many login attempts. Wait a minute, then run snowstead login again");
+    }
     if response.status() != reqwest::StatusCode::OK {
         bail!("Could not start device login");
     }
@@ -156,60 +246,45 @@ async fn device_login(client: &reqwest::Client, origin: &str, options: &Login) -
         eprintln!("Could not open a browser. Open the verification URL above manually.");
     }
     let mut interval = started.interval.min(600);
+    let mut transient = 0;
     loop {
-        if Instant::now() + Duration::from_secs(interval) >= deadline {
-            sleep(deadline.saturating_duration_since(Instant::now())).await;
-            bail!("Device login expired. Run snowstead login again");
-        }
-        sleep(Duration::from_secs(interval)).await;
-        let response = timeout(deadline.saturating_duration_since(Instant::now()), async {
-            let response = client
-                .post(format!("{origin}/auth/device/token"))
-                .json(&json!({"deviceCode": started.device_code}))
-                .send()
-                .await?;
-            let status = response.status();
-            let body: serde_json::Value = response.json().await?;
-            Ok::<_, reqwest::Error>((status, body))
-        })
-        .await
-        .context("Device login expired. Run snowstead login again")??;
-        match response {
-            (reqwest::StatusCode::OK, body) => {
-                let authorized: Authorized =
-                    serde_json::from_value(body).context("Invalid device token response")?;
-                if authorized.org_name.is_empty()
-                    || authorized
-                        .expires_at
-                        .as_ref()
-                        .is_some_and(|value| value.is_empty())
-                {
-                    bail!("Invalid device token response");
-                }
+        // The last poll happens at the deadline itself: an approval given
+        // during the final interval still completes the login.
+        let next = Instant::now() + Duration::from_secs(interval);
+        let last = next >= deadline;
+        sleep_until(next.min(deadline)).await;
+        match poll(client, origin, &started.device_code).await {
+            Poll::Authorized(authorized) => {
                 let name = options.name.as_deref().unwrap_or(&authorized.name);
                 config::login(name, &authorized.server, &authorized.token)?;
-                println!("Signed in. Saved local profile '{name}'.");
+                println!(
+                    "Signed in to {}. Saved local profile '{name}'.",
+                    printable(&authorized.org_name)
+                );
+                match &authorized.expires_at {
+                    Some(expires_at) => println!("Token expires {}.", printable(expires_at)),
+                    None => println!("Token does not expire."),
+                }
                 return Ok(());
             }
-            (status, body)
-                if status == reqwest::StatusCode::BAD_REQUEST
-                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
-            {
-                match body["error"].as_str() {
-                    Some("authorization_pending") if status == reqwest::StatusCode::BAD_REQUEST => {
-                    }
-                    Some("slow_down") => interval = interval.saturating_add(5).min(600),
-                    Some("access_denied") => bail!("Device login was denied"),
-                    Some("expired_token") => {
-                        bail!("Device login expired. Run snowstead login again")
-                    }
-                    Some("invalid_grant") => {
-                        bail!("Device login is invalid. Run snowstead login again")
-                    }
-                    _ => bail!("Unexpected device login response"),
+            Poll::Pending => transient = 0,
+            Poll::SlowDown => {
+                transient = 0;
+                interval = interval.saturating_add(5).min(600);
+            }
+            Poll::Denied => bail!("Device login was denied"),
+            Poll::Expired => bail!("Device login expired. Run snowstead login again"),
+            Poll::Invalid => bail!("Device login is invalid. Run snowstead login again"),
+            Poll::Unexpected => bail!("Unexpected device login response"),
+            Poll::Transient => {
+                transient += 1;
+                if transient > TRANSIENT_LIMIT {
+                    bail!("Device login request failed repeatedly. Run snowstead login again");
                 }
             }
-            _ => bail!("Device login request failed"),
+        }
+        if last {
+            bail!("Device login expired. Run snowstead login again");
         }
     }
 }
@@ -232,4 +307,83 @@ async fn open_browser(url: &str) -> bool {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     matches!(timeout(Duration::from_secs(3), command.status()).await, Ok(Ok(status)) if status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn poll_classification_separates_transient_failures_from_final_answers() {
+        let error = |code: &str| Some(json!({"error": code}));
+        let authorized = json!({"server":"https://cache.example/org", "token":"t", "name":"org", "orgName":"Org", "expiresAt":null});
+        for status in [500, 502, 503, 504] {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert!(matches!(classify(status, None), Poll::Transient));
+            assert!(matches!(
+                classify(status, error("access_denied")),
+                Poll::Transient
+            ));
+        }
+        // A proxy's HTML page is not an answer from the login service.
+        assert!(matches!(classify(StatusCode::OK, None), Poll::Transient));
+        assert!(matches!(
+            classify(StatusCode::BAD_REQUEST, None),
+            Poll::Transient
+        ));
+        assert!(matches!(
+            classify(StatusCode::TOO_MANY_REQUESTS, None),
+            Poll::SlowDown
+        ));
+        assert!(matches!(
+            classify(StatusCode::TOO_MANY_REQUESTS, error("slow_down")),
+            Poll::SlowDown
+        ));
+        let bad = StatusCode::BAD_REQUEST;
+        assert!(matches!(
+            classify(bad, error("authorization_pending")),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            classify(bad, error("access_denied")),
+            Poll::Denied
+        ));
+        assert!(matches!(
+            classify(bad, error("expired_token")),
+            Poll::Expired
+        ));
+        assert!(matches!(
+            classify(bad, error("invalid_grant")),
+            Poll::Invalid
+        ));
+        assert!(matches!(classify(bad, error("other")), Poll::Unexpected));
+        assert!(matches!(
+            classify(
+                StatusCode::TOO_MANY_REQUESTS,
+                error("authorization_pending")
+            ),
+            Poll::Unexpected
+        ));
+        assert!(matches!(
+            classify(StatusCode::FORBIDDEN, error("access_denied")),
+            Poll::Unexpected
+        ));
+        assert!(matches!(
+            classify(StatusCode::OK, Some(authorized.clone())),
+            Poll::Authorized(_)
+        ));
+        for (field, value) in [
+            ("orgName", json!("")),
+            ("expiresAt", json!("")),
+            ("token", json!(null)),
+        ] {
+            let mut body = authorized.clone();
+            body[field] = value;
+            assert!(matches!(
+                classify(StatusCode::OK, Some(body)),
+                Poll::Unexpected
+            ));
+        }
+    }
 }

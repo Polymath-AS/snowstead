@@ -61,7 +61,8 @@ pub fn validate_url(server: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-fn save(config: &Config) -> Result<()> {
+/// Creates the owner-only config directory and a temporary file in it.
+fn private_file() -> Result<(PathBuf, tempfile::NamedTempFile)> {
     let path = path()?;
     let dir = path.parent().context("Invalid config directory")?;
     fs::create_dir_all(dir).context("Could not create config directory")?;
@@ -72,8 +73,21 @@ fn save(config: &Config) -> Result<()> {
             .context("Could not secure config directory")?;
     }
     // NamedTempFile starts owner-only and stays on the same filesystem for rename.
-    let mut file =
+    let file =
         tempfile::NamedTempFile::new_in(dir).context("Could not create private config file")?;
+    Ok((path, file))
+}
+
+/// Checks that a later `login` can save: the config loads and its directory
+/// accepts a new file. Run this before asking a server to mint a token.
+pub fn preflight() -> Result<()> {
+    load()?;
+    private_file()?;
+    Ok(())
+}
+
+fn save(config: &Config) -> Result<()> {
+    let (path, mut file) = private_file()?;
     serde_json::to_writer_pretty(&mut file, &config).context("Could not encode config")?;
     file.write_all(b"\n").context("Could not write config")?;
     file.as_file().sync_all().context("Could not sync config")?;

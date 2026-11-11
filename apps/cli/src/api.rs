@@ -53,16 +53,20 @@ pub struct SessionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline: Option<bool>,
 }
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitResult {
-    pub session_id: String,
-    #[serde(default)]
-    pub published: bool,
-    #[serde(default)]
-    pub prepared: bool,
-    pub status: Option<u16>,
-    pub error: Option<String>,
+/// How the server left one row of a publication batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowOutcome {
+    Published,
+    /// Verified and stored for a push job, which publishes it later.
+    Prepared,
+    /// Refused with a status that retrying cannot change.
+    Rejected {
+        status: u16,
+    },
+    /// Still busy or unreachable when the retry budget ran out.
+    TransientExhausted,
+    /// The batch stopped on this error after other rows had resolved.
+    Failed(String),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,11 +119,29 @@ fn inline_frames(uploads: &[&InlineUpload]) -> Result<Vec<bytes::Bytes>> {
         .chain(uploads.iter().map(|upload| upload.bytes.clone()))
         .collect())
 }
+/// A non-success HTTP status. Typed so callers can classify a failure (for
+/// example 401/403) without parsing its message.
+#[derive(Debug)]
+pub struct HttpError {
+    operation: String,
+    pub status: u16,
+}
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed (HTTP {})", self.operation, self.status)
+    }
+}
+impl std::error::Error for HttpError {}
+
 fn status_ok(operation: &str, response: Response) -> Result<Response> {
     if response.status().is_success() {
         Ok(response)
     } else {
-        bail!("{operation} failed (HTTP {})", response.status().as_u16())
+        Err(HttpError {
+            operation: operation.to_owned(),
+            status: response.status().as_u16(),
+        }
+        .into())
     }
 }
 async fn decode<T: DeserializeOwned>(operation: &str, response: Response) -> Result<T> {
@@ -131,11 +153,252 @@ async fn decode<T: DeserializeOwned>(operation: &str, response: Response) -> Res
 fn transient(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
 }
-async fn backoff(attempt: i32) {
-    tokio::time::sleep(Duration::from_secs_f64(
-        0.25 * 2_f64.powi(attempt) * (0.5 + rand::random::<f64>()),
-    ))
-    .await;
+
+const ATTEMPTS: u32 = 4;
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
+
+/// What one attempt of a retried call came to.
+enum Attempt<T> {
+    Done(T),
+    /// Transient: worth another attempt, after the server's Retry-After if sent.
+    Retry {
+        after: Option<Duration>,
+    },
+    Fatal(anyhow::Error),
+}
+
+/// Whether a request may be sent again once the server may have received it.
+#[derive(Clone, Copy, PartialEq)]
+enum Replay {
+    /// Resend after transport failures, lost responses, and transient statuses.
+    Idempotent,
+    /// Resend only after 503, which the server returns before acting. Any
+    /// other failure leaves the commit outcome unknown.
+    RefusedOnly,
+}
+
+/// Seconds only; HTTP dates are ignored. Bounded so a server cannot stall a push.
+fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(RETRY_AFTER_CAP))
+}
+
+/// Sorts one HTTP exchange into done, retryable, or fatal for this call.
+fn classify<E>(
+    operation: &str,
+    replay: Replay,
+    result: std::result::Result<Response, E>,
+) -> Attempt<Response> {
+    let response = match result {
+        Ok(response) => response,
+        Err(_) if replay == Replay::Idempotent => return Attempt::Retry { after: None },
+        Err(_) => return Attempt::Fatal(anyhow!("{operation}: HTTP transport failed")),
+    };
+    let status = response.status().as_u16();
+    if match replay {
+        Replay::Idempotent => transient(status),
+        Replay::RefusedOnly => status == 503,
+    } {
+        return Attempt::Retry {
+            after: retry_after(response.headers()),
+        };
+    }
+    match status_ok(operation, response) {
+        Ok(response) => Attempt::Done(response),
+        Err(error) => Attempt::Fatal(error),
+    }
+}
+
+impl Attempt<Response> {
+    async fn json<T: DeserializeOwned>(self, operation: &str, replay: Replay) -> Attempt<T> {
+        match self {
+            Attempt::Done(response) => match response.json().await {
+                Ok(data) => Attempt::Done(data),
+                Err(error)
+                    if replay == Replay::Idempotent && (error.is_body() || error.is_timeout()) =>
+                {
+                    Attempt::Retry { after: None }
+                }
+                Err(_) => Attempt::Fatal(anyhow!("{operation}: invalid response")),
+            },
+            Attempt::Retry { after } => Attempt::Retry { after },
+            Attempt::Fatal(error) => Attempt::Fatal(error),
+        }
+    }
+}
+
+fn exhausted(operation: &str) -> anyhow::Error {
+    anyhow!("{operation}: transient failure after {ATTEMPTS} attempts")
+}
+
+/// The retry budget every call shares: four attempts, with jittered
+/// exponential backoff between them unless the server names a delay.
+struct Budget {
+    attempt: u32,
+}
+impl Budget {
+    fn new() -> Self {
+        Self { attempt: 1 }
+    }
+    /// Waits out a transient failure. False once the budget is spent.
+    async fn wait(&mut self, after: Option<Duration>) -> bool {
+        if self.attempt >= ATTEMPTS {
+            return false;
+        }
+        tokio::time::sleep(after.unwrap_or_else(|| {
+            Duration::from_secs_f64(
+                0.25 * 2_f64.powi(self.attempt as i32) * (0.5 + rand::random::<f64>()),
+            )
+        }))
+        .await;
+        self.attempt += 1;
+        true
+    }
+    /// For calls with a single result: `None` means send the request again.
+    async fn settle<T>(&mut self, operation: &str, attempt: Attempt<T>) -> Result<Option<T>> {
+        match attempt {
+            Attempt::Done(value) => Ok(Some(value)),
+            Attempt::Fatal(error) => Err(error),
+            Attempt::Retry { after } if self.wait(after).await => Ok(None),
+            Attempt::Retry { .. } => Err(exhausted(operation)),
+        }
+    }
+}
+
+trait Upload {
+    fn session_id(&self) -> &str;
+}
+impl Upload for Finalize {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+impl Upload for InlineUpload {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Row {
+    session_id: String,
+    #[serde(default)]
+    published: bool,
+    #[serde(default)]
+    prepared: bool,
+    status: Option<u16>,
+    error: Option<String>,
+}
+#[derive(Deserialize)]
+struct Rows {
+    results: Vec<Row>,
+}
+
+/// One publication batch across its attempts. A row keeps the outcome it
+/// resolved to, whatever later attempts do to the rows still pending.
+struct Publication<'a, U> {
+    operation: &'static str,
+    /// A push job's client stores verified bytes and leaves publication to the job.
+    prepares: bool,
+    pending: Vec<(usize, &'a U)>,
+    outcomes: Vec<Option<RowOutcome>>,
+    budget: Budget,
+}
+impl<'a, U: Upload> Publication<'a, U> {
+    fn new(operation: &'static str, prepares: bool, uploads: &'a [U]) -> Self {
+        Self {
+            operation,
+            prepares,
+            pending: uploads.iter().enumerate().collect(),
+            outcomes: vec![None; uploads.len()],
+            budget: Budget::new(),
+        }
+    }
+    fn pending(&self) -> Vec<&'a U> {
+        self.pending.iter().map(|(_, upload)| *upload).collect()
+    }
+    /// Folds in one attempt. `Some` ends the batch; `None` asks for another
+    /// attempt with the rows still pending.
+    async fn settle(&mut self, attempt: Attempt<Rows>) -> Option<Result<Vec<RowOutcome>>> {
+        let after = match attempt {
+            Attempt::Fatal(error) => return Some(self.finish(Err(error))),
+            Attempt::Retry { after } => after,
+            Attempt::Done(data) => {
+                if data.results.len() != self.pending.len()
+                    || data
+                        .results
+                        .iter()
+                        .zip(&self.pending)
+                        .any(|(row, (_, upload))| row.session_id != upload.session_id())
+                {
+                    return Some(self.finish(Err(anyhow!(
+                        "{}: response count or order differs from request",
+                        self.operation
+                    ))));
+                }
+                let mut retry = Vec::new();
+                for ((index, upload), row) in std::mem::take(&mut self.pending)
+                    .into_iter()
+                    .zip(data.results)
+                {
+                    let prepared = self.prepares
+                        && row.prepared
+                        && row.status == Some(202)
+                        && row.error.is_none();
+                    self.outcomes[index] = Some(match (row.published, row.status) {
+                        (true, _) => RowOutcome::Published,
+                        _ if prepared => RowOutcome::Prepared,
+                        (false, Some(status)) if transient(status) => {
+                            retry.push((index, upload));
+                            continue;
+                        }
+                        (false, Some(status)) => RowOutcome::Rejected { status },
+                        (false, None) => {
+                            RowOutcome::Failed(format!("{}: invalid result", self.operation))
+                        }
+                    });
+                }
+                self.pending = retry;
+                if self.pending.is_empty() {
+                    return Some(self.finish(Ok(())));
+                }
+                None
+            }
+        };
+        if self.budget.wait(after).await {
+            None
+        } else {
+            Some(self.finish(Ok(())))
+        }
+    }
+    /// The batch itself fails only when no row resolved. Otherwise the rows
+    /// still pending take the reason the batch stopped.
+    fn finish(&mut self, stopped: Result<()>) -> Result<Vec<RowOutcome>> {
+        if self.outcomes.iter().all(Option::is_none) {
+            match stopped {
+                Err(error) => return Err(error),
+                Ok(()) if !self.pending.is_empty() => return Err(exhausted(self.operation)),
+                Ok(()) => (),
+            }
+        }
+        let unresolved = match stopped {
+            Ok(()) => RowOutcome::TransientExhausted,
+            Err(error) => RowOutcome::Failed(format!("{error:#}")),
+        };
+        for (index, _) in self.pending.drain(..) {
+            self.outcomes[index] = Some(unresolved.clone());
+        }
+        std::mem::take(&mut self.outcomes)
+            .into_iter()
+            .map(|row| row.ok_or_else(|| anyhow!("{}: missing result", self.operation)))
+            .collect()
+    }
 }
 impl Client {
     pub fn new(server: &crate::config::Server) -> Result<Self> {
@@ -192,44 +455,38 @@ impl Client {
         );
         Ok(response)
     }
-    // One attempt only: callers share a four-attempt budget across HTTP and
-    // per-upload failures. Never use this for non-idempotent session creation.
-    pub(crate) async fn replayable_post<T: DeserializeOwned>(
+    /// One attempt only: the caller owns the retry budget and says whether
+    /// this request may be replayed.
+    async fn post<T: DeserializeOwned>(
         &self,
         operation: &str,
+        replay: Replay,
         path: &str,
         body: Value,
-    ) -> Result<Option<T>> {
-        let response = match self
+    ) -> Attempt<T> {
+        let result = self
             .request(operation, Method::POST, path, Some(body))
+            .await;
+        classify(operation, replay, result)
+            .json(operation, replay)
             .await
-        {
-            Ok(response) => response,
-            Err(_) => return Ok(None),
-        };
-        if transient(response.status().as_u16()) {
-            return Ok(None);
-        }
-        let response = status_ok(operation, response)?;
-        match response.json().await {
-            Ok(data) => Ok(Some(data)),
-            Err(error) if error.is_body() || error.is_timeout() => Ok(None),
-            Err(_) => bail!("{operation}: invalid response"),
-        }
     }
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
     pub async fn missing(&self, cache: &str, hashes: &[String]) -> Result<Missing> {
-        decode(
-            "get-missing-paths",
-            self.request(
-                "get-missing-paths",
-                Method::POST,
-                "/_api/v1/get-missing-paths",
-                Some(json!({"cache":cache,"storePathHashes":hashes})),
-            )
-            .await?,
-        )
-        .await
+        let mut budget = Budget::new();
+        loop {
+            let attempt = self
+                .post(
+                    "get-missing-paths",
+                    Replay::Idempotent,
+                    "/_api/v1/get-missing-paths",
+                    json!({"cache":cache,"storePathHashes":hashes}),
+                )
+                .await;
+            if let Some(missing) = budget.settle("get-missing-paths", attempt).await? {
+                return Ok(missing);
+            }
+        }
     }
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
     pub async fn create_sessions(
@@ -242,109 +499,64 @@ impl Client {
             sessions: Vec<Session>,
         }
         let path = format!("/_api/v1/caches/{}/upload-streams/batch", segment(cache)?);
-        if let Some(job) = &self.push_job {
-            for attempt in 1..=4 {
-                if let Some(data) = self
-                    .replayable_post::<Sessions>(
+        let mut budget = Budget::new();
+        loop {
+            // The server returns busy before committing session creation.
+            // Never replay transport failures or gateway errors: their commit
+            // outcome is unknown and creation is not idempotent. A push job's
+            // sessions are keyed by the job, so replaying them is safe.
+            let attempt = match &self.push_job {
+                Some(job) => {
+                    self.post::<Sessions>(
                         "create-sessions",
+                        Replay::Idempotent,
                         &path,
                         json!({"jobId":job,"paths":paths}),
                     )
-                    .await?
-                {
-                    return Ok(data.sessions);
+                    .await
                 }
-                if attempt < 4 {
-                    backoff(attempt).await;
+                None => {
+                    self.post::<Sessions>(
+                        "create-sessions",
+                        Replay::RefusedOnly,
+                        &path,
+                        json!({"paths":paths}),
+                    )
+                    .await
                 }
+            };
+            if let Some(data) = budget.settle("create-sessions", attempt).await? {
+                return Ok(data.sessions);
             }
-            bail!("create-sessions: failed after 4 attempts");
         }
-        for attempt in 1..=4 {
-            let response = self
-                .request(
-                    "create-sessions",
-                    Method::POST,
-                    &path,
-                    Some(json!({"paths":paths})),
-                )
-                .await?;
-            // The server returns busy before committing session creation.
-            // Never replay transport failures or gateway errors: their commit
-            // outcome is unknown and creation is not idempotent.
-            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                if attempt == 4 {
-                    bail!("create-sessions: failed after 4 attempts");
-                }
-                backoff(attempt).await;
-                continue;
-            }
-            let data: Sessions = decode("create-sessions", response).await?;
-            return Ok(data.sessions);
-        }
-        unreachable!("bounded creation attempts return a result")
     }
+    /// One outcome per upload, in request order. Rows that are still busy
+    /// replay together; an error means no row resolved at all.
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-    pub async fn finalize(&self, uploads: &[Finalize]) -> Result<Vec<CommitResult>> {
-        #[derive(Deserialize)]
-        struct Results {
-            results: Vec<CommitResult>,
-        }
-        let mut pending: Vec<_> = uploads.iter().enumerate().collect();
-        let mut results = vec![None; uploads.len()];
-        for attempt in 1..=4 {
-            let paths: Vec<_> = pending.iter().map(|(_, upload)| *upload).collect();
-            if let Some(data) = self
-                .replayable_post::<Results>(
+    pub async fn finalize(&self, uploads: &[Finalize]) -> Result<Vec<RowOutcome>> {
+        let mut batch = Publication::new("finalize", self.prepares_only(), uploads);
+        loop {
+            let attempt = self
+                .post(
                     "finalize",
-                    if self.push_job.is_some() {
+                    Replay::Idempotent,
+                    if self.prepares_only() {
                         "/_api/v1/uploads/finalize?prepareOnly=true"
                     } else {
                         "/_api/v1/uploads/finalize"
                     },
-                    json!({"uploads":paths}),
+                    json!({"uploads":batch.pending()}),
                 )
-                .await?
-            {
-                if data.results.len() != pending.len()
-                    || data
-                        .results
-                        .iter()
-                        .zip(&pending)
-                        .any(|(row, (_, upload))| row.session_id != upload.session_id)
-                {
-                    bail!("finalize: response count or order differs from request");
-                }
-                let mut retry = Vec::new();
-                for ((index, upload), row) in pending.into_iter().zip(data.results) {
-                    if attempt < 4 && !row.published && row.status.is_some_and(transient) {
-                        retry.push((index, upload));
-                    } else {
-                        results[index] = Some(row);
-                    }
-                }
-                pending = retry;
-                if pending.is_empty() {
-                    return results
-                        .into_iter()
-                        .map(|row| row.ok_or_else(|| anyhow!("finalize: missing result")))
-                        .collect();
-                }
+                .await;
+            if let Some(outcomes) = batch.settle(attempt).await {
+                return outcomes;
             }
-            if attempt == 4 {
-                bail!("finalize: transient HTTP failure after 4 attempts");
-            }
-            backoff(attempt).await;
         }
-        unreachable!()
     }
     /// Replays retain the same globally budgeted allocation, including after a
     /// lost publication acknowledgement. HTTP and item failures share a budget.
-    pub async fn inline_batch(&self, uploads: &[InlineUpload]) -> Result<Vec<CommitResult>> {
-        #[derive(Deserialize)]
-        struct Results {
-            results: Vec<CommitResult>,
-        }
+    /// Outcomes follow the same rules as `finalize`.
+    pub async fn inline_batch(&self, uploads: &[InlineUpload]) -> Result<Vec<RowOutcome>> {
         if uploads.is_empty() || uploads.len() > 8 {
             bail!("inline upload: invalid batch size");
         }
@@ -364,77 +576,43 @@ impl Client {
                 bail!("inline upload: invalid bytes, hash, or duplicate session");
             }
         }
-        let mut pending: Vec<_> = uploads.iter().enumerate().collect();
-        let mut results = vec![None; uploads.len()];
-        for attempt in 1..=4 {
-            let paths: Vec<_> = pending.iter().map(|(_, upload)| *upload).collect();
-            let frames = inline_frames(&paths)?;
-            let length: usize = frames.iter().map(bytes::Bytes::len).sum();
-            let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
-                frames.into_iter().map(Ok::<_, std::io::Error>),
-            ));
-            let response = self
-                .http
-                .post(format!(
-                    "{}/_api/v1/uploads/inline/batch{}",
-                    self.server,
-                    if self.push_job.is_some() {
-                        "?prepareOnly=true"
-                    } else {
-                        ""
-                    }
-                ))
-                .header(header::AUTHORIZATION, self.authorization.clone())
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, length)
-                .body(body)
-                .send()
-                .await;
-            let data = match response {
-                Err(_) => None,
-                Ok(response) if transient(response.status().as_u16()) => None,
-                Ok(response) => {
-                    match status_ok("inline upload", response)?
-                        .json::<Results>()
-                        .await
-                    {
-                        Ok(row) => Some(row),
-                        Err(error) if error.is_body() || error.is_timeout() => None,
-                        Err(_) => bail!("inline upload: invalid response"),
-                    }
-                }
-            };
-            if let Some(data) = data {
-                if data.results.len() != pending.len()
-                    || data
-                        .results
-                        .iter()
-                        .zip(&pending)
-                        .any(|(row, (_, upload))| row.session_id != upload.session_id)
-                {
-                    bail!("inline upload: response count or order differs from request");
-                }
-                let mut retry = Vec::new();
-                for ((index, upload), row) in pending.into_iter().zip(data.results) {
-                    if attempt < 4 && !row.published && row.status.is_some_and(transient) {
-                        retry.push((index, upload));
-                    } else {
-                        results[index] = Some(row);
-                    }
-                }
-                pending = retry;
-                if pending.is_empty() {
-                    return results
-                        .into_iter()
-                        .map(|row| row.ok_or_else(|| anyhow!("inline upload: missing result")))
-                        .collect();
-                }
-            } else if attempt == 4 {
-                bail!("inline upload: transient HTTP failure after 4 attempts");
+        let mut batch = Publication::new("inline upload", self.prepares_only(), uploads);
+        loop {
+            let attempt = self.inline_attempt(&batch.pending()).await;
+            if let Some(outcomes) = batch.settle(attempt).await {
+                return outcomes;
             }
-            backoff(attempt).await;
         }
-        unreachable!()
+    }
+    async fn inline_attempt(&self, uploads: &[&InlineUpload]) -> Attempt<Rows> {
+        let frames = match inline_frames(uploads) {
+            Ok(frames) => frames,
+            Err(error) => return Attempt::Fatal(error),
+        };
+        let length: usize = frames.iter().map(bytes::Bytes::len).sum();
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        let result = self
+            .http
+            .post(format!(
+                "{}/_api/v1/uploads/inline/batch{}",
+                self.server,
+                if self.prepares_only() {
+                    "?prepareOnly=true"
+                } else {
+                    ""
+                }
+            ))
+            .header(header::AUTHORIZATION, self.authorization.clone())
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await;
+        classify("inline upload", Replay::Idempotent, result)
+            .json("inline upload", Replay::Idempotent)
+            .await
     }
     pub async fn abort(&self, id: &str) -> Result<()> {
         let path = format!("/_api/v1/uploads/{}/abort", segment(id)?);
@@ -487,73 +665,77 @@ impl Client {
         let mut results: Vec<_> = std::iter::repeat_with(|| None)
             .take(requests.len())
             .collect();
-        for attempt in 1..=4 {
+        let mut budget = Budget::new();
+        loop {
             let uploads: Vec<_> = pending.iter().map(|(id, parts)| json!({
                 "sessionId":id,
                 "parts":parts.iter().map(|(_, p)| json!({"partNumber":p.part_number,"size":p.size})).collect::<Vec<_>>()
             })).collect();
-            if let Some(data) = self
-                .replayable_post::<Results>(
+            let after = match self
+                .post::<Results>(
                     "reserve parts",
+                    Replay::Idempotent,
                     "/_api/v1/uploads/parts",
                     json!({"uploads":uploads}),
                 )
-                .await?
+                .await
             {
-                if data.results.len() != pending.len()
-                    || data
-                        .results
-                        .iter()
-                        .zip(&pending)
-                        .any(|(row, (id, _))| row.session_id != *id)
-                {
-                    bail!("reserve parts: response count or order differs from request");
-                }
-                let mut retry = Vec::new();
-                for (group, row) in pending.into_iter().zip(data.results) {
-                    if let Some(parts) = row.parts {
-                        if row.status.is_some()
-                            || parts.len() != group.1.len()
-                            || parts
-                                .iter()
-                                .zip(&group.1)
-                                .any(|(part, (_, request))| part.part_number != request.part_number)
-                        {
-                            bail!("reserve parts: invalid part instructions");
-                        }
-                        for (part, (index, _)) in parts.into_iter().zip(&group.1) {
-                            results[*index] = Some(Ok(part));
-                        }
-                    } else {
-                        let status = row
-                            .status
-                            .ok_or_else(|| anyhow!("reserve parts: invalid result"))?;
-                        if attempt < 4 && transient(status) {
-                            retry.push(group);
+                Attempt::Fatal(error) => return Err(error),
+                Attempt::Retry { after } => after,
+                Attempt::Done(data) => {
+                    if data.results.len() != pending.len()
+                        || data
+                            .results
+                            .iter()
+                            .zip(&pending)
+                            .any(|(row, (id, _))| row.session_id != *id)
+                    {
+                        bail!("reserve parts: response count or order differs from request");
+                    }
+                    let mut retry = Vec::new();
+                    for (group, row) in pending.into_iter().zip(data.results) {
+                        if let Some(parts) = row.parts {
+                            if row.status.is_some()
+                                || parts.len() != group.1.len()
+                                || parts.iter().zip(&group.1).any(|(part, (_, request))| {
+                                    part.part_number != request.part_number
+                                })
+                            {
+                                bail!("reserve parts: invalid part instructions");
+                            }
+                            for (part, (index, _)) in parts.into_iter().zip(&group.1) {
+                                results[*index] = Some(Ok(part));
+                            }
                         } else {
-                            for (index, _) in &group.1 {
-                                results[*index] =
-                                    Some(Err(format!("reserve parts: rejected (status {status})")));
+                            let status = row
+                                .status
+                                .ok_or_else(|| anyhow!("reserve parts: invalid result"))?;
+                            if transient(status) {
+                                retry.push(group);
+                            } else {
+                                for (index, _) in &group.1 {
+                                    results[*index] = Some(Err(format!(
+                                        "reserve parts: rejected (status {status})"
+                                    )));
+                                }
                             }
                         }
                     }
+                    pending = retry;
+                    if pending.is_empty() {
+                        break;
+                    }
+                    None
                 }
-                pending = retry;
-                if pending.is_empty() {
-                    break;
-                }
-            }
-            if attempt == 4 {
+            };
+            if !budget.wait(after).await {
                 for (_, parts) in pending {
                     for (index, _) in parts {
-                        results[*index] = Some(Err(
-                            "reserve parts: transient HTTP failure after 4 attempts".into(),
-                        ));
+                        results[*index] = Some(Err(exhausted("reserve parts").to_string()));
                     }
                 }
                 break;
             }
-            backoff(attempt).await;
         }
         results
             .into_iter()
@@ -587,44 +769,38 @@ impl Client {
             header::CONTENT_LENGTH,
             header::HeaderValue::from_str(&bytes.len().to_string())?,
         );
-        for attempt in 1..=4 {
-            let body = reqwest::Body::from(bytes.clone());
+        let mut budget = Budget::new();
+        loop {
             let result = self
                 .http
                 .put(url.clone())
                 .headers(headers.clone())
-                .body(body)
+                .body(reqwest::Body::from(bytes.clone()))
                 .send()
                 .await;
-            match result {
-                Ok(response) => {
-                    let status = response.status();
-                    tracing::debug!(status = status.as_u16(), attempt, "part PUT response");
-                    if attempt == 4 || !transient(status.as_u16()) {
-                        let response = status_ok("part upload", response)?;
-                        let etag = response
-                            .headers()
-                            .get(header::ETAG)
-                            .and_then(|v| v.to_str().ok())
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| anyhow!("part upload returned no ETag"))?
-                            .to_owned();
-                        return Ok(UploadedPart {
-                            part_number: part.part_number,
-                            etag,
-                        });
-                    }
-                }
-                Err(_) => {
-                    tracing::debug!(attempt, "part PUT transport failed");
-                    if attempt == 4 {
-                        bail!("part upload: HTTP transport failed");
-                    }
-                }
+            match &result {
+                Ok(response) => tracing::debug!(
+                    status = response.status().as_u16(),
+                    attempt = budget.attempt,
+                    "part PUT response"
+                ),
+                Err(_) => tracing::debug!(attempt = budget.attempt, "part PUT transport failed"),
             }
-            backoff(attempt).await;
+            let attempt = classify("part upload", Replay::Idempotent, result);
+            if let Some(response) = budget.settle("part upload", attempt).await? {
+                let etag = response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| anyhow!("part upload returned no ETag"))?
+                    .to_owned();
+                return Ok(UploadedPart {
+                    part_number: part.part_number,
+                    etag,
+                });
+            }
         }
-        unreachable!()
     }
     pub async fn admin_get(&self, path: &str) -> Result<Value> {
         validate_admin_path(path)?;
@@ -803,8 +979,8 @@ pub(crate) mod tests {
                     .inline_batch(&[inline_upload("s1", b"abcdef")])
                     .await;
                 match index {
-                    0 => assert!(result.unwrap()[0].published),
-                    2 | 5 => assert!(!result.unwrap()[0].published),
+                    0 => assert_eq!(result.unwrap(), [RowOutcome::Published]),
+                    5 => assert_eq!(result.unwrap(), [RowOutcome::Rejected { status: 400 }]),
                     _ => {
                         let error = result.unwrap_err().to_string();
                         assert!(
@@ -812,7 +988,7 @@ pub(crate) mod tests {
                                 && !error.contains("secret-token")
                                 && !error.contains(&url)
                         );
-                        if index == 1 {
+                        if index == 1 || index == 2 {
                             assert!(error.contains("4 attempts"));
                         }
                     }
@@ -910,19 +1086,14 @@ pub(crate) mod tests {
             .collect();
         let results = client.inline_batch(&uploads).await.unwrap();
         assert_eq!(
-            results
-                .iter()
-                .map(|row| row.session_id.as_str())
-                .collect::<Vec<_>>(),
-            ["ok", "busy", "bad", "denied", "full"]
-        );
-        assert!(results[0].published && results[1].published);
-        assert_eq!(
-            results[2..]
-                .iter()
-                .map(|row| row.status)
-                .collect::<Vec<_>>(),
-            [Some(400), Some(403), Some(507)]
+            results,
+            [
+                RowOutcome::Published,
+                RowOutcome::Published,
+                RowOutcome::Rejected { status: 400 },
+                RowOutcome::Rejected { status: 403 },
+                RowOutcome::Rejected { status: 507 },
+            ]
         );
         let bodies = server.await.unwrap();
         assert_eq!(
@@ -1035,10 +1206,8 @@ pub(crate) mod tests {
                 (0..19).map(|index| batch.request(inline_upload(&format!("s{index}"), b"abcdef"))),
             )
             .await;
-            for (index, row) in results.into_iter().enumerate() {
-                let row = row.unwrap();
-                assert_eq!(row.session_id, format!("s{index}"));
-                assert!(row.published);
+            for row in results {
+                assert_eq!(row.unwrap(), RowOutcome::Published);
             }
             assert_eq!(server.await.unwrap(), [8, 8, 3]);
         })
@@ -1144,7 +1313,7 @@ pub(crate) mod tests {
             let part = upload_one(&client, bytes::Bytes::from_static(b"abcdef"))
                 .await
                 .unwrap();
-            assert!(
+            assert_eq!(
                 client
                     .finalize(&[Finalize {
                         session_id: "s1".into(),
@@ -1155,8 +1324,8 @@ pub(crate) mod tests {
                         parts: vec![part]
                     }])
                     .await
-                    .unwrap()[0]
-                    .published
+                    .unwrap(),
+                [RowOutcome::Published]
             );
             client.abort("s1").await.unwrap();
             server.await.unwrap();
@@ -1329,19 +1498,14 @@ pub(crate) mod tests {
             .collect();
         let results = client.finalize(&uploads).await.unwrap();
         assert_eq!(
-            results
-                .iter()
-                .map(|row| row.session_id.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "busy", "bad", "denied", "full"]
-        );
-        assert!(results[0].published && results[1].published);
-        assert_eq!(
-            results[2..]
-                .iter()
-                .map(|row| row.status)
-                .collect::<Vec<_>>(),
-            [Some(400), Some(403), Some(507)]
+            results,
+            [
+                RowOutcome::Published,
+                RowOutcome::Published,
+                RowOutcome::Rejected { status: 400 },
+                RowOutcome::Rejected { status: 403 },
+                RowOutcome::Rejected { status: 507 },
+            ]
         );
         let requests = server.await.unwrap();
         assert_eq!(
@@ -1376,13 +1540,7 @@ pub(crate) mod tests {
             let error = match operation {
                 "reserve" => upload_one(&client, bytes::Bytes::from_static(b"abcdef")).await.unwrap_err(),
                 "finalize" => client.finalize(&[upload("s1")]).await.unwrap_err(),
-                "busy" => {
-                    let result = client.finalize(&[upload("s1")]).await.unwrap();
-                    assert!(!result[0].published);
-                    assert_eq!(result[0].status, Some(503));
-                    assert_eq!(server.await.unwrap().len(), count);
-                    return;
-                }
+                "busy" => client.finalize(&[upload("s1")]).await.unwrap_err(),
                 _ => client.create_sessions("main", &[]).await.err().unwrap(),
             };
             let text = format!("{error:#}");
@@ -1424,5 +1582,113 @@ pub(crate) mod tests {
             assert!(error.to_string().contains("response count or order"));
             assert_eq!(server.await.unwrap().len(), 1);
         }
+    }
+    #[tokio::test]
+    async fn resolved_rows_survive_later_exhaustion_and_fatal_errors() {
+        // (later responses, outcome of the row left pending by the first reply)
+        for (later, fatal) in [(vec![503, 0, 429], false), (vec![403], true)] {
+            let first = json!({"results":[
+                {"sessionId":"done","published":true},
+                {"sessionId":"busy","status":503},
+                {"sessionId":"bad","status":400}
+            ]});
+            let rest = json!({"error":"private secret-token"});
+            let responses: Vec<_> = std::iter::once((200, first))
+                .chain(later.iter().map(|status| (*status, rest.clone())))
+                .collect();
+
+            let (client, server) = scripted(responses.clone()).await;
+            let uploads: Vec<_> = ["done", "busy", "bad"].into_iter().map(upload).collect();
+            let finalized = client.finalize(&uploads).await.unwrap();
+            let requests = server.await.unwrap();
+            assert_eq!(requests[1], json!({"uploads":[uploads[1]]}));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = self::client(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                for (status, response) in responses {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read(&mut socket).await;
+                    if status != 0 {
+                        reply(&mut socket, status, &response.to_string(), "").await;
+                    }
+                }
+            });
+            let uploads: Vec<_> = ["done", "busy", "bad"]
+                .into_iter()
+                .map(|id| inline_upload(id, b"abcdef"))
+                .collect();
+            let inlined = client.inline_batch(&uploads).await.unwrap();
+            server.await.unwrap();
+
+            for outcomes in [finalized, inlined] {
+                assert_eq!(outcomes[0], RowOutcome::Published);
+                assert_eq!(outcomes[2], RowOutcome::Rejected { status: 400 });
+                match &outcomes[1] {
+                    RowOutcome::TransientExhausted => assert!(!fatal),
+                    RowOutcome::Failed(message) => {
+                        assert!(fatal && message.contains("403"));
+                        assert!(!message.contains("private") && !message.contains("secret-token"));
+                    }
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn missing_paths_retry_transient_failures_and_lost_responses() {
+        let (client, server) = scripted(vec![
+            (503, json!({"error":"Database busy; retry"})),
+            (0, Value::Null),
+            (200, json!({"missing":["a"]})),
+        ])
+        .await;
+        let missing = client.missing("main", &["a".into()]).await.unwrap();
+        assert_eq!(missing.missing, ["a"]);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[2]);
+
+        let (client, server) = scripted(vec![(503, Value::Null); 4]).await;
+        let error = client.missing("main", &[]).await.unwrap_err();
+        assert!(error.to_string().contains("4 attempts"));
+        assert_eq!(server.await.unwrap().len(), 4);
+        let (client, server) = scripted(vec![(403, json!({"error":"secret-token"}))]).await;
+        let error = client.missing("main", &[]).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<HttpError>().unwrap().status, 403);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn retry_after_is_honored_and_capped() {
+        let headers = |value: &'static str| {
+            let mut headers = header::HeaderMap::new();
+            headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static(value));
+            headers
+        };
+        assert_eq!(retry_after(&headers("2")), Some(Duration::from_secs(2)));
+        assert_eq!(retry_after(&headers("3600")), Some(RETRY_AFTER_CAP));
+        assert_eq!(retry_after(&headers("Wed, 21 Oct 2015 07:28:00 GMT")), None);
+        assert_eq!(retry_after(&header::HeaderMap::new()), None);
+
+        // Ordinary backoff after a first attempt is at most 0.75 s.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut times = Vec::new();
+            for step in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read(&mut socket).await;
+                times.push(Instant::now());
+                if step == 0 {
+                    reply(&mut socket, 503, "{}", "Retry-After: 1\r\n").await;
+                } else {
+                    reply(&mut socket, 200, r#"{"missing":[]}"#, "").await;
+                }
+            }
+            times
+        });
+        client.missing("main", &[]).await.unwrap();
+        let times = server.await.unwrap();
+        assert!(times[1].duration_since(times[0]) >= Duration::from_secs(1));
     }
 }
