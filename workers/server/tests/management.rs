@@ -1022,7 +1022,29 @@ async fn management_limit_is_shared_by_router_clones_and_operator_is_exempt(pool
         None,
     )
     .await;
+    // Changes made for a person count against that person.
+    let revoke = || {
+        call(
+            &app,
+            "POST",
+            "/_api/v1/orgs/org_alpha/tokens/missing/revoke",
+            json!({"reason":"test"}),
+            Some("dev@example.test"),
+        )
+    };
     for _ in 0..600 {
+        assert_ne!(revoke().await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+    let (status, headers, value) = revoke().await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "60");
+    assert_eq!(
+        value,
+        json!({"error":"Too many requests: slow down, and retry in 60 seconds"})
+    );
+    // Reads the operator makes for that same person are not: a dashboard
+    // page view is several, and browsing must not be refused.
+    for _ in 0..601 {
         assert_eq!(
             call(
                 &app,
@@ -1036,20 +1058,6 @@ async fn management_limit_is_shared_by_router_clones_and_operator_is_exempt(pool
             StatusCode::OK
         );
     }
-    let (status, headers, value) = call(
-        &app,
-        "GET",
-        "/_api/v1/orgs/org_alpha",
-        Value::Null,
-        Some("dev@example.test"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(headers["retry-after"], "60");
-    assert_eq!(
-        value,
-        json!({"error":"Too many requests: slow down, and retry in 60 seconds"})
-    );
     assert_eq!(
         call(&app, "GET", "/_api/v1/orgs/org_alpha", Value::Null, None)
             .await

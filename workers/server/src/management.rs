@@ -308,7 +308,14 @@ async fn authorize_and_audit(
             Err(error) => return Err(error),
         }
     };
-    if !admin && !matches!(identity, Identity::Admin { on_behalf_of: None }) {
+    // The operator is trusted, and so are the reads it makes for a person it
+    // has already signed in: a dashboard page is several of them, and a
+    // refusal would show that person an error for browsing. What the operator
+    // changes on someone's behalf is still counted against them, as is
+    // everything an API key or token does.
+    let operator_read = matches!(identity, Identity::Admin { .. })
+        && matches!(*request.method(), Method::GET | Method::HEAD);
+    if !admin && !operator_read && !matches!(identity, Identity::Admin { on_behalf_of: None }) {
         state.management_limits.check(identity.actor())?;
     }
     let root_put = request.method() == Method::PUT && matches!(endpoint, "" | "/");
