@@ -28,7 +28,8 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
                 .put(get_missing_paths)
                 .route_layer(middleware::from_fn_with_state(state.clone(), write_access)),
         )
-        .merge(crate::uploads::router(state))
+        .merge(crate::uploads::router(state.clone()))
+        .merge(crate::push_jobs::router(state))
 }
 
 pub(crate) async fn write_access(
@@ -72,6 +73,13 @@ pub(crate) async fn write_access(
         "/_api/v1/uploads/{id}/parts" => "reserve-upload-parts",
         "/_api/v1/uploads/{id}/abort" => "abort-upload-stream",
         "/_api/v1/uploads/{id}/part/{number}" => "upload-part",
+        "/_api/v1/caches/{cache}/push-jobs" => "create-push-job",
+        "/_api/v1/caches/{cache}/push-jobs/{job}" => "push-job-manifest",
+        "/_api/v1/caches/{cache}/push-jobs/{job}/manifest/{chunk}" => "push-manifest-chunk",
+        "/_api/v1/caches/{cache}/push-jobs/{job}/seal" => "seal-push-manifest",
+        "/_api/v1/caches/{cache}/push-jobs/{job}/resume" => "resume-push-job",
+        "/_api/v1/caches/{cache}/push-jobs/{job}/cancel" => "cancel-push-job",
+        "/_api/v1/caches/{cache}/push-jobs/{job}/complete" => "complete-push-job",
         _ => unreachable!("write middleware is only installed on Nix routes"),
     };
     let cache = if endpoint == "create-upload-streams" {

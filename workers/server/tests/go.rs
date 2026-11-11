@@ -534,9 +534,44 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         .execute(&pool)
         .await
         .unwrap();
+    // The shared admission path must also honor temporary Nix job protection
+    // for both compiler products. No maintenance run releases this lease.
+    sqlx::raw_sql("INSERT INTO api_tokens(jti,subject,perms_json,created_by,org_id) VALUES('job-token','test','[\"push\"]','test','org_a');
+        INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,state,manifest_bytes,authorization_jti,authorization_expires_at)
+        SELECT 'job',id,'job-token','job','selected','[]','sealed',1,'job-token',now()+interval '30 minutes' FROM caches WHERE org_id='org_a' AND name='compiler';
+        INSERT INTO push_job_members(job_id,store_path_hash,metadata)
+        SELECT 'job',store_path_hash,jsonb_build_object('storePath',store_path,'narHash',nar_hash,'narSize',nar_size,'references',references_json::jsonb,'deriver',deriver)
+        FROM published_paths;").execute(&pool).await.unwrap();
+    for (url, bytes) in [(&path("compiler", 'f'), vec![4; 32]), (&cc, vec![5; 32])] {
+        assert_eq!(
+            put(&app, url, &credential, &bytes).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+    assert_eq!(
+        send(&app, "GET", &go, Some(&credential), &[], &[]).await.2,
+        vec![3; 26]
+    );
+    sqlx::query("UPDATE push_jobs SET authorization_expires_at=now()-interval '1 second'")
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         put(&app, &path("compiler", 'f'), &credential, &[4; 32]).await,
-        StatusCode::CREATED
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &path("compiler", 'f'),
+            Some(&credential),
+            &[],
+            &[]
+        )
+        .await
+        .2,
+        vec![4; 32]
     );
     let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
         .fetch_one(&pool)

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.id,\n            c.org_id\n        FROM caches c\n        WHERE c.retention_days IS NOT NULL\n            AND EXISTS(\n                SELECT 1\n                FROM published_paths p\n                WHERE p.cache_id = c.id\n                    AND p.last_pushed_at < now() - c.retention_days * INTERVAL '1 day'\n                    AND NOT nix_path_pinned(p.cache_id, p.store_path_hash, now())\n                    AND NOT EXISTS (\n                        SELECT 1 FROM nix_job_protected_paths(c.org_id, now()) j\n                        WHERE j.cache_id=p.cache_id AND j.store_path_hash=p.store_path_hash\n                    )\n            )\n        ORDER BY c.id\n        LIMIT $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1fc03fc3ef2ca5f6797041613007f3bf7cf2a85fee3f70b7558da2f94fd324d5"
+}

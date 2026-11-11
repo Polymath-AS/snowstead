@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use crate::db::Transaction;
+use crate::db::{self, Transaction};
 use axum::{
     Extension, Router,
     body::{Body, to_bytes},
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::Response,
@@ -21,6 +21,7 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Acquire;
 use tokio::io::AsyncReadExt;
 
 use crate::{
@@ -108,7 +109,7 @@ fn hash_valid(s: &str) -> bool {
 fn store_hash(s: &str) -> bool {
     s.len() == 32 && s.chars().all(|c| NIX32.contains(c))
 }
-fn basename(s: &str) -> bool {
+pub(crate) fn basename(s: &str) -> bool {
     let Some((hash, name)) = s.split_once('-') else {
         return false;
     };
@@ -182,6 +183,10 @@ struct Session {
     is_public: bool,
     private_caches: bool,
     publication_result: Option<Value>,
+    #[serde(skip)]
+    job_authorized: bool,
+    #[serde(skip)]
+    push_job_id: Option<String>,
 }
 fn authorize(s: &Session, identity: &Identity) -> Result<(), ApiError> {
     match identity {
@@ -235,7 +240,16 @@ async fn load_sessions(
             c.is_public,
             o.slug,
             o.private_caches,
-            u.publication_result
+            u.publication_result,
+            u.push_job_id,
+            (u.push_job_id IS NULL OR EXISTS (
+                SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti
+                WHERE j.id=u.push_job_id AND j.cache_id=u.cache_id AND j.creator=$2 AND $3
+                    AND (j.state='sealed' OR (j.state='completed' AND u.status='completed'))
+                    AND j.idle_expires_at>NOW()
+                    AND j.hard_expires_at>NOW() AND j.authorization_expires_at>NOW()
+                    AND t.revoked_at IS NULL
+            )) AS "job_authorized!"
         FROM upload_sessions u
         JOIN caches c ON c.id = u.cache_id
         JOIN orgs o ON o.id = c.org_id
@@ -249,11 +263,19 @@ async fn load_sessions(
             )
         "#,
         ids,
+        identity.actor(),
+        matches!(identity, Identity::Jwt(_)),
     )
     .fetch_all(executor)
     .await?;
     for session in &sessions {
         authorize(session, identity)?;
+        if !session.job_authorized {
+            return Err(error(
+                409,
+                "Push job authorization is inactive; resume the job",
+            ));
+        }
     }
     Ok(sessions)
 }
@@ -292,22 +314,58 @@ async fn lock_session(
     Ok((tx, current))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct PathInput {
-    store_path: String,
-    store_path_hash: String,
-    nar_hash: String,
-    nar_size: i64,
-    compression: String,
-    references: Option<Vec<String>>,
-    deriver: Option<String>,
+pub(crate) struct PathInput {
+    pub(crate) store_path: String,
+    pub(crate) store_path_hash: String,
+    pub(crate) nar_hash: String,
+    pub(crate) nar_size: i64,
+    pub(crate) compression: String,
+    pub(crate) references: Option<Vec<String>>,
+    pub(crate) deriver: Option<String>,
     #[serde(default)]
-    inline: bool,
+    pub(crate) inline: bool,
+}
+
+impl PathInput {
+    pub(crate) fn normalize(&mut self) -> Result<(), ApiError> {
+        self.inline = false;
+        self.nar_hash = self.validate()?;
+        let references = self.references.get_or_insert_default();
+        references.sort();
+        references.dedup();
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<String, ApiError> {
+        if !store_hash(&self.store_path_hash)
+            || !self
+                .store_path
+                .starts_with(&format!("/nix/store/{}-", self.store_path_hash))
+            || !basename(self.store_path.strip_prefix("/nix/store/").unwrap_or(""))
+            || !bounded(self.nar_size)
+            || self.compression != "zstd"
+            || (self.inline && self.nar_size > MIB)
+            || self
+                .references
+                .as_ref()
+                .is_some_and(|r| r.iter().any(|s| !basename(s)))
+            || self
+                .deriver
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || !s.bytes().all(|b| (33..=126).contains(&b)))
+        {
+            return Err(error(400, "Invalid stream metadata"));
+        }
+        canonical_hash(&self.nar_hash)
+    }
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Create {
     paths: Vec<PathInput>,
+    job_id: Option<String>,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -323,6 +381,15 @@ async fn create(
     let identity = &identity;
     let cache = cache.as_str();
     batch(&body.paths)?;
+    let mut members = Vec::new();
+    if body.job_id.is_some() {
+        distinct(body.paths.iter().map(|p| p.store_path_hash.as_str()))?;
+        members = body.paths.clone();
+        for member in &mut members {
+            member.validate()?;
+            member.normalize()?;
+        }
+    }
     let mut tx = crate::profile_future!(
         crate::db::begin(state, identity.org()),
         label = "uploads.create_pool_begin"
@@ -374,6 +441,11 @@ async fn create(
     if !is_public && !allowed {
         return Err(error(403, PRIVATE_CACHES_REFUSED));
     }
+    let mut reused = if let Some(job) = &body.job_id {
+        crate::push_jobs::upload_members(&mut tx, identity, cache_id, job, &members).await?
+    } else {
+        HashMap::new()
+    };
     let active = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) AS "count!"
@@ -387,7 +459,7 @@ async fn create(
     )
     .fetch_one(&mut *tx)
     .await?;
-    if active + body.paths.len() as i64 > 8192 {
+    if active + (body.paths.len() - reused.len()) as i64 > 8192 {
         return Err(error(
             429,
             "Too many active upload sessions; finish or abort existing uploads",
@@ -396,27 +468,19 @@ async fn create(
     let mut sessions = Vec::with_capacity(body.paths.len());
     let mut rows = Vec::with_capacity(body.paths.len());
     for p in body.paths {
-        if !store_hash(&p.store_path_hash)
-            || !p
-                .store_path
-                .starts_with(&format!("/nix/store/{}-", p.store_path_hash))
-            || !basename(p.store_path.strip_prefix("/nix/store/").unwrap_or(""))
-            || !bounded(p.nar_size)
-            || p.compression != "zstd"
-            || (p.inline && p.nar_size > MIB)
-            || p.references
-                .as_ref()
-                .is_some_and(|r| r.iter().any(|s| !basename(s)))
-            || p.deriver
-                .as_ref()
-                .is_some_and(|s| s.is_empty() || !s.bytes().all(|b| (33..=126).contains(&b)))
-        {
-            return Err(error(400, "Invalid stream metadata"));
+        let hash = p.validate()?;
+        if let Some(session) = reused.remove(&p.store_path_hash) {
+            sessions.push(session);
+            continue;
         }
-        let hash = canonical_hash(&p.nar_hash)?;
         let id = format!("s2.{}.{}", identity.org(), uuid::Uuid::now_v7());
         let size = if p.inline { MIB } else { part_size(p.nar_size) };
-        sessions.push(json!({"sessionId":id,"partSize":size,"inline":p.inline}));
+        let mut session = json!({"sessionId":id,"partSize":size,"inline":p.inline});
+        if body.job_id.is_some() {
+            session["status"] = json!("streaming");
+            session["publicationResult"] = Value::Null;
+        }
+        sessions.push(session);
         rows.push((id, p, hash, size));
     }
     let ids: Vec<_> = rows.iter().map(|(id, _, _, _)| id.clone()).collect();
@@ -443,12 +507,13 @@ async fn create(
         .map(|(id, p, _, _)| if p.inline { None } else { Some(id.clone()) })
         .collect();
     let sizes: Vec<_> = rows.iter().map(|(_, _, _, size)| *size as i32).collect();
-    sqlx::query!(
-        r#"
+    if !rows.is_empty() {
+        sqlx::query!(
+            r#"
         INSERT INTO upload_sessions (
             id, cache_id, store_path_hash, store_path, nar_hash, nar_size,
             file_size, compression, references_json, deriver, status,
-            r2_upload_key, r2_upload_id, part_size, expires_at, staging_capacity
+            r2_upload_key, r2_upload_id, part_size, expires_at, staging_capacity, push_job_id
         )
         SELECT
             incoming.id,
@@ -466,7 +531,8 @@ async fn create(
             incoming.r2_upload_id,
             incoming.part_size,
             NOW() + INTERVAL '1 hour',
-            $2
+            $2,
+            $13
         FROM UNNEST(
             $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[],
             $8::text[], $9::text[], $10::text[], $11::text[], $12::integer[]
@@ -475,21 +541,34 @@ async fn create(
             references_json, deriver, r2_upload_key, r2_upload_id, part_size
         )
         "#,
-        cache_id,
-        capacity,
-        &ids,
-        &hashes,
-        &paths,
-        &nar_hashes,
-        &nar_sizes,
-        &references,
-        &derivers as &[Option<String>],
-        &keys,
-        &upload_ids as &[Option<String>],
-        &sizes,
-    )
-    .execute(&mut *tx)
-    .await?;
+            cache_id,
+            capacity,
+            &ids,
+            &hashes,
+            &paths,
+            &nar_hashes,
+            &nar_sizes,
+            &references,
+            &derivers as &[Option<String>],
+            &keys,
+            &upload_ids as &[Option<String>],
+            &sizes,
+            body.job_id.as_deref(),
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    if body.job_id.is_some() && !ids.is_empty() {
+        sqlx::query(
+            "WITH linked AS (UPDATE push_job_members m SET session_id=u.id FROM upload_sessions u \
+            WHERE u.id=ANY($1) AND m.job_id=u.push_job_id AND m.store_path_hash=u.store_path_hash \
+            RETURNING u.id,m.publication_order) \
+            UPDATE upload_sessions u SET publication_order=m.publication_order FROM linked m WHERE u.id=m.id",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(json_response(
         StatusCode::CREATED,
@@ -801,6 +880,23 @@ impl Receipt {
 struct Finalize {
     uploads: Vec<Receipt>,
 }
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Finalization {
+    #[serde(default)]
+    prepare_only: bool,
+}
+
+impl Finalization {
+    fn validate(&self, session: &Session) -> Result<(), ApiError> {
+        if self.prepare_only && session.push_job_id.is_none() {
+            return Err(error(409, "Preparation-only uploads require a push job"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn seal(
     state: &AppState,
@@ -1120,7 +1216,7 @@ async fn publish(
     ready: &Prepared,
     protect: &[(i32, String)],
 ) -> Result<Value, ApiError> {
-    Ok(publish_group(state, identity, &[ready], protect)
+    Ok(publish_group(state, identity, &[ready], protect, None)
         .await?
         .remove(0))
 }
@@ -1147,10 +1243,15 @@ async fn publish_group(
     identity: &Identity,
     ready: &[&Prepared],
     protect: &[(i32, String)],
+    claim: Option<&crate::push_job_worker::Claim>,
 ) -> Result<Vec<Value>, ApiError> {
     let org = &ready[0].session.org_id;
     let mut tx = crate::db::begin(state, org).await?;
+    let result = async {
     lock(&mut tx, &format!("org:{org}")).await?;
+    if let Some(claim) = claim {
+        crate::push_job_worker::validate(&mut tx, claim).await?;
+    }
     lock_set(
         &mut tx,
         ready
@@ -1242,8 +1343,37 @@ async fn publish_group(
         });
     }
     if incoming.is_empty() {
-        tx.commit().await?;
+        if let Some(claim) = claim {
+            crate::push_job_worker::complete(&mut tx, claim).await?;
+        }
         return Ok(results);
+    }
+    if incoming.iter().any(|p| p.session.push_job_id.is_some()) {
+        // Prerequisites must match the actual first path winner, not a losing
+        // job session with different metadata. Fall back to ordered singletons
+        // for conflicting identities before any publication mutates SQL.
+        let mut winners = HashMap::new();
+        for item in &incoming {
+            let s = item.session;
+            let first = *winners.entry((s.cache_id, &s.store_path_hash)).or_insert(s);
+            if (first.push_job_id.is_some() || s.push_job_id.is_some())
+                && (first.store_path != s.store_path
+                    || first.nar_hash != s.nar_hash
+                    || first.nar_size != s.nar_size
+                    || first.references_json != s.references_json
+                    || first.deriver != s.deriver)
+            {
+                return Err(error(409, "Conflicting batch manifest identities"));
+            }
+        }
+        crate::push_jobs::publication(
+            &mut tx,
+            &incoming
+                .iter()
+                .map(|p| p.session.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
     }
     // GC takes this table fence before NAR locks. Obtain it before admission
     // too: eviction can update sessions through invalidation triggers.
@@ -1336,9 +1466,17 @@ async fn publish_group(
         ON CONFLICT (cache_id,store_path_hash) DO UPDATE SET last_pushed_at=NOW()
         "#,
     ).bind(input).execute(&mut *tx).await?;
+    // Completed replays need the immutable receipts, not their staging bytes.
+    // Retire those exact keys with publication, never after a failed commit.
     sqlx::query(
-        "UPDATE upload_sessions u SET status='completed',publication_result=i.result \
-         FROM jsonb_to_recordset($1) AS i(session_id text,result jsonb) WHERE u.id=i.session_id",
+        "WITH completed AS (UPDATE upload_sessions u SET status='completed',publication_result=i.result \
+         FROM jsonb_to_recordset($1) AS i(session_id text,result jsonb) WHERE u.id=i.session_id \
+         RETURNING u.id,u.push_job_id), \
+         staging_cleanup AS (INSERT INTO object_cleanup(is_private,key) \
+         SELECT TRUE,p.storage_key FROM upload_parts p JOIN completed u ON u.id=p.session_id \
+         WHERE starts_with(p.storage_key,'staging/'||u.id||'/') ON CONFLICT DO NOTHING) \
+         UPDATE push_job_members m SET blocked_generation=NULL,publication_error=NULL FROM completed u \
+         WHERE m.job_id=u.push_job_id AND m.session_id=u.id AND m.blocked_generation IS NOT NULL",
     )
     .bind(json!(
         incoming
@@ -1348,8 +1486,23 @@ async fn publish_group(
     ))
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    if let Some(claim) = claim {
+        crate::push_job_worker::complete(&mut tx, claim).await?;
+    }
     Ok(results)
+    }.await;
+    match result {
+        Ok(results) => {
+            tx.commit().await?;
+            Ok(results)
+        }
+        Err(error) => {
+            // Drop only queues ROLLBACK. Wait for PostgreSQL to release the
+            // locks before ordered fallback starts another transaction.
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 struct Prepared {
@@ -1357,6 +1510,185 @@ struct Prepared {
     source: PreparedSource,
     key: String,
     operation: String,
+}
+
+/// Discover a bounded dependency-closed set of prepared members. This is only a
+/// scheduling hint: publish_group reloads authorization, policy, sessions,
+/// dependencies, and immutable ownership under the existing org fence.
+pub(crate) async fn publish_job(
+    state: &AppState,
+    claim: &mut crate::push_job_worker::Claim,
+) -> Result<usize, ApiError> {
+    let mut tx = db::begin_read(state).await?;
+    // Use this complete frontier scan only when the indexed window cannot fill
+    // a turn. Unprepared prerequisites must not hide other independent members.
+    let frontier = r#"
+        SELECT u.id,n.key,n.operation_id FROM push_job_members m
+        JOIN push_jobs j ON j.id=m.job_id
+        JOIN upload_sessions u ON u.id=m.session_id AND u.push_job_id=j.id
+        JOIN nar_installations n ON n.session_id=u.id
+        JOIN caches c ON c.id=j.cache_id
+        WHERE j.id=$1 AND m.blocked_generation IS DISTINCT FROM j.grant_generation
+            AND u.status='finalizing' AND u.expires_at>NOW()
+            AND n.phase='ready' AND n.expires_at>NOW() AND n.is_private=NOT c.is_public
+            AND NOT EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(m.metadata->'references') r
+                WHERE left(r.value,32)<>m.store_path_hash AND (
+                    SELECT NOT EXISTS (
+                        SELECT 1 FROM published_paths p WHERE p.cache_id=j.cache_id
+                            AND p.store_path_hash=d.store_path_hash
+                            AND d.metadata->>'storePath'=p.store_path AND d.metadata->>'narHash'=p.nar_hash
+                            AND (d.metadata->>'narSize')::bigint=p.nar_size
+                            AND (d.metadata->>'deriver') IS NOT DISTINCT FROM p.deriver
+                            AND p.references_json::jsonb @> (d.metadata->'references')
+                            AND (d.metadata->'references') @> p.references_json::jsonb
+                    ) FROM push_job_members d
+                    WHERE d.job_id=$1 AND d.store_path_hash=left(r.value,32)
+                        AND d.metadata->>'storePath'='/nix/store/'||r.value
+                )
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM published_paths p WHERE p.cache_id=j.cache_id
+                    AND p.store_path_hash=m.store_path_hash AND NOT (
+                        m.metadata->>'storePath'=p.store_path AND m.metadata->>'narHash'=p.nar_hash
+                        AND (m.metadata->>'narSize')::bigint=p.nar_size
+                        AND (m.metadata->>'deriver') IS NOT DISTINCT FROM p.deriver
+                        AND p.references_json::jsonb @> (m.metadata->'references')
+                        AND (m.metadata->'references') @> p.references_json::jsonb
+                    )
+            )
+        ORDER BY m.store_path_hash LIMIT $2
+        "#;
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    {
+        // A timeout in the indexed selector must still allow the complete
+        // frontier scan. A savepoint recovers the read transaction.
+        let mut expansion = tx.begin().await?;
+        let expanded = sqlx::query_as(
+        r#"
+        WITH RECURSIVE pending_sessions AS MATERIALIZED (
+            SELECT id,push_job_id,store_path_hash FROM upload_sessions
+            WHERE push_job_id=$1 AND status='finalizing' AND expires_at>NOW()
+            ORDER BY publication_order,id LIMIT $2
+        ), pending AS MATERIALIZED (
+            SELECT u.id,n.key,n.operation_id,m.store_path_hash,m.metadata,j.cache_id
+            FROM pending_sessions u
+            JOIN push_job_members m ON m.job_id=u.push_job_id AND m.session_id=u.id
+                AND m.store_path_hash=u.store_path_hash
+            JOIN push_jobs j ON j.id=u.push_job_id
+            JOIN nar_installations n ON n.session_id=u.id
+            JOIN caches c ON c.id=j.cache_id
+            WHERE m.blocked_generation IS DISTINCT FROM j.grant_generation
+                AND n.phase='ready' AND n.expires_at>NOW() AND n.is_private=NOT c.is_public
+        ), candidates AS MATERIALIZED (
+        SELECT m.id,m.key,m.operation_id,m.store_path_hash,ARRAY(
+                SELECT left(r.value,32) FROM jsonb_array_elements_text(m.metadata->'references') r
+                WHERE left(r.value,32)<>m.store_path_hash AND (
+                    SELECT NOT EXISTS (
+                        SELECT 1 FROM published_paths p WHERE p.cache_id=m.cache_id
+                            AND p.store_path_hash=d.store_path_hash
+                            AND d.metadata->>'storePath'=p.store_path AND d.metadata->>'narHash'=p.nar_hash
+                            AND (d.metadata->>'narSize')::bigint=p.nar_size
+                            AND (d.metadata->>'deriver') IS NOT DISTINCT FROM p.deriver
+                            AND p.references_json::jsonb @> (d.metadata->'references')
+                            AND (d.metadata->'references') @> p.references_json::jsonb
+                    ) FROM push_job_members d
+                    WHERE d.job_id=$1 AND d.store_path_hash=left(r.value,32)
+                        AND d.metadata->>'storePath'='/nix/store/'||r.value
+                )
+            ) AS missing FROM pending m
+        WHERE NOT EXISTS (
+                SELECT 1 FROM published_paths p WHERE p.cache_id=m.cache_id
+                    AND p.store_path_hash=m.store_path_hash AND NOT (
+                        m.metadata->>'storePath'=p.store_path AND m.metadata->>'narHash'=p.nar_hash
+                        AND (m.metadata->>'narSize')::bigint=p.nar_size
+                        AND (m.metadata->>'deriver') IS NOT DISTINCT FROM p.deriver
+                        AND p.references_json::jsonb @> (m.metadata->'references')
+                        AND (m.metadata->'references') @> p.references_json::jsonb
+                    )
+            )
+        ), chosen(hashes) AS (
+            SELECT ARRAY[]::text[]
+            UNION ALL
+            SELECT chosen.hashes||next.store_path_hash FROM chosen
+            CROSS JOIN LATERAL (
+                SELECT c.store_path_hash FROM candidates c
+                WHERE NOT c.store_path_hash=ANY(chosen.hashes) AND c.missing <@ chosen.hashes
+                ORDER BY c.store_path_hash LIMIT 1
+            ) next WHERE cardinality(chosen.hashes)<$2
+        ), batch AS (
+            SELECT hashes FROM chosen ORDER BY cardinality(hashes) DESC LIMIT 1
+        )
+        SELECT c.id,c.key,c.operation_id FROM candidates c,batch
+        WHERE c.store_path_hash=ANY(batch.hashes)
+        "#,
+    ).bind(&claim.job).bind(i64::from(claim.members)).fetch_all(&mut *expansion).await;
+        match expanded {
+            Ok(rows) => {
+                expansion.commit().await?;
+                candidates = rows;
+            }
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("57014") => {
+                expansion.rollback().await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if candidates.len() < claim.members as usize {
+        let ready: Vec<(String, String, String)> = sqlx::query_as(frontier)
+            .bind(&claim.job)
+            .bind(i64::from(claim.members))
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in ready {
+            if candidates.len() == claim.members as usize {
+                break;
+            }
+            if !candidates.iter().any(|candidate| candidate.0 == row.0) {
+                candidates.push(row);
+            }
+        }
+    }
+    tx.rollback().await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<_> = candidates.iter().map(|(id, _, _)| id.clone()).collect();
+    let sessions = load_sessions(&state.pool, &ids, &claim.identity).await?;
+    let ready: Vec<_> = sessions
+        .into_iter()
+        .filter_map(|session| {
+            // A member may have been replaced or completed after discovery.
+            if session.status != "finalizing"
+                || session.push_job_id.as_deref() != Some(&claim.job)
+                || session.org_id != claim.org
+            {
+                return None;
+            }
+            let (_, key, operation) = candidates.iter().find(|(id, _, _)| *id == session.id)?;
+            Some(Prepared {
+                session,
+                source: PreparedSource::Ready,
+                key: key.clone(),
+                operation: operation.clone(),
+            })
+        })
+        .collect();
+    if ready.is_empty() {
+        return Ok(0);
+    }
+    let count = ready.len();
+    claim.members = count as i32;
+    claim.member = (count == 1).then(|| ready[0].session.id.clone());
+    publish_group(
+        state,
+        &claim.identity,
+        &ready.iter().collect::<Vec<_>>(),
+        &[],
+        Some(claim),
+    )
+    .await?;
+    Ok(count)
 }
 
 enum PreparedSource {
@@ -1731,7 +2063,12 @@ async fn preflight(state: &AppState, org: &str, ready: &[&Prepared]) -> Result<(
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Receipt>) -> Vec<Value> {
+async fn finalize_batch(
+    state: &AppState,
+    identity: &Identity,
+    inputs: Vec<Receipt>,
+    options: Finalization,
+) -> Vec<Value> {
     let mut results = vec![Value::Null; inputs.len()];
     let mut ready = Vec::with_capacity(inputs.len());
     let mut sealed = Vec::with_capacity(inputs.len());
@@ -1742,6 +2079,7 @@ async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Recei
         let reserved = async {
             input.validate()?;
             let session = load(&state.pool, &id, identity).await?;
+            options.validate(&session)?;
             seal(state, identity, &session, &input, None).await
         }
         .await;
@@ -1761,7 +2099,7 @@ async fn finalize_batch(state: &AppState, identity: &Identity, inputs: Vec<Recei
             Err(e) => results[index] = result_value(&id, Err(e), true),
         }
     }
-    publish_batch(state, identity, ready, results).await
+    publish_batch(state, identity, ready, results, options).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1770,6 +2108,7 @@ async fn publish_batch(
     identity: &Identity,
     ready: Vec<(usize, Prepared)>,
     mut results: Vec<Value>,
+    options: Finalization,
 ) -> Vec<Value> {
     let mut pending = Vec::with_capacity(ready.len());
     for (index, p) in ready {
@@ -1789,7 +2128,7 @@ async fn publish_batch(
         .iter()
         .map(|(_, p)| p.session.org_id.clone())
         .collect();
-    for org in orgs {
+    for org in orgs.into_iter().filter(|_| !options.prepare_only) {
         let group: Vec<_> = ready
             .iter()
             .filter(|(_, p)| p.session.org_id == org)
@@ -1832,6 +2171,9 @@ async fn publish_batch(
                 }
                 let id = p.session.id.clone();
                 match finish_preparation(&owned, &identity, p).await {
+                    Ok(p) if options.prepare_only => {
+                        results[index] = prepared_value(&p);
+                    }
                     Ok(p) => pending.push((index, p)),
                     Err(e) => results[index] = result_value(&id, Err(e), true),
                 }
@@ -1847,7 +2189,7 @@ async fn publish_batch(
                     .collect();
                 for chunk in group.chunks(16) {
                     let members: Vec<_> = chunk.iter().map(|(_, p)| p).collect();
-                    match publish_group(&owned, &identity, &members, &protect).await {
+                    match publish_group(&owned, &identity, &members, &protect, None).await {
                         Ok(outcomes) => {
                             for ((index, _), result) in chunk.iter().zip(outcomes) {
                                 results[*index] = result;
@@ -1875,6 +2217,11 @@ async fn publish_batch(
         Ok(results) => results,
         Err(_) => failed,
     }
+}
+
+fn prepared_value(ready: &Prepared) -> Value {
+    json!({"sessionId":ready.session.id,"storePathHash":ready.session.store_path_hash,
+        "prepared":true,"published":false,"status":202})
 }
 
 fn result_value(id: &str, result: Result<Value, ApiError>, finalize: bool) -> Value {
@@ -1912,9 +2259,11 @@ async fn seal_inline(
     identity: &Identity,
     input: &InlineInput,
     bytes: axum::body::Bytes,
+    options: &Finalization,
 ) -> Result<Prepared, ApiError> {
     let id = &input.session_id;
     let s = load(&state.pool, id, identity).await?;
+    options.validate(&s)?;
     if s.r2_upload_id.is_some() || s.part_size != Some(MIB as i32) || s.nar_size > MIB {
         return Err(error(409, "Not an inline upload"));
     }
@@ -1936,6 +2285,7 @@ async fn seal_inline(
 async fn inline_batch(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
+    Query(options): Query<Finalization>,
     request: Request,
 ) -> Result<Response, ApiError> {
     request_origin(&state, &request)?;
@@ -2004,7 +2354,7 @@ async fn inline_batch(
     for (index, input) in body.uploads.into_iter().enumerate() {
         let bytes = frame.slice(offset..offset + input.file_size);
         offset += input.file_size;
-        match seal_inline(state, identity, &input, bytes).await {
+        match seal_inline(state, identity, &input, bytes, &options).await {
             Ok(prepared) => sealed.push((index, input.session_id, prepared)),
             Err(e) => results[index] = result_value(&input.session_id, Err(e), true),
         }
@@ -2020,7 +2370,7 @@ async fn inline_batch(
             Err(e) => results[index] = result_value(&id, Err(e), true),
         }
     }
-    let results = publish_batch(state, identity, ready, results).await;
+    let results = publish_batch(state, identity, ready, results, options).await;
     Ok(json_response(StatusCode::OK, json!({"results":results})))
 }
 
@@ -2029,6 +2379,7 @@ async fn inline(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
     Path(id): Path<String>,
+    Query(options): Query<Finalization>,
     request: Request,
 ) -> Result<Response, ApiError> {
     request_origin(&state, &request)?;
@@ -2075,8 +2426,20 @@ async fn inline(
         file_size: length as usize,
     };
     let result = async {
-        let ready = seal_inline(state, identity, &input, bytes).await?;
+        let ready = seal_inline(state, identity, &input, bytes, &options).await?;
         let ready = prepare(state, identity, ready).await?;
+        if options.prepare_only && ready.session.status != "completed" {
+            let owned = state.clone();
+            let identity = identity.clone();
+            return state
+                .tasks
+                .spawn(async move {
+                    let ready = finish_preparation(&owned, &identity, ready).await?;
+                    Ok(prepared_value(&ready))
+                })
+                .await
+                .map_err(|_| error(500, "Preparation failed"))?;
+        }
         let protect = vec![(
             ready.session.cache_id,
             ready.session.store_path_hash.clone(),
@@ -2188,6 +2551,7 @@ async fn reserve_parts_batch(
 async fn finalize(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
+    Query(options): Query<Finalization>,
     request: Request,
 ) -> Result<Response, ApiError> {
     request_origin(&state, &request)?;
@@ -2217,7 +2581,7 @@ async fn finalize(
     let owned = state.clone();
     let results = state
         .tasks
-        .spawn(async move { finalize_batch(&owned, &identity, body.uploads).await })
+        .spawn(async move { finalize_batch(&owned, &identity, body.uploads, options).await })
         .await
         .map_err(|_| error(500, "Finalization failed"))?;
     Ok(json_response(StatusCode::OK, json!({"results":results})))
@@ -2468,6 +2832,8 @@ mod tests {
             is_public: false,
             private_caches: false,
             publication_result: None,
+            job_authorized: true,
+            push_job_id: None,
         };
         let permit = state
             .verification_slots

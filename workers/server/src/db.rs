@@ -59,6 +59,31 @@ impl Transaction {
     }
 }
 
+/// Worker discovery takes no organization fence, but must release its snapshot
+/// and pool connection promptly even when a manifest has no ready members.
+pub(crate) async fn begin_read(
+    state: &crate::AppState,
+) -> Result<sqlx::Transaction<'static, Postgres>, ApiError> {
+    let pool = state.pool.clone();
+    // Keep BEGIN cancellation-safe, just like writer transaction startup.
+    Ok(state
+        .tasks
+        .spawn(async move {
+            let mut tx = pool.begin_with("BEGIN READ ONLY").await?;
+            sqlx::query("SET LOCAL statement_timeout='1s'")
+                .execute(&mut *tx)
+                .await?;
+            Ok::<_, sqlx::Error>(tx)
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Transaction startup failed",
+            )
+        })??)
+}
+
 /// Bound queued writers before borrowing a connection. Active SQL work remains
 /// bounded by the pool; storage work must not retain the returned transaction.
 pub(crate) async fn begin(state: &crate::AppState, org: &str) -> Result<Transaction, ApiError> {

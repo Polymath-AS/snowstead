@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH active AS MATERIALIZED (\n            SELECT\n                u.cache_id,\n                u.store_path_hash\n            FROM upload_sessions u\n            JOIN caches c ON c.id = u.cache_id\n            WHERE c.org_id = $1\n                AND (\n                    u.status = 'finalizing'\n                    OR (u.status IN ('pending', 'uploading', 'streaming') AND u.expires_at > NOW())\n                )\n        )\n        SELECT\n            kind AS \"kind!\",\n            id AS \"id!\",\n            size AS \"size!\"\n        FROM (\n            SELECT\n                'nix' AS kind,\n                e.id::text AS id,\n                b.file_size AS size,\n                GREATEST(e.last_pushed_at, e.last_accessed_at) AS used\n            FROM published_paths e\n            JOIN caches c ON c.id = e.cache_id\n            JOIN blob_objects b ON b.id = e.blob_object_id\n            WHERE c.org_id = $1\n                AND NOT nix_path_pinned(e.cache_id, e.store_path_hash, NOW())\n                AND NOT EXISTS (\n                    SELECT 1 FROM nix_job_protected_paths($1, NOW()) j\n                    WHERE j.cache_id=e.cache_id AND j.store_path_hash=e.store_path_hash\n                )\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = e.store_path_hash\n                )\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM active a\n                    WHERE a.cache_id = e.cache_id\n                        AND a.store_path_hash = e.store_path_hash\n                )\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM nar_installations i\n                    WHERE i.file_hash = b.file_hash\n                        AND i.compression = b.compression\n                )\n            UNION ALL\n            SELECT\n                'go',\n                e.id,\n                e.size,\n                GREATEST(e.uploaded_at, e.last_accessed_at)\n            FROM go_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.go_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = 'go:' || e.id\n                )\n            UNION ALL\n            SELECT\n                'sccache',\n                e.id,\n                e.size,\n                GREATEST(e.uploaded_at, e.last_accessed_at)\n            FROM sccache_entries e\n            JOIN caches c ON c.id = e.cache_id\n            WHERE c.org_id = $1\n                AND e.generation = c.sccache_generation\n                AND e.uploaded_at IS NOT NULL\n                AND e.expires_at > NOW()\n                AND NOT EXISTS (\n                    SELECT 1\n                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)\n                    WHERE p.cache = e.cache_id\n                        AND p.hash = 'sccache:' || e.id\n                )\n        ) victims\n        ORDER BY used, kind, id\n        LIMIT 256\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "size!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "8a2f55b1b6ff018dd29d6c441f49afafa9ba73ee06749a6109d129f3ded44257"
+}

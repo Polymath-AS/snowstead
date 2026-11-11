@@ -226,6 +226,12 @@ async fn revoke_token(
         512,
         "reason exceeds maximum length",
     )?;
+    let token_org: String = sqlx::query_scalar(
+        "SELECT COALESCE(org_id,'default') FROM api_tokens WHERE jti=$1 AND ($2::text IS NULL OR org_id=$2)",
+    ).bind(&jti).bind(org).fetch_optional(&state.pool).await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Token not found or already revoked"))?;
+    let mut tx = crate::db::begin(&state, &token_org).await?;
+    crate::db::advisory_lock(&mut tx, &format!("org:{token_org}")).await?;
     let changed = sqlx::query!(
         r#"
                 UPDATE api_tokens
@@ -241,7 +247,7 @@ async fn revoke_token(
         reason,
         org
     )
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if changed == 0 {
@@ -250,6 +256,9 @@ async fn revoke_token(
             "Token not found or already revoked",
         ));
     }
+    sqlx::query("UPDATE push_jobs SET authorization_jti=NULL,authorization_expires_at=NULL,grant_generation=grant_generation+1 WHERE authorization_jti=$1")
+        .bind(&jti).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(json_response(
         StatusCode::OK,
         json!({"revoked":true,"jti":jti}),

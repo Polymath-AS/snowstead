@@ -684,6 +684,7 @@ async fn withdraw_cache(
     // Expire every session, but preserve completed outcomes: cleanup
     // must distinguish reclaimable bytes from uncertain canonical MPUs.
     // Unfinished finalization rechecks status under this org fence.
+    crate::push_jobs::withdraw(&mut tx, id, None).await?;
     sqlx::query!(
         r#"
                 UPDATE upload_sessions
@@ -1371,6 +1372,7 @@ async fn delete_paths(
     }
     // Fence only the withdrawn paths, including absent named paths. Unrelated
     // uploads remain valid; completed outcomes may replay but never republish.
+    crate::push_jobs::withdraw(tx, cache, Some(&withdrawn)).await?;
     sqlx::query(
         "UPDATE upload_sessions SET status='aborted' WHERE cache_id=$1 \
         AND store_path_hash=ANY($2) AND status<>'completed'",
@@ -1492,6 +1494,10 @@ async fn eviction(
             JOIN blob_objects b ON b.id = e.blob_object_id
             WHERE c.org_id = $1
                 AND NOT nix_path_pinned(e.cache_id, e.store_path_hash, NOW())
+                AND NOT EXISTS (
+                    SELECT 1 FROM nix_job_protected_paths($1, NOW()) j
+                    WHERE j.cache_id=e.cache_id AND j.store_path_hash=e.store_path_hash
+                )
                 AND NOT EXISTS (
                     SELECT 1
                     FROM active a

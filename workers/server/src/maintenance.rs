@@ -4,13 +4,16 @@
 //! never holds a transaction. Legacy canonical installations do not expire.
 use std::collections::BTreeSet;
 
+use futures_util::{StreamExt, stream};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::{AppState, auth::JWT_CLOCK_SKEW_SECONDS, management_policy::MetadataTarget};
 
 const BATCH: i64 = 500;
 const BATCHES: usize = 20;
+const CLEANUP_CONCURRENCY: usize = 8;
 // At most 400 distinct sessions per sweep, each with one 500-receipt page and
 // one 500-object listing. Do not let one huge or broken upload spend the run.
 const SESSION_PAGE: usize = 20;
@@ -20,6 +23,35 @@ const SESSION_PAGES: usize = 20;
 const TOKEN_EXPIRY_MARGIN_SECONDS: i64 = 5;
 static RUNNING: Mutex<()> = Mutex::const_new(());
 
+#[derive(Default)]
+struct CleanupCursor {
+    after: i64,
+    through: i64,
+}
+
+/// Drain durable retirement work independently of the slow discovery sweep.
+/// Each tick finishes one bounded page before shutdown. The cursor passes
+/// failed entries and wraps, so neither retries nor new arrivals can starve.
+pub(crate) async fn drain(state: AppState, stopped: CancellationToken) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = CleanupCursor::default();
+    loop {
+        tokio::select! {
+            _ = stopped.cancelled() => break,
+            _ = interval.tick() => {
+                let mut counts = Counts::default();
+                record(&mut counts.push_jobs, &mut counts.failed_stages,
+                    "push manifests", expire_manifests(&state).await);
+                record(&mut counts.orphan_objects, &mut counts.failed_stages,
+                    "publication reservations", expire_installations(&state).await);
+                record(&mut counts.orphan_objects, &mut counts.failed_stages,
+                    "object cleanup", cleanup_objects(&state, &mut cursor).await);
+            }
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 /// Counts from fully successful stages; a failed stage may have made partial
 /// progress in independently committed batches before retaining its retry work.
@@ -27,6 +59,7 @@ pub(crate) struct Counts {
     pub compiler_entries: u64,
     pub orphan_objects: u64,
     pub sessions: u64,
+    pub push_jobs: u64,
     pub paths: u64,
     pub blobs: u64,
     pub tokens: u64,
@@ -47,6 +80,12 @@ pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
         return Ok(Counts::default());
     };
     let mut counts = Counts::default();
+    record(
+        &mut counts.push_jobs,
+        &mut counts.failed_stages,
+        "push manifests",
+        expire_manifests(state).await,
+    );
     record(
         &mut counts.orphan_objects,
         &mut counts.failed_stages,
@@ -105,7 +144,23 @@ pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
         &mut counts.orphan_objects,
         &mut counts.failed_stages,
         "object cleanup",
-        cleanup_objects(state).await,
+        async {
+            let mut cursor = CleanupCursor::default();
+            let mut count = 0;
+            let mut failed = false;
+            for _ in 0..BATCHES {
+                match cleanup_objects(state, &mut cursor).await {
+                    Ok(n) => count += n,
+                    Err(_) => failed = true,
+                }
+                if cursor.after >= cursor.through {
+                    break;
+                }
+            }
+            anyhow::ensure!(!failed, "Object cleanup incomplete");
+            Ok(count)
+        }
+        .await,
     );
     for (table, destination) in [
         ("api_tokens", &mut counts.tokens),
@@ -838,6 +893,10 @@ async fn retention(state: &AppState) -> anyhow::Result<u64> {
                 WHERE p.cache_id = c.id
                     AND p.last_pushed_at < now() - c.retention_days * INTERVAL '1 day'
                     AND NOT nix_path_pinned(p.cache_id, p.store_path_hash, now())
+                    AND NOT EXISTS (
+                        SELECT 1 FROM nix_job_protected_paths(c.org_id, now()) j
+                        WHERE j.cache_id=p.cache_id AND j.store_path_hash=p.store_path_hash
+                    )
             )
         ORDER BY c.id
         LIMIT $1
@@ -917,6 +976,10 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
             WHERE c.id = $1
                 AND p.last_pushed_at < now() - c.retention_days * INTERVAL '1 day'
                 AND NOT nix_path_pinned(p.cache_id, p.store_path_hash, now())
+                AND NOT EXISTS (
+                    SELECT 1 FROM nix_job_protected_paths(c.org_id, now()) j
+                    WHERE j.cache_id=p.cache_id AND j.store_path_hash=p.store_path_hash
+                )
             ORDER BY p.last_pushed_at, p.id
             LIMIT $2
         )
@@ -1123,6 +1186,40 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
     Ok(count)
 }
 
+/// Reclaim at most twenty bounded manifests per sweep. Keep expired identities
+/// until 24 hours after their hard deadline so delayed retries cannot reopen
+/// a builder. All mutations use the same org fence as manifest writes.
+async fn expire_manifests(state: &AppState) -> anyhow::Result<u64> {
+    let jobs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT j.id,c.org_id FROM push_jobs j JOIN caches c ON c.id=j.cache_id \
+         WHERE (j.manifest_bytes>0 AND (j.idle_expires_at<=NOW() OR j.hard_expires_at<=NOW())) \
+            OR j.hard_expires_at<=NOW()-INTERVAL '24 hours' ORDER BY j.idle_expires_at,j.id LIMIT 20",
+    ).fetch_all(&state.pool).await?;
+    let mut count = 0;
+    for (id, org) in jobs {
+        let mut tx = crate::db::begin(state, &org).await?;
+        crate::db::advisory_lock(&mut tx, &format!("org:{org}")).await?;
+        let cleared: i64 = sqlx::query_scalar(
+            "WITH expired AS (UPDATE push_jobs SET manifest_bytes=0 WHERE id=$1 AND manifest_bytes>0 \
+                AND (idle_expires_at<=NOW() OR hard_expires_at<=NOW()) RETURNING id), \
+             chunks AS (DELETE FROM push_manifest_chunks WHERE job_id IN (SELECT id FROM expired)), \
+             members AS (DELETE FROM push_job_members WHERE job_id IN (SELECT id FROM expired)), \
+             sessions AS (UPDATE upload_sessions SET status='aborted',expires_at=LEAST(expires_at,NOW()) \
+                WHERE push_job_id IN (SELECT id FROM expired) AND status IN ('streaming','finalizing')) \
+             SELECT count(*) FROM expired",
+        ).bind(&id).fetch_one(&mut *tx).await?;
+        let removed = sqlx::query(
+            "DELETE FROM push_jobs WHERE id=$1 AND hard_expires_at<=NOW()-INTERVAL '24 hours'",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        count += u64::from(cleared > 0 || removed.rows_affected() > 0);
+    }
+    Ok(count)
+}
+
 /// Expiry revokes adoption, not provider execution. Late writes use unique keys
 /// and are rediscovered by orphan_nars. Legacy canonical work has no expiry.
 async fn expire_installations(state: &AppState) -> anyhow::Result<u64> {
@@ -1206,41 +1303,60 @@ async fn orphan_nars(state: &AppState, private: bool, prefix: &str) -> anyhow::R
 
 /// Retired keys are never adopted again. Duplicate deletion after a crash is
 /// safe, so no database transaction or worker lease spans storage I/O.
-async fn cleanup_objects(state: &AppState) -> anyhow::Result<u64> {
-    let mut count = 0;
-    let mut failed = false;
-    let mut after = 0i64;
-    for _ in 0..BATCHES {
-        let jobs: Vec<(i64, bool, String, Option<String>)> = sqlx::query_as(
-            "SELECT id,is_private,key,upload_id FROM object_cleanup WHERE id>$1 ORDER BY id LIMIT $2",
-        ).bind(after).bind(BATCH).fetch_all(&state.pool).await?;
-        if jobs.is_empty() {
-            break;
-        }
-        // Advance past failures too, so one broken key cannot starve others.
-        after = jobs.last().unwrap().0;
-        for (id, private, key, upload) in jobs {
+async fn cleanup_objects(state: &AppState, cursor: &mut CleanupCursor) -> anyhow::Result<u64> {
+    if cursor.after >= cursor.through {
+        // Freeze this pass's endpoint so continuous arrivals cannot postpone
+        // retries forever. A restart can safely begin another pass at zero.
+        cursor.through = sqlx::query_scalar("SELECT coalesce(max(id),0) FROM object_cleanup")
+            .fetch_one(&state.pool)
+            .await?;
+        cursor.after = 0;
+    }
+    let jobs: Vec<(i64, bool, String, Option<String>)> = sqlx::query_as(
+        "SELECT id,is_private,key,upload_id FROM object_cleanup WHERE id>$1 AND id<=$2 ORDER BY id LIMIT $3",
+    ).bind(cursor.after).bind(cursor.through).bind(BATCH).fetch_all(&state.pool).await?;
+    let Some(last) = jobs.last() else {
+        cursor.after = cursor.through;
+        return Ok(0);
+    };
+    cursor.after = last.0;
+    let results = stream::iter(jobs)
+        .map(|(id, private, key, upload)| async move {
             let result: anyhow::Result<()> = async {
-                if let Some(upload) = upload {
-                    state
-                        .storage
-                        .abort_multipart(private, &key, &upload)
-                        .await?;
+                if let Some(upload) = upload.as_deref() {
+                    state.storage.abort_multipart(private, &key, upload).await?;
                 }
                 state.storage.delete(private, &key).await?;
-                sqlx::query("DELETE FROM object_cleanup WHERE id=$1")
-                    .bind(id)
-                    .execute(&state.pool)
-                    .await?;
                 Ok(())
             }
             .await;
-            match result {
-                Ok(()) => count += 1,
-                Err(_) => failed = true,
-            }
+            (id, upload, result)
+        })
+        .buffer_unordered(CLEANUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut ids = Vec::new();
+    let mut uploads = Vec::new();
+    let mut failed = false;
+    for (id, upload, result) in results {
+        if result.is_ok() {
+            ids.push(id);
+            uploads.push(upload);
+        } else {
+            failed = true;
         }
     }
+    // A crash before acknowledgement merely repeats safe deletions. Do not
+    // acknowledge a multipart upload that changed while storage was in flight.
+    let count = sqlx::query(
+        "DELETE FROM object_cleanup q USING unnest($1::bigint[],$2::text[]) AS done(id,upload_id) \
+         WHERE q.id=done.id AND q.upload_id IS NOT DISTINCT FROM done.upload_id",
+    )
+    .bind(&ids)
+    .bind(&uploads)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
     if failed {
         anyhow::bail!("Object cleanup incomplete")
     }
@@ -1306,6 +1422,197 @@ mod tests {
         )
         .unwrap();
         (state, cache)
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn cleanup_passes_failures_bounds_arrivals_and_retries_after_wrap(pool: PgPool) {
+        let (state, _) = fixture(pool).await;
+        // This store cannot abort persisted multipart uploads. A whole failed
+        // page must not prevent later public/private objects being deleted.
+        sqlx::query(
+            "INSERT INTO object_cleanup(is_private,key,upload_id) \
+            SELECT false,'failed/'||n,'unsupported' FROM generate_series(1,500) n",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state
+            .storage
+            .put(false, "retired/public", b"public")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_cleanup(is_private,key) VALUES(false,'retired/public')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut cursor = CleanupCursor::default();
+        assert!(cleanup_objects(&state, &mut cursor).await.is_err());
+        state
+            .storage
+            .put(true, "retired/private", b"private")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_cleanup(is_private,key) VALUES(true,'retired/private')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE object_cleanup SET upload_id=NULL WHERE upload_id IS NOT NULL")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_objects(&state, &mut cursor).await.unwrap(), 1);
+        assert!(state.storage.head(false, "retired/public").await.is_err());
+        assert!(
+            state.storage.head(true, "retired/private").await.is_ok(),
+            "arrivals belong to the next pass, so retries cannot starve"
+        );
+        assert_eq!(cleanup_objects(&state, &mut cursor).await.unwrap(), 500);
+        assert_eq!(cleanup_objects(&state, &mut cursor).await.unwrap(), 1);
+        assert!(state.storage.head(true, "retired/private").await.is_err());
+
+        // Exercise the lifecycle worker, not just manual sweeps: newly queued
+        // retirement must drain without waiting for the six-hour discovery.
+        state
+            .storage
+            .put(false, "retired/background", b"background")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO object_cleanup(is_private,key) VALUES(false,'retired/background')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let stopped = CancellationToken::new();
+        let worker = tokio::spawn(drain(state.clone(), stopped.clone()));
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM object_cleanup")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+                if queued == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        stopped.cancel();
+        worker.await.unwrap();
+        drained.unwrap();
+        assert!(
+            state
+                .storage
+                .head(false, "retired/background")
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn manifest_expiry_is_bounded_and_retains_retry_identities(pool: PgPool) {
+        let _run = RUN_TESTS.lock().await;
+        let (state, cache) = fixture(pool).await;
+        sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes,idle_expires_at) \
+            SELECT 'expired-'||n,$1,'actor',n::text,'closure','[]',32,NOW()-INTERVAL '1 hour' FROM generate_series(1,23) n")
+            .bind(cache).execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes,idle_expires_at,hard_expires_at) \
+            VALUES('old',$1,'actor','old','closure','[]',32,NOW()-INTERVAL '26 hours',NOW()-INTERVAL '25 hours'), \
+            ('active',$1,'actor','active','closure','[]',32,NOW()+INTERVAL '1 hour',NOW()+INTERVAL '2 hours')")
+            .bind(cache).execute(&state.pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO push_manifest_chunks SELECT id,0,'[]' FROM push_jobs; \
+            INSERT INTO push_job_members SELECT id,'member','{}' FROM push_jobs;",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE push_jobs SET state='completed',completed_at=NOW()-INTERVAL '2 hours', \
+            protection_expires_at=NOW()-INTERVAL '1 hour' WHERE id='expired-1'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for status in ["streaming", "finalizing", "completed"] {
+            let id = format!("expired-{status}");
+            session(
+                &state,
+                cache,
+                &id,
+                &id,
+                &format!("staging/{id}/source"),
+                status,
+            )
+            .await;
+            sqlx::query("UPDATE upload_sessions SET push_job_id='expired-1',expires_at=NOW()+INTERVAL '1 hour' WHERE id=$1")
+                .bind(id).execute(&state.pool).await.unwrap();
+        }
+        assert_eq!(expire_manifests(&state).await.unwrap(), 20);
+        let sessions: Vec<(String, bool)> =
+            sqlx::query_as("SELECT status,expires_at<=NOW() FROM upload_sessions ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                ("completed".into(), false),
+                ("aborted".into(), true),
+                ("aborted".into(), true)
+            ],
+            "expiry releases unfinished work without destroying completed receipts"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM push_manifest_chunks")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            5
+        );
+        let second = run(&state).await.unwrap();
+        assert_eq!(second.failed_stages, 0);
+        assert_eq!(second.push_jobs, 4);
+        let chunks: Vec<String> = sqlx::query_scalar("SELECT job_id FROM push_manifest_chunks")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        let members: Vec<String> = sqlx::query_scalar("SELECT job_id FROM push_job_members")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(chunks, vec!["active"]);
+        assert_eq!(members, vec!["active"]);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT state='completed' AND completed_at IS NOT NULL \
+            FROM push_jobs WHERE id='expired-1'"
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            "manifest reclamation must preserve the historical completion receipt"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM push_jobs WHERE id LIKE 'expired-%' AND manifest_bytes=0"
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            23
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM push_jobs WHERE id='old'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(run(&state).await.unwrap().push_jobs, 0);
     }
 
     async fn blob(state: &AppState, hash: &str) -> i64 {
@@ -1589,7 +1896,9 @@ mod tests {
             .bind(cache).execute(&state.pool).await.unwrap();
         assert_eq!(retention(&state).await.unwrap(), 1);
         assert_eq!(blobs(&state).await.unwrap(), 0);
-        cleanup_objects(&state).await.unwrap();
+        cleanup_objects(&state, &mut CleanupCursor::default())
+            .await
+            .unwrap();
         let hashes: Vec<String> =
             sqlx::query_scalar("SELECT store_path_hash FROM published_paths WHERE cache_id=$1")
                 .bind(cache)
@@ -1636,6 +1945,40 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn retention_honors_job_protection_until_its_deadline(pool: PgPool) {
+        let (state, cache) = fixture(pool).await;
+        let shared = blob(&state, "job-shared").await;
+        path(&state, cache, shared, "protected").await;
+        path(&state, cache, shared, "ordinary").await;
+        sqlx::query("INSERT INTO api_tokens(jti,subject,perms_json,created_by,org_id) VALUES('job-token','test','[\"push\"]','test','maintenance')")
+            .execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,state,manifest_bytes,authorization_jti,authorization_expires_at)
+            VALUES('job',$1,'job-token','job','selected','[]','sealed',1,'job-token',now()+interval '30 minutes')")
+            .bind(cache).execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO push_job_members(job_id,store_path_hash,metadata)
+            SELECT 'job',store_path_hash,jsonb_build_object('storePath',store_path,'narHash',nar_hash,'narSize',nar_size,'references',references_json::jsonb,'deriver',deriver)
+            FROM published_paths WHERE store_path_hash='protected'").execute(&state.pool).await.unwrap();
+        assert_eq!(retention(&state).await.unwrap(), 1);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT store_path_hash FROM published_paths")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, ["protected"]);
+        sqlx::query("UPDATE push_jobs SET idle_expires_at=now()-interval '1 second'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(retention(&state).await.unwrap(), 1);
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
     async fn failed_sql_commit_keeps_blob_and_rolls_back_cleanup_jobs(pool: PgPool) {
         let _run = RUN_TESTS.lock().await;
         let (state, _) = fixture(pool).await;
@@ -1658,7 +2001,12 @@ mod tests {
             1
         );
         // A failed retirement cannot delete bytes or leave a cleanup job.
-        assert_eq!(cleanup_objects(&state).await.unwrap(), 0);
+        assert_eq!(
+            cleanup_objects(&state, &mut CleanupCursor::default())
+                .await
+                .unwrap(),
+            0
+        );
         assert!(
             state
                 .storage
@@ -1692,7 +2040,12 @@ mod tests {
             .unwrap();
         assert_eq!(blob_batch(&state).await.unwrap(), 1);
         assert_eq!(blob_batch(&state).await.unwrap(), 0);
-        assert_eq!(cleanup_objects(&state).await.unwrap(), 2);
+        assert_eq!(
+            cleanup_objects(&state, &mut CleanupCursor::default())
+                .await
+                .unwrap(),
+            2
+        );
         assert!(
             state
                 .storage
@@ -1747,7 +2100,12 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
-        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 3);
+        assert_eq!(
+            cleanup_objects(&restarted, &mut CleanupCursor::default())
+                .await
+                .unwrap(),
+            3
+        );
         assert!(state.storage.head(false, old).await.is_err());
         assert!(state.storage.head(false, new).await.is_ok());
         assert_eq!(blob_batch(&restarted).await.unwrap(), 0);
@@ -1760,8 +2118,18 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 1);
-        assert_eq!(cleanup_objects(&restarted).await.unwrap(), 0);
+        assert_eq!(
+            cleanup_objects(&restarted, &mut CleanupCursor::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            cleanup_objects(&restarted, &mut CleanupCursor::default())
+                .await
+                .unwrap(),
+            0
+        );
         assert!(state.storage.head(false, old).await.is_err());
         let mut object = state.storage.open(false, new).await.unwrap();
         let mut bytes = Vec::new();
@@ -1890,7 +2258,9 @@ mod tests {
         );
         assert_eq!(sessions(&state).await.unwrap(), 2);
         orphan_page(&state, "staging/", None).await.unwrap();
-        cleanup_objects(&state).await.unwrap();
+        cleanup_objects(&state, &mut CleanupCursor::default())
+            .await
+            .unwrap();
         assert!(
             state
                 .storage
@@ -1907,7 +2277,9 @@ mod tests {
         );
         assert!(state.storage.head(true, "staging/pinned").await.is_ok());
         assert_eq!(blobs(&state).await.unwrap(), 1);
-        cleanup_objects(&state).await.unwrap();
+        cleanup_objects(&state, &mut CleanupCursor::default())
+            .await
+            .unwrap();
         assert!(
             state
                 .storage
@@ -1990,7 +2362,9 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(retained.as_deref(), Some(upload.as_str()));
-            cleanup_objects(&state).await.unwrap();
+            cleanup_objects(&state, &mut CleanupCursor::default())
+                .await
+                .unwrap();
             assert!(
                 provider
                     .complete_multipart(&path, &upload, vec![part])
@@ -2037,7 +2411,9 @@ mod tests {
                     .unwrap(),
                 1
             );
-            cleanup_objects(&state).await.unwrap();
+            cleanup_objects(&state, &mut CleanupCursor::default())
+                .await
+                .unwrap();
             assert!(
                 state
                     .storage

@@ -39,6 +39,7 @@ pub struct AppState {
     pub(crate) protocol_limits: Arc<protocol_policy::ProtocolLimits>,
     pub(crate) verification_slots: Arc<Semaphore>,
     pub(crate) preparation_slots: Arc<Semaphore>,
+    pub(crate) manifest_slots: Arc<Semaphore>,
     pub(crate) sql_waiters: Arc<Semaphore>,
     pub(crate) sql_writers: Arc<crate::db::Writers>,
     proxy_ips: Arc<[IpAddr]>,
@@ -54,6 +55,7 @@ impl AppState {
         http: reqwest::Client,
     ) -> anyhow::Result<Self> {
         config.resources.validate()?;
+        config.push_jobs.validate()?;
         storage.configure_limits(&config.resources);
         cdn::validate_config(&config)?;
         crate::cache_host::validate_config(&config)?;
@@ -82,6 +84,8 @@ impl AppState {
             // Bound preparations and part transfers waiting to record receipts.
             // Allow one eight-member batch per verifier across both stages.
             preparation_slots: Arc::new(Semaphore::new(config.resources.verifications * 8)),
+            // Manifest parsing must not consume upload or verifier admission.
+            manifest_slots: Arc::new(Semaphore::new(4)),
             config: Arc::new(config),
             http,
             tasks: TaskTracker::new(),
@@ -107,6 +111,16 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let retry_stop = CancellationToken::new();
+    state
+        .tasks
+        .spawn(maintenance::drain(state.clone(), retry_stop.clone()));
+    for _ in 0..state.config.push_jobs.publication_workers {
+        let worker_state = state.clone();
+        let stopped = retry_stop.clone();
+        state
+            .tasks
+            .spawn(crate::push_job_worker::run(worker_state, stopped));
+    }
     if !state.config.cdn_zone_id.is_empty() {
         let retry_state = state.clone();
         let stopped = retry_stop.clone();

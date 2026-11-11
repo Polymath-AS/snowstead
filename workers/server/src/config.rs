@@ -29,6 +29,94 @@ pub struct Config {
     /// Exact canonical DNS hosts inside the suffix, separated by whitespace.
     pub cache_canonical_hosts: String,
     pub resources: ResourceLimits,
+    pub push_jobs: PushJobLimits,
+}
+
+#[derive(Clone, Debug)]
+pub struct PushJobLimits {
+    pub members: usize,
+    pub chunk_members: usize,
+    pub manifest_bytes: usize,
+    pub active_per_org: usize,
+    /// Reserved by unfinished jobs and retained through completion grace.
+    pub protected_members_per_org: usize,
+    pub protected_manifest_bytes_per_org: usize,
+    /// Opt-in publication of verified job candidates; no transfer scheduling.
+    pub publication_workers: usize,
+}
+
+impl Default for PushJobLimits {
+    fn default() -> Self {
+        Self {
+            members: 10_000,
+            chunk_members: 100,
+            manifest_bytes: 16 * 1024 * 1024,
+            active_per_org: 4,
+            protected_members_per_org: 40_000,
+            protected_manifest_bytes_per_org: 64 * 1024 * 1024,
+            publication_workers: 0,
+        }
+    }
+}
+
+impl PushJobLimits {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=100_000).contains(&self.members),
+            "Invalid PUSH_JOB_MAX_MEMBERS"
+        );
+        anyhow::ensure!(
+            (1..=self.members).contains(&self.chunk_members),
+            "Invalid PUSH_JOB_CHUNK_MEMBERS"
+        );
+        anyhow::ensure!(
+            (1..=16 * 1024 * 1024).contains(&self.manifest_bytes),
+            "Invalid PUSH_JOB_MANIFEST_BYTES"
+        );
+        anyhow::ensure!(
+            (1..=128).contains(&self.active_per_org),
+            "Invalid PUSH_JOB_ACTIVE_PER_ORG"
+        );
+        anyhow::ensure!(
+            (self.members..=12_800_000).contains(&self.protected_members_per_org),
+            "Invalid PUSH_JOB_PROTECTED_MEMBERS_PER_ORG"
+        );
+        anyhow::ensure!(
+            (self.manifest_bytes..=2_147_483_648).contains(&self.protected_manifest_bytes_per_org),
+            "Invalid PUSH_JOB_PROTECTED_MANIFEST_BYTES_PER_ORG"
+        );
+        anyhow::ensure!(
+            self.publication_workers <= 16,
+            "Invalid PUSH_JOB_PUBLICATION_WORKERS"
+        );
+        Ok(())
+    }
+
+    fn from_env() -> Self {
+        let read = |name: &str, default| match std::env::var(name) {
+            Ok(value) => value.parse().unwrap_or_else(|_| panic!("Invalid {name}")),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(_) => panic!("Invalid {name}"),
+        };
+        let defaults = Self::default();
+        let limits = Self {
+            members: read("PUSH_JOB_MAX_MEMBERS", defaults.members),
+            chunk_members: read("PUSH_JOB_CHUNK_MEMBERS", defaults.chunk_members),
+            manifest_bytes: read("PUSH_JOB_MANIFEST_BYTES", defaults.manifest_bytes),
+            active_per_org: read("PUSH_JOB_ACTIVE_PER_ORG", defaults.active_per_org),
+            protected_members_per_org: read(
+                "PUSH_JOB_PROTECTED_MEMBERS_PER_ORG",
+                defaults.protected_members_per_org,
+            ),
+            protected_manifest_bytes_per_org: read(
+                "PUSH_JOB_PROTECTED_MANIFEST_BYTES_PER_ORG",
+                defaults.protected_manifest_bytes_per_org,
+            ),
+            publication_workers: read("PUSH_JOB_PUBLICATION_WORKERS", defaults.publication_workers),
+        };
+        limits.validate().expect("Invalid push job limits");
+        limits
+    }
 }
 
 /// Per-process upload memory and verification budgets.
@@ -120,6 +208,7 @@ impl Config {
             cache_host_suffix: std::env::var("CACHE_HOST_SUFFIX").unwrap_or_default(),
             cache_canonical_hosts: std::env::var("CACHE_CANONICAL_HOSTS").unwrap_or_default(),
             resources: ResourceLimits::from_env(),
+            push_jobs: PushJobLimits::from_env(),
         }
     }
 }
