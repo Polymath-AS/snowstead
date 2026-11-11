@@ -972,6 +972,120 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
+async fn final_nar_digest_failure_cannot_complete_a_multipart_destination(pool: PgPool) {
+    pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
+    let mut config = Config::from_env();
+    config.auth_token = "legacy".into();
+    let storage = snowstead_server::storage::Storage::new(&config).unwrap();
+    let state = AppState::new(
+        pool.clone(),
+        config,
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let app = router(state.clone());
+    let mut seed = 0x76543210u32;
+    let contents: Vec<u8> = (0..9 * 1024 * 1024)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let raw = nar(&contents);
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    assert!(compressed.len() > 8 * 1024 * 1024);
+    let hash = "d".repeat(32);
+    let mut input = path_input(&hash, &raw, false);
+    // A syntactically valid stream with matching compressed hash and sizes,
+    // but the wrong final NAR digest. Failure occurs after the entire stream.
+    input["narHash"] = json!(format!("sha256-{}", STANDARD.encode([0u8; 32])));
+    let session = create(&app, "main", "legacy", input.clone()).await;
+    let id = session["sessionId"].as_str().unwrap();
+    let part_size = session["partSize"].as_u64().unwrap() as usize;
+    let reservations: Vec<_> = compressed
+        .chunks(part_size)
+        .enumerate()
+        .map(|(i, bytes)| json!({"partNumber":i+1,"size":bytes.len()}))
+        .collect();
+    let (status, reserved) = post(
+        &app,
+        &format!("/_api/v1/uploads/{id}/parts"),
+        "legacy",
+        json!({"parts":reservations}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reserved}");
+    let mut receipts = Vec::new();
+    for (i, bytes) in compressed.chunks(part_size).enumerate() {
+        let (status, _, body) = send(
+            &app,
+            "PUT",
+            &format!("/_api/v1/uploads/{id}/part/{}", i + 1),
+            Some("legacy"),
+            &[("content-length", &bytes.len().to_string())],
+            bytes.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let uploaded: Value = serde_json::from_slice(&body).unwrap();
+        receipts.push(json!({"partNumber":i+1,"etag":uploaded["etag"]}));
+    }
+    let file_hash = hex::encode(Sha256::digest(&compressed));
+    let (status, result) = tokio::time::timeout(std::time::Duration::from_secs(30), post(
+        &app, "/_api/v1/uploads/finalize", "legacy",
+        json!({"uploads":[{"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),"fileHash":file_hash,"fileSize":compressed.len(),"parts":receipts}]}),
+    )).await.expect("failed verification must close both sides of the pipe");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["results"][0]["status"], 400, "{result}");
+    assert_eq!(result["results"][0]["published"], false);
+    state.finish_background().await;
+    let key: String = sqlx::query_scalar("SELECT key FROM object_cleanup WHERE key LIKE $1")
+        .bind(format!("nar/objects/%/{file_hash}/zstd.nar"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Retirement only queued deletion. No maintenance has run, so absence
+    // proves the failed digest never completed the provider object.
+    assert!(
+        storage
+            .head(false, &key)
+            .await
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/main/{hash}.narinfo"),
+            None,
+            &[],
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_boundary(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let app = router(
@@ -1181,7 +1295,7 @@ async fn unresolved_canonical_writers_do_not_block_immutable_publication(pool: P
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgPool) {
+async fn failed_publication_retains_candidate_until_session_expiry(pool: PgPool) {
     let storage = common::storage();
     let state = AppState::new(
         pool.clone(),
@@ -1213,7 +1327,7 @@ async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgP
         assert_eq!(result["published"], false, "{result}");
         assert_eq!(result["status"], 500, "{result}");
         let key: String = sqlx::query_scalar(
-            "SELECT key FROM object_cleanup WHERE is_private=$1 AND key LIKE $2",
+            "SELECT key FROM nar_installations WHERE is_private=$1 AND key LIKE $2 AND phase='ready'",
         )
         .bind(private)
         .bind(format!("%/{hash}/zstd.nar"))
@@ -1234,7 +1348,7 @@ async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgP
                 .unwrap(),
             0
         );
-        // A confirmed completed copy needs GC ownership, not a permanent pin.
+        // SQL failure keeps confirmed bytes reusable until session expiry.
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM nar_installations WHERE file_hash=$1"
@@ -1243,6 +1357,14 @@ async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgP
             .fetch_one(&pool)
             .await
             .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup WHERE key=$1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
             0
         );
         keys.push((private, key));
@@ -1260,7 +1382,9 @@ async fn failed_publication_queues_exact_immutable_key_for_maintenance(pool: PgP
     }));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM object_cleanup")
+            if sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT count(*) FROM object_cleanup) + (SELECT count(*) FROM nar_installations)",
+            )
                 .fetch_one(&pool)
                 .await
                 .unwrap()
@@ -1304,8 +1428,9 @@ async fn uncertain_immutable_completion_does_not_poison_retries_across_restart(p
         async move {
             let (parts, body) = request.into_parts();
             let canonical = parts.uri.path().contains("/nar/objects/");
-            let completion = parts.method == "POST"
-                && parts.uri.query().is_some_and(|q| q.contains("uploadId="));
+            let completion = (parts.method == "PUT" && parts.uri.query().is_none())
+                || (parts.method == "POST"
+                    && parts.uri.query().is_some_and(|q| q.contains("uploadId=")));
             let response = reqwest::Client::new()
                 .request(parts.method, format!("{upstream}{}", parts.uri))
                 .headers(parts.headers)
@@ -1410,14 +1535,29 @@ async fn uncertain_immutable_completion_does_not_poison_retries_across_restart(p
         .await
         .unwrap();
     assert!(storage.head(false, &uncertain).await.is_ok());
-    let source: String = sqlx::query_scalar(
+    let source: Option<String> = sqlx::query_scalar(
         "SELECT storage_key FROM upload_parts WHERE session_id=$1 AND part_number=1",
     )
     .bind(failed["sessionId"].as_str().unwrap())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(storage.head(true, &source).await.is_ok());
+    assert!(
+        source.is_none(),
+        "inline bytes must not create a staged source"
+    );
+    assert!(
+        storage
+            .list(
+                true,
+                &format!("staging/{}", failed["sessionId"].as_str().unwrap()),
+                None,
+                1
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let restarted = router(
         AppState::new(
             pool.clone(),
@@ -1427,7 +1567,21 @@ async fn uncertain_immutable_completion_does_not_poison_retries_across_restart(p
         )
         .unwrap(),
     );
-    let retry = upload_inline(&restarted, "main", input, &compressed).await;
+    // Replay the same sealed session after recreating application state.
+    let (status, _, retry) = send(
+        &restarted,
+        "POST",
+        &format!(
+            "/_api/v1/uploads/{}/inline?fileHash={hash}",
+            failed["sessionId"].as_str().unwrap()
+        ),
+        Some("legacy"),
+        &[("content-length", &compressed.len().to_string())],
+        compressed.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let retry: Value = serde_json::from_slice(&retry).unwrap();
     assert_eq!(retry["published"], true, "{retry}");
     let committed: String =
         sqlx::query_scalar("SELECT public_key FROM blob_objects WHERE file_hash=$1")
@@ -1462,7 +1616,7 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
     use axum::{extract::Request as AxumRequest, response::IntoResponse, routing::any};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -1477,7 +1631,11 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         assert!(upstream.starts_with("http://127.0.0.1:"));
         let ids = Arc::new(Mutex::new((String::new(), String::new())));
         let overtaken = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
         let fast = Arc::new(tokio::sync::Notify::new());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let delayed = Arc::new(AtomicBool::new(false));
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = Config::from_env();
@@ -1485,24 +1643,35 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         let proxy_app = Router::new().fallback(any({
             let ids = ids.clone();
             let overtaken = overtaken.clone();
+            let reads = reads.clone();
+            let writes = writes.clone();
+            let reached = reached.clone();
+            let release = release.clone();
             move |request: AxumRequest| {
                 let upstream = upstream.clone();
                 let ids = ids.clone();
                 let overtaken = overtaken.clone();
+                let reads = reads.clone();
+                let writes = writes.clone();
                 let fast = fast.clone();
+                let reached = reached.clone();
+                let release = release.clone();
                 let delayed = delayed.clone();
                 async move {
                     let (parts, body) = request.into_parts();
                     let (slow_id, fast_id) = ids.lock().unwrap().clone();
+                    if parts.method == "PUT" && parts.uri.path().contains("/objects/") {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                    }
                     if parts.method == "GET" && !slow_id.is_empty() {
-                        if parts.uri.path().contains(&fast_id)
-                            && parts.uri.path().contains("/assembled-")
-                        {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        if parts.uri.path().contains(&fast_id) {
                             fast.notify_one();
                         }
                         if parts.uri.path().contains(&slow_id)
                             && !delayed.swap(true, Ordering::SeqCst)
                         {
+                            reached.notify_one();
                             // No DB connection may be held here: another preparation
                             // must reach storage even though the pool has one slot.
                             let concurrent =
@@ -1510,7 +1679,7 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                                     .await
                                     .is_ok();
                             overtaken.store(concurrent, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            release.notified().await;
                         }
                     }
                     let response = reqwest::Client::new()
@@ -1540,8 +1709,8 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         });
         let storage = snowstead_server::storage::Storage::new(&config).unwrap();
         config.auth_token = "legacy".into();
-        let app =
-            router(AppState::new(single.clone(), config, storage, reqwest::Client::new()).unwrap());
+        let state = AppState::new(single.clone(), config, storage, reqwest::Client::new()).unwrap();
+        let app = router(state.clone());
         let cache = if inline { "inline" } else { "multipart" };
         let mut inputs = Vec::new();
         let mut payloads = Vec::new();
@@ -1622,6 +1791,28 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
             if inline {
                 send_inline_batch(&app, inline_frame(&json!(uploads), &payloads)).await
             } else {
+                let pending = tokio::spawn({
+                    let app = app.clone();
+                    let uploads = uploads.clone();
+                    async move {
+                        post(
+                            &app,
+                            "/_api/v1/uploads/finalize",
+                            "legacy",
+                            json!({"uploads":uploads}),
+                        )
+                        .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(10), reached.notified())
+                    .await
+                    .unwrap();
+                // Disconnect with some batch members not yet streamed. The
+                // owned batch must finish every reservation, not strand them.
+                pending.abort();
+                assert!(pending.await.unwrap_err().is_cancelled());
+                release.notify_one();
+                state.finish_background().await;
                 post(
                     &app,
                     "/_api/v1/uploads/finalize",
@@ -1634,10 +1825,33 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         .await
         .expect("batch must not deadlock with pool one");
         assert_eq!(status, StatusCode::OK, "{result}");
-        assert!(
-            overtaken.load(Ordering::SeqCst),
-            "later preparation must overtake blocked first source read"
-        );
+        if inline {
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                0,
+                "inline preparation must not read storage"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                7,
+                "each valid inline input gets one PUT; invalid NARs get none"
+            );
+        } else {
+            assert!(
+                overtaken.load(Ordering::SeqCst),
+                "later preparation must overtake blocked first source read"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                8,
+                "each sealed part is read once"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                8,
+                "each input gets one final PUT"
+            );
+        }
         for (index, row) in result["results"].as_array().unwrap().iter().enumerate() {
             assert_eq!(row["sessionId"], uploads[index]["sessionId"]);
             if inline && index == 7 {
@@ -1686,7 +1900,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     use axum::{extract::Request as AxumRequest, response::IntoResponse, routing::any};
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -1710,6 +1924,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     let reached = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let paused = Arc::new(AtomicBool::new(false));
+    let storage_work = Arc::new(AtomicUsize::new(0));
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::from_env();
     config.r2_endpoint = format!("http://{}", proxy.local_addr().unwrap());
@@ -1719,14 +1934,23 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         let reached = reached.clone();
         let release = release.clone();
         let paused = paused.clone();
+        let storage_work = storage_work.clone();
         move |request: AxumRequest| {
             let upstream = upstream.clone();
             let reached = reached.clone();
             let release = release.clone();
             let paused = paused.clone();
+            let storage_work = storage_work.clone();
             async move {
                 let (parts, body) = request.into_parts();
-                if parts.method == "POST"
+                // S3 uses POST ?delete for source cleanup after publication;
+                // count byte reads/writes, not that expected cleanup request.
+                if matches!(parts.method.as_str(), "GET" | "PUT" | "POST")
+                    && parts.uri.query() != Some("delete")
+                {
+                    storage_work.fetch_add(1, Ordering::SeqCst);
+                }
+                if (parts.method == "POST" || parts.method == "PUT")
                     && parts.uri.path().contains("/nar/objects/")
                     && !paused.swap(true, Ordering::SeqCst)
                 {
@@ -1762,7 +1986,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     let app = router(
         AppState::new(
             single.clone(),
-            config,
+            config.clone(),
             storage.clone(),
             reqwest::Client::new(),
         )
@@ -1778,6 +2002,9 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     tokio::time::timeout(Duration::from_secs(10), reached.notified())
         .await
         .expect("immutable copy must reach barrier");
+    // The first provider request is the final immutable PUT. Inline NAR
+    // verification must not stage, assemble, or read bytes from storage.
+    assert_eq!(storage_work.load(Ordering::SeqCst), 1);
     // Every operation below uses the same one-slot application pool, with the
     // storage barrier still closed. No sleep or scheduler ordering is required.
     let stale_key = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1787,6 +2014,15 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
                 .await
                 .unwrap();
         assert!(key.starts_with("nar/objects/"));
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT source_key IS NULL FROM nar_installations WHERE key=$1"
+            )
+            .bind(&key)
+            .fetch_one(&single)
+            .await
+            .unwrap()
+        );
         assert_eq!(
             send(&app, "GET", "/main/nix-cache-info", None, &[], vec![])
                 .await
@@ -1894,9 +2130,8 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         .unwrap(),
         0
     );
-    // A transient org conflict after copying must retire the failed attempt
-    // while the competing writer still holds its fence. Otherwise the session's
-    // unique ownership pins every retry until expiry.
+    // A transient org conflict must retain the verified immutable candidate.
+    // A fresh server retries publication without reading or writing any bytes.
     paused.store(false, Ordering::SeqCst);
     let pending = tokio::spawn({
         let app = app.clone();
@@ -1919,22 +2154,35 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         .unwrap();
     assert_eq!(busy["status"], 503, "{busy}");
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations WHERE session_id=$1")
-            .bind(busy["sessionId"].as_str().unwrap())
-            .fetch_one(&single)
-            .await
-            .unwrap(),
-        0
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM nar_installations WHERE session_id=$1 AND phase='ready'"
+        )
+        .bind(busy["sessionId"].as_str().unwrap())
+        .fetch_one(&single)
+        .await
+        .unwrap(),
+        1
     );
     competing.rollback().await.unwrap();
+    let before_replay = storage_work.load(Ordering::SeqCst);
+    let restarted = router(
+        AppState::new(
+            single.clone(),
+            config,
+            storage.clone(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
     let uploads = json!([{
         "sessionId": busy["sessionId"],
         "fileHash": new_hash,
         "fileSize": new.len()
     }]);
-    let (status, replay) = send_inline_batch(&app, inline_frame(&uploads, &[new])).await;
+    let (status, replay) = send_inline_batch(&restarted, inline_frame(&uploads, &[new])).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(replay["results"][0]["published"], true, "{replay}");
+    assert_eq!(storage_work.load(Ordering::SeqCst), before_replay);
     stop.send(()).unwrap();
     proxy_task.await.unwrap();
     single.close().await;

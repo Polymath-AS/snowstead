@@ -275,10 +275,45 @@ impl Storage {
             .clone()
             .try_acquire_many_owned(buffer_size.div_ceil(MEMORY_UNIT) as u32)
             .map_err(|_| UploadError::Busy)?;
-        let mut pending =
-            PendingUpload::new(self.store(private).clone(), path, options, memory).await?;
         let stream = crate::profile_stream!(stream, label = "storage.upload_body");
         futures_util::pin_mut!(stream);
+        if expected_size < PART_SIZE as u64 {
+            let mut buffer = Vec::with_capacity(buffer_size);
+            let mut hash = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if chunk.len() as u64 > expected_size - buffer.len() as u64 {
+                    return Err(UploadError::Size);
+                }
+                crate::profile_block!("storage.upload_hash", hash.update(&chunk));
+                buffer.extend_from_slice(&chunk);
+            }
+            if buffer.len() as u64 != expected_size {
+                return Err(UploadError::Size);
+            }
+            let store = self.store(private).clone();
+            // A dispatched PUT can outlive its caller. Its task owns both the
+            // payload and memory reservation until the provider request ends.
+            tokio::spawn(async move {
+                let _memory = memory;
+                store
+                    .put_opts(
+                        &path,
+                        buffer.into(),
+                        PutOptions {
+                            attributes: options.attributes,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(io_error)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            return Ok(hex::encode(hash.finalize()));
+        }
+        let mut pending =
+            PendingUpload::new(self.store(private).clone(), path, options, memory).await?;
         let mut buffer = Vec::new();
         let mut size = 0_u64;
         let mut hash = Sha256::new();
@@ -363,7 +398,7 @@ impl Storage {
             .await
             .map_err(io_error)?;
         let size = source.meta.size;
-        // Stream through multipart, not CopyObject (which is limited to 5 GiB).
+        // Stream through upload, not CopyObject (which is limited to 5 GiB).
         // upload derives metadata from the destination, never from staging.
         self.upload(
             target_private,
@@ -590,9 +625,12 @@ mod tests {
         parts: Mutex<Vec<usize>>,
         starts: AtomicUsize,
         abort_gate: Mutex<Option<Arc<Semaphore>>>,
+        put_gate: Mutex<Option<Arc<Semaphore>>>,
+        puts: AtomicUsize,
         metadata_size: Mutex<Option<u64>>,
         completions: AtomicUsize,
         aborts: AtomicUsize,
+        fail_put: AtomicBool,
         fail_part: AtomicBool,
         fail_complete: AtomicBool,
     }
@@ -617,6 +655,14 @@ mod tests {
             bytes: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
+            self.observations.puts.fetch_add(1, Ordering::SeqCst);
+            let gate = self.observations.put_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            if self.observations.fail_put.load(Ordering::SeqCst) {
+                return Err(injected_error());
+            }
             self.inner.put_opts(path, bytes, options).await
         }
 
@@ -907,7 +953,9 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_hash_empty_and_large_frame() {
-        let storage = fixture();
+        let store = Arc::new(ObservedStore::default());
+        let observations = store.observations.clone();
+        let storage = Storage::from_stores(store, Arc::new(InMemory::new()));
         for size in [0, PART_SIZE - 1, PART_SIZE, PART_SIZE * 2 + 1] {
             let bytes = vec![0xa5; size];
             let receipt = storage
@@ -923,6 +971,8 @@ mod tests {
             assert_eq!(head, object.metadata);
             assert_eq!(read(&storage, false, "object").await, bytes);
         }
+        assert_eq!(observations.puts.load(Ordering::SeqCst), 2);
+        assert_eq!(observations.starts.load(Ordering::SeqCst), 2);
         let chunks = (0..4096).map(|_| Ok::<_, io::Error>(Bytes::from_static(b"abcd")));
         let receipt = storage
             .write_body(
@@ -934,6 +984,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt, hex::encode(Sha256::digest(b"abcd".repeat(4096))));
+    }
+
+    #[tokio::test]
+    async fn small_put_failure_and_cancellation_keep_memory_until_provider_finishes() {
+        let store = Arc::new(ObservedStore::default());
+        let observations = store.observations.clone();
+        let mut storage = Storage::from_stores(store, Arc::new(InMemory::new()));
+        storage.configure_limits(&ResourceLimits {
+            upload_buffer_mib: 8,
+            ..Default::default()
+        });
+        storage.put(false, "object", b"old").await.unwrap();
+        observations.fail_put.store(true, Ordering::SeqCst);
+        let error = storage
+            .write_body(false, "object", Body::from("new"), 3)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.message, "Internal error");
+        assert_eq!(read(&storage, false, "object").await, b"old");
+        observations.fail_put.store(false, Ordering::SeqCst);
+
+        let gate = Arc::new(Semaphore::new(0));
+        *observations.put_gate.lock().unwrap() = Some(gate.clone());
+        let bytes = vec![0xa5; PART_SIZE - 1];
+        let mut upload = Box::pin(storage.write_body(
+            false,
+            "object",
+            Body::from(bytes.clone()),
+            bytes.len() as u64,
+        ));
+        tokio::select! {
+            result = &mut upload => panic!("unexpected completion: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                while observations.puts.load(Ordering::SeqCst) < 3 {
+                    tokio::task::yield_now().await;
+                }
+            }) => result.unwrap(),
+        }
+        drop(upload);
+        let unread = Body::from_stream(stream::poll_fn(
+            |_| -> std::task::Poll<Option<io::Result<Bytes>>> {
+                panic!("overloaded body must not be polled")
+            },
+        ));
+        let error = storage
+            .write_body(false, "blocked", unread, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(read(&storage, false, "object").await, b"old");
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while storage.upload_memory.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(read(&storage, false, "object").await, bytes);
+        assert_eq!(observations.starts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -973,7 +1084,7 @@ mod tests {
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.message, "Internal error");
         assert_eq!(read(&storage, false, "object").await, b"old");
-        assert_eq!(observations.aborts.load(Ordering::SeqCst), 3);
+        assert_eq!(observations.aborts.load(Ordering::SeqCst), 1);
         assert_eq!(observations.completions.load(Ordering::SeqCst), 0);
 
         let (sent, received) = oneshot::channel();
@@ -996,7 +1107,7 @@ mod tests {
         }
         drop(upload);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while observations.aborts.load(Ordering::SeqCst) != 4 {
+            while observations.aborts.load(Ordering::SeqCst) != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1039,7 +1150,12 @@ mod tests {
                 .fail_complete
                 .store(fail_complete, Ordering::SeqCst);
             let error = storage
-                .write_body(false, "object", Body::from("new"), 3)
+                .write_body(
+                    false,
+                    "object",
+                    Body::from(vec![1; PART_SIZE]),
+                    PART_SIZE as u64,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
