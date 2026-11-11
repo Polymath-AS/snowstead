@@ -158,6 +158,25 @@ Use `--no-deps` to push only the exact paths given; then a path already in the
 cache is skipped without needing a local copy. `.drv` paths are build recipes,
 not outputs, and are rejected unless you pass `--allow-drv`.
 
+Use `--resumable` to save a push manifest on servers with background publication
+workers enabled. The CLI prints a job ID before starting work. Compression and
+transfer proceed independently of reference publication; the server publishes
+each path only when its manifest prerequisites are available. The CLI reports
+success only after all manifest members are available in the target cache.
+Unlike ordinary pushes, upstream availability does not skip these members.
+
+```bash
+snowstead push main ./result --resumable
+snowstead push main --resume JOB_ID
+```
+
+Resume uses the saved manifest, without paths or stdin. It reuses prepared
+uploads and transfers only missing work. Keep unprepared store paths locally
+until the push completes. `--no-deps --resumable` saves only the selected paths;
+resume cannot change that selection. Interruptions and publication timeouts
+leave unfinished jobs resumable while their server leases remain valid.
+Resuming a completed job checks availability but never restores deleted paths.
+
 Normal output contains a summary and any errors. Add `--verbose` (or `-v`) for
 `tracing` diagnostics on stderr, including compression sizes/times and upload
 request status/retries. Credentials and signed upload URLs are not logged.
@@ -171,6 +190,10 @@ Compression defaults to zstd level 3; use `--compression-level <1-19>` to change
 it. Independent paths use a bounded native worker pool. NARs of at least
 64 MiB use up to four additional zstd workers; the producer and codec workers
 share one CPU budget, rather than multiplying workers by `--jobs`.
+Resumable pushes limit active preparation and multipart transfer to `--jobs`,
+but allow up to `max(jobs, 8)` paths to await preparation receipts. This lets
+small inline uploads fill an eight-path batch even with `--jobs 1`. Queued
+frames retain their charge against the same upload-buffer budget.
 The Rust CLI streams compressed NARs directly into multipart uploads: no NAR
 temporary files, whole-NAR buffering, or compression pass just to learn the
 size. Upload buffers share a global budget of 64 MiB, or one negotiated part

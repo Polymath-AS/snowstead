@@ -217,6 +217,18 @@ fn invalid_commands_fail_before_credentials_or_http() {
         ),
         (vec!["push", "main"], "No store paths given on stdin"),
         (
+            vec!["push", "main", "--resume", "../job"],
+            "invalid API identifier",
+        ),
+        (
+            vec!["push", "main", "--resume", "job", "--resumable"],
+            "cannot be used with",
+        ),
+        (
+            vec!["push", "main", "--resume", "job", "/anything"],
+            "cannot be used with",
+        ),
+        (
             vec!["push", "main", ".#app"],
             "is not an existing store path",
         ),
