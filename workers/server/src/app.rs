@@ -79,7 +79,8 @@ impl AppState {
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),
-            // Allow one eight-member inline batch to queue per verifier.
+            // Bound preparations and part transfers waiting to record receipts.
+            // Allow one eight-member batch per verifier across both stages.
             preparation_slots: Arc::new(Semaphore::new(config.resources.verifications * 8)),
             config: Arc::new(config),
             http,

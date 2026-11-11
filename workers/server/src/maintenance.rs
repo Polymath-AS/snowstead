@@ -1136,6 +1136,7 @@ async fn expire_installations(state: &AppState) -> anyhow::Result<u64> {
                 LEFT JOIN caches c ON c.id=i.cache_id
                 WHERE i.expires_at IS NOT NULL AND (
                     i.expires_at<=NOW() OR i.phase='revoked'
+                    OR (i.phase='preparing' AND i.lease_expires_at<=NOW())
                     OR (i.session_id IS NOT NULL AND (u.id IS NULL
                         OR u.status NOT IN ('finalizing','completed') OR u.expires_at<=NOW()))
                     OR c.id IS NULL
