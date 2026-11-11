@@ -130,6 +130,31 @@ pub async fn push(
                 .with_context(|| format!("missing path info for {path}"))?,
         );
     }
+    let transferred = transfer(client, cache, ordered, jobs, level).await?;
+    summary.pushed = transferred.pushed;
+    summary.failed = transferred.failed;
+    summary.errors = transferred.errors;
+    Ok(summary)
+}
+
+/// The job client prepares independent members; ordinary pushes publish them.
+pub(crate) async fn transfer(
+    client: &Client,
+    cache: &str,
+    ordered: Vec<nix::PathInfo>,
+    jobs: usize,
+    level: i32,
+) -> anyhow::Result<Summary> {
+    let mut summary = Summary {
+        pushed: 0,
+        skipped: 0,
+        upstream: 0,
+        failed: 0,
+        errors: Vec::new(),
+    };
+    if ordered.is_empty() {
+        return Ok(summary);
+    }
     let ordered = publish_order(ordered);
     // Each path publishes only after the references pushed alongside it have.
     // Paths start in publish order, so every wait is on an earlier path that
@@ -149,6 +174,14 @@ pub async fn push(
     let large_threads = cpu.saturating_sub(1).min(4) as i32;
     let compression = Arc::new(Semaphore::new(cpu));
     let parts = Arc::new(Semaphore::new(16));
+    // Prepared receipts may wait for a full inline batch without occupying
+    // every transfer slot. Ordinary publication keeps its existing job bound.
+    let preparations = Arc::new(Semaphore::new(jobs));
+    let outstanding = if client.prepares_only() {
+        jobs.max(8)
+    } else {
+        jobs
+    };
     // Prefetch one session batch while the current batch uploads. Growing the shared
     // byte budget only when a larger part is negotiated preserves the global
     // max(64 MiB, largest part) bound without delaying all transfers first.
@@ -262,7 +295,7 @@ pub async fn push(
     let large_commits = Batcher::new(jobs.min(8), 1, Duration::from_millis(10), finalize);
     let inline_client = client.clone();
     let inline_commits = Batcher::new(
-        jobs.min(8),
+        outstanding.min(8),
         jobs.min(3),
         Duration::from_millis(10),
         move |uploads: Vec<api::InlineUpload>| {
@@ -274,6 +307,7 @@ pub async fn push(
         .map_ok(|((info, outcome), (session, mut guard))| {
             let compression = compression.clone();
             let parts = parts.clone();
+            let preparations = preparations.clone();
             let buffers = buffers.clone();
             let reservations = reservations.clone();
             let small_commits = small_commits.clone();
@@ -284,11 +318,45 @@ pub async fn push(
                 let path = info.store_path.clone();
                 let start = Instant::now();
                 let result = async {
+                    if client.prepares_only()
+                        && (session.prepared || session.status.as_deref() == Some("completed"))
+                    {
+                        guard.disarm();
+                        return Ok(());
+                    }
+                    if client.prepares_only()
+                        && !session.inline
+                        && session.status.as_deref() == Some("finalizing")
+                    {
+                        // Sealed multipart bytes survive a preparation crash.
+                        // Replay their receipt without reading local Nix data
+                        // or trying to reserve immutable parts again.
+                        let receipt = session.receipt.context("sealed upload has no receipt")?;
+                        if receipt.session_id != session.session_id {
+                            bail!("sealed upload receipt has a different session");
+                        }
+                        let result = large_commits.request(receipt).await?;
+                        if result.session_id != session.session_id
+                            || !(result.published
+                                || result.prepared
+                                    && result.status == Some(202)
+                                    && result.error.is_none())
+                        {
+                            bail!("sealed upload recovery failed: {:?}", result.error);
+                        }
+                        guard.disarm();
+                        return Ok(());
+                    }
+                    let preparation = if client.prepares_only() {
+                        Some(preparations.acquire().await?)
+                    } else {
+                        None
+                    };
                     // Inline bytes stay live through publication. Wait before
                     // taking any permits so dependents cannot exhaust the byte
                     // budget needed by an earlier streaming dependency.
                     let mut dependency_wait_ms = 0;
-                    if session.inline {
+                    if session.inline && !client.prepares_only() {
                         let started = Instant::now();
                         wait_dependencies(&info, published).await?;
                         dependency_wait_ms = started.elapsed().as_millis();
@@ -344,8 +412,9 @@ pub async fn push(
                     let digest = producer.await?;
                     let uploaded = uploaded?;
                     let digest = digest?;
+                    drop(preparation);
                     let upload_elapsed_ms = start.elapsed().as_millis();
-                    if !session.inline {
+                    if !session.inline && !client.prepares_only() {
                         let started = Instant::now();
                         wait_dependencies(&info, published).await?;
                         dependency_wait_ms = started.elapsed().as_millis();
@@ -376,7 +445,13 @@ pub async fn push(
                             })
                             .await?
                     };
-                    if published.session_id != session.session_id || !published.published {
+                    let prepared = client.prepares_only()
+                        && published.prepared
+                        && published.status == Some(202)
+                        && published.error.is_none();
+                    if published.session_id != session.session_id
+                        || !(published.published || prepared)
+                    {
                         tracing::debug!(
                             has_error = published.error.is_some(),
                             "publication rejected"
@@ -393,7 +468,8 @@ pub async fn push(
                         upload_elapsed_ms,
                         dependency_wait_ms,
                         finalization_elapsed_ms = finalization_started.elapsed().as_millis(),
-                        "published store path"
+                        prepared,
+                        "finished store path transfer"
                     );
                     Ok::<_, anyhow::Error>(())
                 }
@@ -406,7 +482,7 @@ pub async fn push(
             }
             .instrument(span)
         })
-        .try_buffer_unordered(jobs);
+        .try_buffer_unordered(outstanding);
     let mut work = Box::pin(work);
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
@@ -679,6 +755,15 @@ struct AbortGuard {
 }
 impl AbortGuard {
     fn new(client: Client, id: String, live: Arc<std::sync::Mutex<HashSet<String>>>) -> Self {
+        // Job leases own unfinished work across disconnects. Do not abort
+        // reusable receipts when a transfer fails or the process is cancelled.
+        if client.prepares_only() {
+            return Self {
+                client,
+                id: None,
+                live,
+            };
+        }
         live.lock().unwrap().insert(id.clone());
         Self {
             client,
@@ -725,6 +810,89 @@ mod tests {
     use crate::api::tests::{client, read, reply};
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::Notify};
+
+    #[tokio::test]
+    async fn serial_preparation_keeps_inline_receipts_and_item_failures_independent() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let mut infos = Vec::new();
+        for i in 0..9 {
+            let path = root.path().join(format!("{i}-data"));
+            std::fs::write(&path, vec![i as u8; 37 + i * 11]).unwrap();
+            let raw = std::process::Command::new("nix-store")
+                .arg("--dump")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(raw.status.success());
+            infos.push(nix::PathInfo {
+                store_path: path.to_str().unwrap().to_owned(),
+                store_path_hash: format!("{i:032}"),
+                nar_hash: format!("sha256:{}", hex::encode(Sha256::digest(&raw.stdout))),
+                nar_size: raw.stdout.len() as u64,
+                references: Vec::new(),
+                deriver: None,
+            });
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(&format!("http://{}", listener.local_addr().unwrap()))
+            .for_job("job-1")
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut received = HashSet::new();
+            while received.len() < 9 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, body) = read(&mut socket).await;
+                let response =
+                    if headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch ") {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["jobId"], "job-1");
+                        json!({"sessions":body["paths"].as_array().unwrap().iter().map(|p|
+                        json!({"sessionId":format!("s{}",p["storePathHash"].as_str().unwrap()),
+                            "partSize":1048576,"inline":true,"prepared":false,"status":"streaming"})
+                    ).collect::<Vec<_>>()})
+                    } else if headers
+                        .starts_with("POST /_api/v1/uploads/inline/batch?prepareOnly=true ")
+                    {
+                        let length = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+                        let manifest: Value = serde_json::from_slice(&body[4..4 + length]).unwrap();
+                        let uploads = manifest["uploads"].as_array().unwrap();
+                        assert!((1..=8).contains(&uploads.len()));
+                        let mut offset = 4 + length;
+                        let mut results = Vec::new();
+                        for upload in uploads {
+                            let id = upload["sessionId"].as_str().unwrap();
+                            assert!(received.insert(id.to_owned()));
+                            let size = upload["fileSize"].as_u64().unwrap() as usize;
+                            assert_eq!(
+                                hex::encode(Sha256::digest(&body[offset..offset + size])),
+                                upload["fileHash"]
+                            );
+                            offset += size;
+                            let rejected = id == format!("s{:032}", 4);
+                            results.push(json!({"sessionId":id,"prepared":!rejected,
+                            "status":if rejected {400} else {202},"published":false}));
+                        }
+                        assert_eq!(offset, body.len());
+                        json!({"results":results})
+                    } else {
+                        panic!("unexpected request: {}", headers.lines().next().unwrap());
+                    };
+                reply(&mut socket, 200, &response.to_string(), "").await;
+            }
+        });
+        let summary = tokio::time::timeout(Duration::from_secs(10), async {
+            let result = transfer(&client, "main", infos, 1, 3).await.unwrap();
+            server.await.unwrap();
+            result
+        })
+        .await
+        .expect("serial preparation and partial receipt tails must finish");
+        assert_eq!(summary.pushed, 8);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.errors.len(), 1);
+        assert!(summary.errors[0].contains("4-data"));
+    }
 
     #[tokio::test]
     async fn inline_native_frame_retains_budget_and_never_blocks_the_producer() {

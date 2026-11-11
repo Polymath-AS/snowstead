@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createCipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, verify } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -34,7 +34,7 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     SIGNING_MASTER_KEY: master.toString("base64"), REQUIRE_CACHE_SIGNING_KEYS: "true",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",
-    DATABASE_MAX_CONNECTIONS: "2", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info", PUBLIC_URL: "", UPSTREAM_CACHES: "" };
+    DATABASE_MAX_CONNECTIONS: "2", PUSH_JOB_PUBLICATION_WORKERS: "1", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info", PUBLIC_URL: "", UPSTREAM_CACHES: "" };
   let server;
   let closed;
   const stop = async () => {
@@ -59,25 +59,27 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     await db.connect();
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
     try {
-      const { rows: [{ id }] } = await db.query("INSERT INTO caches(name) VALUES ('native') RETURNING id");
-      await db.query("INSERT INTO cache_protocols(cache_id,protocol) VALUES ($1,'nix')", [id]);
-      const seed = privateKey.export({ type: "pkcs8", format: "der" }).subarray(-32);
-      const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
-      const keyId = randomUUID();
-      const keyName = `server-fixture-${id}`;
-      const publicName = `${keyName}:${publicBytes.toString("base64")}`;
-      const iv = randomBytes(12);
-      const cipher = createCipheriv("aes-256-gcm", master, iv);
-      cipher.setAAD(Buffer.from(JSON.stringify(["v2", id, keyId, keyName, publicName])));
-      const material = Buffer.concat([iv, cipher.update(Buffer.concat([seed, publicBytes])), cipher.final(), cipher.getAuthTag()]);
-      await db.query("UPDATE caches SET signing_key_name=$2,signing_public_key=$3,signing_key_sealed=$4 WHERE id=$1",
-        [id, keyName, publicName, `v2:${keyId}:${material.toString("base64")}`]);
+      for (const cache of ["native", "pipeline"]) {
+        const { rows: [{ id }] } = await db.query("INSERT INTO caches(name) VALUES ($1) RETURNING id", [cache]);
+        await db.query("INSERT INTO cache_protocols(cache_id,protocol) VALUES ($1,'nix')", [id]);
+        const seed = privateKey.export({ type: "pkcs8", format: "der" }).subarray(-32);
+        const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+        const keyId = randomUUID();
+        const keyName = `server-fixture-${id}`;
+        const publicName = `${keyName}:${publicBytes.toString("base64")}`;
+        const iv = randomBytes(12);
+        const cipher = createCipheriv("aes-256-gcm", master, iv);
+        cipher.setAAD(Buffer.from(JSON.stringify(["v2", id, keyId, keyName, publicName])));
+        const material = Buffer.concat([iv, cipher.update(Buffer.concat([seed, publicBytes])), cipher.final(), cipher.getAuthTag()]);
+        await db.query("UPDATE caches SET signing_key_name=$2,signing_public_key=$3,signing_key_sealed=$4 WHERE id=$1",
+          [id, keyName, publicName, `v2:${keyId}:${material.toString("base64")}`]);
+      }
     } finally { await db.end(); }
     let url = await start();
     const issued = await fetch(`${url}/_api/v1/admin/tokens`, {
       method: "POST",
       headers: { authorization: `Bearer ${operator}`, "content-type": "application/json" },
-      body: JSON.stringify({ subject: "cli-migration", caches: ["native"], perms: ["pull", "push"] }),
+      body: JSON.stringify({ subject: "cli-migration", caches: ["native", "pipeline"], perms: ["pull", "push"] }),
     });
     assert.equal(issued.status, 201);
     const { token: credential, jti } = await issued.json();
@@ -133,6 +135,76 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
       return sum.digest("hex");
     }
     assert.equal(await digest("zstd", ["-d", "-q", "-c"], compressed), await digest("nix-store", ["--dump", path]));
+    // The explicit job mode must reach durable completion, not merely return a
+    // preparation receipt. Resume needs neither paths on stdin nor local Nix queries.
+    await stop();
+    url = await start();
+    await login();
+    let small;
+    for (const name of await readdir("/nix/store")) {
+      if (name.endsWith(".drv")) continue;
+      const candidate = join("/nix/store", name);
+      const metadata = await lstat(candidate);
+      if (metadata.isFile() && metadata.size < 4096) { small = candidate; break; }
+    }
+    assert.ok(small, "Nix shell must contain a small file output");
+    const pipeline = await run("push", "pipeline", path, small, "--no-deps", "--resumable", "--jobs", "2");
+    assert.match(pipeline.stdout, /2 pushed, 0 skipped.*0 failed/);
+    const jobId = /Push job: ([a-z0-9-]+)/.exec(pipeline.stdout)?.[1];
+    assert.ok(jobId, pipeline.stdout);
+    const jobHeaders = { authorization: `Bearer ${credential}` };
+    const completed = await (await fetch(`${url}/_api/v1/caches/pipeline/push-jobs/${jobId}`, { headers: jobHeaders })).json();
+    assert.equal(completed.job.state, "completed");
+    assert.equal(completed.available, true);
+    assert.equal(completed.members.length, 2);
+    for (const member of completed.members) assert.equal(member.session.status, "completed");
+    const pipelineInfo = await fetch(`${url}/pipeline/${hash}.narinfo`, { headers: jobHeaders });
+    assert.equal(pipelineInfo.status, 200);
+    const pipelineMetadata = await pipelineInfo.text();
+    const pipelineDownload = await fetch(new URL(/^URL: (.+)$/m.exec(pipelineMetadata)[1], pipelineInfo.url), { headers: jobHeaders });
+    assert.equal(pipelineDownload.status, 200);
+    assert.equal(await digest("zstd", ["-d", "-q", "-c"], Buffer.from(await pipelineDownload.arrayBuffer())), await digest("nix-store", ["--dump", path]));
+    const smallInfo = await fetch(`${url}/pipeline/${small.split("/").at(-1).slice(0, 32)}.narinfo`, { headers: jobHeaders });
+    assert.equal(smallInfo.status, 200);
+    const smallMetadata = await smallInfo.text();
+    const smallDownload = await fetch(new URL(/^URL: (.+)$/m.exec(smallMetadata)[1], smallInfo.url), { headers: jobHeaders });
+    assert.equal(smallDownload.status, 200);
+    assert.equal(await digest("zstd", ["-d", "-q", "-c"], Buffer.from(await smallDownload.arrayBuffer())), await digest("nix-store", ["--dump", small]));
+    await stop();
+    url = await start();
+    await login();
+    const resumed = await run("push", "pipeline", "--resume", jobId);
+    assert.match(resumed.stdout, /0 pushed, 2 skipped.*0 failed/);
+    const cached = await run("push", "pipeline", path, small, "--no-deps", "--resumable");
+    assert.match(cached.stdout, /0 pushed, 2 skipped.*0 failed/);
+    const closure = (await exec("nix-store", ["--query", "--requisites", small])).stdout.trim().split("\n");
+    const cachedMembers = closure.filter(member => member === small || member === path).length;
+    const fullClosure = await run("push", "pipeline", small, "--resumable");
+    assert.match(fullClosure.stdout, new RegExp(`${closure.length - cachedMembers} pushed, ${cachedMembers} skipped.*0 failed`));
+    await stop();
+    env.PUSH_JOB_PUBLICATION_WORKERS = "0";
+    url = await start();
+    await login();
+    let interrupted;
+    await assert.rejects(run("push", "pipeline", small, "--no-deps", "--resumable"), error => {
+      assert.match(error.stderr, /require server publication workers/);
+      interrupted = /Push job: (\S+)/.exec(error.stdout)?.[1];
+      assert.ok(interrupted, error.stdout);
+      return true;
+    });
+    await stop();
+    env.PUSH_JOB_PUBLICATION_WORKERS = "1";
+    url = await start();
+    await login();
+    const recovered = await run("push", "pipeline", "--resume", interrupted);
+    assert.match(recovered.stdout, /0 pushed, 1 skipped.*0 failed/);
+    const removed = await fetch(`${url}/_api/v1/admin/caches/pipeline/paths/delete`, {
+      method: "POST", headers: { authorization: `Bearer ${operator}`, "content-type": "application/json" },
+      body: JSON.stringify({ storePathHashes: [hash] }),
+    });
+    assert.equal(removed.status, 200);
+    await assert.rejects(run("push", "pipeline", "--resume", jobId), /no longer fully available/);
+    assert.equal((await fetch(`${url}/pipeline/${hash}.narinfo`, { headers: jobHeaders })).status, 404);
     const revoked = await fetch(`${url}/_api/v1/admin/tokens/${jti}/revoke`, {
       method: "POST",
       headers: { authorization: `Bearer ${operator}`, "content-type": "application/json" },

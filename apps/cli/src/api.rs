@@ -14,6 +14,7 @@ pub struct Client {
     authorization: header::HeaderValue,
     http: reqwest::Client,
     upstream: reqwest::Client,
+    push_job: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,8 +34,12 @@ pub struct Session {
     pub session_id: String,
     pub part_size: u64,
     pub inline: bool,
+    #[serde(default)]
+    pub prepared: bool,
+    pub status: Option<String>,
+    pub receipt: Option<Finalize>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionParams {
     pub store_path: String,
@@ -54,6 +59,8 @@ pub struct CommitResult {
     pub session_id: String,
     #[serde(default)]
     pub published: bool,
+    #[serde(default)]
+    pub prepared: bool,
     pub status: Option<u16>,
     pub error: Option<String>,
 }
@@ -63,7 +70,7 @@ pub struct UploadedPart {
     pub part_number: u32,
     pub etag: String,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Finalize {
     pub session_id: String,
@@ -148,6 +155,7 @@ impl Client {
         Ok(Self {
             server: server.server.trim_end_matches('/').to_owned(),
             authorization,
+            push_job: None,
             http: reqwest::Client::builder()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(300))
@@ -157,7 +165,7 @@ impl Client {
                 .build()?,
         })
     }
-    async fn request(
+    pub(crate) async fn request(
         &self,
         operation: &str,
         method: Method,
@@ -186,7 +194,7 @@ impl Client {
     }
     // One attempt only: callers share a four-attempt budget across HTTP and
     // per-upload failures. Never use this for non-idempotent session creation.
-    async fn replayable_post<T: DeserializeOwned>(
+    pub(crate) async fn replayable_post<T: DeserializeOwned>(
         &self,
         operation: &str,
         path: &str,
@@ -234,6 +242,24 @@ impl Client {
             sessions: Vec<Session>,
         }
         let path = format!("/_api/v1/caches/{}/upload-streams/batch", segment(cache)?);
+        if let Some(job) = &self.push_job {
+            for attempt in 1..=4 {
+                if let Some(data) = self
+                    .replayable_post::<Sessions>(
+                        "create-sessions",
+                        &path,
+                        json!({"jobId":job,"paths":paths}),
+                    )
+                    .await?
+                {
+                    return Ok(data.sessions);
+                }
+                if attempt < 4 {
+                    backoff(attempt).await;
+                }
+            }
+            bail!("create-sessions: failed after 4 attempts");
+        }
         for attempt in 1..=4 {
             let response = self
                 .request(
@@ -271,7 +297,11 @@ impl Client {
             if let Some(data) = self
                 .replayable_post::<Results>(
                     "finalize",
-                    "/_api/v1/uploads/finalize",
+                    if self.push_job.is_some() {
+                        "/_api/v1/uploads/finalize?prepareOnly=true"
+                    } else {
+                        "/_api/v1/uploads/finalize"
+                    },
                     json!({"uploads":paths}),
                 )
                 .await?
@@ -345,7 +375,15 @@ impl Client {
             ));
             let response = self
                 .http
-                .post(format!("{}/_api/v1/uploads/inline/batch", self.server))
+                .post(format!(
+                    "{}/_api/v1/uploads/inline/batch{}",
+                    self.server,
+                    if self.push_job.is_some() {
+                        "?prepareOnly=true"
+                    } else {
+                        ""
+                    }
+                ))
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .header(header::CONTENT_TYPE, "application/octet-stream")
                 .header(header::CONTENT_LENGTH, length)
@@ -627,8 +665,17 @@ impl Client {
             .await
             .is_ok_and(|r| r.status().is_success())
     }
+    pub fn for_job(&self, id: &str) -> Result<Self> {
+        let mut client = self.clone();
+        client.push_job = Some(segment(id)?);
+        Ok(client)
+    }
+
+    pub fn prepares_only(&self) -> bool {
+        self.push_job.is_some()
+    }
 }
-fn segment(value: &str) -> Result<String> {
+pub(crate) fn segment(value: &str) -> Result<String> {
     if value.is_empty()
         || value == "."
         || value == ".."

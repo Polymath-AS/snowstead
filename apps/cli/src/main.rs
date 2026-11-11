@@ -7,6 +7,7 @@ mod local;
 mod nar;
 mod nix;
 mod push;
+mod push_job;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -54,6 +55,12 @@ enum Command {
         /// Upload .drv files (build recipes) instead of rejecting them.
         #[arg(long)]
         allow_drv: bool,
+        /// Prepare transfers independently and retain a resumable push job.
+        #[arg(long, conflicts_with = "resume")]
+        resumable: bool,
+        /// Resume a push job without repeating completed transfers or passing paths.
+        #[arg(long, conflicts_with_all = ["paths", "no_deps", "allow_drv"])]
+        resume: Option<String>,
         #[arg(long, default_value = "32", value_parser = positive)]
         jobs: usize,
         #[arg(long, default_value = "3", value_parser = clap::value_parser!(i32).range(1..=19))]
@@ -245,10 +252,17 @@ async fn async_main() -> Result<()> {
 async fn run(mut cli: Cli) -> Result<()> {
     // Validate command combinations before loading credentials or making requests.
     if let Command::Push {
-        paths, allow_drv, ..
+        paths,
+        allow_drv,
+        resume,
+        ..
     } = &mut cli.command
     {
-        *paths = push_roots(std::mem::take(paths), *allow_drv)?;
+        if let Some(id) = resume {
+            api::segment(id)?;
+        } else {
+            *paths = push_roots(std::mem::take(paths), *allow_drv)?;
+        }
     }
     match &cli.command {
         Command::Cache {
@@ -299,19 +313,34 @@ async fn run(mut cli: Cli) -> Result<()> {
             paths,
             no_deps,
             allow_drv: _,
+            resumable,
+            resume,
             jobs,
             compression_level,
         } => {
-            let paths = if no_deps {
-                paths
+            let summary = if resumable || resume.is_some() {
+                push_job::push(
+                    &client,
+                    &cache,
+                    paths,
+                    no_deps,
+                    resume.as_deref(),
+                    jobs,
+                    compression_level,
+                )
+                .await?
             } else {
-                println!("Resolving closure...");
-                let paths = nix::closure(&paths).await?;
-                println!("Found {} paths in closure", paths.len());
-                paths
+                let paths = if no_deps {
+                    paths
+                } else {
+                    println!("Resolving closure...");
+                    let paths = nix::closure(&paths).await?;
+                    println!("Found {} paths in closure", paths.len());
+                    paths
+                };
+                tracing::debug!(target: "snowstead", paths = paths.len(), jobs, compression_level, "Starting push");
+                push::push(&client, &cache, paths, jobs, compression_level).await?
             };
-            tracing::debug!(target: "snowstead", paths = paths.len(), jobs, compression_level, "Starting push");
-            let summary = push::push(&client, &cache, paths, jobs, compression_level).await?;
             println!(
                 "Done: {} pushed, {} skipped ({} served upstream), {} failed",
                 summary.pushed, summary.skipped, summary.upstream, summary.failed
