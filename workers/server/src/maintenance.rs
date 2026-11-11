@@ -2,22 +2,32 @@
 //!
 //! SQL withdrawal records exact keys in a durable cleanup queue. Storage I/O
 //! never holds a transaction. Legacy canonical installations do not expire.
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 
 use futures_util::{StreamExt, stream};
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::{AppState, auth::JWT_CLOCK_SKEW_SECONDS, management_policy::MetadataTarget};
+use crate::{
+    AppState, auth::JWT_CLOCK_SKEW_SECONDS, lifecycle::UploadStatus,
+    management_policy::MetadataTarget,
+};
 
 const BATCH: i64 = 500;
 const BATCHES: usize = 20;
 const CLEANUP_CONCURRENCY: usize = 8;
-// At most 400 distinct sessions per sweep, each with one 500-receipt page and
-// one 500-object listing. Do not let one huge or broken upload spend the run.
+// Each session costs one transaction, with one 500-receipt page. Do not let
+// one huge or broken upload spend the run: the cursor moves past it.
 const SESSION_PAGE: usize = 20;
-const SESSION_PAGES: usize = 20;
+// Row expiry and the session sweep run until drained, since each can gain far
+// more than one batch between runs. Both stay bounded: the deadline is checked
+// between statements (batch size and statement timeouts are unchanged), and
+// the iteration caps hold even if the clock does not.
+const SESSION_PAGES: usize = 5_000;
+const SESSION_BUDGET: Duration = Duration::from_secs(300);
+const ROW_BATCHES: usize = 2_000;
+const ROW_BUDGET: Duration = Duration::from_secs(60);
 // Retain revocations beyond the verifier's entire acceptance window, with
 // a small margin for clock/precision differences between SQL and the server.
 const TOKEN_EXPIRY_MARGIN_SECONDS: i64 = 5;
@@ -76,6 +86,10 @@ pub(crate) struct Counts {
     tracing::instrument(target = "snowstead_observability", skip_all, name = "maintenance.run")
 )]
 pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
+    run_bounded(state, SESSION_PAGES).await
+}
+
+async fn run_bounded(state: &AppState, session_pages: usize) -> anyhow::Result<Counts> {
     let Ok(_running) = RUNNING.try_lock() else {
         return Ok(Counts::default());
     };
@@ -110,7 +124,7 @@ pub(crate) async fn run(state: &AppState) -> anyhow::Result<Counts> {
         &mut counts.sessions,
         &mut counts.failed_stages,
         "upload sessions",
-        sessions(state).await,
+        sessions(state, session_pages).await,
     );
     // Also finds unadmitted parts, assembled sources, and transfers that finish
     // after their expired session was removed. The cursor wraps on every pass.
@@ -230,6 +244,20 @@ async fn lock(tx: &mut Transaction<'_, Postgres>, key: &str) -> anyhow::Result<(
     )
 )]
 async fn expire_rows(pool: &PgPool, table: &'static str) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + ROW_BUDGET;
+    let mut count = 0;
+    // One short autocommit statement per batch: other writers interleave.
+    for _ in 0..ROW_BATCHES {
+        let n = expire_row_batch(pool, table).await?;
+        count += n;
+        if n < BATCH as u64 || Instant::now() >= deadline {
+            break;
+        }
+    }
+    Ok(count)
+}
+
+async fn expire_row_batch(pool: &PgPool, table: &'static str) -> anyhow::Result<u64> {
     let result = match table {
         "api_tokens" => {
             sqlx::query!(
@@ -608,7 +636,7 @@ struct Session {
     file_hash: Option<String>,
     file_size: i64,
     compression: String,
-    status: String,
+    status: UploadStatus,
     r2_upload_key: Option<String>,
     r2_upload_id: Option<String>,
 }
@@ -622,7 +650,8 @@ struct Session {
         name = "maintenance.sessions"
     )
 )]
-async fn sessions(state: &AppState) -> anyhow::Result<u64> {
+async fn sessions(state: &AppState, pages: usize) -> anyhow::Result<u64> {
+    let deadline = Instant::now() + SESSION_BUDGET;
     // IDs are immutable. Persist a keyset cursor even for partial/failed work
     // so those oldest records cannot monopolize successive bounded sweeps.
     let mut cursor: Option<String> = sqlx::query_scalar!(
@@ -637,7 +666,7 @@ async fn sessions(state: &AppState) -> anyhow::Result<u64> {
     .await?;
     let mut count = 0;
     let mut failed = false;
-    for page in 0..SESSION_PAGES {
+    for page in 0..pages {
         let candidates = sqlx::query!(
             r#"
             SELECT
@@ -708,6 +737,10 @@ async fn sessions(state: &AppState) -> anyhow::Result<u64> {
         .execute(&state.pool)
         .await?;
         cursor = next;
+        // The saved cursor resumes here next run.
+        if Instant::now() >= deadline {
+            break;
+        }
     }
     if failed {
         anyhow::bail!("Session cleanup incomplete")
@@ -735,7 +768,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
             u.file_hash,
             u.file_size,
             u.compression,
-            u.status,
+            u.status AS "status: UploadStatus",
             u.r2_upload_key,
             u.r2_upload_id
         FROM upload_sessions u
@@ -758,7 +791,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
         if !key.starts_with("staging/") {
             // Old canonical MPUs may still complete after an abort. An expired
             // SQL lease does not prove their bytes are safe to reclaim.
-            if s.r2_upload_id.is_some() && s.status != "completed" {
+            if s.r2_upload_id.is_some() && s.status != UploadStatus::Completed {
                 return Ok(false);
             }
             if let Some(hash) = &s.file_hash {
@@ -786,7 +819,7 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
             let upload = s
                 .r2_upload_id
                 .as_ref()
-                .filter(|upload| *upload != &s.id && s.status != "completed");
+                .filter(|upload| *upload != &s.id && s.status != UploadStatus::Completed);
             sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) \
                 ON CONFLICT(is_private,key) DO UPDATE SET upload_id=COALESCE(object_cleanup.upload_id,EXCLUDED.upload_id)")
                 .bind(key).bind(upload).execute(&mut *tx).await?;
@@ -1659,6 +1692,9 @@ mod tests {
     ) {
         let _run = RUN_TESTS.lock().await;
         let (state, cache) = fixture(pool).await;
+        // A run stops at its page budget here, as a production run does at its
+        // deadline: the cursor rules are the same.
+        const PAGES: usize = 20;
         // Both troublesome records precede more than a full run's budget.
         for id in ["a-failing", "b-partial"] {
             let key = format!("staging/{id}/source");
@@ -1696,7 +1732,7 @@ mod tests {
             state.storage.put(true, &key, b"data").await.unwrap();
         }
 
-        let counts = run(&state).await.unwrap();
+        let counts = run_bounded(&state, PAGES).await.unwrap();
         assert_eq!(counts.failed_stages, 1);
         let healthy: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM upload_sessions WHERE starts_with(id,'healthy-')",
@@ -1731,7 +1767,7 @@ mod tests {
             "one bounded receipt page, not repeated oldest-session work"
         );
 
-        let counts = run(&state).await.unwrap();
+        let counts = run_bounded(&state, PAGES).await.unwrap();
         assert_eq!(
             counts.failed_stages, 0,
             "cursor advances past the failed record"
@@ -1751,7 +1787,7 @@ mod tests {
                 .is_err()
         );
 
-        assert_eq!(run(&state).await.unwrap().failed_stages, 1);
+        assert_eq!(run_bounded(&state, PAGES).await.unwrap().failed_stages, 1);
         let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_parts")
             .fetch_one(&state.pool)
             .await
@@ -1764,7 +1800,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        let counts = run(&state).await.unwrap();
+        let counts = run_bounded(&state, PAGES).await.unwrap();
         assert_eq!(counts.failed_stages, 0);
         assert_eq!(counts.sessions, 2);
         let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_sessions")
@@ -1785,6 +1821,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn one_run_drains_backlogs_larger_than_a_batch(pool: PgPool) {
+        let _run = RUN_TESTS.lock().await;
+        let (state, cache) = fixture(pool).await;
+        // More than one 500-row batch per table and more than twenty session
+        // pages: what a single run used to leave behind for six hours.
+        sqlx::raw_sql(
+            "INSERT INTO audit_logs(actor,action,status,timestamp)
+             SELECT 'ci','push',200,now()-interval '31 days' FROM generate_series(1,1201);
+             INSERT INTO audit_logs(actor,action,status) VALUES('ci','push',200);
+             INSERT INTO eviction_logs(org_id,cache_id,cache,product,key,size,reason,evicted_at)
+             SELECT 'maintenance',0,'cache','nix',n::text,1,'capacity',now()-interval '31 days'
+             FROM generate_series(1,501) n;",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,expires_at)
+             SELECT 'expired-'||n,$1,n::text,'/nix/store/'||n,'sha256:test',4,4,'zstd','streaming',now()-interval '1 day'
+             FROM generate_series(1,450) n",
+        )
+        .bind(cache)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let counts = run(&state).await.unwrap();
+        assert_eq!(counts.failed_stages, 0);
+        assert_eq!(counts.audit_logs, 1201);
+        assert_eq!(counts.eviction_logs, 501);
+        assert_eq!(counts.sessions, 450);
+        let remaining: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM audit_logs), (SELECT count(*) FROM eviction_logs),
+                (SELECT count(*) FROM upload_sessions)",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (1, 0, 0), "only the unexpired audit row remains");
     }
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
@@ -2244,7 +2323,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        assert_eq!(sessions(&state).await.unwrap(), 0);
+        assert_eq!(sessions(&state, SESSION_PAGES).await.unwrap(), 0);
         let app = crate::router(state.clone());
         assert_eq!(
             request(
@@ -2256,7 +2335,7 @@ mod tests {
             .await,
             StatusCode::OK
         );
-        assert_eq!(sessions(&state).await.unwrap(), 2);
+        assert_eq!(sessions(&state, SESSION_PAGES).await.unwrap(), 2);
         orphan_page(&state, "staging/", None).await.unwrap();
         cleanup_objects(&state, &mut CleanupCursor::default())
             .await

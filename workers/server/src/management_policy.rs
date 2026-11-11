@@ -6,6 +6,7 @@ use crate::{
     AppState,
     auth::Identity,
     error::{ApiError, json_response},
+    lifecycle::{InstallationPhase, PinKeep, UploadStatus},
     management::ManagementContext,
     management_auth::js_number,
 };
@@ -945,7 +946,7 @@ async fn list_pins(tx: &mut Transaction, id: i32) -> Result<Vec<Value>, ApiError
         r#"
         SELECT
             p.name,
-            p.keep_kind,
+            p.keep_kind AS "keep_kind: PinKeep",
             p.keep_value,
             p.current_revision,
             r.revision,
@@ -969,11 +970,11 @@ async fn list_pins(tx: &mut Transaction, id: i32) -> Result<Vec<Value>, ApiError
         let name = row.name;
         if pins.last().is_none_or(|p| p["name"] != name) {
             let kind = row.keep_kind;
-            let keep = if kind == "forever" {
-                json!("forever")
+            let keep = if kind == PinKeep::Forever {
+                json!(kind.as_str())
             } else {
                 let mut v = json!({});
-                v[&kind] = json!(row.keep_value);
+                v[kind.as_str()] = json!(row.keep_value);
                 v
             };
             pins.push(json!({"name":name,"keep":keep,"currentRevision":row.current_revision,"history":[]}));
@@ -997,19 +998,19 @@ async fn put_pin(tx: &mut Transaction, cache: i32, value: Value) -> Result<Respo
         .filter(|s| store_path_valid(s))
         .ok_or_else(|| bad("storePath must be a full Nix store path"))?;
     let keep = &value["keep"];
-    let (kind, count) = if keep == "forever" {
-        ("forever", None)
+    let (kind, count) = if keep == PinKeep::Forever.as_str() {
+        (PinKeep::Forever, None)
     } else {
-        strict(keep, &["days", "revisions"])?;
-        let kind = if keep.get("days").is_some() {
-            "days"
+        strict(keep, &[PinKeep::Days.as_str(), PinKeep::Revisions.as_str()])?;
+        let kind = if keep.get(PinKeep::Days.as_str()).is_some() {
+            PinKeep::Days
         } else {
-            "revisions"
+            PinKeep::Revisions
         };
         if keep.as_object().unwrap().len() != 1 {
             return Err(bad("Invalid keep"));
         }
-        let count = keep[kind]
+        let count = keep[kind.as_str()]
             .as_f64()
             .filter(|n| n.fract() == 0.0 && (1.0..=10000.0).contains(n))
             .ok_or_else(|| bad("Invalid keep"))? as i32;
@@ -1107,7 +1108,7 @@ async fn put_pin(tx: &mut Transaction, cache: i32, value: Value) -> Result<Respo
         &id,
         cache,
         name,
-        kind,
+        kind.as_str(),
         count,
         revision
     )
@@ -1374,19 +1375,22 @@ async fn delete_paths(
     // uploads remain valid; completed outcomes may replay but never republish.
     crate::push_jobs::withdraw(tx, cache, Some(&withdrawn)).await?;
     sqlx::query(
-        "UPDATE upload_sessions SET status='aborted' WHERE cache_id=$1 \
-        AND store_path_hash=ANY($2) AND status<>'completed'",
+        "UPDATE upload_sessions SET status=$3 WHERE cache_id=$1 \
+        AND store_path_hash=ANY($2) AND status<>$4",
     )
     .bind(cache)
     .bind(&withdrawn)
+    .bind(UploadStatus::Aborted)
+    .bind(UploadStatus::Completed)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "UPDATE nar_installations SET phase='revoked' WHERE session_id IN ( \
+        "UPDATE nar_installations SET phase=$3 WHERE session_id IN ( \
         SELECT id FROM upload_sessions WHERE cache_id=$1 AND store_path_hash=ANY($2))",
     )
     .bind(cache)
     .bind(&withdrawn)
+    .bind(InstallationPhase::Revoked)
     .execute(&mut **tx)
     .await?;
     metadata.withdraw(tx, &withdrawn).await?;

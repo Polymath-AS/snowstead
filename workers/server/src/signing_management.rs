@@ -28,6 +28,7 @@ use crate::{
     auth::Identity,
     config::Config,
     error::{ApiError, json_response},
+    lifecycle::SigningKeyState,
     management::ManagementContext,
 };
 
@@ -193,7 +194,7 @@ struct History {
     signing_public_key: String,
     signing_key_sealed: Option<String>,
     managed_public_key: Option<String>,
-    state: String,
+    state: SigningKeyState,
     created_at: DateTime<Utc>,
 }
 
@@ -227,7 +228,7 @@ async fn history(conn: &mut sqlx::PgConnection, cache_id: i32) -> Result<Vec<His
                 signing_public_key,
                 signing_key_sealed,
                 managed_public_key,
-                state,
+                state AS "state: SigningKeyState",
                 created_at
             FROM cache_signing_keys
             WHERE cache_id = $1
@@ -321,14 +322,14 @@ async fn list_keys(
     let mut keys: Vec<Value> = rows
         .iter()
         .map(|k| {
-            json!({"id": k.id, "publicKey": k.signing_public_key, "state": k.state,
+            json!({"id": k.id, "publicKey": k.signing_public_key, "state": k.state.as_str(),
             "createdAt": k.created_at.to_rfc3339_opts(SecondsFormat::Millis, true)})
         })
         .collect();
     if let Some(p) = &public
         && !rows.iter().any(|k| &k.signing_public_key == p)
     {
-        keys.push(json!({"id": null, "publicKey": p, "state": "active"}));
+        keys.push(json!({"id": null, "publicKey": p, "state": SigningKeyState::Active.as_str()}));
     }
     tx.commit().await?;
     Ok(json_response(
@@ -452,7 +453,7 @@ async fn create_key(
     if made {
         Ok(json_response(
             StatusCode::CREATED,
-            json!({"id":key.id,"publicKey":key.signing_public_key,"state":"staged"}),
+            json!({"id":key.id,"publicKey":key.signing_public_key,"state":SigningKeyState::Staged.as_str()}),
         ))
     } else {
         Err(ApiError::new(
@@ -479,7 +480,7 @@ async fn activate_key(
         .iter()
         .find(|k| k.id == id)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no signing key"))?;
-    if target.state != "staged"
+    if target.state != SigningKeyState::Staged
         || target
             .signing_key_sealed
             .as_ref()
@@ -579,6 +580,6 @@ async fn activate_key(
     tx.commit().await?;
     Ok(json_response(
         StatusCode::OK,
-        json!({"id":id,"publicKey":target.signing_public_key,"state":"active"}),
+        json!({"id":id,"publicKey":target.signing_public_key,"state":SigningKeyState::Active.as_str()}),
     ))
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            p.name,\n            p.keep_kind,\n            p.keep_value,\n            p.current_revision,\n            r.revision,\n            r.store_path,\n            r.created_at,\n            r.superseded_at,\n            (r.revision = p.current_revision\n                OR p.keep_kind = 'forever'\n                OR (p.keep_kind = 'revisions' AND r.revision > p.current_revision - p.keep_value)\n                OR (p.keep_kind = 'days' AND r.superseded_at > NOW() - p.keep_value * INTERVAL '1 day')\n            ) AS \"pinned!\"\n        FROM pins p\n        JOIN pin_revisions r ON r.pin_id = p.id\n        WHERE p.cache_id = $1\n        ORDER BY p.name, r.revision DESC\n        ",
+  "query": "\n        SELECT\n            p.name,\n            p.keep_kind AS \"keep_kind: PinKeep\",\n            p.keep_value,\n            p.current_revision,\n            r.revision,\n            r.store_path,\n            r.created_at,\n            r.superseded_at,\n            (r.revision = p.current_revision\n                OR p.keep_kind = 'forever'\n                OR (p.keep_kind = 'revisions' AND r.revision > p.current_revision - p.keep_value)\n                OR (p.keep_kind = 'days' AND r.superseded_at > NOW() - p.keep_value * INTERVAL '1 day')\n            ) AS \"pinned!\"\n        FROM pins p\n        JOIN pin_revisions r ON r.pin_id = p.id\n        WHERE p.cache_id = $1\n        ORDER BY p.name, r.revision DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "keep_kind",
+        "name": "keep_kind: PinKeep",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -115,5 +115,5 @@
       null
     ]
   },
-  "hash": "1f8031068b8bf78b27e659e6f13bd6e3c8378007f5cc75883b2024a880adbfd1"
+  "hash": "484eeea545c5e37df537e229b0a1817b0afe8220db4bc26719f6f4798a5ccb9a"
 }

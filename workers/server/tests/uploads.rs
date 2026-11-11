@@ -6154,3 +6154,166 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     proxy_task.await.unwrap();
     single.close().await;
 }
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn sealed_sessions_can_be_aborted_without_racing_publication(pool: PgPool) {
+    let storage = common::storage();
+    let state = AppState::new(
+        pool.clone(),
+        Config {
+            auth_token: "legacy".into(),
+            ..Default::default()
+        },
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let app = router(state.clone());
+    pool_execute(&pool, "INSERT INTO caches(name) VALUES('main');
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;
+        CREATE FUNCTION fail_publication() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected publication failure'; END $$;
+        CREATE TRIGGER fail_publication BEFORE INSERT ON published_paths FOR EACH ROW EXECUTE FUNCTION fail_publication();").await;
+    let abort = |id: String| {
+        let app = app.clone();
+        async move {
+            post(
+                &app,
+                &format!("/_api/v1/uploads/{id}/abort"),
+                "legacy",
+                json!({}),
+            )
+            .await
+            .0
+        }
+    };
+    let status = |id: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT status FROM upload_sessions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Sealed, then failed: verification rejects one, publication the other.
+    let raw = nar(b"sealed but never published");
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    let mut corrupt = path_input(&"a".repeat(32), &raw, true);
+    corrupt["narHash"] = json!(format!("sha256:{}", "0".repeat(64)));
+    let unverified = upload_inline(&app, "main", corrupt, &compressed).await;
+    assert_eq!(unverified["status"], 400, "{unverified}");
+    let unpublished = upload_inline(
+        &app,
+        "main",
+        path_input(&"b".repeat(32), &raw, true),
+        &compressed,
+    )
+    .await;
+    assert_eq!(unpublished["status"], 500, "{unpublished}");
+    let unverified = unverified["sessionId"].as_str().unwrap().to_owned();
+    let unpublished = unpublished["sessionId"].as_str().unwrap().to_owned();
+    // The failed publication keeps its verified candidate reserved for a retry.
+    let reserved: String =
+        sqlx::query_scalar("SELECT key FROM nar_installations WHERE session_id=$1")
+            .bind(&unpublished)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    for id in [&unverified, &unpublished] {
+        assert_eq!(status(id.clone()).await, "finalizing");
+        // Idempotent, like an abort while streaming.
+        for _ in 0..2 {
+            assert_eq!(abort(id.clone()).await, StatusCode::OK);
+        }
+        assert_eq!(status(id.clone()).await, "aborted");
+    }
+    // The reservation is released as expiry releases it: gone, and its exact
+    // key handed to cleanup rather than left adoptable.
+    let reservations: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_installations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reservations, 0);
+    let queued: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE key=$1)")
+            .bind(&reserved)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(queued);
+    // Aborted is final: the same bytes cannot be sealed or published again.
+    pool_execute(&pool, "DROP TRIGGER fail_publication ON published_paths").await;
+    let hash = hex::encode(Sha256::digest(&compressed));
+    let (code, _, bytes) = send(
+        &app,
+        "POST",
+        &format!("/_api/v1/uploads/{unpublished}/inline?fileHash={hash}"),
+        Some("legacy"),
+        &[("content-length", &compressed.len().to_string())],
+        compressed.clone(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let replay: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(replay["status"], 409, "{replay}");
+    assert_eq!(replay["published"], false);
+
+    // Abort and publication fence each other: whatever the interleaving,
+    // exactly one outcome is recorded and no reservation outlives it.
+    for round in 0..12u8 {
+        let raw = nar(&[b'r', round]);
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+        let store_hash = format!(
+            "{}{}",
+            "c".repeat(31),
+            b"0123456789ab"[round as usize] as char
+        );
+        let session = create(&app, "main", "legacy", path_input(&store_hash, &raw, true)).await;
+        let id = session["sessionId"].as_str().unwrap().to_owned();
+        let path = format!(
+            "/_api/v1/uploads/{id}/inline?fileHash={}",
+            hex::encode(Sha256::digest(&compressed))
+        );
+        let length = compressed.len().to_string();
+        let headers = [("content-length", length.as_str())];
+        let upload = send(&app, "POST", &path, Some("legacy"), &headers, compressed);
+        let racing = async {
+            // Let the upload reach a different point each round.
+            for _ in 0..round * 3 {
+                tokio::task::yield_now().await;
+            }
+            abort(id.clone()).await
+        };
+        let ((_, _, bytes), aborted) = tokio::join!(upload, racing);
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let published: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM published_paths WHERE store_path_hash=$1)",
+        )
+        .bind(&store_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(result["published"] == true, published, "{result}");
+        let recorded = status(id.clone()).await;
+        if aborted == StatusCode::OK {
+            assert!(!published, "round {round}: aborted and published");
+            assert_eq!(recorded, "aborted");
+        } else {
+            // Refused by the fence or by the completed publication.
+            assert!(
+                aborted == StatusCode::CONFLICT || aborted == StatusCode::SERVICE_UNAVAILABLE,
+                "round {round}: {aborted}"
+            );
+        }
+        if published {
+            assert_eq!(recorded, "completed");
+        }
+        let reservations: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_installations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0, "round {round}");
+    }
+}

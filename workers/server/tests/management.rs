@@ -1069,3 +1069,72 @@ async fn management_limit_is_shared_by_router_clones_and_operator_is_exempt(pool
         StatusCode::OK
     );
 }
+
+thread_local! {
+    static STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts the statements sqlx logs on each thread. Every `sqlx::test` owns a
+/// current-thread runtime, so a thread's count is one test's count.
+struct Statements;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statements {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            STATEMENTS.set(STATEMENTS.get() + 1);
+        }
+    }
+}
+
+async fn counted(app: &Router, path: &str) -> (usize, Value) {
+    use tracing_subscriber::layer::SubscriberExt;
+    // Process-wide, not scoped to this thread: tracing caches whether a
+    // callsite is enabled, and a parallel test without a subscriber would
+    // otherwise cache sqlx's as disabled.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Statements))
+            .expect("no other global subscriber in tests");
+    });
+    STATEMENTS.set(0);
+    let (status, _, value) = call(app, "GET", path, Value::Null, None).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    (STATEMENTS.get(), value)
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn org_reports_read_the_org_once_and_share_round_trips(pool: PgPool) {
+    let app = router(state(pool.clone()));
+    let base = "/_api/v1/orgs/org_alpha";
+    let (status, _, _) = call(&app, "PUT", base, json!({"slug":"alpha"}), None).await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::raw_sql(
+        "INSERT INTO caches(name,org_id,size,path_count) VALUES ('main','org_alpha',7,1);
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches WHERE org_id='org_alpha';
+        INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,expires_at)
+        SELECT 'sealed',id,'hash','/nix/store/hash','sha256:test',1,5,'zstd','finalizing',now()-interval '1 day' FROM caches WHERE org_id='org_alpha';
+        INSERT INTO bandwidth_daily(org_id,cache_id,product,day,bytes,public_bytes,imported_at)
+        SELECT 'org_alpha',id,'nix',(now() AT TIME ZONE 'UTC')::date,11,13,'2026-10-01T00:00:00.123Z' FROM caches WHERE org_id='org_alpha';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let report = json!({"id":"org_alpha","slug":"alpha","movingFrom":null,"storageLimit":null,
+        "privateCaches":true,"customSigningKeys":false,"used":7,"pending":5,
+        "servedThisMonth":11,"publicServedThisMonth":13,
+        "servedThisMonthByProduct":{"nix":24,"go":0,"sccache":0},
+        "bandwidthUpdatedAt":"2026-10-01T00:00:00.123Z"});
+    // Authorization's org row, then usage (with the import time) and bandwidth.
+    let (statements, org) = counted(&app, base).await;
+    assert_eq!(org, report);
+    assert_eq!(statements, 3);
+    // The cache inventory is one more statement, not a second pass.
+    let (statements, overview) = counted(&app, &format!("{base}/overview")).await;
+    assert_eq!(statements, 4);
+    let caches = overview["caches"].as_array().unwrap();
+    assert_eq!(caches.len(), 1);
+    assert_eq!(caches[0]["name"], "main");
+    let mut without = overview.clone();
+    without.as_object_mut().unwrap().remove("caches");
+    assert_eq!(without, report);
+}
