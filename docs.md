@@ -27,15 +27,14 @@ never point it at production data. The populated benchmark database is not stagi
 For local development, `pnpm dev` runs Rust on http://127.0.0.1:8787 with
 disposable Postgres and S3 services and fresh local secrets, without `.dev.vars`.
 
-# Provision the SAME JWT_SECRET on both services: control issues tokens, Nix verifies them.
 ### Existing-installation cutover
 
 Back up and restore-test the existing database before migration. Preserve the
 original `JWT_SECRET`, `ADMIN_SECRET`, signing master key, database, buckets,
 object keys, cache URLs, and CDN rules. Supply the existing master-key value as
 Rust's `SIGNING_MASTER_KEY`; a new key makes sealed signing keys unreadable.
-Legacy self-hosters must also preserve `AUTH_TOKEN` and shared signing settings
-until their clients migrate. Keep secret values out of source control and logs.
+Legacy self-hosters must also preserve shared signing settings, and keep
+`AUTH_TOKEN` with `ALLOW_SHARED_AUTH_TOKEN=true` until their clients migrate. Keep secret values out of source control and logs.
 
 Validate the Rust backend against existing objects and clients before changing
 traffic. Retain a tested rollback path and legacy state, including KV, until
@@ -394,8 +393,8 @@ and streamed by the Rust server, never redirected to a reusable presigned URL.
 
 ## Managing tokens
 
-JWT tokens scope write access to specific caches. The signed JWT is
-returned once on creation and never stored. Save it immediately.
+API tokens (`snowstead_tok_…`) scope access to specific caches. The token is
+returned once on creation; the server keeps only a hash of it. Save it immediately.
 
 ```bash
 # Create a token scoped to the "main" cache with push access
@@ -451,11 +450,46 @@ The server remembers paths found upstream, so each is looked up there once.
 
 ## Migrating from AUTH_TOKEN
 
-1. Set `JWT_SECRET` and `ADMIN_SECRET` in the Rust runtime's secret environment.
+1. Set `ADMIN_SECRET` in the Rust runtime's secret environment, and keep
+   `AUTH_TOKEN` with `ALLOW_SHARED_AUTH_TOKEN=true` meanwhile.
 2. Log in with the admin secret: `snowstead login --token-stdin --url "$URL" --name prod < admin-token-file`
 3. Create scoped tokens: `snowstead token create ci-runner --caches main`
-4. Update publishers to log in with their JWT
-5. Remove `AUTH_TOKEN` to disable legacy auth
+4. Update publishers to log in with their token
+5. Remove `ALLOW_SHARED_AUTH_TOKEN` and `AUTH_TOKEN` to disable legacy auth
+
+## Authentication and authorization
+
+Authentication turns a request's bearer credential into one principal;
+`workers/server/src/authz.rs` then decides, in one function, whether that
+principal may take the route's action on its org, cache, or the service.
+Anything it does not allow is denied.
+
+| Credential | Principal | May |
+| --- | --- | --- |
+| `ADMIN_SECRET` | operator | `/_api/v1/admin/...` only, including org creation and limits |
+| `snowstead_web.<claims>.<signature>` | dashboard user (owner, admin, or member) | its org's management API; members can't change the slug, API keys, or signing keys |
+| `snowstead_key_<id>_<secret>` | org API key | its org's management API, except creating keys and changing the slug |
+| `snowstead_tok_<id>_<secret>` | API token | Nix, Go, and sccache in its org, per its permissions and caches; pins with `push` |
+| JWT-era token | API token | the same, only while its `jti` is listed and unrevoked in `api_tokens` |
+| `AUTH_TOKEN` | shared token | Nix pushes to the `default` org, only with `ALLOW_SHARED_AUTH_TOKEN=true` |
+
+API tokens store only a SHA-256 hash of their secret. Their permissions and
+caches live in `token_permissions` and `token_caches` and are read on every
+request; a JWT's own claims grant nothing. Migration `0015_central_auth.sql`
+backfills those tables from existing rows.
+
+The dashboard signs each org request with an Ed25519 key. The claims are
+`{aud: "snowstead-cache", org, sub, email, role, iat, exp, method, path}`,
+base64url-encoded JSON signed over `snowstead_web.<claims>`. They live at most
+60 seconds and bind the request's method and path (with its query). The
+route's org must match, and audit logs name `user:<email>` from the claims.
+`WEB_ASSERTION_PUBLIC_KEYS` holds the base64 raw public keys, separated by
+whitespace for rotation.
+
+The server refuses to start without an `ADMIN_SECRET` of at least 16
+characters, with a malformed `WEB_ASSERTION_PUBLIC_KEYS`, with
+`ALLOW_SHARED_AUTH_TOKEN=true` but no `AUTH_TOKEN`, or without `JWT_SECRET`
+while unrevoked JWT-era tokens exist.
 
 ## Audit logging
 
@@ -483,9 +517,10 @@ without an org are its tokens.
   metadata keys for cleanup and clears `movingFrom`. It does not move
   NARs or rewrite narinfo. Old raw CDN/client copies can remain stale.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
-  caches, tokens, API keys, and audit log. `ADMIN_SECRET` reaches every
-  org; an org's API key (`snowstead_key_…`) reaches only its own. Only the
-  operator sets org limits and permissions, and makes API keys.
+  caches, tokens, API keys, and audit log. The dashboard reaches it for its
+  signed-in users, and an org's API key (`snowstead_key_…`) reaches only
+  its own; `ADMIN_SECRET` does not. Only the operator sets org limits and
+  permissions, through `/_api/v1/admin/orgs/:org`.
   An org without private-cache permission keeps its
   private caches private and readable, but they take no pushes, and it
   can't make new ones.
@@ -521,7 +556,8 @@ safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
 
 - `GET /_api/v1/admin/orgs` returns
   `{orgs: [{id, slug, storageLimit, privateCaches, customSigningKeys}]}`.
-- `PUT /_api/v1/orgs/:org` takes
+- `GET /_api/v1/admin/orgs/:org` returns one org as the org GET does.
+- `PUT /_api/v1/admin/orgs/:org` takes
   `{slug?, storageLimit?, privateCaches?, customSigningKeys?}`. Creation
   requires a slug and defaults to unlimited storage, private caches allowed,
   and custom signing keys disallowed. Omitted limits preserve existing
@@ -531,10 +567,11 @@ safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
   `servedThisMonth`.
 - `GET /_api/v1/admin/overview` retains the global operator overview.
 
-All admin endpoints and org PUTs require operator `ADMIN_SECRET`
-authentication; org API keys cannot change their own limits or list all orgs.
-`org.put` records old/new slug and limits in the affected org's audit log,
-with the operator or forwarded dashboard actor identity.
+Admin endpoints require operator `ADMIN_SECRET` authentication. An org's
+owner or admin can change only its slug, with `PUT /_api/v1/orgs/:org` and
+`{slug}`; org API keys cannot change limits or list all orgs. `org.put`
+records old/new slug and limits in the affected org's audit log, with the
+operator (`admin`) or the signed-in user as actor.
 
 Limits are read from Postgres on every enforcement lookup.
 Updates apply immediately on subsequent requests. Lowering a limit never
@@ -549,8 +586,8 @@ The compatibility `POST /_api/v1/admin/auth/sync` route does not populate KV.
 
 Apply the Rust migrations through infra before deploying. All endpoints below
 use `/_api/v1/orgs/:org` (the org ID, not its mutable slug),
-return JSON with `Cache-Control: no-store`, and require `ADMIN_SECRET` or that
-org's management API key unless stated otherwise. Dates are ISO strings; sizes
+return JSON with `Cache-Control: no-store`, and require a dashboard user's
+assertion for that org or that org's API key unless stated otherwise. Dates are ISO strings; sizes
 are integer bytes. Errors use `{ "error": "message" }`.
 
 #### Token last use
@@ -566,7 +603,7 @@ lastUsedAt, expiresAt, createdBy, revokedAt, revokedBy, revocationReason }`.
 org token-list shape. The operator-wide admin token list is unchanged.
 `expiresAt`, `revokedAt`, `revokedBy`, and `revocationReason` can be null.
 
-Successful JWT authentication for Nix, Go, and sccache attempts a conditional
+Successful API token authentication for Nix, Go, and sccache attempts a conditional
 SQL update through the bounded connection pool. A token's timestamp changes at most once
 per five minutes, including concurrent calls. It records authentication, not
 successful artifact delivery. Anonymous public/CDN reads cannot identify a
@@ -630,8 +667,8 @@ type Pin = {
 
 Pin names match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`; `storePath` is a full
 `/nix/store/<hash>-<name>` path; days/revisions are integers 1–10000. Unknown
-request fields and invalid policies return 400. POST and DELETE also accept a
-JWT with Nix `push` permission for this exact cache and org. GET remains
+request fields and invalid policies return 400. POST and DELETE also accept an
+API token with Nix `push` permission for this exact cache and org. GET remains
 management-only. Writes audit `pin.create`, `pin.update`, or `pin.delete`.
 
 Re-pinning a name to a different path adds a monotonically numbered revision;
@@ -682,7 +719,7 @@ can still contend with writers; fail-fast callers must retry.
 ### Cache signing key lifecycle
 
 Run database migrations before deploying. Signing management uses the org
-API's bearer authentication (`ADMIN_SECRET` or that org's API key), not a
+API's bearer authentication (a dashboard assertion or that org's API key), not a
 push token. BYOK staging and activation require `customSigningKeys`; managed
 key rotation does not. In the dashboard, mutations require the org owner.
 All responses are

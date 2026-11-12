@@ -103,7 +103,7 @@ pkgs.testers.runNixOSTest {
     # matching stock Linux. Install the actual generic bundle, not a module.
     machine.succeed("mkdir /run/test-units; cp -a /etc/systemd/system/. /run/test-units/; chmod -R u+w /run/test-units; rm /etc/systemd/system; ln -s /run/test-units /etc/systemd/system")
     # Object storage is not exercised here; all values are dummy test inputs.
-    machine.succeed("install -d -m 0700 /etc/snowstead; printf '%s\\n' 'DATABASE_URL=postgres://snowstead@database/snowstead?sslmode=disable' 'R2_ENDPOINT=http://127.0.0.1:9999' 'R2_ACCESS_KEY_ID=test' 'R2_SECRET_ACCESS_KEY=test' > /etc/snowstead/environment; chmod 0600 /etc/snowstead/environment")
+    machine.succeed("install -d -m 0700 /etc/snowstead; printf '%s\\n' 'DATABASE_URL=postgres://snowstead@database/snowstead?sslmode=disable' 'R2_ENDPOINT=http://127.0.0.1:9999' 'R2_ACCESS_KEY_ID=test' 'R2_SECRET_ACCESS_KEY=test' 'ADMIN_SECRET=test-operator-secret' > /etc/snowstead/environment; chmod 0600 /etc/snowstead/environment")
     # Startup never migrates. Prepare the disposable application schema explicitly.
     machine.succeed("set -a; . /etc/snowstead/environment; ${serverPackage}/bin/snowstead-server migrate")
     machine.succeed("openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=origin.test -addext 'subjectAltName=DNS:origin.test,DNS:cache.test,DNS:*.example.test' -keyout /etc/snowstead/origin-key -out /etc/snowstead/origin-certificate; cp /etc/snowstead/origin-certificate /etc/snowstead/origin-client-ca; chmod 0600 /etc/snowstead/*")
