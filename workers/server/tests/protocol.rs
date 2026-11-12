@@ -13,11 +13,20 @@ use base64::{
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use snowstead_server::{AppState, auth, config::Config, router};
+use snowstead_server::{
+    AppState, auth,
+    authz::{self, Action, Resource},
+    config::Config,
+    router,
+};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-fn token(org: Option<&str>, caches: &[&str], perms: &[&str], jti: &str) -> String {
+#[path = "support/tokens.rs"]
+mod tokens;
+
+/// A JWT-era token as issued, before it is listed in `api_tokens`.
+fn jwt(org: Option<&str>, caches: &[&str], perms: &[&str], jti: &str) -> String {
     let mut claims = json!({ "jti": jti, "sub": "unchanged-cli", "iss": "snowstead", "aud": "snowstead", "iat": 1,
         "caches": caches, "perms": perms });
     if let Some(org) = org {
@@ -66,6 +75,17 @@ async fn request(
     (status, headers, body)
 }
 
+/// A listed JWT-era token, which still works with its database scope.
+async fn token(
+    pool: &PgPool,
+    org: Option<&str>,
+    caches: &[&str],
+    perms: &[&str],
+    jti: &str,
+) -> String {
+    tokens::register(pool, jwt(org, caches, perms, jti)).await
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
     sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_alpha','alpha'),('org_beta','beta');
@@ -100,7 +120,7 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
         pool.clone(),
         Config {
             jwt_secret: "contract-secret".into(),
-            auth_token: "legacy-secret".into(),
+            shared_auth_token: Some("legacy-secret".into()),
             admin_secret: "operator-secret".into(),
             upstreams: vec![upstream.clone()],
             ..Default::default()
@@ -120,7 +140,14 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let alpha = token(Some("org_alpha"), &["main"], &["push"], "alpha-token");
+    let alpha = token(
+        &pool,
+        Some("org_alpha"),
+        &["main"],
+        &["push"],
+        "alpha-token",
+    )
+    .await;
     let path = "/_api/v1/get-missing-paths";
     let body = json!({"cache":"main", "storePathHashes":[known, other_org, known_upstream, missing, missing]});
     let (status, headers, result) = request(&app, "POST", path, Some(&alpha), body.clone()).await;
@@ -202,22 +229,43 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
     assert_eq!(error["error"], "Unauthorized");
     for (credential, cache, expected) in [
         (
-            token(Some("org_beta"), &["main"], &["push"], "beta-token"),
+            token(&pool, Some("org_beta"), &["main"], &["push"], "beta-token").await,
             "go-only",
             StatusCode::NOT_FOUND,
         ),
         (
-            token(Some("org_alpha"), &["elsewhere"], &["push"], "wrong-cache"),
+            token(
+                &pool,
+                Some("org_alpha"),
+                &["elsewhere"],
+                &["push"],
+                "wrong-cache",
+            )
+            .await,
             "main",
             StatusCode::FORBIDDEN,
         ),
         (
-            token(Some("org_alpha"), &["*"], &["go:write"], "wrong-product"),
+            token(
+                &pool,
+                Some("org_alpha"),
+                &["*"],
+                &["go:write"],
+                "wrong-product",
+            )
+            .await,
             "main",
             StatusCode::FORBIDDEN,
         ),
         (
-            token(Some("org_alpha"), &["*"], &["push"], "disabled-product"),
+            token(
+                &pool,
+                Some("org_alpha"),
+                &["*"],
+                &["push"],
+                "disabled-product",
+            )
+            .await,
             "go-only",
             StatusCode::NOT_FOUND,
         ),
@@ -237,7 +285,7 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
     }
     for credential in [
         "legacy-secret".to_owned(),
-        token(None, &["local"], &["push"], "old-token"),
+        token(&pool, None, &["local"], &["push"], "old-token").await,
     ] {
         assert_eq!(
             request(
@@ -258,12 +306,21 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
             .await
             .unwrap();
     let id_token = token(
+        &pool,
         Some("org_alpha"),
         &[&format!("id:{alpha_id}")],
         &["push", "pull"],
         "revocable",
+    )
+    .await;
+    // A validly signed JWT that is not listed is rejected, whatever it claims.
+    let unlisted = jwt(Some("org_alpha"), &["*"], &["push", "pull"], "unlisted");
+    assert_eq!(
+        request(&app, "POST", path, Some(&unlisted), body.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
     );
-    sqlx::query("INSERT INTO api_tokens (jti,subject,perms_json,created_by,org_id) VALUES ('revocable','cli','[\"push\",\"pull\"]','test','org_alpha')").execute(&pool).await.unwrap();
     assert_eq!(
         request(&app, "POST", path, Some(&id_token), body.clone())
             .await
@@ -342,20 +399,12 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
         header::AUTHORIZATION,
         format!("Bearer {key}").parse().unwrap(),
     );
-    assert_eq!(
-        auth::authenticate_org(&key_headers, &state, "org_alpha")
-            .await
-            .unwrap()
-            .actor(),
-        "key:0123456789abcdef"
-    );
-    assert_eq!(
-        auth::authenticate_org(&key_headers, &state, "org_beta")
-            .await
-            .unwrap_err()
-            .status,
-        StatusCode::FORBIDDEN
-    );
+    let key_principal = auth::authenticate(&key_headers, &state, None)
+        .await
+        .unwrap();
+    assert_eq!(key_principal.actor(), "key:0123456789abcdef");
+    assert!(authz::authorize(&key_principal, Action::OrgRead, &Resource::Org("org_alpha")).is_ok());
+    assert!(authz::authorize(&key_principal, Action::OrgRead, &Resource::Org("org_beta")).is_err());
     // Background positive discovery is recorded, then used by the next request.
     state.finish_background().await;
     request(
@@ -412,7 +461,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
         pool.clone(),
         Config {
             jwt_secret: "contract-secret".into(),
-            auth_token: "legacy-secret".into(),
+            shared_auth_token: Some("legacy-secret".into()),
             public_url: "https://cache.example.test".into(),
             ..Default::default()
         },
@@ -421,7 +470,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     )
     .unwrap();
     let app = router(state);
-    let pull = token(None, &["*"], &["pull"], "pull-only");
+    let pull = token(&pool, None, &["*"], &["pull"], "pull-only").await;
     let response = app
         .clone()
         .oneshot(

@@ -1,6 +1,9 @@
 //! Real management router + disposable Postgres. Run via scripts/with-postgres.sh.
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use anyhow::{Context, Result};
 use axum::{
     Router,
@@ -72,6 +75,7 @@ where
 fn config() -> Config {
     Config {
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         signing_master_key: STANDARD.encode([42; 32]),
         signing_key_name: "shared".into(),
         signing_private_key: SECRET.into(),
@@ -86,11 +90,18 @@ async fn send(
     credential: Option<&str>,
     body: Value,
 ) -> (StatusCode, Value) {
+    let (path, credential) = match credential {
+        Some(credential) if credential == "operator-secret" => {
+            let (path, credential) = web::dashboard(method, path, credential, None);
+            (path, Some(credential))
+        }
+        _ => (path.to_owned(), credential.map(str::to_owned)),
+    };
     let mut builder = Request::builder()
         .method(method)
-        .uri(path)
+        .uri(path.as_str())
         .header("content-type", "application/json");
-    if let Some(credential) = credential {
+    if let Some(credential) = &credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));
     }
     let response = app

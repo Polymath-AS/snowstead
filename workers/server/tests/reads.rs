@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -37,6 +40,10 @@ fn credential() -> String {
 
 async fn fixture(pool: &PgPool, origin: &str, storage: Storage) -> AppState {
     sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_alpha','alpha');
+        -- The JWT credential() presents is listed, with the scope its claims name.
+        INSERT INTO api_tokens (jti,subject,org_id,created_by) VALUES ('reads-test','test','org_alpha','test');
+        INSERT INTO token_permissions (token_jti,permission,position) VALUES ('reads-test','pull',1);
+        INSERT INTO token_caches (token_jti,pattern) VALUES ('reads-test','secret');
         INSERT INTO caches (name,org_id,is_public) VALUES
         ('main','org_alpha',true),('secret','org_alpha',false),('empty','org_alpha',true);
         INSERT INTO cache_protocols (cache_id,protocol) SELECT id,'nix' FROM caches;
@@ -50,6 +57,7 @@ async fn fixture(pool: &PgPool, origin: &str, storage: Storage) -> AppState {
         pool.clone(),
         Config {
             admin_secret: "operator-secret".into(),
+            web_assertion_public_keys: web::public_key(),
             jwt_secret: "read-test-secret".into(),
             signing_master_key: STANDARD.encode([42; 32]),
             signing_key_name: "reads-test".into(),
@@ -87,13 +95,14 @@ async fn text(response: Response) -> String {
 }
 
 async fn signing_post(app: &Router, path: &str, body: Value) -> Value {
+    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(path)
-                .header("authorization", "Bearer operator-secret")
+                .uri(path.as_str())
+                .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),

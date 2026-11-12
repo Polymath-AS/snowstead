@@ -1916,6 +1916,20 @@ mod tests {
             sqlx::query("INSERT INTO api_tokens(jti,subject,perms_json,created_by,org_id,expires_at,revoked_at)
                 VALUES($1,'cli','[\"pull\"]','test','maintenance',to_timestamp($2),CASE WHEN $3 THEN now() END)")
                 .bind(jti).bind(exp as f64).bind(revoked).execute(&state.pool).await.unwrap();
+            // The row, not the claims, grants what the token may do.
+            sqlx::query(
+                "INSERT INTO token_permissions(token_jti,permission,position) VALUES($1,'pull',1)",
+            )
+            .bind(jti)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO token_caches(token_jti,cache_id) VALUES($1,$2)")
+                .bind(jti)
+                .bind(cache)
+                .execute(&state.pool)
+                .await
+                .unwrap();
         }
         let app = crate::router(state.clone());
         for after_cleanup in [false, true] {
@@ -2325,12 +2339,18 @@ mod tests {
             .unwrap();
         assert_eq!(sessions(&state, SESSION_PAGES).await.unwrap(), 0);
         let app = crate::router(state.clone());
+        // Org routes take the org's own credentials, not the operator's.
+        sqlx::query("INSERT INTO org_api_keys(id,org_id,name,secret_hash) VALUES('0123456789abcdef','maintenance','test',$1)")
+            .bind(crate::auth::secret_hash("key-secret"))
+            .execute(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(
             request(
                 &app,
                 "POST",
                 "/_api/v1/orgs/maintenance/caches/cache/evict",
-                "maintenance-admin"
+                "snowstead_key_0123456789abcdef_key-secret"
             )
             .await,
             StatusCode::OK

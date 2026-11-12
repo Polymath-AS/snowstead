@@ -42,6 +42,8 @@ pub struct AppState {
     pub(crate) manifest_slots: Arc<Semaphore>,
     pub(crate) sql_waiters: Arc<Semaphore>,
     pub(crate) sql_writers: Arc<crate::db::Writers>,
+    /// Keys that sign the web's per-request user assertions.
+    pub(crate) assertion_keys: Arc<[ed25519_dalek::VerifyingKey]>,
     proxy_ips: Arc<[IpAddr]>,
 }
 
@@ -74,7 +76,9 @@ impl AppState {
                     "TRUSTED_PROXY_IPS must contain IP addresses separated by whitespace"
                 )
             })?;
+        let assertion_keys = crate::auth::assertion_keys(&config.web_assertion_public_keys)?;
         Ok(Self {
+            assertion_keys: assertion_keys.into(),
             read_pool: pool.clone(),
             sql_waiters: Arc::new(Semaphore::new(pool.options().get_max_connections() as usize)),
             sql_writers: Arc::default(),

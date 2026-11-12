@@ -14,8 +14,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-fn token(org: &str, cache: &str, perms: &[&str]) -> String {
-    let claims = json!({"jti":"sccache-fixture","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
+fn jwt(org: &str, cache: &str, perms: &[&str]) -> String {
+    let claims = json!({"jti":format!("sccache-{org}-{cache}-{}", perms.join("+")),"sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
     let input = format!(
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -73,7 +73,7 @@ async fn fixture(pool: &PgPool) -> (Router, [Arc<InMemory>; 2]) {
             pool.clone(),
             Config {
                 jwt_secret: String::from_utf8(b"test-jwt".to_vec()).unwrap(),
-                auth_token: "legacy".into(),
+                shared_auth_token: Some("legacy".into()),
                 admin_secret: "admin".into(),
                 ..Default::default()
             },
@@ -92,12 +92,20 @@ fn archive(cache: &str, digit: char) -> String {
     )
 }
 
+#[path = "support/tokens.rs"]
+mod tokens;
+
+/// A listed JWT-era token, which works with the scope its row records.
+async fn token(pool: &PgPool, org: &str, cache: &str, perms: &[&str]) -> String {
+    tokens::register(pool, jwt(org, cache, perms)).await
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn private_misses_require_explicit_product_org_and_cache_permissions(pool: PgPool) {
     let (app, _stores) = fixture(&pool).await;
     let path = archive("vault", 'a');
-    let read = token("org_a", "vault", &["sccache:read"]);
-    let write = token("org_a", "vault", &["sccache:write"]);
+    let read = token(&pool, "org_a", "vault", &["sccache:read"]).await;
+    let write = token(&pool, "org_a", "vault", &["sccache:write"]).await;
     for method in ["GET", "HEAD"] {
         assert_eq!(
             send(&app, method, &path, None, None, vec![]).await.0,
@@ -106,9 +114,15 @@ async fn private_misses_require_explicit_product_org_and_cache_permissions(pool:
         for denied in [
             "legacy".to_owned(),
             "admin".to_owned(),
-            token("org_b", "*", &["sccache:read"]),
-            token("org_a", "other", &["sccache:read"]),
-            token("org_a", "*", &["pull", "push", "go:read", "go:write"]),
+            token(&pool, "org_b", "*", &["sccache:read"]).await,
+            token(&pool, "org_a", "other", &["sccache:read"]).await,
+            token(
+                &pool,
+                "org_a",
+                "*",
+                &["pull", "push", "go:read", "go:write"],
+            )
+            .await,
             write.clone(),
         ] {
             assert_eq!(
@@ -134,9 +148,9 @@ async fn private_misses_require_explicit_product_org_and_cache_permissions(pool:
         "legacy".to_owned(),
         "admin".to_owned(),
         read,
-        token("org_a", "*", &["push", "go:write"]),
-        token("org_b", "*", &["sccache:write"]),
-        token("org_a", "other", &["sccache:write"]),
+        token(&pool, "org_a", "*", &["push", "go:write"]).await,
+        token(&pool, "org_b", "*", &["sccache:write"]).await,
+        token(&pool, "org_a", "other", &["sccache:write"]).await,
     ] {
         assert_eq!(
             send(&app, "PUT", &path, Some(&denied), Some("0"), vec![])
@@ -175,8 +189,8 @@ async fn private_misses_require_explicit_product_org_and_cache_permissions(pool:
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn virtual_directories_probe_and_canonical_paths(pool: PgPool) {
     let (app, stores) = fixture(&pool).await;
-    let write = token("org_a", "*", &["sccache:write"]);
-    let read = token("org_a", "*", &["sccache:read"]);
+    let write = token(&pool, "org_a", "*", &["sccache:write"]).await;
+    let read = token(&pool, "org_a", "*", &["sccache:read"]).await;
     for suffix in ["", "a/", "a/b/", "a/b/c/"] {
         let path = format!("/_api/v1/sccache/alpha/public///{suffix}");
         let (status, headers, body) = send(&app, "PROPFIND", &path, None, None, vec![]).await;
@@ -309,7 +323,7 @@ async fn virtual_directories_probe_and_canonical_paths(pool: PgPool) {
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn archives_are_immutable_and_reset_expiry_and_slug_changes_hide_them(pool: PgPool) {
     let (app, _stores) = fixture(&pool).await;
-    let credential = token("org_a", "*", &["sccache:read", "sccache:write"]);
+    let credential = token(&pool, "org_a", "*", &["sccache:read", "sccache:write"]).await;
     for cache in ["public", "vault"] {
         let path = archive(cache, 'b');
         assert_eq!(
@@ -361,7 +375,7 @@ async fn archives_are_immutable_and_reset_expiry_and_slug_changes_hide_them(pool
             &app,
             "GET",
             &archive("vault", 'b').replace("/alpha/", "/beta/"),
-            Some(&token("org_b", "*", &["sccache:read"])),
+            Some(&token(&pool, "org_b", "*", &["sccache:read"]).await),
             None,
             vec![]
         )
@@ -435,7 +449,7 @@ async fn archives_are_immutable_and_reset_expiry_and_slug_changes_hide_them(pool
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn lengths_zero_and_size_boundaries(pool: PgPool) {
     let (app, _stores) = fixture(&pool).await;
-    let credential = token("org_a", "*", &["sccache:write"]);
+    let credential = token(&pool, "org_a", "*", &["sccache:write"]).await;
     let path = archive("public", 'c');
     let probe = "/_api/v1/sccache/alpha/public/.sccache_check";
     for path in [path.as_str(), probe] {

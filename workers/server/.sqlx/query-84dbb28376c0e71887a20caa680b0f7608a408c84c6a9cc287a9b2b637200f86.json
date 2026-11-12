@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO api_tokens (\n            jti,\n            subject,\n            secret_hash,\n            expires_at,\n            created_by,\n            org_id\n        )\n        VALUES ($1, $2, $3, $4, $5, $6)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "84dbb28376c0e71887a20caa680b0f7608a408c84c6a9cc287a9b2b637200f86"
+}

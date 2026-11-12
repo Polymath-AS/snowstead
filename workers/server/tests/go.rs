@@ -16,8 +16,8 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-fn token(org: &str, cache: &str, perms: &[&str]) -> String {
-    let claims = json!({"jti":"compiler-test","sub":"compiler","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
+fn jwt(org: &str, cache: &str, perms: &[&str]) -> String {
+    let claims = json!({"jti":format!("compiler-{org}-{cache}-{}", perms.join("+")),"sub":"compiler","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
     let input = format!(
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -44,7 +44,7 @@ async fn fixture_with_storage(pool: &PgPool, storage: Storage) -> AppState {
 fn config() -> Config {
     Config {
         jwt_secret: "fixture-jwt".into(),
-        auth_token: "legacy".into(),
+        shared_auth_token: Some("legacy".into()),
         ..Default::default()
     }
 }
@@ -99,6 +99,14 @@ async fn put(app: &Router, path: &str, token: &str, bytes: &[u8]) -> StatusCode 
     )
     .await
     .0
+}
+
+#[path = "support/tokens.rs"]
+mod tokens;
+
+/// A listed JWT-era token, which works with the scope its row records.
+async fn token(pool: &PgPool, org: &str, cache: &str, perms: &[&str]) -> String {
+    tokens::register(pool, jwt(org, cache, perms)).await
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -172,8 +180,8 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
     let storage = common::storage();
     let state = fixture_with_storage(&pool, storage.clone()).await;
     let app = router(state.clone());
-    let write = token("org_a", "compiler", &["go:write"]);
-    let read = token("org_a", "compiler", &["go:read"]);
+    let write = token(&pool, "org_a", "compiler", &["go:write"]).await;
+    let read = token(&pool, "org_a", "compiler", &["go:read"]).await;
     let url = path("compiler", 'a');
     assert_eq!(
         send(&app, "GET", &url, None, &[], &[]).await.0,
@@ -182,12 +190,14 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
     for denied in [
         "legacy".to_owned(),
         token(
+            &pool,
             "org_a",
             "*",
             &["push", "pull", "sccache:read", "sccache:write"],
-        ),
-        token("org_b", "*", &["go:read", "go:write"]),
-        token("org_a", "other", &["go:read", "go:write"]),
+        )
+        .await,
+        token(&pool, "org_b", "*", &["go:read", "go:write"]).await,
+        token(&pool, "org_a", "other", &["go:read", "go:write"]).await,
     ] {
         assert_eq!(
             send(&app, "GET", &url, Some(&denied), &[], &[]).await.0,
@@ -333,7 +343,7 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn compiler_expiration_is_checked_after_waiting_for_access_recording(pool: PgPool) {
     let app = router(fixture(&pool).await);
-    let credential = token("org_a", "compiler", &["go:write", "go:read"]);
+    let credential = token(&pool, "org_a", "compiler", &["go:write", "go:read"]).await;
     let url = path("compiler", '9');
     assert_eq!(
         put(&app, &url, &credential, b"expires during read").await,
@@ -399,10 +409,12 @@ async fn failed_duplicate_cannot_expire_an_inflight_compiler_upload(pool: PgPool
         .unwrap();
     let app = router(fixture(&bounded).await);
     let credential = token(
+        &pool,
         "org_a",
         "compiler",
         &["go:write", "go:read", "sccache:write", "sccache:read"],
-    );
+    )
+    .await;
     for product in ["go", "sccache"] {
         let url = if product == "go" {
             path("compiler", '2')
@@ -475,10 +487,12 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
     let state = fixture(&pool).await;
     let app = router(state);
     let credential = token(
+        &pool,
         "org_a",
         "compiler",
         &["go:write", "go:read", "sccache:write", "sccache:read"],
-    );
+    )
+    .await;
     let go = path("compiler", 'e');
     let cc = format!("/_api/v1/sccache/alpha/compiler/f/f/f/{}", "f".repeat(64));
     assert_eq!(
@@ -590,7 +604,7 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn compiler_capacity_ignores_pending_nix_attempts(pool: PgPool) {
     let app = router(fixture(&pool).await);
-    let credential = token("org_a", "compiler", &["go:write", "go:read"]);
+    let credential = token(&pool, "org_a", "compiler", &["go:write", "go:read"]).await;
     let first = path("compiler", '1');
     let second = path("compiler", '2');
     let third = path("compiler", '3');
@@ -659,10 +673,12 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
     let state = fixture(&pool).await;
     let app = router(state);
     let credential = token(
+        &pool,
         "org_a",
         "compiler",
         &["go:write", "go:read", "sccache:write", "sccache:read"],
-    );
+    )
+    .await;
     for product in ["go", "sccache"] {
         let url = if product == "go" {
             path("compiler", '1')

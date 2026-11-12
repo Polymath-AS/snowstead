@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    AppState,
-    auth::{Identity, authenticate_write},
+    AppState, auth,
+    authz::{self, Action, Resource},
     error::ApiError,
     protocol_policy::CallerLimit,
 };
@@ -30,12 +30,12 @@ impl Product {
             Self::Sccache => "sccache",
         }
     }
-    fn permission(self, write: bool) -> &'static str {
+    fn action(self, write: bool) -> Action {
         match (self, write) {
-            (Self::Go, true) => "go:write",
-            (Self::Go, false) => "go:read",
-            (Self::Sccache, true) => "sccache:write",
-            (Self::Sccache, false) => "sccache:read",
+            (Self::Go, true) => Action::GoWrite,
+            (Self::Go, false) => Action::GoRead,
+            (Self::Sccache, true) => Action::SccacheWrite,
+            (Self::Sccache, false) => Action::SccacheRead,
         }
     }
 }
@@ -164,23 +164,21 @@ pub async fn authorize(
     if !write && target.public {
         return Ok(());
     }
-    let identity = authenticate_write(headers, state).await?;
-    if let Identity::Jwt(claims) = &identity
-        && claims.has_permission(product.permission(write))
-        && claims.belongs_to(&target.org)
-        && claims.has_cache_access(target.cache_id, name)
-    {
-        state.protocol_limits.check(
-            if write {
-                CallerLimit::Push
-            } else {
-                CallerLimit::Read
-            },
-            &identity.actor(),
-        )?;
-        return Ok(());
-    }
-    Err(error(StatusCode::FORBIDDEN, "Forbidden"))
+    let principal = auth::authenticate(headers, state, None).await?;
+    authz::authorize(
+        &principal,
+        product.action(write),
+        &Resource::cache(&target.org, target.cache_id, name),
+    )?;
+    state.protocol_limits.check(
+        if write {
+            CallerLimit::Push
+        } else {
+            CallerLimit::Read
+        },
+        &principal.actor(),
+    )?;
+    Ok(())
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]

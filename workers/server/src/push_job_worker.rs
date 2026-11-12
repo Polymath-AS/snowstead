@@ -4,12 +4,12 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use sqlx::{FromRow, types::Json};
+use sqlx::FromRow;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState,
-    auth::{Claims, Identity},
+    authz::{ApiToken, CacheGrant, Permission, Principal as Identity},
     db::{self, Transaction},
     error::ApiError,
 };
@@ -127,12 +127,13 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
     struct Grant {
         id: String,
         grant_generation: i64,
-        authorization_claims: Json<Claims>,
+        authorization_jti: String,
+        cache_id: i32,
         work_failures: i32,
         work_members: i32,
     }
     let grant: Option<Grant> = sqlx::query_as(
-        "SELECT j.id,j.grant_generation,j.authorization_claims,j.work_failures,j.work_members \
+        "SELECT j.id,j.grant_generation,j.authorization_jti,j.cache_id,j.work_failures,j.work_members \
          FROM push_jobs j JOIN caches c ON c.id=j.cache_id JOIN api_tokens t ON t.jti=j.authorization_jti \
          WHERE c.org_id=$1 AND j.state='sealed' AND NOT j.work_blocked AND j.work_at<=NOW() \
          AND (j.work_expires_at IS NULL OR j.work_expires_at<=NOW()) \
@@ -164,7 +165,15 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
         id,
         generation: grant.grant_generation,
         org: org.into(),
-        identity: Identity::Jwt(grant.authorization_claims.0),
+        // The delegation resume recorded: the job's token, pushing to the
+        // job's cache only. The query above requires the token unrevoked.
+        identity: Identity::ApiToken(ApiToken {
+            id: grant.authorization_jti,
+            org: org.into(),
+            permissions: vec![Permission::Push],
+            caches: vec![CacheGrant::Id(grant.cache_id)],
+            expires_at: None,
+        }),
         members: grant.work_members,
         member: None,
         failures: grant.work_failures,

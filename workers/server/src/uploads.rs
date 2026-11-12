@@ -26,7 +26,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     AppState,
-    auth::Identity,
+    authz::{Action, Principal as Identity, Resource, authorize as decide},
     error::{ApiError, json_response},
     lifecycle::UploadStatus,
     native, signing,
@@ -190,15 +190,12 @@ struct Session {
     push_job_id: Option<String>,
 }
 fn authorize(s: &Session, identity: &Identity) -> Result<(), ApiError> {
-    match identity {
-        Identity::Jwt(c)
-            if !c.belongs_to(&s.org_id) || !c.has_cache_access(s.cache_id, &s.name) =>
-        {
-            Err(error(403, "Forbidden"))
-        }
-        Identity::OrgKey { org, .. } if org != &s.org_id => Err(error(403, "Forbidden")),
-        _ => Ok(()),
-    }
+    decide(
+        identity,
+        Action::NixPush,
+        &Resource::cache(&s.org_id, s.cache_id, &s.name),
+    )
+    .map_err(|_| error(403, "Forbidden"))
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn load(
@@ -265,7 +262,7 @@ async fn load_sessions(
         "#,
         ids,
         identity.actor(),
-        matches!(identity, Identity::Jwt(_)),
+        matches!(identity, Identity::ApiToken(_)),
     )
     .fetch_all(executor)
     .await?;
@@ -434,11 +431,12 @@ async fn create(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| error(404, "Cache not found"))?;
-    if let Identity::Jwt(c) = identity
-        && !c.has_cache_access(cache_id, cache)
-    {
-        return Err(error(403, "Forbidden"));
-    }
+    decide(
+        identity,
+        Action::NixPush,
+        &Resource::cache(identity.org(), cache_id, cache),
+    )
+    .map_err(|_| error(403, "Forbidden"))?;
     if !is_public && !allowed {
         return Err(error(403, PRIVATE_CACHES_REFUSED));
     }
@@ -2666,7 +2664,7 @@ mod tests {
             .await
             .unwrap();
         let config = crate::config::Config {
-            auth_token: "legacy".into(),
+            shared_auth_token: Some("legacy".into()),
             ..Default::default()
         };
         let storage = crate::storage::Storage::from_stores(

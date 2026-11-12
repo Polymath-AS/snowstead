@@ -50,6 +50,7 @@ pub(crate) use profile_block;
 mod app;
 mod artifacts;
 pub mod auth;
+pub mod authz;
 mod bandwidth;
 mod cache_host;
 mod capacity;

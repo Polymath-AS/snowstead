@@ -9,7 +9,7 @@ use std::{
 use axum::{
     Extension, Router,
     body::{Body, to_bytes},
-    extract::{MatchedPath, Path, Request, State},
+    extract::{MatchedPath, OriginalUri, Path, Request, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::{
-    AppState,
-    auth::{self, Identity},
+    AppState, auth,
+    authz::{self, Action, Principal, Resource},
     error::{ApiError, json_response},
     signing_management,
 };
@@ -189,7 +189,7 @@ async fn body(request: Request) -> Result<Value, ApiError> {
 
 #[derive(Clone)]
 pub(crate) struct ManagementContext {
-    pub(crate) identity: Identity,
+    pub(crate) principal: Principal,
     pub(crate) org: Option<String>,
     /// The scoped org as authorization read it, so a handler which only
     /// reports it need not read it again. Absent for admin routes and for
@@ -227,6 +227,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .merge(signing_management::org_router());
     let admin = Router::new()
         .route("/orgs", get(list_orgs))
+        .route("/orgs/{org}", get(get_org).put(put_org))
         .route("/overview", get(global_overview))
         .route("/caches", get(list_caches).post(create_cache))
         .route("/caches/{cache}", get(get_cache))
@@ -242,15 +243,57 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, authorize_and_audit))
 }
 
+/// What each management route does, for [`authz::authorize`]. Routes not
+/// listed here are denied.
+fn route_action(method: &Method, endpoint: &str) -> Option<Action> {
+    Some(match (method.as_str(), endpoint) {
+        ("GET", "" | "/" | "/overview" | "/caches" | "/caches/{cache}" | "/eviction") => {
+            Action::OrgRead
+        }
+        ("GET", "/caches/{cache}/pins" | "/caches/{cache}/go" | "/caches/{cache}/sccache") => {
+            Action::OrgRead
+        }
+        ("GET", "/caches/{cache}/paths") => Action::OrgRead,
+        ("PUT", "" | "/") => Action::OrgSlugWrite,
+        ("POST", "/move") => Action::OrgMove,
+        (
+            "POST",
+            "/caches"
+            | "/caches/{cache}/go/reset"
+            | "/caches/{cache}/sccache/reset"
+            | "/caches/{cache}/paths/delete"
+            | "/caches/{cache}/delete"
+            | "/caches/{cache}/evict"
+            | "/caches/{cache}/purge",
+        ) => Action::CacheWrite,
+        ("POST", "/caches/{cache}/pins") | ("DELETE", "/caches/{cache}/pins/{pin}") => {
+            Action::PinWrite
+        }
+        ("GET", "/tokens" | "/tokens/{jti}") => Action::TokenRead,
+        ("POST", "/tokens" | "/tokens/{jti}/revoke") => Action::TokenWrite,
+        ("GET", "/keys") => Action::ApiKeyRead,
+        ("POST", "/keys") => Action::ApiKeyCreate,
+        ("POST", "/keys/{key}/revoke") => Action::ApiKeyRevoke,
+        ("GET", "/caches/{cache}/signing-keys") => Action::SigningKeyRead,
+        (
+            "POST",
+            "/caches/{cache}/signing-keys" | "/caches/{cache}/signing-keys/{key}/activate",
+        ) => Action::SigningKeyWrite,
+        ("GET", "/audit") => Action::AuditRead,
+        _ => return None,
+    })
+}
+
 async fn authorize_and_audit(
     State(state): State<AppState>,
     Path(params): Path<RouteParams>,
     matched: MatchedPath,
+    OriginalUri(uri): OriginalUri,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let admin = matched.as_str().starts_with("/_api/v1/admin");
     let scope = params.org;
-    let admin = scope.is_none();
     if scope.as_ref().is_some_and(|id| !valid_org(id)) {
         return Err(not_found());
     }
@@ -262,27 +305,24 @@ async fn authorize_and_audit(
             "/_api/v1/orgs/{org}"
         })
         .ok_or_else(not_found)?;
-    let pin = !admin
-        && matches!(
-            endpoint,
-            "/caches/{cache}/pins" | "/caches/{cache}/pins/{pin}"
-        );
-    let identity = if admin {
-        auth::authenticate_admin(request.headers(), &state).await?
+    let target = auth::Target {
+        method: request.method(),
+        path: uri
+            .path_and_query()
+            .map_or_else(|| uri.path(), |p| p.as_str()),
+    };
+    let principal = auth::authenticate(request.headers(), &state, Some(target)).await?;
+    let action = if admin {
+        Some(Action::Operate)
     } else {
-        let scope = scope.as_deref().unwrap();
-        match auth::authenticate_org(request.headers(), &state, scope).await {
-            Ok(identity) => identity,
-            Err(_) if pin && request.method() != Method::GET => {
-                let identity = auth::authenticate_write(request.headers(), &state).await?;
-                let Identity::Jwt(claims) = &identity else {
-                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-                };
-                if !claims.belongs_to(scope) || !claims.has_permission("push") {
-                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-                }
-                let cache = sqlx::query_scalar!(
-                    r#"
+        route_action(request.method(), endpoint)
+    }
+    .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "Forbidden"))?;
+    // Only API tokens hold cache-level grants, so only they need the ID.
+    let cache_id = match (&scope, &params.cache, &principal) {
+        (Some(scope), Some(cache), Principal::ApiToken(_)) if !admin => {
+            sqlx::query_scalar!(
+                r#"
                     SELECT c.id
                     FROM caches c
                     WHERE c.org_id = $1
@@ -294,31 +334,37 @@ async fn authorize_and_audit(
                                 AND p.protocol = 'nix'
                         )
                     "#,
-                    scope,
-                    params.cache.as_deref()
-                )
-                .fetch_optional(&state.pool)
-                .await?;
-                let cache = cache.ok_or_else(not_found)?;
-                if !claims.has_cache_access(cache, params.cache.as_deref().unwrap()) {
-                    return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-                }
-                identity
-            }
-            Err(error) => return Err(error),
+                scope,
+                Some(cache.as_str())
+            )
+            .fetch_optional(&state.pool)
+            .await?
         }
+        _ => None,
     };
-    // The operator is trusted, and so are the reads it makes for a person it
-    // has already signed in: a dashboard page is several of them, and a
-    // refusal would show that person an error for browsing. What the operator
-    // changes on someone's behalf is still counted against them, as is
-    // everything an API key or token does.
-    let operator_read = matches!(identity, Identity::Admin { .. })
-        && matches!(*request.method(), Method::GET | Method::HEAD);
-    if !admin && !operator_read && !matches!(identity, Identity::Admin { on_behalf_of: None }) {
-        state.management_limits.check(identity.actor())?;
+    let resource = match (&scope, &params.cache) {
+        (Some(org), Some(name)) if !admin => Resource::Cache {
+            org,
+            id: cache_id,
+            name,
+        },
+        (Some(org), _) => Resource::Org(org),
+        (None, _) => Resource::Service,
+    };
+    authz::authorize(&principal, action, &resource)?;
+    // The operator is trusted, and so are the reads a signed-in person makes:
+    // a dashboard page is several of them, and a refusal would show that
+    // person an error for browsing. What they change is still counted
+    // against them, as is everything an API key or token does.
+    let limited = match &principal {
+        Principal::Operator => false,
+        Principal::WebUser(_) => !matches!(*request.method(), Method::GET | Method::HEAD),
+        _ => true,
+    };
+    if limited {
+        state.management_limits.check(principal.actor())?;
     }
-    let root_put = request.method() == Method::PUT && matches!(endpoint, "" | "/");
+    let root_put = request.method() == Method::PUT && matches!(endpoint, "" | "/" | "/orgs/{org}");
     let row = match &scope {
         Some(scope) if !root_put => Some(
             org(&state.pool, scope)
@@ -348,9 +394,9 @@ async fn authorize_and_audit(
         (request, Value::Null)
     };
     #[cfg(feature = "observability")]
-    crate::observability::identity(&identity, scope.as_deref());
+    crate::observability::identity(&principal, scope.as_deref());
     request.extensions_mut().insert(ManagementContext {
-        identity: identity.clone(),
+        principal: principal.clone(),
         org: scope.clone(),
         row,
     });
@@ -436,7 +482,7 @@ async fn authorize_and_audit(
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
-            identity.actor(),
+            principal.actor(),
             actual_action,
             cache,
             i32::from(parts.status.as_u16()),
@@ -458,6 +504,7 @@ async fn authorize_and_audit(
 fn audit_action(method: &Method, endpoint: &str, admin: bool) -> Option<&'static str> {
     match (method.as_str(), endpoint) {
         ("PUT", "" | "/") if !admin => Some("org.put"),
+        ("PUT", "/orgs/{org}") if admin => Some("org.put"),
         ("POST", "/tokens") => Some("token.create"),
         ("GET", "/tokens") if admin => Some("token.list"),
         ("POST", "/tokens/{jti}/revoke") => Some("token.revoke"),
@@ -933,12 +980,19 @@ async fn put_org(
     Path(params): Path<OrgPath>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    if !matches!(context.identity, Identity::Admin { .. }) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-    }
     let state = &state;
     let id = params.org.as_str();
     let raw = body(request).await?;
+    // Only the operator sets limits; a slug change is authorized by the route.
+    let limits = |principal: &Principal| {
+        authz::authorize(principal, Action::OrgLimitsWrite, &Resource::Org(id))
+    };
+    if ["storageLimit", "privateCaches", "customSigningKeys"]
+        .iter()
+        .any(|field| raw.get(*field).is_some())
+    {
+        limits(&context.principal)?;
+    }
     if raw.as_object().unwrap().keys().any(|k| {
         !["slug", "storageLimit", "privateCaches", "customSigningKeys"].contains(&k.as_str())
     }) {
@@ -991,6 +1045,10 @@ async fn put_org(
     )
     .fetch_optional(&mut *tx)
     .await?;
+    // Creating an org sets its limits.
+    if current.is_none() {
+        limits(&context.principal)?;
+    }
     let mut slug = current.as_ref().map(|o| o.slug.clone());
     if let Some(wanted) = raw.get("slug")
         && Some(wanted) != slug.as_ref().map(|s| json!(s)).as_ref()

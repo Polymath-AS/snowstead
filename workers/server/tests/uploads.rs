@@ -16,7 +16,7 @@ use snowstead_server::{AppState, config::Config, router};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-fn token(org: &str, cache: &str) -> String {
+fn jwt(org: &str, cache: &str) -> String {
     let claims = json!({"jti":format!("{org}-{cache}"),"sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":["push","pull"]});
     signed_token(claims)
 }
@@ -141,6 +141,21 @@ async fn put_manifest(
     .0
 }
 
+#[path = "support/tokens.rs"]
+mod tokens;
+#[path = "support/web.rs"]
+mod web;
+
+/// The dashboard, as the default org's owner, for `method path`.
+fn owner(method: &str, path: &str) -> String {
+    web::dashboard(method, path, "admin", None).1
+}
+
+/// A listed JWT-era token, which works with the scope its row records.
+async fn token(pool: &PgPool, org: &str, cache: &str) -> String {
+    tokens::register(pool, jwt(org, cache)).await
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn durable_manifest_replay_normalization_and_pagination(pool: PgPool) {
     pool_execute(
@@ -168,7 +183,7 @@ async fn durable_manifest_replay_normalization_and_pagination(pool: PgPool) {
         )
     };
     let app = fresh();
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let raw = nar(b"manifest bytes are not an upload");
     let mut x = path_input(&"0".repeat(32), &raw, false);
@@ -297,7 +312,7 @@ async fn durable_manifest_replay_normalization_and_pagination(pool: PgPool) {
             &app,
             "GET",
             &job,
-            Some(&token("default", "manifest")),
+            Some(&token(&pool, "default", "manifest").await),
             &[],
             vec![]
         )
@@ -372,7 +387,7 @@ async fn manifest_authorization_is_bounded_and_cancellation_is_terminal(pool: Pg
         )
     };
     let app = fresh();
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let input = path_input(&"0".repeat(32), &nar(b"authorization"), false);
     let identity = json!({"idempotencyKey":"lease","mode":"selected","roots":[input["storePath"]]});
@@ -393,27 +408,29 @@ async fn manifest_authorization_is_bounded_and_cancellation_is_terminal(pool: Pg
         post(&app, &format!("{job}/seal"), &auth, json!({})).await.0,
         StatusCode::OK
     );
-    // Signed but unregistered JWTs retain legacy upload access, not delegation.
+    // A validly signed JWT that is not listed in api_tokens is rejected.
+    let unlisted = signed_token(
+        json!({"jti":"unlisted","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,
+        "org":"default","caches":["*"],"perms":["push"]}),
+    );
     assert_eq!(
-        post(&app, &format!("{job}/resume"), &auth, json!({}))
+        post(&app, &format!("{job}/resume"), &unlisted, json!({}))
             .await
             .0,
-        StatusCode::CONFLICT
+        StatusCode::UNAUTHORIZED
     );
-    pool_execute(
-        &pool,
-        "INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');",
-    )
-    .await;
     let now: i64 = sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM NOW()))::bigint")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let short = signed_token(
-        json!({"jti":"default-*","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,
-        "exp":now+120,"org":"default","caches":["*"],"perms":["push"]}),
-    );
-    let (status, leased) = post(&app, &format!("{job}/resume"), &short, json!({})).await;
+    // The delegation lasts no longer than the token's recorded expiry.
+    let expire = |at: Option<i64>| {
+        sqlx::query("UPDATE api_tokens SET expires_at=to_timestamp($1) WHERE jti='default-*'")
+            .bind(at)
+            .execute(&pool)
+    };
+    expire(Some(now + 120)).await.unwrap();
+    let (status, leased) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{leased}");
     assert_eq!(leased["job"]["authorizationExpiresAt"], now + 120);
     assert_eq!(leased["job"]["grantGeneration"], 1);
@@ -421,18 +438,15 @@ async fn manifest_authorization_is_bounded_and_cancellation_is_terminal(pool: Pg
         leased["capabilities"],
         json!(["manifest", "prepareOnly", "completion", "readiness"])
     );
-    // Request authentication tolerates clock skew; delegation does not extend
-    // an already expired credential into a fresh background lease.
-    let expired = signed_token(
-        json!({"jti":"default-*","sub":"cli","iss":"snowstead","aud":"snowstead","iat":1,
-        "exp":now-1,"org":"default","caches":["*"],"perms":["push"]}),
-    );
+    // An expired token authenticates nothing, so it cannot renew a lease.
+    expire(Some(now - 1)).await.unwrap();
     assert_eq!(
-        post(&app, &format!("{job}/resume"), &expired, json!({}))
+        post(&app, &format!("{job}/resume"), &auth, json!({}))
             .await
             .0,
         StatusCode::UNAUTHORIZED
     );
+    expire(None).await.unwrap();
     let (status, idle) = post(&app, &format!("{job}/resume"), &auth, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{idle}");
     assert_eq!(
@@ -517,12 +531,13 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
         &pool,
         "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
-        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');",
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;",
     )
     .await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -534,7 +549,7 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let input = path_input(&"0".repeat(32), &nar(b"revocation"), false);
     let (_, created) = post(
@@ -570,7 +585,7 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
         post(
             &app,
             revoke,
-            "operator-secret",
+            &owner("POST", revoke),
             json!({"reason":"test revocation"})
         )
         .await
@@ -579,20 +594,16 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
     );
     fence.rollback().await.unwrap();
     let resume = format!("{job}/resume");
+    let revoker = owner("POST", revoke);
     let (revoked, renewed) = tokio::join!(
-        post(
-            &app,
-            revoke,
-            "operator-secret",
-            json!({"reason":"test revocation"})
-        ),
+        post(&app, revoke, &revoker, json!({"reason":"test revocation"})),
         post(&app, &resume, &auth, json!({}))
     );
     let revoked = if revoked.0 == StatusCode::SERVICE_UNAVAILABLE {
         post(
             &app,
             revoke,
-            "operator-secret",
+            &owner("POST", revoke),
             json!({"reason":"test revocation"}),
         )
         .await
@@ -625,10 +636,11 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
 ) {
     pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true),('other',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
-        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;").await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -640,7 +652,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let raw = nar(b"protected");
     let mut x = path_input(&"0".repeat(32), &raw, false);
@@ -685,7 +697,8 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
         SELECT c.id,p.store_path_hash,p.store_path,p.nar_hash,p.nar_size,p.blob_object_id,p.references_json
         FROM published_paths p CROSS JOIN caches c WHERE c.name='other'").execute(&pool).await.unwrap();
     let eviction = "/_api/v1/orgs/default/eviction";
-    let inventory = || send(&app, "GET", eviction, Some("operator-secret"), &[], vec![]);
+    let viewer = owner("GET", eviction);
+    let inventory = || send(&app, "GET", eviction, Some(&viewer), &[], vec![]);
     let (status, _, bytes) = inventory().await;
     assert_eq!(status, StatusCode::OK);
     let visible = serde_json::from_slice::<Value>(&bytes).unwrap();
@@ -730,7 +743,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
     let (status, result) = post(
         &app,
         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-        "operator-secret",
+        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
         json!({"storePathHashes":[x["storePathHash"],z["storePathHash"]]}),
     )
     .await;
@@ -753,7 +766,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
         post(
             &app,
             "/_api/v1/orgs/default/caches/manifest/evict",
-            "operator-secret",
+            &owner("POST", "/_api/v1/orgs/default/caches/manifest/evict"),
             json!({})
         )
         .await
@@ -775,12 +788,13 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
         "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
         INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) \
-        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+        VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;",
     )
     .await;
     let mut config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     config.push_jobs.active_per_org = 1;
@@ -796,7 +810,7 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let raw = nar(b"already cached completion");
     let mut member = path_input(&"0".repeat(32), &raw, false);
@@ -932,12 +946,13 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
         StatusCode::CONFLICT,
         "completion must not issue more upload grants"
     );
+    let viewer = owner("GET", "/_api/v1/orgs/default/eviction");
     let inventory = || {
         send(
             &app,
             "GET",
             "/_api/v1/orgs/default/eviction",
-            Some("operator-secret"),
+            Some(&viewer),
             &[],
             vec![],
         )
@@ -1077,7 +1092,7 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
     let (status, deleted) = post(
         &app,
         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-        "operator-secret",
+        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
         json!({"storePathHashes":[member["storePathHash"]]}),
     )
     .await;
@@ -1123,10 +1138,11 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
 async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
-        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;").await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let storage = common::storage();
@@ -1142,7 +1158,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         )
     };
     let app = fresh();
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
     let raw = nar(b"parent bytes");
@@ -1223,7 +1239,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         post(
             &app,
             allocate,
-            &token("default", "manifest"),
+            &token(&pool, "default", "manifest").await,
             request.clone()
         )
         .await
@@ -1234,7 +1250,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         post(
             &app,
             &format!("/_api/v1/uploads/{parent_id}/parts"),
-            &token("default", "manifest"),
+            &token(&pool, "default", "manifest").await,
             json!({"parts":[{"partNumber":1,"size":1}]})
         )
         .await
@@ -1595,7 +1611,7 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         INSERT INTO caches(name,is_public,org_id) VALUES('manifest',true,'default'),('manifest',true,'org_z'); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
         INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES \
-        ('default-*','cli','default','[\"push\"]','fixture'),('org_z-*','cli','org_z','[\"push\"]','fixture');").await;
+        ('default-*','cli','default','[\"push\"]','fixture'),('org_z-*','cli','org_z','[\"push\"]','fixture') ON CONFLICT DO NOTHING;").await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         ..Default::default()
@@ -1634,7 +1650,7 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
     let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
     let mut jobs = Vec::new();
     for org in ["default", "org_z"] {
-        let auth = token(org, "*");
+        let auth = token(&pool, org, "*").await;
         let indices: Vec<usize> = if org == "default" {
             vec![0, 1, 2, 3]
         } else {
@@ -1713,7 +1729,7 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         let _ = stopped.await;
     }));
     let (org, id, members) = &jobs[0];
-    let auth = token(org, "*");
+    let auth = token(&pool, org, "*").await;
     let job = format!("{base}/{id}");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1891,7 +1907,7 @@ async fn check_manifest_worker_dependencies(pool: PgPool, blocked: usize) {
         "INSERT INTO caches(name,is_public) VALUES('manifest',true);
         INSERT INTO cache_protocols SELECT id,'nix' FROM caches;
         INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by)
-        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+        VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;",
     )
     .await;
     let config = Config {
@@ -1908,7 +1924,7 @@ async fn check_manifest_worker_dependencies(pool: PgPool, blocked: usize) {
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let mut raw: Vec<_> = [
         b"root".as_slice(),
         b"middle bytes",
@@ -2200,7 +2216,7 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
     };
     pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
-        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;").await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         ..Default::default()
@@ -2215,7 +2231,7 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     // Change grants, lifetimes, and policy after the claim commits but before
     // publication. No product-only barrier or shorter lease is required.
@@ -2663,10 +2679,11 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
         .unwrap();
     pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
-        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture');").await;
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;").await;
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
+        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -2678,7 +2695,7 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     // A rejected writer must finish its rollback before the next local
     // writer can try the same PostgreSQL organization fence.
@@ -2854,7 +2871,7 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
                     post(
                         &app,
                         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-                        "operator-secret",
+                        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
                         json!({"storePathHashes":[root_hash]})
                     )
                     .await
@@ -2875,7 +2892,7 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
                     post(
                         &app,
                         "/_api/v1/orgs/default/tokens/default-*/revoke",
-                        "operator-secret",
+                        &owner("POST", "/_api/v1/orgs/default/tokens/default-*/revoke"),
                         json!({"reason":"job upload fence test"})
                     )
                     .await
@@ -2936,9 +2953,16 @@ async fn manifest_graph_boundaries_and_identity_conflicts(pool: PgPool) {
         ..Default::default()
     };
     config.push_jobs.active_per_org = 16;
-    let app =
-        router(AppState::new(pool, config, common::storage(), reqwest::Client::new()).unwrap());
-    let auth = token("default", "*");
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let raw = nar(b"graph");
     let mut x = path_input(&"0".repeat(32), &raw, false);
@@ -3047,7 +3071,7 @@ async fn manifest_admission_bounds_bodies_without_blocking_uploads(pool: PgPool)
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let mut pending = Vec::new();
     for _ in 0..4 {
@@ -3111,7 +3135,7 @@ async fn manifest_default_limit_accepts_a_deep_closure_without_recursion(pool: P
         "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
         INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) \
-        VALUES('default-*','cli','default','[\"push\"]','fixture');",
+        VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;",
     )
     .await;
     let config = Config {
@@ -3127,7 +3151,7 @@ async fn manifest_default_limit_accepts_a_deep_closure_without_recursion(pool: P
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     let root = format!("/nix/store/{:032b}-fixture", 9999);
     let (status, created) = post(
@@ -3261,7 +3285,7 @@ async fn manifest_limits_auth_policy_and_expiry(pool: PgPool) {
         )
         .unwrap(),
     );
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let base = "/_api/v1/caches/manifest/push-jobs";
     assert_eq!(
         send(&app, "POST", base, None, &[], b"not JSON".to_vec())
@@ -3274,9 +3298,14 @@ async fn manifest_limits_auth_policy_and_expiry(pool: PgPool) {
     let y = path_input(&"1".repeat(32), &raw, false);
     let create = json!({"idempotencyKey":"limited","mode":"selected","roots":[x["storePath"]]});
     assert_eq!(
-        post(&app, base, &token("default", "other"), create.clone())
-            .await
-            .0,
+        post(
+            &app,
+            base,
+            &token(&pool, "default", "other").await,
+            create.clone()
+        )
+        .await
+        .0,
         StatusCode::FORBIDDEN
     );
     let (status, created) = post(&app, base, &auth, create.clone()).await;
@@ -3284,9 +3313,16 @@ async fn manifest_limits_auth_policy_and_expiry(pool: PgPool) {
     let id = created["job"]["id"].as_str().unwrap();
     let job = format!("{base}/{id}");
     assert_eq!(
-        send(&app, "GET", &job, Some(&token("org_b", "*")), &[], vec![])
-            .await
-            .0,
+        send(
+            &app,
+            "GET",
+            &job,
+            Some(&token(&pool, "org_b", "*").await),
+            &[],
+            vec![]
+        )
+        .await
+        .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -3388,7 +3424,7 @@ async fn manifest_protection_budget_bounds_chunks_across_caches(pool: PgPool) {
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
     )
     .await;
-    let auth = token("default", "*");
+    let auth = token(&pool, "default", "*").await;
     let raw = nar(b"aggregate protection budgets");
     let x = path_input(&"0".repeat(32), &raw, false);
     let y = path_input(&"1".repeat(32), &raw, false);
@@ -3499,8 +3535,8 @@ async fn inline_private_publication_and_read_isolation(pool: PgPool) {
     )
     .unwrap();
     let app = router(state.clone());
-    let a = token("org_a", "*");
-    let b = token("org_b", "*");
+    let a = token(&pool, "org_a", "*").await;
+    let b = token(&pool, "org_b", "*").await;
     let hash = "0".repeat(32);
     let raw = nar(b"private bytes, not a digest possession proof");
     let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
@@ -3690,7 +3726,7 @@ async fn send_inline_batch(app: &Router, frame: Vec<u8>) -> (StatusCode, Value) 
 async fn inline_batch_cli_contract_validates_before_work_and_protects_capacity(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let config = Config {
-        auth_token: "legacy".into(),
+        shared_auth_token: Some("legacy".into()),
         ..Default::default()
     };
     let storage = if std::env::var_os("SNOWSTEAD_TEST_R2_ENDPOINT").is_some() {
@@ -3943,7 +3979,7 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
     let state = AppState::new(
         pool.clone(),
         Config {
-            auth_token: "legacy".into(),
+            shared_auth_token: Some("legacy".into()),
             ..Default::default()
         },
         storage.clone(),
@@ -4130,8 +4166,9 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
 async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let config = Config {
-        auth_token: "legacy".into(),
+        shared_auth_token: Some("legacy".into()),
         admin_secret: "admin".into(),
+        web_assertion_public_keys: web::public_key(),
         public_url: "https://cache.example.test".into(),
         ..Default::default()
     };
@@ -4394,7 +4431,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     let (status, _) = post(
         &app,
         "/_api/v1/orgs/default/caches/main/paths/delete",
-        "admin",
+        &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
         json!({"storePathHashes":[hash]}),
     )
     .await;
@@ -4441,7 +4478,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
 async fn final_nar_digest_failure_cannot_complete_a_multipart_destination(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let mut config = Config::from_env();
-    config.auth_token = "legacy".into();
+    config.shared_auth_token = Some("legacy".into());
     let storage = snowstead_server::storage::Storage::new(&config).unwrap();
     let state = AppState::new(
         pool.clone(),
@@ -4557,7 +4594,7 @@ async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_bounda
         AppState::new(
             pool.clone(),
             Config {
-                auth_token: "legacy".into(),
+                shared_auth_token: Some("legacy".into()),
                 ..Default::default()
             },
             common::storage(),
@@ -4659,7 +4696,7 @@ async fn unresolved_canonical_writers_do_not_block_immutable_publication(pool: P
         AppState::new(
             pool.clone(),
             Config {
-                auth_token: "legacy".into(),
+                shared_auth_token: Some("legacy".into()),
                 jwt_secret: "test-jwt".into(),
                 ..Default::default()
             },
@@ -4721,7 +4758,7 @@ async fn unresolved_canonical_writers_do_not_block_immutable_publication(pool: P
                     &app,
                     "GET",
                     &format!("/{name}/{store_hash}.narinfo"),
-                    Some(&token("default", name)),
+                    Some(&token(&pool, "default", name).await),
                     &[],
                     vec![]
                 )
@@ -4773,8 +4810,9 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
     let state = AppState::new(
         pool.clone(),
         Config {
-            auth_token: "legacy".into(),
+            shared_auth_token: Some("legacy".into()),
             admin_secret: "admin".into(),
+            web_assertion_public_keys: web::public_key(),
             jwt_secret: "test-jwt".into(),
             ..Default::default()
         },
@@ -4815,7 +4853,7 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
     let (status, deleted) = post(
         &app,
         "/_api/v1/orgs/default/caches/main/paths/delete",
-        "admin",
+        &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
         json!({"storePathHashes":["0".repeat(32)]}),
     )
     .await;
@@ -4829,7 +4867,7 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
     for (private, key) in retired {
         storage.delete(private, &key).await.unwrap();
     }
-    let credential = token("default", "*");
+    let credential = token(&pool, "default", "*").await;
     for url in [
         format!("/nar/{hash}/zstd.nar"),
         format!("/private/secret/nar/{hash}/zstd.nar"),
@@ -4877,8 +4915,9 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
             AppState::new(
                 independent.clone(),
                 Config {
-                    auth_token: "legacy".into(),
+                    shared_auth_token: Some("legacy".into()),
                     admin_secret: "admin".into(),
+                    web_assertion_public_keys: web::public_key(),
                     ..Default::default()
                 },
                 storage.clone(),
@@ -5108,7 +5147,7 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
 
     // Pinning A makes B inadmissible. Raising the limit to the exact combined
     // size then admits B, still without its deleted staging bytes.
-    let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", "admin",
+    let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", &owner("POST", "/_api/v1/orgs/default/caches/main/pins"),
         json!({"name":"release","storePath":format!("/nix/store/{}-fixture", "a".repeat(32)),"keep":"forever"})).await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
     let (status, result) = post(
@@ -5197,7 +5236,7 @@ async fn failed_publication_retains_candidate_until_session_expiry(pool: PgPool)
     let state = AppState::new(
         pool.clone(),
         Config {
-            auth_token: "legacy".into(),
+            shared_auth_token: Some("legacy".into()),
             ..Default::default()
         },
         storage.clone(),
@@ -5314,7 +5353,7 @@ async fn uncertain_immutable_completion_does_not_poison_retries_across_restart(p
     assert_eq!(r2.r2_endpoint, upstream);
     assert!(upstream.starts_with("http://127.0.0.1:"));
     let config = Config {
-        auth_token: "legacy".into(),
+        shared_auth_token: Some("legacy".into()),
         ..Default::default()
     };
     let storage = Storage::new(&r2).unwrap();
@@ -5605,8 +5644,9 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                 .unwrap();
         });
         let storage = snowstead_server::storage::Storage::new(&config).unwrap();
-        config.auth_token = "legacy".into();
+        config.shared_auth_token = Some("legacy".into());
         config.admin_secret = "admin".into();
+        config.web_assertion_public_keys = web::public_key();
         let state = AppState::new(single.clone(), config, storage, reqwest::Client::new()).unwrap();
         let app = router(state.clone());
         let cache = if inline { "inline" } else { "multipart" };
@@ -5810,7 +5850,10 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
             &app,
             "GET",
             &format!("/_api/v1/orgs/default/caches/{cache}"),
-            Some("admin"),
+            Some(&owner(
+                "GET",
+                &format!("/_api/v1/orgs/default/caches/{cache}"),
+            )),
             &[],
             vec![],
         )
@@ -5833,7 +5876,10 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         let (status, deleted) = post(
             &app,
             &format!("/_api/v1/orgs/default/caches/{cache}/paths/delete"),
-            "admin",
+            &owner(
+                "POST",
+                &format!("/_api/v1/orgs/default/caches/{cache}/paths/delete"),
+            ),
             json!({"storePathHashes":["0".repeat(32)]}),
         )
         .await;
@@ -5927,8 +5973,9 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::from_env();
     config.r2_endpoint = format!("http://{}", proxy.local_addr().unwrap());
-    config.auth_token = "legacy".into();
+    config.shared_auth_token = Some("legacy".into());
     config.admin_secret = "admin".into();
+    config.web_assertion_public_keys = web::public_key();
     let proxy_app = Router::new().fallback(any({
         let reached = reached.clone();
         let release = release.clone();
@@ -6047,7 +6094,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         let (status, deleted) = post(
             &app,
             "/_api/v1/orgs/default/caches/main/paths/delete",
-            "admin",
+            &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
             json!({"storePathHashes":[hash]}),
         )
         .await;
@@ -6055,7 +6102,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         let (status, _, body) = send(
             &app,
             "PUT",
-            "/_api/v1/orgs/default",
+            "/_api/v1/admin/orgs/default",
             Some("admin"),
             &[("content-type", "application/json")],
             serde_json::to_vec(&json!({"storageLimit":2*new.len()})).unwrap(),
@@ -6193,7 +6240,7 @@ async fn sealed_sessions_can_be_aborted_without_racing_publication(pool: PgPool)
     let state = AppState::new(
         pool.clone(),
         Config {
-            auth_token: "legacy".into(),
+            shared_auth_token: Some("legacy".into()),
             ..Default::default()
         },
         storage.clone(),

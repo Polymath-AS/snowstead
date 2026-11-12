@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COALESCE(t.org_id, 'default') AS \"org!\",\n                t.secret_hash,\n                t.expires_at,\n                -- Expiry allows the clock skew JWT verification always has.\n                t.revoked_at IS NULL\n                    AND (t.expires_at IS NULL OR t.expires_at > NOW() - INTERVAL '60 seconds')\n                    AS \"live!\",\n                t.last_used_at IS NULL OR t.last_used_at <= NOW() - INTERVAL '5 minutes'\n                    AS \"usage_due!\",\n                ARRAY(\n                    SELECT p.permission\n                    FROM token_permissions p\n                    WHERE p.token_jti = t.jti\n                    ORDER BY p.position\n                ) AS \"permissions!\",\n                ARRAY(\n                    SELECT tc.cache_id\n                    FROM token_caches tc\n                    WHERE tc.token_jti = t.jti\n                        AND tc.cache_id IS NOT NULL\n                    ORDER BY tc.id\n                ) AS \"cache_ids!: Vec<i32>\",\n                ARRAY(\n                    SELECT tc.pattern\n                    FROM token_caches tc\n                    WHERE tc.token_jti = t.jti\n                        AND tc.pattern IS NOT NULL\n                    ORDER BY tc.id\n                ) AS \"patterns!: Vec<String>\"\n            FROM api_tokens t\n            WHERE t.jti = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "secret_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "secret_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "usage_due!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "permissions!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "cache_ids!: Vec<i32>",
+        "type_info": "Int4Array",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "patterns!: Vec<String>",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "5065716cde3674da3b289961e2ecd27136e65151ea31baff7b0f08b43c8c352f"
+}

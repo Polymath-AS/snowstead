@@ -252,7 +252,7 @@ mod tests {
         let state = crate::AppState::new(
             pool,
             crate::config::Config {
-                auth_token: "legacy-secret".into(),
+                shared_auth_token: Some("legacy-secret".into()),
                 ..Default::default()
             },
             crate::storage::Storage::from_stores(store.clone(), store),

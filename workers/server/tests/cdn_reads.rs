@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -52,8 +55,8 @@ async fn fixture_with_storage(pool: PgPool, origin: &str, storage: Storage) -> A
     AppState::new(pool, config(origin), storage, reqwest::Client::new()).unwrap()
 }
 
-fn token(org: &str, cache: &str) -> String {
-    let claims = json!({"jti":"cdn-test", "sub":"test", "iss":"snowstead", "aud":"snowstead",
+fn jwt(org: &str, cache: &str) -> String {
+    let claims = json!({"jti":format!("cdn-{org}-{cache}"), "sub":"test", "iss":"snowstead", "aud":"snowstead",
         "iat":1, "org":org, "caches":[cache], "perms":["pull"]});
     let input = format!(
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
@@ -94,6 +97,14 @@ fn metadata(response: &Response) {
     assert!(!response.headers().contains_key("x-snowstead-cdn-read"));
 }
 
+#[path = "support/tokens.rs"]
+mod tokens;
+
+/// A listed JWT-era token, which works with the scope its row records.
+async fn token(pool: &PgPool, org: &str, cache: &str) -> String {
+    tokens::register(pool, jwt(org, cache)).await
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn sql_metadata_and_public_nar_redirects_without_stored_objects(pool: PgPool) {
     // A GET or HEAD would wait forever for a zero-permit store. Successful
@@ -107,7 +118,7 @@ async fn sql_metadata_and_public_nar_redirects_without_stored_objects(pool: PgPo
     let hash = "1".repeat(32); // Deliberately absent from SQL and object storage.
     let blob = "a".repeat(64);
     let private_blob = "b".repeat(64);
-    let credential = format!("Bearer {}", token("org_alpha", "secret"));
+    let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
     for method in ["GET", "HEAD"] {
         for path in [
             "/alpha/main/nix-cache-info".to_owned(),
@@ -308,9 +319,9 @@ async fn private_stays_authenticated_and_streamed(pool: PgPool) {
         .await
         .unwrap();
     let app = router(state);
-    let credential = format!("Bearer {}", token("org_alpha", "secret"));
-    let wrong_org = format!("Bearer {}", token("org_beta", "secret"));
-    let wrong_cache = format!("Bearer {}", token("org_alpha", "main"));
+    let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
+    let wrong_org = format!("Bearer {}", token(&pool, "org_beta", "secret").await);
+    let wrong_cache = format!("Bearer {}", token(&pool, "org_alpha", "main").await);
     for (path, bytes) in [
         (
             "/alpha/secret/nix-cache-info".to_owned(),
@@ -370,13 +381,14 @@ async fn private_stays_authenticated_and_streamed(pool: PgPool) {
 }
 
 async fn signing_post(app: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
+    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(path)
-                .header("authorization", "Bearer operator-secret")
+                .uri(path.as_str())
+                .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -393,6 +405,7 @@ async fn private_sql_representation_validators_and_key_activation(pool: PgPool) 
     let initial = fixture_with_storage(pool.clone(), CDN, storage.clone()).await;
     let mut cfg = config(CDN);
     cfg.admin_secret = "operator-secret".into();
+    cfg.web_assertion_public_keys = web::public_key();
     cfg.signing_master_key = STANDARD.encode([42; 32]);
     cfg.signing_key_name = "fixture".into();
     let state = AppState::new(pool.clone(), cfg, storage.clone(), reqwest::Client::new()).unwrap();
@@ -404,7 +417,7 @@ async fn private_sql_representation_validators_and_key_activation(pool: PgPool) 
         .execute(&pool).await.unwrap();
     let hash = "0".repeat(32);
     let path = format!("/alpha/secret/{hash}.narinfo");
-    let credential = format!("Bearer {}", token("org_alpha", "secret"));
+    let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
     let expected = format!(
         "StorePath: /nix/store/test\nURL: nar/{}/zstd.nar\nCompression: zstd\nFileHash: sha256:{}\nFileSize: 32\nNarHash: sha256:{}\nNarSize: 32\nReferences: 11111111111111111111111111111111-z 00000000000000000000000000000000-a\nDeriver: 00000000000000000000000000000000-test.drv\nSystem: x86_64-linux\nSig: upstream:kept\n",
         "b".repeat(64),
@@ -1012,7 +1025,7 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
             read(&app, method, &path, &alpha).await.status(),
             StatusCode::UNAUTHORIZED
         );
-        let credential = format!("Bearer {}", token("org_alpha", "secret"));
+        let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
         let response = read(
             &app,
             method,
@@ -1038,7 +1051,7 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
             }
         );
         for (org, cache) in [("org_beta", "secret"), ("org_alpha", "main")] {
-            let denied = format!("Bearer {}", token(org, cache));
+            let denied = format!("Bearer {}", token(&pool, org, cache).await);
             assert_eq!(
                 read(
                     &app,
@@ -1051,7 +1064,7 @@ async fn organization_hosts_are_read_only_and_isolated(pool: PgPool) {
                 StatusCode::FORBIDDEN
             );
         }
-        let credential = format!("Bearer {}", token("org_alpha", "secret"));
+        let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
         assert_eq!(
             read(
                 &app,
@@ -1101,7 +1114,7 @@ async fn alias_metadata_is_scoped_signed_and_conditional(pool: PgPool) {
     use ed25519_dalek::{Signature, SigningKey};
     let state = alias_fixture(pool.clone(), CDN).await;
     let app = router(state.clone());
-    let credential = format!("Bearer {}", token("org_alpha", "secret"));
+    let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
     for (cache, blob, private) in [
         ("main", "a".repeat(64), false),
         ("secret", "b".repeat(64), true),

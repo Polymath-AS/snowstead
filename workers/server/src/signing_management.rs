@@ -25,7 +25,6 @@ use zeroize::Zeroizing;
 
 use crate::{
     AppState,
-    auth::Identity,
     config::Config,
     error::{ApiError, json_response},
     lifecycle::SigningKeyState,
@@ -271,11 +270,6 @@ async fn cache_id(
         .org
         .as_deref()
         .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "Forbidden"))?;
-    match &context.identity {
-        Identity::Admin { .. } => {}
-        Identity::OrgKey { org: own, .. } if own == org => {}
-        _ => return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden")),
-    }
     sqlx::query_scalar!(
         r#"
         SELECT id

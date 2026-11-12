@@ -10,15 +10,11 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
-use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::io::Read;
 
 use crate::{
     AppState,
-    auth::{Claims, Identity},
     error::{ApiError, json_response},
     management::ManagementContext,
 };
@@ -161,20 +157,14 @@ struct KeyPath {
     key: String,
 }
 
-fn authorize(context: &ManagementContext) -> Result<Option<&str>, ApiError> {
-    let org = context.org.as_deref();
-    // Defense in depth: a caller cannot use a scoped identity on the admin API
-    // or on another org, even if a future router forgets its auth boundary.
-    match &context.identity {
-        Identity::Admin { .. } => {}
-        Identity::OrgKey { org: own, .. } if org == Some(own.as_str()) => {}
-        _ => return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden")),
-    }
-    Ok(org)
+/// The org the route names; None on the operator surface. The middleware has
+/// already authorized the principal for this route.
+fn scope(context: &ManagementContext) -> Option<&str> {
+    context.org.as_deref()
 }
 
-fn authorize_org(context: &ManagementContext) -> Result<&str, ApiError> {
-    authorize(context)?.ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "Forbidden"))
+fn org_scope(context: &ManagementContext) -> Result<&str, ApiError> {
+    scope(context).ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "Forbidden"))
 }
 
 fn query_url(uri: &Uri) -> Result<reqwest::Url, ApiError> {
@@ -192,7 +182,7 @@ async fn get_tokens(
     Extension(context): Extension<ManagementContext>,
     uri: Uri,
 ) -> Result<Response, ApiError> {
-    let org = authorize(&context)?;
+    let org = scope(&context);
     let url = query_url(&uri)?;
     let filter = org.map(str::to_owned).or_else(|| query(&url, "org"));
     if filter.as_deref().is_some_and(|s| !valid_org(s)) {
@@ -206,7 +196,7 @@ async fn get_token(
     Extension(context): Extension<ManagementContext>,
     Path(TokenPath { jti }): Path<TokenPath>,
 ) -> Result<Response, ApiError> {
-    let org = authorize_org(&context)?;
+    let org = org_scope(&context)?;
     list_tokens(&state, Some(org), true, Some(&jti)).await
 }
 
@@ -216,8 +206,8 @@ async fn revoke_token(
     Path(TokenPath { jti }): Path<TokenPath>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let org = authorize(&context)?;
-    let identity = &context.identity;
+    let org = scope(&context);
+    let principal = &context.principal;
     let value = body(request).await?;
     let reason = string(
         &value,
@@ -243,7 +233,7 @@ async fn revoke_token(
                     AND ($4::text IS NULL OR org_id = $4)
                 "#,
         &jti,
-        identity.actor(),
+        principal.actor(),
         reason,
         org
     )
@@ -269,7 +259,7 @@ async fn list_keys(
     State(state): State<AppState>,
     Extension(context): Extension<ManagementContext>,
 ) -> Result<Response, ApiError> {
-    let org = authorize_org(&context)?;
+    let org = org_scope(&context)?;
     let rows = sqlx::query!(
         r#"
                 SELECT
@@ -294,10 +284,7 @@ async fn create_key(
     Extension(context): Extension<ManagementContext>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let org = authorize_org(&context)?;
-    if !matches!(&context.identity, Identity::Admin { .. }) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-    }
+    let org = org_scope(&context)?;
     let value = body(request).await?;
     let name = value
         .get("name")
@@ -305,17 +292,14 @@ async fn create_key(
         .map(str::trim)
         .filter(|s| !s.is_empty() && s.encode_utf16().count() <= 64)
         .ok_or_else(|| bad("name must be 1 to 64 characters"))?;
-    let mut bytes = [0u8; 48];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|_| internal())?;
+    let bytes = crate::auth::random_bytes::<48>().map_err(|_| internal())?;
     let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let id: String = bytes[..16]
         .iter()
         .map(|b| alphabet[(*b as usize) % alphabet.len()] as char)
         .collect();
     let secret = URL_SAFE_NO_PAD.encode(&bytes[16..]);
-    let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+    let hash = crate::auth::secret_hash(&secret);
     let created = sqlx::query_scalar!(
         r#"
                 INSERT INTO org_api_keys (
@@ -345,7 +329,7 @@ async fn revoke_key(
     Extension(context): Extension<ManagementContext>,
     Path(KeyPath { key: id }): Path<KeyPath>,
 ) -> Result<Response, ApiError> {
-    let org = authorize_org(&context)?;
+    let org = org_scope(&context)?;
     let changed = sqlx::query!(
         r#"
                 UPDATE org_api_keys
@@ -381,7 +365,7 @@ async fn list_audit(
     Extension(context): Extension<ManagementContext>,
     uri: Uri,
 ) -> Result<Response, ApiError> {
-    let org = authorize_org(&context)?;
+    let org = org_scope(&context)?;
     let url = query_url(&uri)?;
     let limit = query(&url, "limit").map(|v| js_number(&v)).unwrap_or(50.0);
     if !limit.is_finite() || limit.fract() != 0.0 || !(1.0..=200.0).contains(&limit) {
@@ -465,14 +449,8 @@ async fn create_token(
     Extension(context): Extension<ManagementContext>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let scope = authorize(&context)?;
-    let identity = &context.identity;
-    if state.config.jwt_secret.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Service unavailable",
-        ));
-    }
+    let scope = scope(&context);
+    let principal = &context.principal;
     let value = body(request).await?;
     let requested_org = value
         .get("org")
@@ -491,6 +469,8 @@ async fn create_token(
     )?;
     let caches = strings(&value, "caches", 50)?;
     let perms = strings(&value, "perms", 10)?;
+    // Null keeps the token until it is revoked: `snowstead login` offers
+    // tokens that never expire.
     let days = match value.get("expiresInDays") {
         None => Some(90),
         Some(Value::Null) => None,
@@ -547,56 +527,47 @@ async fn create_token(
             entries.push(format!("id:{id}"));
         }
     }
-    let now = Utc::now();
-    let expires = days.map(|days| now + chrono::Duration::days(days));
-    let jti = uuid::Uuid::now_v7().to_string();
-    let claims = Claims {
-        jti: jti.clone(),
-        sub: subject.into(),
-        iss: "snowstead".into(),
-        aud: "snowstead".into(),
-        caches: entries.clone(),
-        perms: perms.clone(),
-        org: Some(org.into()),
-        iat: now.timestamp(),
-        exp: expires.map(|v| v.timestamp()),
-    };
-    let input = format!(
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).map_err(|_| internal())?)
-    );
-    let mut mac = Hmac::<Sha256>::new_from_slice(state.config.jwt_secret.as_bytes())
-        .map_err(|_| internal())?;
-    mac.update(input.as_bytes());
-    let token = format!(
-        "{input}.{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    );
+    let expires = days.map(|days| Utc::now() + chrono::Duration::days(days));
+    let (jti, token, hash) = crate::auth::issue_token().map_err(|_| internal())?;
     sqlx::query!(
         r#"
         INSERT INTO api_tokens (
             jti,
             subject,
-            caches_json,
-            perms_json,
+            secret_hash,
             expires_at,
             created_by,
             org_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
         &jti,
         subject,
-        json!(entries).to_string(),
-        json!(perms).to_string(),
+        hash,
         expires,
-        identity.actor(),
+        principal.actor(),
         org
     )
     .execute(&mut *tx)
     .await?;
+    // The token's scope lives only in these rows, read on every request.
+    sqlx::query!(
+        r#"
+        INSERT INTO token_permissions (
+            token_jti,
+            permission,
+            position
+        )
+        SELECT $1, permission, position
+        FROM UNNEST($2::text[]) WITH ORDINALITY AS requested(permission, position)
+        "#,
+        &jti,
+        &perms
+    )
+    .execute(&mut *tx)
+    .await?;
     // Explicit ordinality keeps generated row IDs (and later listings) in
-    // claim order, including patterns interleaved with literal cache IDs.
+    // request order, including patterns interleaved with literal cache IDs.
     sqlx::query!(
         r#"
         INSERT INTO token_caches (
@@ -641,7 +612,22 @@ async fn list_tokens(
     let rows = sqlx::query!(
         r#"
         SELECT
-            t.*,
+            t.jti,
+            t.subject,
+            t.org_id,
+            t.created_at,
+            t.expires_at,
+            t.created_by,
+            t.revoked_at,
+            t.revoked_by,
+            t.revocation_reason,
+            t.last_used_at,
+            ARRAY(
+                SELECT p.permission
+                FROM token_permissions p
+                WHERE p.token_jti = t.jti
+                ORDER BY p.position
+            ) AS "perms!",
             ARRAY(
                 SELECT COALESCE(c.name, 'id:' || tc.cache_id::text, tc.pattern)
                 FROM token_caches tc
@@ -661,8 +647,7 @@ async fn list_tokens(
     .await?;
     let mut tokens = Vec::new();
     for r in rows {
-        let perms: Value = serde_json::from_str(&r.perms_json).map_err(|_| internal())?;
-        let mut token = json!({"jti":r.jti,"subject":r.subject,"caches":r.entries,"perms":perms,"org":r.org_id,"createdAt":date(Some(r.created_at)),"expiresAt":date(r.expires_at),"createdBy":r.created_by,"revokedAt":date(r.revoked_at),"revokedBy":r.revoked_by,"revocationReason":r.revocation_reason});
+        let mut token = json!({"jti":r.jti,"subject":r.subject,"caches":r.entries,"perms":r.perms,"org":r.org_id,"createdAt":date(Some(r.created_at)),"expiresAt":date(r.expires_at),"createdBy":r.created_by,"revokedAt":date(r.revoked_at),"revokedBy":r.revoked_by,"revocationReason":r.revocation_reason});
         if scoped {
             token["lastUsedAt"] = date(r.last_used_at);
         }

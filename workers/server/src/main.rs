@@ -85,6 +85,21 @@ async fn run_server() -> anyhow::Result<()> {
         _ => anyhow::bail!("Usage: snowstead-server [migrate [--rebaseline]]"),
     }
     let config = Config::from_env();
+    config.validate_auth()?;
+    if config.jwt_secret.is_empty() {
+        // Without the secret, every live JWT-era token would be rejected.
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM api_tokens WHERE secret_hash IS NULL \
+             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()))",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| anyhow::anyhow!("Reading API tokens failed; run migrations first"))?;
+        anyhow::ensure!(
+            !live,
+            "JWT_SECRET is required while unrevoked JWT-era API tokens exist"
+        );
+    }
     let storage = Storage::new(&config)?;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))

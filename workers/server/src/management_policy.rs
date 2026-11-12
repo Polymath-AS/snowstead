@@ -4,7 +4,6 @@
 use crate::db::Transaction;
 use crate::{
     AppState,
-    auth::Identity,
     error::{ApiError, json_response},
     lifecycle::{InstallationPhase, PinKeep, UploadStatus},
     management::ManagementContext,
@@ -28,9 +27,6 @@ fn bad(message: &str) -> ApiError {
 }
 fn missing() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "Not Found")
-}
-fn forbidden() -> ApiError {
-    ApiError::new(StatusCode::FORBIDDEN, "Forbidden")
 }
 fn date(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -204,19 +200,6 @@ fn context_org(context: &ManagementContext) -> &str {
     context.org.as_deref().unwrap_or("default")
 }
 
-fn authorize(identity: &Identity, org: &str, pin_write: bool) -> Result<(), ApiError> {
-    match identity {
-        Identity::Admin { .. } => Ok(()),
-        Identity::OrgKey { org: owner, .. } if owner == org => Ok(()),
-        Identity::Jwt(claims)
-            if pin_write && claims.belongs_to(org) && claims.has_permission("push") =>
-        {
-            Ok(())
-        }
-        _ => Err(forbidden()),
-    }
-}
-
 struct FencedCache {
     tx: Transaction,
     id: i32,
@@ -225,12 +208,7 @@ struct FencedCache {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn load_cache(
-    state: &AppState,
-    org: &str,
-    name: &str,
-    identity: &Identity,
-) -> Result<FencedCache, ApiError> {
+async fn load_cache(state: &AppState, org: &str, name: &str) -> Result<FencedCache, ApiError> {
     let mut tx = crate::profile_future!(
         crate::db::begin(state, org),
         label = "management_policy.pool_begin"
@@ -261,11 +239,6 @@ async fn load_cache(
     let id = cache.id;
     let public = cache.is_public;
     let metadata = MetadataTarget::new(public, &cache.slug, cache.moving_from.as_deref(), name);
-    if let Identity::Jwt(claims) = identity
-        && !claims.has_cache_access(id, name)
-    {
-        return Err(forbidden());
-    }
     Ok(FencedCache {
         tx,
         id,
@@ -274,11 +247,8 @@ async fn load_cache(
     })
 }
 
-fn authorize_cache(
-    context: &ManagementContext,
-    name: &str,
-    pin_write: bool,
-) -> Result<(), ApiError> {
+/// The management middleware has authorized the route; this checks the name.
+fn valid_cache(name: &str) -> Result<(), ApiError> {
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -291,7 +261,7 @@ fn authorize_cache(
             "CacheName must be 1-64 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen",
         ));
     }
-    authorize(&context.identity, context_org(context), pin_write)
+    Ok(())
 }
 
 async fn get_eviction(
@@ -300,7 +270,6 @@ async fn get_eviction(
     request: Request,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize(&context.identity, org, false)?;
     eviction(&state, org, params(&request)).await
 }
 
@@ -311,7 +280,7 @@ async fn purge_cache(
     request: Request,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, false)?;
+    valid_cache(&path.cache)?;
     if state.config.cdn_zone_id.is_empty() {
         return Err(bad("no CDN is configured to purge"));
     }
@@ -321,7 +290,7 @@ async fn purge_cache(
         public,
         metadata,
         ..
-    } = load_cache(&state, org, &path.cache, &context.identity).await?;
+    } = load_cache(&state, org, &path.cache).await?;
     strict(&input, &["storePathHashes"])?;
     let hashes = input
         .get("storePathHashes")
@@ -361,9 +330,8 @@ async fn get_pins(
     Path(path): Path<CachePath>,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, false)?;
-    let FencedCache { mut tx, id, .. } =
-        load_cache(&state, org, &path.cache, &context.identity).await?;
+    valid_cache(&path.cache)?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
     protocol(&mut tx, id, "nix").await?;
     let response = ok(json!({"pins":list_pins(&mut tx,id).await?}));
     tx.commit().await?;
@@ -377,10 +345,9 @@ async fn create_pin(
     request: Request,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, true)?;
+    valid_cache(&path.cache)?;
     let input = body(request).await?;
-    let FencedCache { mut tx, id, .. } =
-        load_cache(&state, org, &path.cache, &context.identity).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
     protocol(&mut tx, id, "nix").await?;
     let response = put_pin(&mut tx, id, input).await?;
     tx.commit().await?;
@@ -393,9 +360,8 @@ async fn remove_pin(
     Path(path): Path<PinPath>,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, true)?;
-    let FencedCache { mut tx, id, .. } =
-        load_cache(&state, org, &path.cache, &context.identity).await?;
+    valid_cache(&path.cache)?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
     protocol(&mut tx, id, "nix").await?;
     let pin = path.pin.as_str();
     if !name_valid(pin) {
@@ -458,8 +424,8 @@ async fn compiler_stats(
     reset: bool,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &name, false)?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &name, &context.identity).await?;
+    valid_cache(&name)?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &name).await?;
     if op == "sccache" || reset {
         protocol(&mut tx, id, op).await?;
     }
@@ -556,9 +522,8 @@ async fn get_paths(
     request: Request,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, false)?;
-    let FencedCache { mut tx, id, .. } =
-        load_cache(&state, org, &path.cache, &context.identity).await?;
+    valid_cache(&path.cache)?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
     let response = list_paths(&mut tx, id, params(&request)).await?;
     tx.commit().await?;
     Ok(response)
@@ -571,14 +536,14 @@ async fn remove_paths(
     request: Request,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &path.cache, false)?;
+    valid_cache(&path.cache)?;
     let input = body(request).await?;
     let FencedCache {
         mut tx,
         id,
         metadata,
         ..
-    } = load_cache(&state, org, &path.cache, &context.identity).await?;
+    } = load_cache(&state, org, &path.cache).await?;
     let response = delete_paths(&metadata, &mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
@@ -609,13 +574,13 @@ async fn withdraw_cache(
     delete: bool,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
-    authorize_cache(&context, &name, false)?;
+    valid_cache(&name)?;
     let FencedCache {
         mut tx,
         id,
         public,
         metadata,
-    } = load_cache(&state, org, &name, &context.identity).await?;
+    } = load_cache(&state, org, &name).await?;
     if !delete {
         sqlx::query!(
             r#"

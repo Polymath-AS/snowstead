@@ -13,8 +13,8 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 
 use crate::{
-    AppState,
-    auth::{Identity, authenticate_write},
+    AppState, auth,
+    authz::{self, Action, Principal as Identity, Resource},
     error::{ApiError, json_response},
     protocol_policy::CallerLimit,
 };
@@ -44,24 +44,26 @@ pub(crate) async fn write_access(
         false,
     );
     // Authentication precedes parsing, including on malformed requests.
-    let identity = authenticate_write(request.headers(), &state).await?;
+    let identity = auth::authenticate(request.headers(), &state, None).await?;
     state
         .protocol_limits
         .check(CallerLimit::Push, &identity.actor())?;
     let ip = crate::app::client_ip(&state, &request);
-    if let Identity::Jwt(claims) = &identity
-        && !claims.has_permission("push")
+    if let Err(denied) =
+        authz::authorize(&identity, Action::NixPush, &Resource::Org(identity.org()))
     {
-        audit(
-            &state.pool,
-            &identity,
-            None,
-            StatusCode::FORBIDDEN,
-            json!({"reason":"missing push permission"}),
-            ip.as_deref(),
-        )
-        .await;
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
+        if matches!(identity, Identity::ApiToken(_)) {
+            audit(
+                &state.pool,
+                &identity,
+                None,
+                StatusCode::FORBIDDEN,
+                json!({"reason":"missing push permission"}),
+                ip.as_deref(),
+            )
+            .await;
+        }
+        return Err(denied.into());
     }
     let endpoint = match matched.as_str() {
         "/_api/v1/get-missing-paths" => "get-missing-paths",
@@ -169,11 +171,11 @@ async fn get_missing_paths(
     .fetch_optional(&state.pool)
     .await?;
     let cache_id = cache.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Cache not found"))?;
-    if let Identity::Jwt(claims) = &identity
-        && !claims.has_cache_access(cache_id, cache_name)
-    {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "Forbidden"));
-    }
+    authz::authorize(
+        &identity,
+        Action::NixPush,
+        &Resource::cache(identity.org(), cache_id, cache_name),
+    )?;
     // Refresh retention and return membership in one statement, without
     // rewriting paths whose daily retention refresh is not due.
     let existing: HashSet<String> = sqlx::query_scalar!(

@@ -5,9 +5,17 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 /// Secrets deliberately do not implement Debug.
 #[derive(Clone, Default)]
 pub struct Config {
+    /// Verifies JWT-era API tokens that are still listed in `api_tokens`.
+    /// Empty rejects every JWT; new tokens are opaque and need no secret.
     pub jwt_secret: String,
-    pub auth_token: String,
+    /// A self-hosted installation's shared push token, accepted only when
+    /// `ALLOW_SHARED_AUTH_TOKEN=true`. None disables it.
+    pub shared_auth_token: Option<String>,
+    /// The operator credential, valid only on `/_api/v1/admin`.
     pub admin_secret: String,
+    /// Base64 raw Ed25519 public keys, separated by whitespace, that sign the
+    /// web's per-request assertions. Empty accepts no dashboard users.
+    pub web_assertion_public_keys: String,
     pub upstreams: Vec<String>,
     pub r2_endpoint: String,
     pub r2_access_key_id: String,
@@ -179,8 +187,12 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             jwt_secret: std::env::var("JWT_SECRET").unwrap_or_default(),
-            auth_token: std::env::var("AUTH_TOKEN").unwrap_or_default(),
+            shared_auth_token: std::env::var("ALLOW_SHARED_AUTH_TOKEN")
+                .is_ok_and(|v| v == "true")
+                .then(|| std::env::var("AUTH_TOKEN").unwrap_or_default()),
             admin_secret: std::env::var("ADMIN_SECRET").unwrap_or_default(),
+            web_assertion_public_keys: std::env::var("WEB_ASSERTION_PUBLIC_KEYS")
+                .unwrap_or_default(),
             upstreams: std::env::var("UPSTREAM_CACHES")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -210,6 +222,36 @@ impl Config {
             resources: ResourceLimits::from_env(),
             push_jobs: PushJobLimits::from_env(),
         }
+    }
+}
+
+/// Shortest accepted operator and shared-token secrets.
+const MIN_SECRET_LEN: usize = 16;
+
+impl Config {
+    /// Startup checks for a serving process: refuse to run with credentials
+    /// that are missing or malformed, rather than deny every request later.
+    pub fn validate_auth(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.admin_secret.len() >= MIN_SECRET_LEN,
+            "ADMIN_SECRET must be set, at least {MIN_SECRET_LEN} characters"
+        );
+        if let Some(token) = &self.shared_auth_token {
+            anyhow::ensure!(
+                token.len() >= MIN_SECRET_LEN,
+                "ALLOW_SHARED_AUTH_TOKEN=true needs AUTH_TOKEN, at least {MIN_SECRET_LEN} characters"
+            );
+            anyhow::ensure!(
+                token != &self.admin_secret,
+                "AUTH_TOKEN must differ from ADMIN_SECRET"
+            );
+        }
+        anyhow::ensure!(
+            self.jwt_secret != self.admin_secret,
+            "JWT_SECRET must differ from ADMIN_SECRET"
+        );
+        crate::auth::assertion_keys(&self.web_assertion_public_keys)?;
+        Ok(())
     }
 }
 
@@ -244,6 +286,40 @@ pub async fn connect_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_configuration_fails_closed_at_startup() {
+        let valid = Config {
+            admin_secret: "operator-secret-1234".into(),
+            ..Default::default()
+        };
+        assert!(valid.validate_auth().is_ok());
+        for invalid in [
+            Config::default(),
+            Config {
+                admin_secret: "short".into(),
+                ..Default::default()
+            },
+            Config {
+                shared_auth_token: Some(String::new()),
+                ..valid.clone()
+            },
+            Config {
+                shared_auth_token: Some(valid.admin_secret.clone()),
+                ..valid.clone()
+            },
+            Config {
+                jwt_secret: valid.admin_secret.clone(),
+                ..valid.clone()
+            },
+            Config {
+                web_assertion_public_keys: "not-a-key".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(invalid.validate_auth().is_err());
+        }
+    }
 
     #[test]
     fn resource_limits_reject_zero_excessive_and_impossible_budgets() {

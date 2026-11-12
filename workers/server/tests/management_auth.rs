@@ -1,12 +1,15 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
+use sha2::Digest;
 use snowstead_server::{AppState, config::Config, router};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -18,11 +21,18 @@ async fn call(
     token: Option<&str>,
     body: Value,
 ) -> (StatusCode, Value) {
+    let (path, token) = match token {
+        Some(token) if token == "operator-secret" => {
+            let (path, token) = web::dashboard(method, path, token, None);
+            (path, Some(token))
+        }
+        _ => (path.to_owned(), token.map(str::to_owned)),
+    };
     let mut request = Request::builder()
         .method(method)
-        .uri(path)
+        .uri(path.as_str())
         .header("content-type", "application/json");
-    if let Some(token) = token {
+    if let Some(token) = &token {
         request = request.header("authorization", format!("Bearer {token}"));
     }
     let response = app
@@ -48,7 +58,8 @@ async fn app(pool: &PgPool) -> Router {
             Config {
                 jwt_secret: "contract-secret".into(),
                 admin_secret: "operator-secret".into(),
-                auth_token: "legacy-secret".into(),
+                web_assertion_public_keys: web::public_key(),
+                shared_auth_token: Some("legacy-secret".into()),
                 ..Default::default()
             },
             common::storage(),
@@ -200,26 +211,46 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
     assert_eq!(made["perms"], json!(["pull", "push"]));
     assert_eq!(made["org"], "org_alpha");
     assert_eq!(made["expiresAt"], Value::Null);
-    let jwt = made["token"].as_str().unwrap();
-    let parts: Vec<_> = jwt.split('.').collect();
-    assert_eq!(parts[0], "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
-    assert!(claims.get("exp").is_none());
+    // The token is opaque; the service keeps a hash of its secret and its
+    // scope in normalized rows, never in the token itself.
+    let token = made["token"].as_str().unwrap();
+    let jti = made["jti"].as_str().unwrap();
+    let secret = token
+        .strip_prefix(&format!("snowstead_tok_{jti}_"))
+        .unwrap();
+    assert!(!secret.is_empty() && !secret.contains('.'));
     let cache_id: i32 =
         sqlx::query_scalar("SELECT id FROM caches WHERE org_id='org_alpha' AND name='main'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(claims["caches"], json!([format!("id:{cache_id}"), "ci-*"]));
-    let persisted: String = sqlx::query_scalar("SELECT caches_json FROM api_tokens WHERE jti=$1")
-        .bind(made["jti"].as_str().unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (hash, caches_json, perms_json): (String, String, String) =
+        sqlx::query_as("SELECT secret_hash, caches_json, perms_json FROM api_tokens WHERE jti=$1")
+            .bind(jti)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(hash, hex::encode(sha2::Sha256::digest(secret.as_bytes())));
+    assert!(!token.contains(&hash));
+    assert_eq!((caches_json.as_str(), perms_json.as_str()), ("[]", "[]"));
+    let grants: Vec<(Option<i32>, Option<String>)> =
+        sqlx::query_as("SELECT cache_id, pattern FROM token_caches WHERE token_jti=$1 ORDER BY id")
+            .bind(jti)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&persisted).unwrap(),
-        claims["caches"]
+        grants,
+        [(Some(cache_id), None), (None, Some("ci-*".into()))]
     );
+    let perms: Vec<String> = sqlx::query_scalar(
+        "SELECT permission FROM token_permissions WHERE token_jti=$1 ORDER BY position",
+    )
+    .bind(jti)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(perms, ["pull", "push"]);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM token_caches WHERE token_jti=$1")
         .bind(made["jti"].as_str().unwrap())
         .fetch_one(&pool)
@@ -232,7 +263,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "POST",
             missing,
-            Some(jwt),
+            Some(token),
             json!({"cache":"main","storePathHashes":["0".repeat(32)]})
         )
         .await
@@ -244,7 +275,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "POST",
             missing,
-            Some(jwt),
+            Some(token),
             json!({"cache":"other","storePathHashes":["0".repeat(32)]})
         )
         .await
@@ -256,7 +287,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "GET",
             "/beta/main/nix-cache-info",
-            Some(jwt),
+            Some(token),
             Value::Null
         )
         .await
@@ -273,7 +304,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "POST",
             missing,
-            Some(jwt),
+            Some(token),
             json!({"cache":"renamed","storePathHashes":["0".repeat(32)]})
         )
         .await
@@ -285,7 +316,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "GET",
             "/alpha/renamed/nix-cache-info",
-            Some(jwt),
+            Some(token),
             Value::Null
         )
         .await
@@ -348,7 +379,7 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
             &app,
             "POST",
             missing,
-            Some(jwt),
+            Some(token),
             json!({"cache":"renamed","storePathHashes":["0".repeat(32)]})
         )
         .await
@@ -378,24 +409,15 @@ async fn token_batches_preserve_interleaved_order_and_first_error(pool: PgPool) 
             .await
             .unwrap();
     let ids: std::collections::HashMap<_, _> = ids.into_iter().collect();
-    let claims: Value = serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(made["token"].as_str().unwrap().split('.').nth(1).unwrap())
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        claims["caches"],
-        json!([
-            "z-*",
-            format!("id:{}", ids["other"]),
-            format!("id:{}", ids["main"]),
-            "a-*"
-        ])
-    );
+    let expected = json!([
+        "z-*",
+        format!("id:{}", ids["other"]),
+        format!("id:{}", ids["main"]),
+        "a-*"
+    ]);
     let entries: Vec<String> = sqlx::query_scalar("SELECT coalesce('id:'||cache_id::text,pattern) FROM token_caches WHERE token_jti=$1 ORDER BY id")
         .bind(made["jti"].as_str().unwrap()).fetch_all(&pool).await.unwrap();
-    assert_eq!(json!(entries), claims["caches"]);
+    assert_eq!(json!(entries), expected);
     let (_, listed) = call(
         &app,
         "GET",
@@ -558,8 +580,10 @@ async fn admin_token_validation_and_audit_pagination(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn operator_on_behalf_can_create_keys_without_logging_secrets(pool: PgPool) {
+async fn dashboard_users_create_keys_as_themselves_without_logging_secrets(pool: PgPool) {
     let app = app(&pool).await;
+    // The operator secret no longer reaches org routes, and an actor header
+    // names no one.
     let response = app
         .clone()
         .oneshot(
@@ -568,6 +592,27 @@ async fn operator_on_behalf_can_create_keys_without_logging_secrets(pool: PgPool
                 .uri("/_api/v1/orgs/org_alpha/keys")
                 .header("authorization", "Bearer operator-secret")
                 .header("x-snowstead-actor", "dev@example.test")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name":"dashboard"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let path = "/_api/v1/orgs/org_alpha/keys";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_api/v1/orgs/org_alpha/keys")
+                .header(
+                    "authorization",
+                    format!(
+                        "Bearer {}",
+                        web::assertion("POST", path, "org_alpha", "owner", "dev@example.test")
+                    ),
+                )
                 .header("cf-connecting-ip", "198.51.100.99")
                 .extension(axum::extract::ConnectInfo(
                     "192.0.2.23:43210".parse::<std::net::SocketAddr>().unwrap(),
@@ -605,4 +650,168 @@ async fn operator_on_behalf_can_create_keys_without_logging_secrets(pool: PgPool
         .await
         .unwrap();
     assert!(!audit.to_string().contains(&hash));
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
+    let app = app(&pool).await;
+    let as_user = |method: &str, path: &str, org: &str, role: &str| {
+        web::assertion(method, path, org, role, "person@example.test")
+    };
+    let caches = "/_api/v1/orgs/org_alpha/caches";
+    let keys = "/_api/v1/orgs/org_alpha/keys";
+    let org = "/_api/v1/orgs/org_alpha";
+    let status = |method: &'static str, path: &'static str, credential: String, body: Value| {
+        let app = app.clone();
+        async move { call(&app, method, path, Some(&credential), body).await.0 }
+    };
+    assert_eq!(
+        status(
+            "GET",
+            caches,
+            as_user("GET", caches, "org_alpha", "member"),
+            Value::Null
+        )
+        .await,
+        StatusCode::OK
+    );
+    // Members can't manage API keys; owners can.
+    let named = json!({"name":"deploy"});
+    assert_eq!(
+        status(
+            "POST",
+            keys,
+            as_user("POST", keys, "org_alpha", "member"),
+            named.clone()
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(
+            "POST",
+            keys,
+            as_user("POST", keys, "org_alpha", "owner"),
+            named.clone()
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    // Another org's user, or an assertion for another request, gets nothing.
+    assert_eq!(
+        status(
+            "GET",
+            caches,
+            as_user("GET", caches, "org_beta", "owner"),
+            Value::Null
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an org_beta user is not authorized on org_alpha"
+    );
+    let beta = "/_api/v1/orgs/org_beta/caches";
+    assert_eq!(
+        status(
+            "GET",
+            caches,
+            as_user("GET", beta, "org_beta", "owner"),
+            Value::Null
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(
+            "POST",
+            keys,
+            as_user("GET", keys, "org_alpha", "owner"),
+            named.clone()
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Owners change the slug; only the operator sets limits or creates orgs.
+    assert_eq!(
+        status(
+            "PUT",
+            org,
+            as_user("PUT", org, "org_alpha", "member"),
+            json!({"slug":"alpha-2"})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(
+            "PUT",
+            org,
+            as_user("PUT", org, "org_alpha", "owner"),
+            json!({"slug":"alpha-2"})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(
+            "PUT",
+            org,
+            as_user("PUT", org, "org_alpha", "owner"),
+            json!({"storageLimit":1})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let fresh = "/_api/v1/orgs/org_fresh";
+    assert_eq!(
+        status(
+            "PUT",
+            fresh,
+            as_user("PUT", fresh, "org_fresh", "owner"),
+            json!({"slug":"fresh"})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // The operator works on its own surface (dashboard_users_create_keys_as_
+    // themselves_without_logging_secrets checks it is refused on org routes).
+    let admin_org = "/_api/v1/admin/orgs/org_alpha";
+    let (status_code, updated) = call(
+        &app,
+        "PUT",
+        admin_org,
+        Some("operator-secret"),
+        json!({"storageLimit":5}),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK, "{updated}");
+    let (status_code, read) =
+        call(&app, "GET", admin_org, Some("operator-secret"), Value::Null).await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(
+        (read["slug"].as_str(), read["storageLimit"].as_i64()),
+        (Some("alpha-2"), Some(5))
+    );
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            "/_api/v1/admin/orgs/org_missing",
+            Some("operator-secret"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let key = key(&app, "org_alpha").await;
+    assert_eq!(
+        status(
+            "GET",
+            admin_org,
+            key["key"].as_str().unwrap().into(),
+            Value::Null
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
 }

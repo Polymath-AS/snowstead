@@ -478,7 +478,7 @@ impl Extractor for TraceHeaders<'_> {
 }
 
 /// Record only already-authenticated IDs, never credentials or raw claims.
-pub(crate) fn identity(identity: &crate::auth::Identity, org: Option<&str>) {
+pub(crate) fn identity(identity: &crate::authz::Principal, org: Option<&str>) {
     let span = Span::current();
     let org = org.unwrap_or_else(|| identity.org());
     if safe_id(org) {

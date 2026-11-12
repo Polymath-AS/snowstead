@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO token_permissions (\n            token_jti,\n            permission,\n            position\n        )\n        SELECT $1, permission, position\n        FROM UNNEST($2::text[]) WITH ORDINALITY AS requested(permission, position)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92bd53ea9d3ac798ed68a114c028246da2a9665c57161c190fb5cb855f92983e"
+}

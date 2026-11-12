@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -18,8 +21,8 @@ use std::sync::{
 };
 use tower::ServiceExt;
 
-fn token(org: &str, cache: &str, perms: &[&str]) -> String {
-    let p = json!({"jti":"policy-test","sub":"ci","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
+fn jwt(org: &str, cache: &str, perms: &[&str]) -> String {
+    let p = json!({"jti":format!("policy-{org}-{cache}-{}", perms.join("+")),"sub":"ci","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
     let input = format!(
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.{}",
         URL_SAFE_NO_PAD.encode(p.to_string())
@@ -46,6 +49,7 @@ async fn fixture_with_storage(pool: &PgPool, storage: Storage) -> AppState {
 fn config() -> Config {
     Config {
         admin_secret: "policy-admin".into(),
+        web_assertion_public_keys: web::public_key(),
         jwt_secret: "policy-jwt".into(),
         ..Default::default()
     }
@@ -57,12 +61,17 @@ async fn send(
     credential: &str,
     value: Value,
 ) -> (StatusCode, Value) {
+    let (path, credential) = if credential == "policy-admin" {
+        web::dashboard(method, path, credential, None)
+    } else {
+        (path.to_owned(), credential.to_owned())
+    };
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(method)
-                .uri(path)
+                .uri(path.as_str())
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))
@@ -91,18 +100,26 @@ async fn publish(pool: &PgPool, digit: char, name: &str, refs: Value) -> String 
     root
 }
 
+#[path = "support/tokens.rs"]
+mod tokens;
+
+/// A listed JWT-era token, which works with the scope its row records.
+async fn token(pool: &PgPool, org: &str, cache: &str, perms: &[&str]) -> String {
+    tokens::register(pool, jwt(org, cache, perms)).await
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn closure_revision_retention_and_scoped_deletion(pool: PgPool) {
     let state = fixture(&pool).await;
     let app = router(state);
     let dep = publish(&pool, 'b', "dependency", json!([])).await;
     let root = publish(&pool, 'a', "root", json!([dep])).await;
-    let write = token("policy_a", "shared", &["push"]);
+    let write = token(&pool, "policy_a", "shared", &["push"]).await;
     let pin = json!({"name":"release","storePath":root,"keep":{"revisions":1}});
     for credential in [
-        token("policy_b", "*", &["push"]),
-        token("policy_a", "other", &["push"]),
-        token("policy_a", "*", &["pull"]),
+        token(&pool, "policy_b", "*", &["push"]).await,
+        token(&pool, "policy_a", "other", &["push"]).await,
+        token(&pool, "policy_a", "*", &["pull"]).await,
     ] {
         assert_eq!(
             send(&app, "POST", &path("pins"), &credential, pin.clone())
@@ -376,7 +393,7 @@ async fn reset_eviction_and_deletion_fence_slow_compiler_publication(pool: PgPoo
         .unwrap();
     let state = fixture(&bounded).await;
     let app = router(state);
-    let credential = token("policy_a", "shared", &["go:write", "sccache:write"]);
+    let credential = token(&pool, "policy_a", "shared", &["go:write", "sccache:write"]).await;
     for product in ["go", "sccache"] {
         for operation in [
             format!("{product}/reset"),

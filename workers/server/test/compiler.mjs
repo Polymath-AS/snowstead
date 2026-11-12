@@ -1,7 +1,7 @@
 // Build snowstead-server first, then run inside nix develop:
 // scripts/with-postgres.sh scripts/with-r2.sh node --test workers/server/test/compiler.mjs
 import assert from "node:assert/strict";
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
@@ -48,16 +48,16 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
   created = true;
   const database = new URL(base);
   database.pathname = `/${name}`;
-  const secret = randomBytes(32).toString("hex");
   const env = {
     ...process.env, DATABASE_URL: database.toString(),
-    JWT_SECRET: secret, AUTH_TOKEN: "", ADMIN_SECRET: "", SIGNING_MASTER_KEY: "",
+    JWT_SECRET: "", ADMIN_SECRET: randomBytes(32).toString("hex"), SIGNING_MASTER_KEY: "",
     SIGNING_PRIVATE_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false", PUBLIC_URL: "", UPSTREAM_CACHES: "",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",
     DATABASE_MAX_CONNECTIONS: "2", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info",
   };
   await exec(serverBinary, ["migrate"], { env, timeout: 30_000 });
+  const tokens = {};
   const db = new Client({ connectionString: database.toString() });
   await db.connect();
   try {
@@ -65,18 +65,21 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
       const { rows: [{ id }] } = await db.query(
         "INSERT INTO caches(name,is_public) VALUES ($1,false) RETURNING id", [protocol]);
       await db.query("INSERT INTO cache_protocols(cache_id,protocol) VALUES ($1,$2)", [id, protocol]);
+      // An opaque API token, stored as the service issues them: a hashed
+      // secret, with its scope in token_permissions and token_caches.
+      const jti = randomUUID();
+      const tokenSecret = randomBytes(32).toString("base64url");
+      await db.query(
+        "INSERT INTO api_tokens(jti,subject,secret_hash,created_by,org_id,expires_at) VALUES ($1,'compiler-fixture',$2,'test','default',now()+interval '1 hour')",
+        [jti, createHash("sha256").update(tokenSecret).digest("hex")]);
+      await db.query(
+        "INSERT INTO token_permissions(token_jti,permission,position) VALUES ($1,$2,1),($1,$3,2)",
+        [jti, `${protocol}:read`, `${protocol}:write`]);
+      await db.query("INSERT INTO token_caches(token_jti,cache_id) VALUES ($1,$2)", [jti, id]);
+      tokens[protocol] = `snowstead_tok_${jti}_${tokenSecret}`;
     }
   } finally { await db.end(); }
-  const token = protocol => {
-    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-    const payload = Buffer.from(JSON.stringify({
-      jti: randomUUID(), sub: "compiler-fixture", iss: "snowstead", aud: "snowstead", org: "default",
-      caches: [protocol], perms: [`${protocol}:read`, `${protocol}:write`],
-      iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600,
-    })).toString("base64url");
-    const input = `${header}.${payload}`;
-    return `${input}.${createHmac("sha256", secret).update(input).digest("base64url")}`;
-  };
+  const token = protocol => tokens[protocol];
   server = spawn(serverBinary, [], { env, stdio: ["ignore", "pipe", "inherit"] });
   closed = once(server, "exit");
   const lines = createInterface({ input: server.stdout });

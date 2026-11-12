@@ -20,7 +20,7 @@ use sqlx::{FromRow, types::Json};
 
 use crate::{
     AppState,
-    auth::Identity,
+    authz::{Action, Principal as Identity, Resource, authorize},
     db::{self, Transaction},
     error::{ApiError, json_response},
     uploads::{PathInput, basename},
@@ -104,11 +104,12 @@ async fn cache(
     .fetch_optional(executor)
     .await?
     .ok_or_else(|| error(404, "Cache not found"))?;
-    if let Identity::Jwt(claims) = identity
-        && !claims.has_cache_access(id, name)
-    {
-        return Err(error(403, "Forbidden"));
-    }
+    authorize(
+        identity,
+        Action::NixPush,
+        &Resource::cache(identity.org(), id, name),
+    )
+    .map_err(|_| error(403, "Forbidden"))?;
     if push && !nix {
         return Err(error(404, "Cache not found"));
     }
@@ -516,14 +517,11 @@ async fn resume(
     Extension(identity): Extension<Identity>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let Identity::Jwt(claims) = &identity else {
-        return Err(error(
-            409,
-            "Background authorization requires a registered JWT token",
-        ));
+    let Identity::ApiToken(token) = &identity else {
+        return Err(error(409, "Background authorization requires an API token"));
     };
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
-    let job = load(&mut *tx, cache_id, &claims.jti, &id).await?;
+    let job = load(&mut *tx, cache_id, &token.id, &id).await?;
     if job.state == "completed" {
         tx.commit().await?;
         return progress(
@@ -545,32 +543,27 @@ async fn resume(
     // or reusable client credential is persisted with the job.
     let registered: Option<bool> = sqlx::query_scalar(
         "SELECT revoked_at IS NULL FROM api_tokens WHERE jti=$1 AND COALESCE(org_id,'default')=$2 FOR SHARE NOWAIT",
-    ).bind(&claims.jti).bind(identity.org()).fetch_optional(&mut *tx).await?;
+    ).bind(&token.id).bind(identity.org()).fetch_optional(&mut *tx).await?;
     match registered {
         None => {
-            return Err(error(
-                409,
-                "Background authorization requires a registered JWT token",
-            ));
+            return Err(error(409, "Background authorization requires an API token"));
         }
         Some(false) => return Err(error(401, "Token revoked")),
         _ => {}
     }
-    // Persist only the authenticated action/cache delegation. Token registry
-    // metadata is not authoritative for JWT scope and may be stale.
-    let mut delegated = claims.clone();
-    delegated.caches = vec![format!("id:{cache_id}")];
-    delegated.perms = vec!["push".into()];
+    // Record only the delegated action and cache. The worker acts as this
+    // token, limited to pushing to this cache, while the token stays live.
+    let delegated = json!({"jti": token.id, "cacheId": cache_id, "perms": ["push"]});
     let renewed = sqlx::query("UPDATE push_jobs SET authorization_jti=$2,grant_generation=grant_generation+1, \
         authorization_claims=$4,work_id=NULL,work_expires_at=NULL,work_at=NOW(),work_failures=0,work_blocked=false,work_members=16, \
         idle_expires_at=LEAST(hard_expires_at,NOW()+INTERVAL '30 minutes'), \
         authorization_expires_at=LEAST(hard_expires_at,NOW()+INTERVAL '30 minutes',to_timestamp($3::bigint::double precision)) \
         WHERE id=$1 AND ($3::bigint IS NULL OR to_timestamp($3::bigint::double precision)>NOW())")
-        .bind(&id).bind(&claims.jti).bind(claims.exp).bind(Json(delegated)).execute(&mut *tx).await?;
+        .bind(&id).bind(&token.id).bind(token.expires_at.map(|at| at.timestamp())).bind(Json(delegated)).execute(&mut *tx).await?;
     if renewed.rows_affected() == 0 {
         return Err(error(401, "Token expired"));
     }
-    let job = load(&mut *tx, cache_id, &claims.jti, &id).await?;
+    let job = load(&mut *tx, cache_id, &token.id, &id).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }
@@ -584,8 +577,8 @@ pub(crate) async fn upload_members(
     id: &str,
     paths: &[PathInput],
 ) -> Result<HashMap<String, Value>, ApiError> {
-    if !matches!(identity, Identity::Jwt(_)) {
-        return Err(error(409, "Job uploads require the owning JWT token"));
+    if !matches!(identity, Identity::ApiToken(_)) {
+        return Err(error(409, "Job uploads require the owning API token"));
     }
     let actor = identity.actor();
     let job = load(&mut **tx, cache, &actor, id).await?;

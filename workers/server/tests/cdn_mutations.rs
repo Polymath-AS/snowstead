@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -15,13 +18,20 @@ use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 
 async fn call(app: &Router, path: &str, method: &str, value: Value) -> (StatusCode, Value) {
+    // Nix pushes use the self-hosted shared token; management, the operator.
+    let secret = if path.starts_with("/_api/v1/caches/") {
+        "shared-token"
+    } else {
+        "operator"
+    };
+    let (path, credential) = web::dashboard(method, path, secret, None);
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(method)
-                .uri(path)
-                .header("authorization", "Bearer operator")
+                .uri(path.as_str())
+                .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))
                 .unwrap(),
@@ -98,7 +108,8 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
-        auth_token: "operator".into(),
+        web_assertion_public_keys: web::public_key(),
+        shared_auth_token: Some("shared-token".into()),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
         ..Default::default()
@@ -161,7 +172,7 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
             Request::builder()
                 .method("POST")
                 .uri(format!("/_api/v1/uploads/{id}/inline?fileHash={file_hash}"))
-                .header("authorization", "Bearer operator")
+                .header("authorization", "Bearer shared-token")
                 .header("content-length", compressed.len())
                 .body(Body::from(compressed.clone()))
                 .unwrap(),
@@ -262,6 +273,7 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
+        web_assertion_public_keys: web::public_key(),
         jwt_secret: "metadata-test-secret".into(),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
@@ -276,6 +288,10 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
     .unwrap();
     let app = router(state.clone());
     sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_metadata','before');
+        -- The JWT read() presents is listed, with the scope its claims name.
+        INSERT INTO api_tokens (jti,subject,org_id,created_by) VALUES ('metadata-test','test','org_metadata','test');
+        INSERT INTO token_permissions (token_jti,permission,position) VALUES ('metadata-test','pull',1);
+        INSERT INTO token_caches (token_jti,pattern) VALUES ('metadata-test','private');
         INSERT INTO caches(name,org_id,is_public) VALUES ('public','org_metadata',true),('private','org_metadata',false);
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;
         INSERT INTO blob_objects(file_hash,file_size,compression,r2_key) VALUES(repeat('a',64),5,'none','nar/objects/seed');
@@ -446,6 +462,7 @@ async fn cache_deletion_queues_public_purge_and_manual_purges_validate_and_repor
 ) {
     let config = Config {
         admin_secret: "operator".into(),
+        web_assertion_public_keys: web::public_key(),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
         cdn_zone_id: "test-zone".into(),

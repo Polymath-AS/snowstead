@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "support/web.rs"]
+mod web;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -17,14 +20,12 @@ async fn call(
     input: Value,
     actor: Option<&str>,
 ) -> (StatusCode, HeaderMap, Value) {
-    let mut request = Request::builder()
+    let (path, credential) = web::dashboard(method, path, "operator", actor);
+    let request = Request::builder()
         .method(method)
         .uri(path)
-        .header("authorization", "Bearer operator")
+        .header("authorization", format!("Bearer {credential}"))
         .header("content-type", "application/json");
-    if let Some(actor) = actor {
-        request = request.header("x-snowstead-actor", actor);
-    }
     let response = app
         .clone()
         .oneshot(request.body(Body::from(input.to_string())).unwrap())
@@ -49,6 +50,7 @@ fn state_with_storage(pool: PgPool, storage: Storage) -> AppState {
         pool,
         Config {
             admin_secret: "operator".into(),
+            web_assertion_public_keys: web::public_key(),
             jwt_secret: "jwt-secret".into(),
             ..Default::default()
         },

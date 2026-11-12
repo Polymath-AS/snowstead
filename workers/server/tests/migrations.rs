@@ -423,3 +423,70 @@ async fn a_cache_has_at_most_one_active_signing_key() -> Result<()> {
     })
     .await
 }
+
+#[tokio::test]
+async fn central_auth_backfills_token_scope_from_issued_claims() -> Result<()> {
+    isolated(|pool| async move {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        let (before, after): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|path| path.file_name().unwrap().to_str().unwrap() < "0015");
+        for path in before {
+            pool.execute(sqlx::AssertSqlSafe(std::fs::read_to_string(path)?))
+                .await?;
+        }
+        // Rows as the JWT era left them: one with token_caches already
+        // written, one with only caches_json, including a deleted cache and
+        // an unknown permission the verifier never accepted.
+        pool.execute(
+            "INSERT INTO caches (id, name) OVERRIDING SYSTEM VALUE VALUES (41, 'main');
+            INSERT INTO api_tokens (jti, subject, caches_json, perms_json, created_by)
+            VALUES ('modern', 'ci', '[\"id:41\"]', '[\"push\",\"pull\"]', 'admin'),
+                ('older', 'ci', '[\"ci-*\",\"id:41\",\"id:999\",\"exact\"]', '[\"pull\",\"admin\",\"pull\"]', 'admin');
+            INSERT INTO token_caches (token_jti, cache_id) VALUES ('modern', 41);",
+        )
+        .await?;
+        for path in after {
+            pool.execute(sqlx::AssertSqlSafe(std::fs::read_to_string(path)?))
+                .await?;
+        }
+        let perms: Vec<(String, String, i32)> = sqlx::query_as(
+            "SELECT token_jti, permission, position FROM token_permissions ORDER BY token_jti, position",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            perms,
+            [
+                ("modern".into(), "push".into(), 1),
+                ("modern".into(), "pull".into(), 2),
+                ("older".into(), "pull".into(), 1),
+            ]
+        );
+        let caches: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
+            "SELECT token_jti, cache_id, pattern FROM token_caches ORDER BY token_jti, id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            caches,
+            [
+                ("modern".into(), Some(41), None),
+                ("older".into(), None, Some("ci-*".into())),
+                ("older".into(), Some(41), None),
+                ("older".into(), None, Some("exact".into())),
+            ]
+        );
+        let hashes: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE secret_hash IS NOT NULL")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(hashes, 0, "JWT-era rows have no secret");
+        Ok(())
+    })
+    .await
+}

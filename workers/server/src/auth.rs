@@ -1,111 +1,50 @@
-//! Hosted token authentication. JWT claims remain authoritative; SQL only
-//! supplies revocations, so signed tokens absent from api_tokens still work.
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use base64::Engine;
+//! Authentication: turn a request's credential into a [`Principal`]. Nothing
+//! here grants access; callers ask [`crate::authz::authorize`].
+//!
+//! Credentials, by form:
+//! - `ADMIN_SECRET`: the operator, for `/_api/v1/admin` only.
+//! - `snowstead_web.<claims>.<signature>`: a dashboard user, from an Ed25519
+//!   assertion the web signs per request, bound to its method and path.
+//! - `snowstead_key_<id>_<secret>`: an org API key.
+//! - `snowstead_tok_<jti>_<secret>`: an API token. Only a hash of the secret
+//!   is stored; scope comes from `token_permissions` and `token_caches`.
+//! - A JWT-era API token, accepted only while its `jti` is listed and
+//!   unrevoked in `api_tokens`, with scope from the database, not its claims.
+//! - A self-hosted shared `AUTH_TOKEN`, only when explicitly enabled.
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use ed25519_dalek::{Signature, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use subtle::ConstantTimeEq;
 
-use crate::{AppState, error::ApiError};
+use crate::{
+    AppState,
+    authz::{ApiToken, CacheGrant, Permission, Principal, Role, WebUser},
+    error::ApiError,
+};
 
-const DEFAULT_ORG: &str = "default";
-const JWT_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 pub(crate) const JWT_CLOCK_SKEW_SECONDS: i64 = 60;
-const PERMISSIONS: &[&str] = &[
-    "pull",
-    "push",
-    "go:read",
-    "go:write",
-    "sccache:read",
-    "sccache:write",
-];
+const JWT_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+pub(crate) const TOKEN_PREFIX: &str = "snowstead_tok_";
+const KEY_PREFIX: &str = "snowstead_key_";
+const ASSERTION_PREFIX: &str = "snowstead_web.";
+const ASSERTION_AUDIENCE: &str = "snowstead-cache";
+/// The longest an assertion may claim to live.
+const ASSERTION_LIFETIME_SECONDS: i64 = 60;
+const ASSERTION_SKEW_SECONDS: i64 = 30;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Claims {
-    pub jti: String,
-    pub sub: String,
-    pub iss: String,
-    pub aud: String,
-    pub caches: Vec<String>,
-    pub perms: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exp: Option<i64>,
-    pub iat: i64,
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure_all)]
-impl Claims {
-    pub fn has_permission(&self, permission: &str) -> bool {
-        self.perms.iter().any(|p| p == permission)
-    }
-
-    pub fn has_cache_access(&self, id: i32, name: &str) -> bool {
-        self.caches.iter().any(|entry| {
-            if entry.starts_with("id:") {
-                entry == &format!("id:{id}")
-            } else {
-                matches_pattern(entry, name)
-            }
-        })
-    }
-
-    pub fn belongs_to(&self, org: &str) -> bool {
-        self.org.as_deref().unwrap_or(DEFAULT_ORG) == org
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum Identity {
-    Jwt(Claims),
-    Legacy,
-    Admin { on_behalf_of: Option<String> },
-    OrgKey { org: String, key_id: String },
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure_all)]
-impl Identity {
-    pub fn org(&self) -> &str {
-        match self {
-            Self::Jwt(claims) => claims.org.as_deref().unwrap_or(DEFAULT_ORG),
-            Self::OrgKey { org, .. } => org,
-            _ => DEFAULT_ORG,
-        }
-    }
-
-    pub fn actor(&self) -> String {
-        match self {
-            Self::Jwt(claims) => claims.jti.clone(),
-            Self::Legacy => "legacy".into(),
-            Self::Admin {
-                on_behalf_of: Some(actor),
-            } => format!("user:{actor}"),
-            Self::Admin { on_behalf_of: None } => "admin".into(),
-            Self::OrgKey { key_id, .. } => format!("key:{key_id}"),
-        }
-    }
-}
-
-fn matches_pattern(pattern: &str, name: &str) -> bool {
-    let Some((first, rest)) = pattern.split_once('*') else {
-        return pattern == name;
-    };
-    let Some(mut remaining) = name.strip_prefix(first) else {
-        return false;
-    };
-    let mut parts = rest.split('*').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            return remaining.ends_with(part);
-        }
-        let Some(at) = remaining.find(part) else {
-            return false;
-        };
-        remaining = &remaining[at + part.len()..];
-    }
-    false
+/// The request an assertion must be bound to.
+#[derive(Clone, Copy)]
+pub struct Target<'a> {
+    pub method: &'a Method,
+    /// Path and query exactly as received.
+    pub path: &'a str,
 }
 
 fn auth_error(status: StatusCode, read: bool) -> ApiError {
@@ -149,17 +88,135 @@ fn equal_secret(a: &str, b: &str) -> bool {
     bool::from(a_hash.ct_eq(&b_hash)) & (a.len() == b.len())
 }
 
-fn admin_identity(headers: &HeaderMap) -> Identity {
-    let actor = headers
-        .get("x-snowstead-actor")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    let on_behalf_of = (!actor.is_empty()
-        && actor.encode_utf16().count() <= 254
-        && !actor.chars().any(|c| c.is_whitespace() || c.is_control()))
-    .then(|| actor.to_owned());
-    Identity::Admin { on_behalf_of }
+pub(crate) fn secret_hash(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+pub(crate) fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// A new opaque API token: its ID (`jti`), the bearer value shown once, and
+/// the hash to store.
+pub(crate) fn issue_token() -> std::io::Result<(String, String, String)> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let secret = URL_SAFE_NO_PAD.encode(random_bytes::<32>()?);
+    let hash = secret_hash(&secret);
+    Ok((id.clone(), format!("{TOKEN_PREFIX}{id}_{secret}"), hash))
+}
+
+/// Parse `WEB_ASSERTION_PUBLIC_KEYS`.
+pub fn assertion_keys(value: &str) -> anyhow::Result<Vec<VerifyingKey>> {
+    value
+        .split_whitespace()
+        .map(|key| {
+            let bytes: [u8; 32] = STANDARD
+                .decode(key)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "WEB_ASSERTION_PUBLIC_KEYS must be base64 raw 32-byte Ed25519 public keys"
+                    )
+                })?;
+            let key = VerifyingKey::from_bytes(&bytes).map_err(|_| {
+                anyhow::anyhow!("WEB_ASSERTION_PUBLIC_KEYS contains an invalid Ed25519 key")
+            })?;
+            anyhow::ensure!(
+                !key.is_weak(),
+                "WEB_ASSERTION_PUBLIC_KEYS contains a weak Ed25519 key"
+            );
+            Ok(key)
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Assertion {
+    aud: String,
+    org: String,
+    sub: String,
+    email: String,
+    role: String,
+    iat: i64,
+    exp: i64,
+    method: String,
+    path: String,
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+fn verify_assertion(
+    keys: &[VerifyingKey],
+    credential: &str,
+    target: Target,
+    now: i64,
+) -> Option<WebUser> {
+    if keys.is_empty() || credential.len() > 8192 {
+        return None;
+    }
+    let (signed, signature) = credential.rsplit_once('.')?;
+    let payload = signed.strip_prefix(ASSERTION_PREFIX)?;
+    if payload.contains('.') {
+        return None;
+    }
+    let signature: [u8; 64] = URL_SAFE_NO_PAD.decode(signature).ok()?.try_into().ok()?;
+    let signature = Signature::from_bytes(&signature);
+    if !keys
+        .iter()
+        .any(|key| key.verify_strict(signed.as_bytes(), &signature).is_ok())
+    {
+        return None;
+    }
+    let claims: Assertion = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    let email = claims.email.trim();
+    let valid = claims.aud == ASSERTION_AUDIENCE
+        && claims.exp > claims.iat
+        && claims.exp - claims.iat <= ASSERTION_LIFETIME_SECONDS
+        && claims.iat <= now + ASSERTION_SKEW_SECONDS
+        && now < claims.exp.saturating_add(ASSERTION_SKEW_SECONDS)
+        && claims.method == target.method.as_str()
+        && claims.path == target.path
+        && valid_id(&claims.org)
+        && valid_id(&claims.sub)
+        && email == claims.email
+        && email.contains('@')
+        && email.encode_utf16().count() <= 254
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control());
+    if !valid {
+        return None;
+    }
+    Some(WebUser {
+        org: claims.org,
+        user_id: claims.sub,
+        email: claims.email,
+        role: Role::parse(&claims.role)?,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct Claims {
+    jti: String,
+    sub: String,
+    iss: String,
+    aud: String,
+    caches: Vec<String>,
+    perms: Vec<String>,
+    #[serde(default)]
+    org: Option<String>,
+    #[serde(default)]
+    exp: Option<i64>,
+    iat: i64,
 }
 
 // Match atob's acceptance of padded and unpadded base64url, including standard
@@ -183,6 +240,8 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Check a JWT-era token's signature and well-formedness. Its claims only
+/// identify the token; scope comes from its database row.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 fn verify_jwt(token: &str, secret: &str, now: f64) -> Option<Claims> {
     if token.encode_utf16().count() > 4096 {
@@ -221,10 +280,7 @@ fn verify_jwt(token: &str, secret: &str, now: f64) -> Option<Claims> {
         || claims.caches.iter().any(String::is_empty)
         || claims.perms.is_empty()
         || claims.perms.len() > 10
-        || claims
-            .perms
-            .iter()
-            .any(|p| !PERMISSIONS.contains(&p.as_str()))
+        || claims.perms.iter().any(|p| Permission::parse(p).is_none())
         || claims.iat as f64 > now + JWT_CLOCK_SKEW_SECONDS as f64
         || claims.exp.is_some_and(|exp| {
             exp <= claims.iat || exp as f64 <= now - JWT_CLOCK_SKEW_SECONDS as f64
@@ -243,41 +299,108 @@ fn now() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
 
+/// How a presented API token proves itself against its row.
+enum TokenProof<'a> {
+    Secret(&'a str),
+    /// A verified JWT naming this org.
+    Jwt {
+        org: &'a str,
+    },
+}
+
+/// Load a listed, live token and its scope, or reject the credential.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn check_revocation(state: &AppState, claims: &Claims, read: bool) -> Result<bool, ApiError> {
-    struct Revocation {
-        revoked: bool,
-        usage_due: bool,
-    }
-    let token = crate::profile_future!(
-        sqlx::query_as!(
-            Revocation,
+async fn token(
+    state: &AppState,
+    id: &str,
+    proof: TokenProof<'_>,
+    read: bool,
+) -> Result<Principal, ApiError> {
+    let row = crate::profile_future!(
+        sqlx::query!(
             r#"
             SELECT
-                revoked_at IS NOT NULL AS "revoked!",
-                COALESCE(org_id, 'default') = $2
-                    AND (last_used_at IS NULL OR last_used_at <= NOW() - INTERVAL '5 minutes')
-                    AS "usage_due!"
-            FROM api_tokens
-            WHERE jti = $1
+                COALESCE(t.org_id, 'default') AS "org!",
+                t.secret_hash,
+                t.expires_at,
+                -- Expiry allows the clock skew JWT verification always has.
+                t.revoked_at IS NULL
+                    AND (t.expires_at IS NULL OR t.expires_at > NOW() - INTERVAL '60 seconds')
+                    AS "live!",
+                t.last_used_at IS NULL OR t.last_used_at <= NOW() - INTERVAL '5 minutes'
+                    AS "usage_due!",
+                ARRAY(
+                    SELECT p.permission
+                    FROM token_permissions p
+                    WHERE p.token_jti = t.jti
+                    ORDER BY p.position
+                ) AS "permissions!",
+                ARRAY(
+                    SELECT tc.cache_id
+                    FROM token_caches tc
+                    WHERE tc.token_jti = t.jti
+                        AND tc.cache_id IS NOT NULL
+                    ORDER BY tc.id
+                ) AS "cache_ids!: Vec<i32>",
+                ARRAY(
+                    SELECT tc.pattern
+                    FROM token_caches tc
+                    WHERE tc.token_jti = t.jti
+                        AND tc.pattern IS NOT NULL
+                    ORDER BY tc.id
+                ) AS "patterns!: Vec<String>"
+            FROM api_tokens t
+            WHERE t.jti = $1
             "#,
-            &claims.jti,
-            claims.org.as_deref().unwrap_or(DEFAULT_ORG),
+            id,
         )
         .fetch_optional(&state.pool),
-        label = "auth.revocation_sql"
+        label = "auth.token_sql"
     )
     .await?;
-    if token.as_ref().is_some_and(|token| token.revoked) {
-        return Err(auth_error(StatusCode::UNAUTHORIZED, read));
+    let rejected = || auth_error(StatusCode::UNAUTHORIZED, read);
+    // Compare a hash even for unknown IDs, so timing doesn't reveal which exist.
+    let stored = row
+        .as_ref()
+        .and_then(|row| row.secret_hash.as_deref())
+        .unwrap_or("");
+    let proven = match proof {
+        TokenProof::Secret(secret) => {
+            equal_secret(&secret_hash(secret), stored) & !stored.is_empty()
+        }
+        TokenProof::Jwt { org } => row
+            .as_ref()
+            .is_some_and(|row| row.secret_hash.is_none() && row.org == org),
+    };
+    let Some(row) = row.filter(|row| proven && row.live) else {
+        return Err(rejected());
+    };
+    if row.usage_due {
+        record_use(state, id).await;
     }
-    // The required revocation read also tells us whether telemetry is due.
-    // Most requests need no second pool acquisition or no-op UPDATE.
-    Ok(token.is_some_and(|token| token.usage_due))
+    let principal = Principal::ApiToken(ApiToken {
+        id: id.to_owned(),
+        org: row.org,
+        permissions: row
+            .permissions
+            .iter()
+            .filter_map(|p| Permission::parse(p))
+            .collect(),
+        caches: row
+            .cache_ids
+            .into_iter()
+            .map(CacheGrant::Id)
+            .chain(row.patterns.into_iter().map(CacheGrant::Pattern))
+            .collect(),
+        expires_at: row.expires_at,
+    });
+    #[cfg(feature = "observability")]
+    crate::observability::identity(&principal, None);
+    Ok(principal)
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn record_use(state: &AppState, claims: &Claims) {
+async fn record_use(state: &AppState, id: &str) {
     // Await bounded pool work; never spawn an unbounded task per request.
     // Telemetry is best-effort and the predicate limits actual writes.
     if crate::profile_future!(
@@ -286,11 +409,9 @@ async fn record_use(state: &AppState, claims: &Claims) {
             UPDATE api_tokens
             SET last_used_at = NOW()
             WHERE jti = $1
-                AND COALESCE(org_id, 'default') = $2
                 AND (last_used_at IS NULL OR last_used_at <= NOW() - INTERVAL '5 minutes')
             "#,
-            &claims.jti,
-            claims.org.as_deref().unwrap_or(DEFAULT_ORG),
+            id,
         )
         .execute(&state.pool),
         label = "auth.record_use_sql"
@@ -303,80 +424,8 @@ async fn record_use(state: &AppState, claims: &Claims) {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authenticate_write(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<Identity, ApiError> {
-    if state.config.jwt_secret.is_empty() && state.config.auth_token.is_empty() {
-        return Err(auth_error(StatusCode::FORBIDDEN, false));
-    }
-    let token = bearer(headers)?;
-    if !state.config.jwt_secret.is_empty()
-        && let Some(claims) = verify_jwt(token, &state.config.jwt_secret, now())
-    {
-        if check_revocation(state, &claims, false).await? {
-            record_use(state, &claims).await;
-        }
-        #[cfg(feature = "observability")]
-        crate::observability::identity(&Identity::Jwt(claims.clone()), None);
-        return Ok(Identity::Jwt(claims));
-    }
-    if !state.config.auth_token.is_empty() && equal_secret(token, &state.config.auth_token) {
-        return Ok(Identity::Legacy);
-    }
-    authenticate(headers, state).await?;
-    Err(auth_error(StatusCode::FORBIDDEN, false))
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authenticate_admin(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<Identity, ApiError> {
-    if state.config.admin_secret.is_empty() {
-        return Err(auth_error(StatusCode::FORBIDDEN, false));
-    }
-    match authenticate(headers, state).await? {
-        identity @ Identity::Admin { .. } => Ok(identity),
-        _ => Err(auth_error(StatusCode::FORBIDDEN, false)),
-    }
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authenticate_org(
-    headers: &HeaderMap,
-    state: &AppState,
-    org: &str,
-) -> Result<Identity, ApiError> {
-    match authenticate(headers, state).await? {
-        identity @ Identity::Admin { .. } => Ok(identity),
-        identity @ Identity::OrgKey { .. } if identity.org() == org => Ok(identity),
-        _ => Err(auth_error(StatusCode::FORBIDDEN, false)),
-    }
-}
-
-async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Identity, ApiError> {
-    let token = bearer(headers)?;
-    if !state.config.admin_secret.is_empty() && equal_secret(token, &state.config.admin_secret) {
-        return Ok(admin_identity(headers));
-    }
+async fn org_key(state: &AppState, rest: &str) -> Result<Principal, ApiError> {
     let invalid = || auth_error(StatusCode::UNAUTHORIZED, false);
-    let Some(rest) = token.strip_prefix("snowstead_key_") else {
-        if !state.config.jwt_secret.is_empty()
-            && let Some(claims) = verify_jwt(token, &state.config.jwt_secret, now())
-        {
-            if check_revocation(state, &claims, false).await? {
-                record_use(state, &claims).await;
-            }
-            #[cfg(feature = "observability")]
-            crate::observability::identity(&Identity::Jwt(claims.clone()), None);
-            return Ok(Identity::Jwt(claims));
-        }
-        if !state.config.auth_token.is_empty() && equal_secret(token, &state.config.auth_token) {
-            return Ok(Identity::Legacy);
-        }
-        return Err(invalid());
-    };
     let (id, secret) = rest.split_once('_').ok_or_else(invalid)?;
     if id.len() != 16
         || !id
@@ -408,13 +457,12 @@ async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Identity,
         label = "auth.org_key_sql"
     )
     .await?;
-    let hash = hex::encode(Sha256::digest(secret.as_bytes()));
     let valid = equal_secret(
-        &hash,
+        &secret_hash(secret),
         row.as_ref().map(|r| r.secret_hash.as_str()).unwrap_or(""),
     );
     match row {
-        Some(key) if valid && !key.revoked => Ok(Identity::OrgKey {
+        Some(key) if valid && !key.revoked => Ok(Principal::OrgKey {
             org: key.org_id,
             key_id: id.into(),
         }),
@@ -422,14 +470,74 @@ async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Identity,
     }
 }
 
+/// Identify the holder of `credential`, or reject it with 401. A web
+/// assertion is accepted only when `target` is the request it was signed for.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authorize_read(
+async fn principal(
+    state: &AppState,
+    credential: &str,
+    target: Option<Target<'_>>,
+    read: bool,
+) -> Result<Principal, ApiError> {
+    let rejected = || auth_error(StatusCode::UNAUTHORIZED, read);
+    let config = &state.config;
+    if !config.admin_secret.is_empty() && equal_secret(credential, &config.admin_secret) {
+        return Ok(Principal::Operator);
+    }
+    if credential.starts_with(ASSERTION_PREFIX) {
+        let target = target.ok_or_else(rejected)?;
+        let user = verify_assertion(
+            &state.assertion_keys,
+            credential,
+            target,
+            chrono::Utc::now().timestamp(),
+        )
+        .ok_or_else(rejected)?;
+        return Ok(Principal::WebUser(user));
+    }
+    if let Some(rest) = credential.strip_prefix(KEY_PREFIX) {
+        return org_key(state, rest).await.map_err(|_| rejected());
+    }
+    if let Some(rest) = credential.strip_prefix(TOKEN_PREFIX) {
+        let (id, secret) = rest.split_once('_').ok_or_else(rejected)?;
+        if uuid::Uuid::try_parse(id).is_err() || secret.is_empty() || secret.len() > 128 {
+            return Err(rejected());
+        }
+        return token(state, id, TokenProof::Secret(secret), read).await;
+    }
+    if let Some(shared) = &config.shared_auth_token
+        && equal_secret(credential, shared)
+    {
+        return Ok(Principal::SharedToken);
+    }
+    if !config.jwt_secret.is_empty()
+        && let Some(claims) = verify_jwt(credential, &config.jwt_secret, now())
+    {
+        let org = claims.org.as_deref().unwrap_or("default");
+        return token(state, &claims.jti, TokenProof::Jwt { org }, read).await;
+    }
+    Err(rejected())
+}
+
+/// Authenticate a bearer credential. `target` is the request being served,
+/// for web assertions; protocol routes pass None, which rejects them.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+pub async fn authenticate(
     headers: &HeaderMap,
     state: &AppState,
-    cache_id: i32,
-    cache_name: &str,
-    org: &str,
-) -> Result<(), ApiError> {
+    target: Option<Target<'_>>,
+) -> Result<Principal, ApiError> {
+    let credential = bearer(headers)?;
+    principal(state, credential, target, false).await
+}
+
+/// Authenticate a Nix read: a bearer token, or a Basic password as Nix's
+/// netrc sends it. Failures challenge for Basic credentials.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+pub async fn authenticate_read(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Principal, ApiError> {
     let credential = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -448,28 +556,32 @@ pub async fn authorize_read(
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| auth_error(StatusCode::UNAUTHORIZED, true))?;
-    if state.config.jwt_secret.is_empty() {
-        return Err(auth_error(StatusCode::FORBIDDEN, true));
-    }
-    let claims = verify_jwt(&credential, &state.config.jwt_secret, now())
-        .ok_or_else(|| auth_error(StatusCode::UNAUTHORIZED, true))?;
-    let usage_due = check_revocation(state, &claims, true).await?;
-    if !claims.has_permission("pull")
-        || !claims.has_cache_access(cache_id, cache_name)
-        || !claims.belongs_to(org)
-    {
-        return Err(auth_error(StatusCode::FORBIDDEN, true));
-    }
-    if usage_due {
-        record_use(state, &claims).await;
-    }
+    principal(state, &credential, None, true).await
+}
+
+/// Authorize a private Nix read of a cache.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+pub async fn authorize_read(
+    headers: &HeaderMap,
+    state: &AppState,
+    cache_id: i32,
+    cache_name: &str,
+    org: &str,
+) -> Result<(), ApiError> {
+    let principal = authenticate_read(headers, state).await?;
+    crate::authz::authorize(
+        &principal,
+        crate::authz::Action::NixPull,
+        &crate::authz::Resource::cache(org, cache_id, cache_name),
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{Value, json};
 
     fn payload() -> Value {
@@ -492,14 +604,8 @@ mod tests {
     #[test]
     fn existing_token_without_org_or_expiry() {
         let claims = verify_jwt(&sign(&payload(), JWT_HEADER), "test-secret", 2000.0).unwrap();
-        assert!(claims.belongs_to("default"));
-        assert!(!claims.belongs_to("other"));
-        assert!(claims.has_permission("pull"));
-        assert!(!claims.has_permission("go:read"));
-        assert!(claims.has_cache_access(7, "renamed"));
-        assert!(!claims.has_cache_access(8, "renamed"));
-        assert!(claims.has_cache_access(8, "ci-linux-release"));
-        assert!(!claims.has_cache_access(8, "ci-linux-release-extra"));
+        assert_eq!(claims.jti, "existing-client");
+        assert_eq!(claims.org, None);
     }
 
     #[test]
@@ -540,38 +646,116 @@ mod tests {
         }
     }
 
-    #[hegel::test]
-    fn cache_patterns_match_a_literal_star_model(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-
-        let pattern: String = tc
-            .draw(gs::vecs(gs::sampled_from(&['a', 'b', 'é', '.', '[', '*'])).max_size(16))
-            .into_iter()
-            .collect();
-        let name =
-            tc.draw(gs::vecs(gs::sampled_from(&['a', 'b', 'é', '.', '[', '*'])).max_size(16));
-        // Dynamic programming over Unicode characters, independent of the
-        // production matcher's greedy searches over literal substrings.
-        let mut matched = vec![false; name.len() + 1];
-        matched[0] = true;
-        for token in pattern.chars() {
-            let mut next = vec![false; name.len() + 1];
-            next[0] = token == '*' && matched[0];
-            for (i, &letter) in name.iter().enumerate() {
-                next[i + 1] = if token == '*' {
-                    matched[i + 1] || next[i]
-                } else {
-                    matched[i] && token == letter
-                };
-            }
-            matched = next;
-        }
-        let mut claims: Claims = serde_json::from_value(payload()).unwrap();
-        claims.caches = vec![pattern];
-        assert_eq!(
-            claims.has_cache_access(7, &name.iter().collect::<String>()),
-            matched[name.len()]
+    fn assertion(key: &SigningKey, claims: &Value) -> String {
+        let signed = format!(
+            "{ASSERTION_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap())
         );
+        let signature = key.sign(signed.as_bytes());
+        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn claims() -> Value {
+        json!({"aud":"snowstead-cache","org":"org_a","sub":"user_1","email":"dev@example.test","role":"member",
+            "iat":1000,"exp":1030,"method":"POST","path":"/_api/v1/orgs/org_a/tokens?x=1"})
+    }
+
+    #[test]
+    fn assertions_bind_key_lifetime_method_and_path() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let other = SigningKey::from_bytes(&[8; 32]);
+        let keys = [key.verifying_key()];
+        let post = Method::POST;
+        let target = Target {
+            method: &post,
+            path: "/_api/v1/orgs/org_a/tokens?x=1",
+        };
+        let user = verify_assertion(&keys, &assertion(&key, &claims()), target, 1010).unwrap();
+        assert_eq!(
+            (user.org.as_str(), user.user_id.as_str(), user.role),
+            ("org_a", "user_1", Role::Member)
+        );
+        assert!(verify_assertion(&keys, &assertion(&other, &claims()), target, 1010).is_none());
+        assert!(verify_assertion(&[], &assertion(&key, &claims()), target, 1010).is_none());
+        // Skew allows a little clock drift either way, and no more.
+        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 970).is_some());
+        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 969).is_none());
+        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 1059).is_some());
+        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 1060).is_none());
+        let get = Method::GET;
+        for wrong in [
+            Target {
+                method: &get,
+                path: target.path,
+            },
+            Target {
+                method: &post,
+                path: "/_api/v1/orgs/org_a/tokens",
+            },
+            Target {
+                method: &post,
+                path: "/_api/v1/orgs/org_b/tokens?x=1",
+            },
+        ] {
+            assert!(verify_assertion(&keys, &assertion(&key, &claims()), wrong, 1010).is_none());
+        }
+        for (field, value) in [
+            ("aud", json!("snowstead")),
+            ("exp", json!(1061)),
+            ("exp", json!(1000)),
+            ("role", json!("operator")),
+            ("org", json!("org/a")),
+            ("email", json!("not an email")),
+            ("email", json!("")),
+            ("sub", json!("")),
+            ("extra", json!(true)),
+        ] {
+            let mut c = claims();
+            c[field] = value;
+            assert!(
+                verify_assertion(&keys, &assertion(&key, &c), target, 1010).is_none(),
+                "{field}"
+            );
+        }
+        // Tampering with the signed payload invalidates the signature.
+        let genuine = assertion(&key, &claims());
+        let mut c = claims();
+        c["role"] = json!("owner");
+        let forged = format!(
+            "{ASSERTION_PREFIX}{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&c).unwrap()),
+            genuine.rsplit_once('.').unwrap().1
+        );
+        assert!(verify_assertion(&keys, &forged, target, 1010).is_none());
+    }
+
+    #[test]
+    fn assertion_keys_must_be_valid_ed25519_keys() {
+        let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let encoded = STANDARD.encode(key.as_bytes());
+        assert_eq!(assertion_keys("").unwrap().len(), 0);
+        assert_eq!(
+            assertion_keys(&format!(" {encoded}\n{encoded} ")).unwrap(),
+            vec![key, key]
+        );
+        assert!(assertion_keys("not-base64!").is_err());
+        assert!(assertion_keys(&STANDARD.encode([1u8; 31])).is_err());
+        // The identity point is a weak key.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(assertion_keys(&STANDARD.encode(identity)).is_err());
+    }
+
+    #[test]
+    fn issued_tokens_are_opaque_and_store_only_a_hash() {
+        let (id, token, hash) = issue_token().unwrap();
+        let rest = token.strip_prefix(TOKEN_PREFIX).unwrap();
+        let (token_id, secret) = rest.split_once('_').unwrap();
+        assert_eq!(token_id, id);
+        assert!(uuid::Uuid::try_parse(&id).is_ok());
+        assert_eq!(secret.len(), 43);
+        assert_eq!(hash, secret_hash(secret));
+        assert!(!token.contains(&hash));
     }
 
     #[tokio::test]
@@ -580,7 +764,7 @@ mod tests {
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
         let config = crate::config::Config {
-            auth_token: "legacy-secret".into(),
+            shared_auth_token: Some("legacy-secret".into()),
             admin_secret: "operator-secret".into(),
             ..Default::default()
         };
@@ -591,7 +775,7 @@ mod tests {
         let state = AppState::new(pool, config, storage, reqwest::Client::new()).unwrap();
         let mut headers = HeaderMap::new();
         assert!(
-            authenticate_write(&headers, &state)
+            authenticate(&headers, &state, None)
                 .await
                 .err()
                 .unwrap()
@@ -603,29 +787,43 @@ mod tests {
             HeaderValue::from_static("Bearer legacy-secret"),
         );
         assert!(matches!(
-            authenticate_write(&headers, &state).await,
-            Ok(Identity::Legacy)
+            authenticate(&headers, &state, None).await,
+            Ok(Principal::SharedToken)
         ));
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer operator-secret"),
         );
+        // An actor header names no one: the operator is always just "admin".
         headers.insert(
             "x-snowstead-actor",
             HeaderValue::from_static("dev@example.test"),
         );
-        assert_eq!(
-            authenticate_admin(&headers, &state)
-                .await
-                .ok()
-                .unwrap()
-                .actor(),
-            "user:dev@example.test"
+        let operator = authenticate(&headers, &state, None).await.unwrap();
+        assert!(matches!(operator, Principal::Operator));
+        assert_eq!(operator.actor(), "admin");
+        // Without configured keys, no assertion is accepted.
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "Bearer {}",
+                assertion(&SigningKey::from_bytes(&[7; 32]), &claims())
+            ))
+            .unwrap(),
         );
-        assert!(matches!(
-            authenticate_org(&headers, &state, "any-org").await,
-            Ok(Identity::Admin { .. })
-        ));
+        let post = Method::POST;
+        let target = Target {
+            method: &post,
+            path: "/_api/v1/orgs/org_a/tokens?x=1",
+        };
+        assert_eq!(
+            authenticate(&headers, &state, Some(target))
+                .await
+                .err()
+                .unwrap()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
         headers.clear();
         let error = authorize_read(&headers, &state, 1, "private", "default")
             .await
@@ -635,6 +833,20 @@ mod tests {
         assert_eq!(
             error.headers[header::WWW_AUTHENTICATE],
             "Basic realm=\"snowstead\""
+        );
+        // The shared token authenticates but never reads.
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("user:legacy-secret")))
+                .unwrap(),
+        );
+        assert_eq!(
+            authorize_read(&headers, &state, 1, "private", "default")
+                .await
+                .err()
+                .unwrap()
+                .status,
+            StatusCode::FORBIDDEN
         );
         headers.insert(
             header::AUTHORIZATION,
@@ -646,7 +858,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .status,
-            StatusCode::FORBIDDEN
+            StatusCode::UNAUTHORIZED
         );
     }
 }
