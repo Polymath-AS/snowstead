@@ -26,6 +26,7 @@ rustPlatform.buildRustPackage {
         || rel == "apps" || rel == "apps/cli" || lib.hasPrefix "apps/cli/" rel
         || rel == "workers" || rel == "workers/server" || lib.hasPrefix "workers/server/" rel
         || rel == "pkg" || rel == "pkg/nix-archive" || lib.hasPrefix "pkg/nix-archive/" rel
+        || rel == "pkg/protocol" || lib.hasPrefix "pkg/protocol/" rel
         || rel == "pkg/snitch" || lib.hasPrefix "pkg/snitch/" rel);
   };
 

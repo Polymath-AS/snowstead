@@ -1,12 +1,16 @@
 //! Hosted v1 protocol. Errors omit URLs, credentials, and response bodies.
+//! The wire types and limits live in `snowstead-protocol`, shared with the server.
 use anyhow::{Result, anyhow, bail};
 use reqwest::{Method, Response, Url, header, redirect::Policy};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use snowstead_protocol::{
+    self as protocol, CreateSessions, CreatedSessions, Empty, FinalizeBatch, InlineEntry,
+    InlineManifest, MissingPaths, MissingPathsRequest, PartGrant, PartRequest, PathInput, Receipt,
+    ReceiptPart, ReservationResults, ReservePartsBatch, SessionParts, UploadResults, UploadSession,
+    limits, routes,
 };
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct Client {
@@ -18,41 +22,31 @@ pub struct Client {
     progress: Option<crate::progress::Progress>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Missing {
-    pub missing: Vec<String>,
-    #[serde(default)]
-    pub upstream: Vec<String>,
-    #[serde(default)]
-    pub unchecked: Vec<String>,
-    #[serde(default)]
-    pub upstreams: Vec<String>,
+/// `snowstead-cli/<version>`, sent with every request.
+pub(crate) fn user_agent() -> String {
+    format!("{}/{}", protocol::CLI_PRODUCT, env!("CARGO_PKG_VERSION"))
 }
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Session {
-    pub session_id: String,
-    pub part_size: u64,
-    pub inline: bool,
-    #[serde(default)]
-    pub prepared: bool,
-    pub status: Option<String>,
-    pub receipt: Option<Finalize>,
+
+/// Refuses a response from a server that cannot serve this CLI's protocol
+/// version, with a message saying which side to upgrade. A server predating
+/// versioning advertises nothing and is treated as version 1.
+pub(crate) fn check_protocol(response: &Response) -> Result<()> {
+    let header = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    protocol::check_server(
+        header(protocol::PROTOCOL_VERSION_HEADER),
+        header(protocol::MIN_PROTOCOL_VERSION_HEADER),
+    )?;
+    Ok(())
 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionParams {
-    pub store_path: String,
-    pub store_path_hash: String,
-    pub nar_hash: String,
-    pub nar_size: u64,
-    pub compression: String,
-    pub references: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deriver: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inline: Option<bool>,
+
+/// Serializes a request body. The protocol types always serialize.
+pub(crate) fn body<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|_| anyhow!("invalid request body"))
 }
 /// How the server left one row of a publication batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,30 +63,7 @@ pub enum RowOutcome {
     /// The batch stopped on this error after other rows had resolved.
     Failed(String),
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadedPart {
-    pub part_number: u32,
-    pub etag: String,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Finalize {
-    pub session_id: String,
-    pub nar_hash: String,
-    pub nar_size: u64,
-    pub file_hash: String,
-    pub file_size: u64,
-    pub parts: Vec<UploadedPart>,
-}
-// Never log signed instructions.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Part {
-    part_number: u32,
-    url: String,
-    headers: HashMap<String, String>,
-}
+/// A part to reserve, on behalf of one waiting upload.
 pub struct PartReservation {
     pub session_id: String,
     pub part_number: u32,
@@ -107,10 +78,17 @@ pub struct InlineUpload {
 // Only the small manifest is allocated afresh. Payload frames clone the
 // permit-owned Bytes, retaining the global memory charge throughout a replay.
 fn inline_frames(uploads: &[&InlineUpload]) -> Result<Vec<bytes::Bytes>> {
-    let manifest = serde_json::to_vec(&json!({"uploads": uploads.iter().map(|upload| {
-        json!({"sessionId":upload.session_id,"fileHash":upload.file_hash,"fileSize":upload.bytes.len()})
-    }).collect::<Vec<_>>()}))?;
-    if manifest.len() > 16 * 1024 {
+    let manifest = serde_json::to_vec(&body(&InlineManifest {
+        uploads: uploads
+            .iter()
+            .map(|upload| InlineEntry {
+                session_id: upload.session_id.clone(),
+                file_hash: upload.file_hash.clone(),
+                file_size: upload.bytes.len() as u64,
+            })
+            .collect(),
+    })?)?;
+    if manifest.len() > limits::INLINE_MANIFEST_MAX_BYTES {
         bail!("inline upload: manifest exceeds limit");
     }
     let mut header = Vec::with_capacity(4 + manifest.len());
@@ -158,6 +136,7 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 fn status_ok(operation: &str, response: Response) -> Result<Response> {
+    check_protocol(&response)?;
     if response.status().is_success() {
         Ok(response)
     } else {
@@ -220,6 +199,10 @@ fn classify<E>(
         Err(_) if replay == Replay::Idempotent => return Attempt::Retry { after: None },
         Err(_) => return Attempt::Fatal(anyhow!("{operation}: HTTP transport failed")),
     };
+    // An incompatible server refuses every replay the same way.
+    if let Err(error) = check_protocol(&response) {
+        return Attempt::Fatal(error);
+    }
     let status = response.status().as_u16();
     if match replay {
         Replay::Idempotent => transient(status),
@@ -297,7 +280,7 @@ trait Upload {
         None
     }
 }
-impl Upload for Finalize {
+impl Upload for Receipt {
     fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -309,21 +292,6 @@ impl Upload for InlineUpload {
     fn inline_size(&self) -> Option<u64> {
         Some(self.bytes.len() as u64)
     }
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Row {
-    session_id: String,
-    #[serde(default)]
-    published: bool,
-    #[serde(default)]
-    prepared: bool,
-    status: Option<u16>,
-    error: Option<String>,
-}
-#[derive(Deserialize)]
-struct Rows {
-    results: Vec<Row>,
 }
 
 /// One publication batch across its attempts. A row keeps the outcome it
@@ -358,7 +326,7 @@ impl<'a, U: Upload> Publication<'a, U> {
     }
     /// Folds in one attempt. `Some` ends the batch; `None` asks for another
     /// attempt with the rows still pending.
-    async fn settle(&mut self, attempt: Attempt<Rows>) -> Option<Result<Vec<RowOutcome>>> {
+    async fn settle(&mut self, attempt: Attempt<UploadResults>) -> Option<Result<Vec<RowOutcome>>> {
         let after = match attempt {
             Attempt::Fatal(error) => return Some(self.finish(Err(error))),
             Attempt::Retry { after } => after,
@@ -497,9 +465,11 @@ impl Client {
             http: reqwest::Client::builder()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(300))
+                .user_agent(user_agent())
                 .build()?,
             upstream: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
+                .user_agent(user_agent())
                 .build()?,
         })
     }
@@ -509,6 +479,17 @@ impl Client {
         client
     }
 
+    /// An API request: credentials and this CLI's protocol version. Part
+    /// uploads go to granted URLs with only the granted headers instead.
+    fn api(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, format!("{}{path}", self.server))
+            .header(header::AUTHORIZATION, self.authorization.clone())
+            .header(
+                protocol::PROTOCOL_VERSION_HEADER,
+                protocol::PROTOCOL_VERSION.to_string(),
+            )
+    }
     pub(crate) async fn request(
         &self,
         operation: &str,
@@ -516,10 +497,7 @@ impl Client {
         path: &str,
         body: Option<Value>,
     ) -> Result<Response> {
-        let mut request = self
-            .http
-            .request(method, format!("{}{path}", self.server))
-            .header(header::AUTHORIZATION, self.authorization.clone());
+        let mut request = self.api(method, path);
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -543,8 +521,12 @@ impl Client {
         operation: &str,
         replay: Replay,
         path: &str,
-        body: Value,
+        body: &impl Serialize,
     ) -> Attempt<T> {
+        let body = match self::body(body) {
+            Ok(body) => body,
+            Err(error) => return Attempt::Fatal(error),
+        };
         let result = self
             .request(operation, Method::POST, path, Some(body))
             .await;
@@ -553,15 +535,19 @@ impl Client {
             .await
     }
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-    pub async fn missing(&self, cache: &str, hashes: &[String]) -> Result<Missing> {
+    pub async fn missing(&self, cache: &str, hashes: &[String]) -> Result<MissingPaths> {
+        let request = MissingPathsRequest {
+            cache: cache.to_owned(),
+            store_path_hashes: hashes.to_vec(),
+        };
         let mut budget = Budget::new();
         loop {
             let attempt = self
                 .post(
                     "get-missing-paths",
                     Replay::Idempotent,
-                    "/_api/v1/get-missing-paths",
-                    json!({"cache":cache,"storePathHashes":hashes}),
+                    routes::MISSING_PATHS,
+                    &request,
                 )
                 .await;
             if let Some(missing) = budget.settle("get-missing-paths", attempt).await? {
@@ -573,66 +559,56 @@ impl Client {
     pub async fn create_sessions(
         &self,
         cache: &str,
-        paths: &[SessionParams],
-    ) -> Result<Vec<Session>> {
-        #[derive(Deserialize)]
-        struct Sessions {
-            sessions: Vec<Session>,
-        }
-        let path = format!("/_api/v1/caches/{}/upload-streams/batch", segment(cache)?);
+        paths: &[PathInput],
+    ) -> Result<Vec<UploadSession>> {
+        let path = routes::upload_streams(&segment(cache)?);
+        let request = CreateSessions {
+            paths: paths.to_vec(),
+            job_id: self.push_job.clone(),
+        };
+        // The server returns busy before committing session creation.
+        // Never replay transport failures or gateway errors: their commit
+        // outcome is unknown and creation is not idempotent. A push job's
+        // sessions are keyed by the job, so replaying them is safe.
+        let replay = if self.push_job.is_some() {
+            Replay::Idempotent
+        } else {
+            Replay::RefusedOnly
+        };
         let mut budget = Budget::new();
         loop {
-            // The server returns busy before committing session creation.
-            // Never replay transport failures or gateway errors: their commit
-            // outcome is unknown and creation is not idempotent. A push job's
-            // sessions are keyed by the job, so replaying them is safe.
-            let attempt = match &self.push_job {
-                Some(job) => {
-                    self.post::<Sessions>(
-                        "create-sessions",
-                        Replay::Idempotent,
-                        &path,
-                        json!({"jobId":job,"paths":paths}),
-                    )
-                    .await
-                }
-                None => {
-                    self.post::<Sessions>(
-                        "create-sessions",
-                        Replay::RefusedOnly,
-                        &path,
-                        json!({"paths":paths}),
-                    )
-                    .await
-                }
-            };
+            let attempt = self
+                .post::<CreatedSessions>("create-sessions", replay, &path, &request)
+                .await;
             if let Some(data) = budget.settle("create-sessions", attempt).await? {
                 return Ok(data.sessions);
             }
         }
     }
+    fn prepare_only(&self, path: &str) -> String {
+        if self.prepares_only() {
+            format!("{path}?{}", routes::PREPARE_ONLY_QUERY)
+        } else {
+            path.to_owned()
+        }
+    }
     /// One outcome per upload, in request order. Rows that are still busy
     /// replay together; an error means no row resolved at all.
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-    pub async fn finalize(&self, uploads: &[Finalize]) -> Result<Vec<RowOutcome>> {
+    pub async fn finalize(&self, uploads: &[Receipt]) -> Result<Vec<RowOutcome>> {
         let mut batch = Publication::new(
             "finalize",
             self.prepares_only(),
             uploads,
             self.progress.clone(),
         );
+        let path = self.prepare_only(routes::FINALIZE);
         loop {
+            let request = FinalizeBatch {
+                uploads: batch.pending().into_iter().cloned().collect(),
+            };
             let attempt = self
-                .post(
-                    "finalize",
-                    Replay::Idempotent,
-                    if self.prepares_only() {
-                        "/_api/v1/uploads/finalize?prepareOnly=true"
-                    } else {
-                        "/_api/v1/uploads/finalize"
-                    },
-                    json!({"uploads":batch.pending()}),
-                )
+                .post("finalize", Replay::Idempotent, &path, &request)
                 .await;
             if let Some(outcomes) = batch.settle(attempt).await {
                 return outcomes;
@@ -643,13 +619,13 @@ impl Client {
     /// lost publication acknowledgement. HTTP and item failures share a budget.
     /// Outcomes follow the same rules as `finalize`.
     pub async fn inline_batch(&self, uploads: &[InlineUpload]) -> Result<Vec<RowOutcome>> {
-        if uploads.is_empty() || uploads.len() > 8 {
+        if uploads.is_empty() || uploads.len() > limits::INLINE_BATCH_MAX {
             bail!("inline upload: invalid batch size");
         }
         for (index, upload) in uploads.iter().enumerate() {
             segment(&upload.session_id)?;
             if upload.bytes.is_empty()
-                || upload.bytes.len() > 1024 * 1024
+                || upload.bytes.len() as u64 > limits::INLINE_MAX_BYTES
                 || upload.file_hash.len() != 64
                 || !upload
                     .file_hash
@@ -675,7 +651,7 @@ impl Client {
             }
         }
     }
-    async fn inline_attempt(&self, uploads: &[&InlineUpload]) -> Attempt<Rows> {
+    async fn inline_attempt(&self, uploads: &[&InlineUpload]) -> Attempt<UploadResults> {
         let frames = match inline_frames(uploads) {
             Ok(frames) => frames,
             Err(error) => return Attempt::Fatal(error),
@@ -685,17 +661,7 @@ impl Client {
             frames.into_iter().map(Ok::<_, std::io::Error>),
         ));
         let result = self
-            .http
-            .post(format!(
-                "{}/_api/v1/uploads/inline/batch{}",
-                self.server,
-                if self.prepares_only() {
-                    "?prepareOnly=true"
-                } else {
-                    ""
-                }
-            ))
-            .header(header::AUTHORIZATION, self.authorization.clone())
+            .api(Method::POST, &self.prepare_only(routes::INLINE_BATCH))
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CONTENT_LENGTH, length)
             .body(body)
@@ -706,10 +672,10 @@ impl Client {
             .await
     }
     pub async fn abort(&self, id: &str) -> Result<()> {
-        let path = format!("/_api/v1/uploads/{}/abort", segment(id)?);
+        let path = routes::abort(&segment(id)?);
         status_ok(
             "abort",
-            self.request("abort", Method::POST, &path, Some(json!({})))
+            self.request("abort", Method::POST, &path, Some(body(&Empty {})?))
                 .await?,
         )?;
         Ok(())
@@ -720,24 +686,13 @@ impl Client {
     pub async fn reserve_parts(
         &self,
         requests: &[PartReservation],
-    ) -> Result<Vec<std::result::Result<Part, String>>> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Reservation {
-            session_id: String,
-            parts: Option<Vec<Part>>,
-            status: Option<u16>,
-        }
-        #[derive(Deserialize)]
-        struct Results {
-            results: Vec<Reservation>,
-        }
-        if requests.is_empty() || requests.len() > 100 {
+    ) -> Result<Vec<std::result::Result<PartGrant, String>>> {
+        if requests.is_empty() || requests.len() > limits::BATCH_MAX {
             bail!("invalid part reservations");
         }
         let mut groups: Vec<(&str, Vec<(usize, &PartReservation)>)> = Vec::new();
         for (index, request) in requests.iter().enumerate() {
-            if !(1..=10_000).contains(&request.part_number) || request.size == 0 {
+            if !(1..=limits::MAX_PARTS).contains(&request.part_number) || request.size == 0 {
                 bail!("invalid part reservation");
             }
             if let Some((_, parts)) = groups.iter_mut().find(|(id, _)| *id == request.session_id) {
@@ -758,16 +713,27 @@ impl Client {
             .collect();
         let mut budget = Budget::new();
         loop {
-            let uploads: Vec<_> = pending.iter().map(|(id, parts)| json!({
-                "sessionId":id,
-                "parts":parts.iter().map(|(_, p)| json!({"partNumber":p.part_number,"size":p.size})).collect::<Vec<_>>()
-            })).collect();
+            let request: ReservePartsBatch = ReservePartsBatch {
+                uploads: pending
+                    .iter()
+                    .map(|(id, parts)| SessionParts {
+                        session_id: (*id).to_owned(),
+                        parts: parts
+                            .iter()
+                            .map(|(_, p)| PartRequest {
+                                part_number: p.part_number,
+                                size: p.size as u64,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
             let after = match self
-                .post::<Results>(
+                .post::<ReservationResults>(
                     "reserve parts",
                     Replay::Idempotent,
-                    "/_api/v1/uploads/parts",
-                    json!({"uploads":uploads}),
+                    routes::UPLOAD_PARTS,
+                    &request,
                 )
                 .await
             {
@@ -840,11 +806,11 @@ impl Client {
     pub async fn upload_part(
         &self,
         id: &str,
-        part: Part,
+        part: PartGrant,
         bytes: bytes::Bytes,
-    ) -> Result<UploadedPart> {
+    ) -> Result<ReceiptPart> {
         let progress = self.progress.as_ref().and_then(|p| p.path(id));
-        if !(1..=10_000).contains(&part.part_number) || bytes.is_empty() {
+        if !(1..=limits::MAX_PARTS).contains(&part.part_number) || bytes.is_empty() {
             bail!("invalid upload part");
         }
         let url = Url::parse(&part.url).map_err(|_| anyhow!("invalid upload URL"))?;
@@ -863,6 +829,12 @@ impl Client {
             value.set_sensitive(true);
             headers.insert(name, value);
         }
+        // Not a granted header: the server stays free to retire old clients
+        // on this route too. reqwest adds the User-Agent itself.
+        headers.insert(
+            protocol::PROTOCOL_VERSION_HEADER,
+            header::HeaderValue::from(protocol::PROTOCOL_VERSION),
+        );
         headers.insert(
             header::CONTENT_LENGTH,
             header::HeaderValue::from_str(&bytes.len().to_string())?,
@@ -902,7 +874,7 @@ impl Client {
                 if let Some(progress) = &progress {
                     progress.part_uploaded(part.part_number, bytes.len() as u64);
                 }
-                return Ok(UploadedPart {
+                return Ok(ReceiptPart {
                     part_number: part.part_number,
                     etag,
                 });
@@ -983,6 +955,7 @@ fn validate_admin_path(path: &str) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1016,7 +989,7 @@ pub(crate) mod tests {
     pub async fn reply(socket: &mut tokio::net::TcpStream, status: u16, body: &str, extra: &str) {
         socket.write_all(format!("HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).as_bytes()).await.unwrap();
     }
-    async fn upload_one(client: &Client, bytes: bytes::Bytes) -> Result<UploadedPart> {
+    async fn upload_one(client: &Client, bytes: bytes::Bytes) -> Result<ReceiptPart> {
         let part = client
             .reserve_parts(&[PartReservation {
                 session_id: "s1".into(),
@@ -1372,6 +1345,13 @@ pub(crate) mod tests {
                             supplied_auth
                         );
                         assert!(headers.to_lowercase().contains("content-length: 6"));
+                        // The CLI names its protocol on part PUTs too, outside the grant.
+                        let lower = headers.to_lowercase();
+                        assert!(lower.contains(&format!(
+                            "snowstead-protocol-version: {}\r\n",
+                            protocol::PROTOCOL_VERSION
+                        )));
+                        assert!(lower.contains("user-agent: snowstead-cli/"));
                         match step {
                             3 => reply(&mut socket, 503, "private error", "").await,
                             4 => (), // Lost successful response must replay the same bytes.
@@ -1403,15 +1383,15 @@ pub(crate) mod tests {
             let sessions = client
                 .create_sessions(
                     "main",
-                    &[SessionParams {
+                    &[PathInput {
                         store_path: "/nix/store/hash-name".into(),
                         store_path_hash: "hash".into(),
                         nar_hash: "sha256:nar".into(),
                         nar_size: 42,
                         compression: "zstd".into(),
-                        references: vec![],
+                        references: Some(vec![]),
                         deriver: None,
-                        inline: None,
+                        inline: false,
                     }],
                 )
                 .await
@@ -1422,7 +1402,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(
                 client
-                    .finalize(&[Finalize {
+                    .finalize(&[Receipt {
                         session_id: "s1".into(),
                         nar_hash: "sha256:nar".into(),
                         nar_size: 42,
@@ -1472,14 +1452,14 @@ pub(crate) mod tests {
             server.await.unwrap();
         }
     }
-    fn upload(id: &str) -> Finalize {
-        Finalize {
+    fn upload(id: &str) -> Receipt {
+        Receipt {
             session_id: id.into(),
             nar_hash: "sha256:nar".into(),
             nar_size: 42,
             file_hash: "hash".into(),
             file_size: 6,
-            parts: vec![UploadedPart {
+            parts: vec![ReceiptPart {
                 part_number: 1,
                 etag: "etag".into(),
             }],
@@ -1801,5 +1781,63 @@ pub(crate) mod tests {
         client.missing("main", &[]).await.unwrap();
         let times = server.await.unwrap();
         assert!(times[1].duration_since(times[0]) >= Duration::from_secs(1));
+    }
+    #[tokio::test]
+    async fn requests_name_the_cli_and_protocol_and_refuse_incompatible_servers() {
+        // (advertised range, status, what the CLI should say)
+        for (range, status, expected) in [
+            ("", 200, None),
+            (
+                "Snowstead-Protocol-Version: 1\r\nSnowstead-Min-Protocol-Version: 1\r\n",
+                200,
+                None,
+            ),
+            (
+                "Snowstead-Protocol-Version: 9\r\nSnowstead-Min-Protocol-Version: 9\r\n",
+                400,
+                Some("Upgrade the Snowstead CLI"),
+            ),
+            (
+                "Snowstead-Protocol-Version: 0\r\nSnowstead-Min-Protocol-Version: 0\r\n",
+                400,
+                Some("server is too old"),
+            ),
+        ] {
+            let (client, server) = {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = client(&format!("http://{}", listener.local_addr().unwrap()));
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (headers, _) = read(&mut socket).await;
+                    reply(&mut socket, status, r#"{"missing":[]}"#, range).await;
+                    headers.to_ascii_lowercase()
+                });
+                (client, server)
+            };
+            let result = client.missing("main", &[]).await;
+            let headers = server.await.unwrap();
+            assert!(
+                headers.contains(&format!(
+                    "user-agent: snowstead-cli/{}\r\n",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                "{headers}"
+            );
+            assert!(
+                headers.contains(&format!(
+                    "snowstead-protocol-version: {}\r\n",
+                    protocol::PROTOCOL_VERSION
+                )),
+                "{headers}"
+            );
+            match expected {
+                None => assert!(result.is_ok()),
+                // One request only: an incompatible server is not retried.
+                Some(message) => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains(message), "{error}");
+                }
+            }
+        }
     }
 }

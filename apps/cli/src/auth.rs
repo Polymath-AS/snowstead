@@ -174,6 +174,7 @@ pub async fn login(options: &Login) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
+        .user_agent(crate::api::user_agent())
         .build()?;
     // Fail on an unreadable config or unwritable directory now: once the
     // server mints a token, a failed save would orphan it.

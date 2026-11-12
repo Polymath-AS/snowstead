@@ -36,6 +36,7 @@ These features are API-only; they do not add dashboard or CLI commands.
 workers/gateway/      Forwarding-only gateway to API_ORIGIN
 workers/server/       Rust API, protocols, maintenance, migrations, and tests
 apps/cli/             CLI for pushing store paths
+pkg/protocol/         Wire types, limits, and version shared by the CLI and server
 apps/go-cache/        Native GOCACHEPROG helper
 infra/                Rust service deployment
 scripts/              Development and verification harnesses
@@ -249,6 +250,14 @@ blob, complete, publish, and commit routes have been removed. Deploy database
 migrations and the Rust server before using the streaming CLI. It does not fall
 back to disk spooling on older servers. Config and credential writes still
 use atomic temporary files.
+
+The CLI sends `User-Agent: snowstead-cli/<version>` and its protocol version in
+`Snowstead-Protocol-Version`. Upload, missing-path, and push-job responses carry
+the server's supported range in `Snowstead-Protocol-Version` and
+`Snowstead-Min-Protocol-Version`; an unsupported client gets HTTP 400 and the
+CLI says whether to upgrade itself or the server. Requests without the header
+are served as version 1. `GET /_api/v1/protocol` reports the range and
+capabilities without credentials.
 
 Legacy canonical installations keep a durable source/destination pin that
 never expires automatically. An operator must reconcile an ambiguous R2

@@ -21,20 +21,30 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use snowstead_protocol::{
+    self as protocol, Aborted, CreateSessions, CreatedSessions, FinalizeBatch, InlineEntry,
+    InlineManifest, JobSession, PartGrant, PartGrants, PartRequest, Receipt, ReceiptPart,
+    ReservationResult, ReservationResults, ReservePartsBatch, SessionStatus, UploadResult,
+    UploadResults, UploadSession, limits, routes,
+};
 use sqlx::Acquire;
 use tokio::io::AsyncReadExt;
 
 use crate::{
     AppState,
     authz::{Action, Principal as Identity, Resource, authorize as decide},
-    error::{ApiError, json_response},
+    error::ApiError,
     lifecycle::UploadStatus,
     native, signing,
+    wire::respond,
 };
 
 const MIB: i64 = 1024 * 1024;
-const MAX_INLINE_MANIFEST: usize = 16 * 1024;
-const MAX_INLINE_FRAME: usize = 4 + MAX_INLINE_MANIFEST + 8 * MIB as usize;
+/// Inline sessions' part size, and the bound on their NAR and file sizes.
+const INLINE: i64 = limits::INLINE_MAX_BYTES as i64;
+const MAX_INLINE_MANIFEST: usize = limits::INLINE_MANIFEST_MAX_BYTES;
+const MAX_INLINE_FRAME: usize =
+    4 + MAX_INLINE_MANIFEST + limits::INLINE_BATCH_MAX * limits::INLINE_MAX_BYTES as usize;
 const MAX_OBJECT: i64 = 5 * 1024 * 1024 * 1024 * 1024;
 const NIX32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
 const PRIVATE_CACHES_REFUSED: &str = "this org does not allow private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made";
@@ -44,37 +54,28 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
     let write = middleware::from_fn_with_state(state, crate::nix::write_access);
     Router::new()
         .route(
-            "/_api/v1/caches/{cache}/upload-streams/batch",
+            routes::UPLOAD_STREAMS_ROUTE,
             post(create).route_layer(write.clone()),
         )
         .route(
-            "/_api/v1/uploads/parts",
+            routes::UPLOAD_PARTS,
             post(reserve_parts_batch).route_layer(write.clone()),
         )
+        .route(routes::FINALIZE, post(finalize).route_layer(write.clone()))
         .route(
-            "/_api/v1/uploads/finalize",
-            post(finalize).route_layer(write.clone()),
-        )
-        .route(
-            "/_api/v1/uploads/{id}/parts",
+            routes::SESSION_PARTS_ROUTE,
             post(reserve_parts).route_layer(write.clone()),
         )
+        .route(routes::PART_ROUTE, put(put_part).route_layer(write.clone()))
         .route(
-            "/_api/v1/uploads/{id}/part/{number}",
-            put(put_part).route_layer(write.clone()),
-        )
-        .route(
-            "/_api/v1/uploads/inline/batch",
+            routes::INLINE_BATCH,
             post(inline_batch).route_layer(write.clone()),
         )
         .route(
-            "/_api/v1/uploads/{id}/inline",
+            routes::INLINE_ROUTE,
             post(inline).route_layer(write.clone()),
         )
-        .route(
-            "/_api/v1/uploads/{id}/abort",
-            post(abort).route_layer(write),
-        )
+        .route(routes::ABORT_ROUTE, post(abort).route_layer(write))
 }
 
 fn configured_origin(value: &str) -> Result<String, ApiError> {
@@ -134,13 +135,14 @@ fn part_size(size: i64) -> i64 {
         } else {
             0
         };
-    ((bound + 10_000 * MIB - 1) / (10_000 * MIB) * MIB).clamp(8 * MIB, 1024 * MIB)
+    let parts = i64::from(limits::MAX_PARTS);
+    ((bound + parts * MIB - 1) / (parts * MIB) * MIB).clamp(8 * MIB, 1024 * MIB)
 }
 fn bounded(size: i64) -> bool {
     (1..=MAX_OBJECT).contains(&size)
 }
 fn batch<T>(items: &[T]) -> Result<(), ApiError> {
-    if items.is_empty() || items.len() > 100 {
+    if items.is_empty() || items.len() > limits::BATCH_MAX {
         return Err(error(400, "Batch must contain 1 to 100 entries"));
     }
     Ok(())
@@ -312,22 +314,25 @@ async fn lock_session(
     Ok((tx, current))
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PathInput {
-    pub(crate) store_path: String,
-    pub(crate) store_path_hash: String,
-    pub(crate) nar_hash: String,
-    pub(crate) nar_size: i64,
-    pub(crate) compression: String,
-    pub(crate) references: Option<Vec<String>>,
-    pub(crate) deriver: Option<String>,
-    #[serde(default)]
-    pub(crate) inline: bool,
+pub(crate) use protocol::PathInput;
+
+/// Wire sizes are unsigned; SQL stores `bigint`. Saturating is safe: every
+/// size is checked with [`bounded`], which rejects anything near `i64::MAX`.
+fn signed(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or(i64::MAX)
+}
+/// Stored sizes are positive; a corrupt negative one fails [`bounded`].
+fn unsigned(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or_default()
 }
 
-impl PathInput {
-    pub(crate) fn normalize(&mut self) -> Result<(), ApiError> {
+pub(crate) trait PathInputExt {
+    fn normalize(&mut self) -> Result<(), ApiError>;
+    fn validate(&self) -> Result<String, ApiError>;
+}
+
+impl PathInputExt for PathInput {
+    fn normalize(&mut self) -> Result<(), ApiError> {
         self.inline = false;
         self.nar_hash = self.validate()?;
         let references = self.references.get_or_insert_default();
@@ -336,15 +341,15 @@ impl PathInput {
         Ok(())
     }
 
-    pub(crate) fn validate(&self) -> Result<String, ApiError> {
+    fn validate(&self) -> Result<String, ApiError> {
         if !store_hash(&self.store_path_hash)
             || !self
                 .store_path
                 .starts_with(&format!("/nix/store/{}-", self.store_path_hash))
             || !basename(self.store_path.strip_prefix("/nix/store/").unwrap_or(""))
-            || !bounded(self.nar_size)
-            || self.compression != "zstd"
-            || (self.inline && self.nar_size > MIB)
+            || !bounded(signed(self.nar_size))
+            || self.compression != protocol::COMPRESSION_ZSTD
+            || (self.inline && signed(self.nar_size) > INLINE)
             || self
                 .references
                 .as_ref()
@@ -359,13 +364,6 @@ impl PathInput {
         canonical_hash(&self.nar_hash)
     }
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Create {
-    paths: Vec<PathInput>,
-    job_id: Option<String>,
-}
-
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn create(
     State(state): State<AppState>,
@@ -374,7 +372,7 @@ async fn create(
     request: Request,
 ) -> Result<Response, ApiError> {
     request_origin(&state, &request)?;
-    let body: Create = json_body(request).await?;
+    let body: CreateSessions = json_body(request).await?;
     let state = &state;
     let identity = &identity;
     let cache = cache.as_str();
@@ -473,13 +471,21 @@ async fn create(
             continue;
         }
         let id = format!("s2.{}.{}", identity.org(), uuid::Uuid::now_v7());
-        let size = if p.inline { MIB } else { part_size(p.nar_size) };
-        let mut session = json!({"sessionId":id,"partSize":size,"inline":p.inline});
-        if body.job_id.is_some() {
-            session["status"] = json!("streaming");
-            session["publicationResult"] = Value::Null;
-        }
-        sessions.push(session);
+        let size = if p.inline {
+            INLINE
+        } else {
+            part_size(signed(p.nar_size))
+        };
+        sessions.push(UploadSession {
+            session_id: id.clone(),
+            part_size: unsigned(size),
+            inline: p.inline,
+            job: body.job_id.as_ref().map(|_| JobSession {
+                status: SessionStatus::Streaming,
+                publication_result: None,
+                retained: None,
+            }),
+        });
         rows.push((id, p, hash, size));
     }
     let ids: Vec<_> = rows.iter().map(|(id, _, _, _)| id.clone()).collect();
@@ -492,7 +498,7 @@ async fn create(
         .map(|(_, p, _, _)| p.store_path.clone())
         .collect();
     let nar_hashes: Vec<_> = rows.iter().map(|(_, _, hash, _)| hash.clone()).collect();
-    let nar_sizes: Vec<_> = rows.iter().map(|(_, p, _, _)| p.nar_size).collect();
+    let nar_sizes: Vec<_> = rows.iter().map(|(_, p, _, _)| signed(p.nar_size)).collect();
     let references: Vec<_> = rows
         .iter()
         .map(|(_, p, _, _)| {
@@ -569,31 +575,37 @@ async fn create(
         .await?;
     }
     tx.commit().await?;
-    Ok(json_response(
-        StatusCode::CREATED,
-        json!({"sessions":sessions}),
-    ))
+    Ok(respond(StatusCode::CREATED, &CreatedSessions { sessions }))
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// A part reservation in SQL widths.
+#[derive(Clone)]
 struct Reservation {
     part_number: i32,
     size: i64,
 }
+impl Reservation {
+    fn read(value: Value) -> Result<Vec<Self>, ApiError> {
+        serde_json::from_value::<Vec<PartRequest>>(value)
+            .ok()
+            .and_then(|parts| {
+                parts
+                    .into_iter()
+                    .map(|p| {
+                        Some(Self {
+                            part_number: i32::try_from(p.part_number).ok()?,
+                            size: i64::try_from(p.size).ok()?,
+                        })
+                    })
+                    .collect()
+            })
+            .ok_or_else(|| error(400, "Invalid part reservations"))
+    }
+}
+/// The single-session endpoint's body; its parts parse like a batch row's.
 #[derive(Deserialize)]
 struct Reservations {
-    parts: Vec<Reservation>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReserveInput {
-    session_id: String,
     parts: Value,
-}
-#[derive(Deserialize)]
-struct ReserveBatch {
-    uploads: Vec<ReserveInput>,
 }
 #[derive(Clone)]
 struct Part {
@@ -633,7 +645,7 @@ async fn reserve_tx(
     batch(requested)?;
     let mut seen = HashSet::new();
     if requested.iter().any(|p| {
-        !(1..=10_000).contains(&p.part_number)
+        !(1..=limits::MAX_PARTS as i32).contains(&p.part_number)
             || p.size < 1
             || p.size > i64::from(s.part_size.unwrap_or(0))
             || !seen.insert(p.part_number)
@@ -715,21 +727,36 @@ async fn reserve(
     value: Value,
     origin: &str,
     authorization: &Option<String>,
-) -> Result<Value, ApiError> {
+) -> Result<PartGrants, ApiError> {
     let s = load(&state.pool, id, identity).await?;
     if s.r2_upload_id.is_none() {
         return Err(error(409, "Not a multipart upload"));
     }
-    let requested: Vec<Reservation> =
-        serde_json::from_value(value).map_err(|_| error(400, "Invalid part reservations"))?;
+    let requested = Reservation::read(value)?;
     let (mut tx, s) = locked(state, &s, identity).await?;
     reserve_tx(&mut tx, &s, &requested).await?;
     tx.commit().await?;
-    Ok(json!({"parts":requested.iter().map(|p| {
-        let mut headers = json!({"content-length":p.size.to_string()});
-        if let Some(auth) = authorization { headers["authorization"] = json!(auth); }
-        json!({"partNumber":p.part_number,"url":format!("{origin}/_api/v1/uploads/{id}/part/{}",p.part_number),"headers":headers})
-    }).collect::<Vec<_>>()}))
+    // reserve_tx admitted only part numbers in 1..=MAX_PARTS.
+    Ok(PartGrants {
+        parts: requested
+            .iter()
+            .map(|p| {
+                let number = p.part_number.unsigned_abs();
+                let mut headers = std::collections::BTreeMap::from([(
+                    "content-length".to_owned(),
+                    p.size.to_string(),
+                )]);
+                if let Some(auth) = authorization {
+                    headers.insert("authorization".to_owned(), auth.clone());
+                }
+                PartGrant {
+                    part_number: number,
+                    url: format!("{origin}{}", routes::part(id, number)),
+                    headers,
+                }
+            })
+            .collect(),
+    })
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -828,7 +855,14 @@ async fn put_part(
         let _ = state.storage.delete(true, &key).await;
     }
     admitted?;
-    let mut response = json_response(StatusCode::OK, json!({"partNumber":number,"etag":etag}));
+    // A part is granted, so its number is in 1..=MAX_PARTS.
+    let mut response = respond(
+        StatusCode::OK,
+        &ReceiptPart {
+            part_number: number.unsigned_abs(),
+            etag: etag.clone(),
+        },
+    );
     response.headers_mut().insert(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{etag}\""))
@@ -837,47 +871,21 @@ async fn put_part(
     Ok(response)
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ReceiptPart {
-    part_number: i32,
-    #[serde(deserialize_with = "unquote_etag")]
-    etag: String,
+trait ReceiptExt {
+    fn validate(&self) -> Result<String, ApiError>;
 }
-fn unquote_etag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    Ok(value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(&value)
-        .to_owned())
-}
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Receipt {
-    session_id: String,
-    nar_hash: String,
-    nar_size: i64,
-    file_hash: String,
-    file_size: i64,
-    parts: Vec<ReceiptPart>,
-}
-impl Receipt {
+impl ReceiptExt for Receipt {
     fn validate(&self) -> Result<String, ApiError> {
-        if !bounded(self.file_size)
-            || !bounded(self.nar_size)
+        if !bounded(signed(self.file_size))
+            || !bounded(signed(self.nar_size))
             || !hash_valid(&self.file_hash)
             || self.parts.is_empty()
-            || self.parts.len() > 10_000
+            || self.parts.len() > limits::MAX_PARTS as usize
         {
             return Err(error(400, "Invalid stream receipt"));
         }
         canonical_hash(&self.nar_hash)
     }
-}
-#[derive(Deserialize)]
-struct Finalize {
-    uploads: Vec<Receipt>,
 }
 
 #[derive(Default, Deserialize)]
@@ -916,10 +924,14 @@ async fn seal(
     ) {
         return Err(error(409, "Conflict"));
     }
-    if inline && (s.nar_size > MIB || receipt.file_size > MIB || s.part_size != Some(MIB as i32)) {
+    if inline
+        && (s.nar_size > INLINE
+            || signed(receipt.file_size) > INLINE
+            || s.part_size != Some(INLINE as i32))
+    {
         return Err(error(409, "Not an inline upload"));
     }
-    if s.nar_hash != nar_hash || s.nar_size != receipt.nar_size {
+    if s.nar_hash != nar_hash || s.nar_size != signed(receipt.nar_size) {
         return Err(error(
             400,
             "Stream metadata or parts do not match reservations",
@@ -931,7 +943,7 @@ async fn seal(
             &s,
             &[Reservation {
                 part_number: 1,
-                size: receipt.file_size,
+                size: signed(receipt.file_size),
             }],
         )
         .await?;
@@ -947,17 +959,17 @@ async fn seal(
         )
         .execute(&mut *tx)
         .await?;
-        s.file_size = receipt.file_size;
+        s.file_size = signed(receipt.file_size);
     }
     let stored = parts(&mut tx, &s.id).await?;
     let mut input = receipt.parts.clone();
     input.sort_by_key(|p| p.part_number);
-    if s.file_size != receipt.file_size
+    if s.file_size != signed(receipt.file_size)
         || stored.len() != input.len()
         || stored.is_empty()
         || stored.iter().enumerate().any(|(i, p)| {
             p.part_number != i as i32 + 1
-                || input[i].part_number != p.part_number
+                || i64::from(input[i].part_number) != i64::from(p.part_number)
                 || input[i].etag.is_empty()
                 || (i + 1 < stored.len() && p.size != i64::from(s.part_size.unwrap_or(0)))
         })
@@ -1221,7 +1233,7 @@ async fn publish(
     identity: &Identity,
     ready: &Prepared,
     protect: &[(i32, String)],
-) -> Result<Value, ApiError> {
+) -> Result<UploadResult, ApiError> {
     Ok(publish_group(state, identity, &[ready], protect, None)
         .await?
         .remove(0))
@@ -1250,7 +1262,7 @@ async fn publish_group(
     ready: &[&Prepared],
     protect: &[(i32, String)],
     claim: Option<&crate::push_job_worker::Claim>,
-) -> Result<Vec<Value>, ApiError> {
+) -> Result<Vec<UploadResult>, ApiError> {
     let org = &ready[0].session.org_id;
     let mut tx = crate::db::begin(state, org).await?;
     let result = async {
@@ -1308,9 +1320,7 @@ async fn publish_group(
         let s = &p.session;
         let current = sessions.get(&s.id).ok_or_else(|| error(404, "Not found"))?;
         if current.status == UploadStatus::Completed {
-            results.push(current.publication_result.clone().unwrap_or_else(
-                || json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true}),
-            ));
+            results.push(completed_result(current));
             continue;
         }
         if current.status != UploadStatus::Finalizing || current.file_hash != s.file_hash {
@@ -1340,7 +1350,7 @@ async fn publish_group(
             key.as_ref().map(|(name, key)| (name.as_str(), key)),
         )?;
         let ordinal = results.len();
-        results.push(json!({"sessionId":s.id,"storePathHash":s.store_path_hash,"published":true}));
+        results.push(UploadResult::published(&s.id, &s.store_path_hash));
         incoming.push(Publication {
             ordinal,
             session: s,
@@ -1427,7 +1437,7 @@ async fn publish_group(
         if seen.insert(path) {
             bytes = bytes.saturating_add(s.file_size);
         } else {
-            results[item.ordinal]["alreadyExisted"] = json!(true);
+            results[item.ordinal].already_existed = true;
         }
     }
     if let Some(limit) = limit {
@@ -1938,10 +1948,9 @@ async fn publish_prepared(
     identity: &Identity,
     ready: Prepared,
     protect: Vec<(i32, String)>,
-) -> Result<Value, ApiError> {
+) -> Result<UploadResult, ApiError> {
     if ready.session.status == UploadStatus::Completed {
-        return Ok(ready.session.publication_result.unwrap_or_else(||
-            json!({"sessionId":ready.session.id,"storePathHash":ready.session.store_path_hash,"published":true})));
+        return Ok(completed_result(&ready.session));
     }
     // Caller cancellation must not abandon a publication. Durable reservations
     // survive a crash; TaskTracker lets orderly shutdown finish active work.
@@ -2074,8 +2083,8 @@ async fn finalize_batch(
     identity: &Identity,
     inputs: Vec<Receipt>,
     options: Finalization,
-) -> Vec<Value> {
-    let mut results = vec![Value::Null; inputs.len()];
+) -> Vec<Option<UploadResult>> {
+    let mut results = vec![None; inputs.len()];
     let mut ready = Vec::with_capacity(inputs.len());
     let mut sealed = Vec::with_capacity(inputs.len());
     // Serialize SQL decisions within this request, not storage I/O. Otherwise
@@ -2091,7 +2100,7 @@ async fn finalize_batch(
         .await;
         match reserved {
             Ok(prepared) => sealed.push((index, id, prepared)),
-            Err(e) => results[index] = result_value(&id, Err(e), true),
+            Err(e) => results[index] = result_value(&id, Err(e)),
         }
     }
     let preparations = stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
@@ -2102,7 +2111,7 @@ async fn finalize_batch(
     while let Some((index, id, result)) = preparations.next().await {
         match result {
             Ok(prepared) => ready.push((index, prepared)),
-            Err(e) => results[index] = result_value(&id, Err(e), true),
+            Err(e) => results[index] = result_value(&id, Err(e)),
         }
     }
     publish_batch(state, identity, ready, results, options).await
@@ -2113,18 +2122,14 @@ async fn publish_batch(
     state: &AppState,
     identity: &Identity,
     ready: Vec<(usize, Prepared)>,
-    mut results: Vec<Value>,
+    mut results: Vec<Option<UploadResult>>,
     options: Finalization,
-) -> Vec<Value> {
+) -> Vec<Option<UploadResult>> {
     let mut pending = Vec::with_capacity(ready.len());
     for (index, p) in ready {
         if p.session.status == UploadStatus::Completed {
             let id = p.session.id.clone();
-            results[index] = result_value(
-                &id,
-                publish_prepared(state, identity, p, vec![]).await,
-                true,
-            );
+            results[index] = result_value(&id, publish_prepared(state, identity, p, vec![]).await);
         } else {
             pending.push((index, p));
         }
@@ -2146,7 +2151,6 @@ async fn publish_batch(
                     results[*index] = result_value(
                         &p.session.id,
                         Err(ApiError::new(e.status, e.message.clone())),
-                        true,
                     );
                 }
             }
@@ -2162,9 +2166,8 @@ async fn publish_batch(
     // when a caller disconnects. Storage never runs inside publish_group.
     let mut failed = results.clone();
     for (index, p) in &ready {
-        if failed[*index].is_null() {
-            failed[*index] =
-                result_value(&p.session.id, Err(error(500, "Publication failed")), true);
+        if failed[*index].is_none() {
+            failed[*index] = result_value(&p.session.id, Err(error(500, "Publication failed")));
         }
     }
     let publication = state
@@ -2172,16 +2175,16 @@ async fn publish_batch(
         .spawn(async move {
             let mut pending = Vec::new();
             for (index, p) in ready {
-                if !results[index].is_null() {
+                if results[index].is_some() {
                     continue;
                 }
                 let id = p.session.id.clone();
                 match finish_preparation(&owned, &identity, p).await {
                     Ok(p) if options.prepare_only => {
-                        results[index] = prepared_value(&p);
+                        results[index] = Some(prepared_value(&p));
                     }
                     Ok(p) => pending.push((index, p)),
-                    Err(e) => results[index] = result_value(&id, Err(e), true),
+                    Err(e) => results[index] = result_value(&id, Err(e)),
                 }
             }
             let orgs: HashSet<_> = pending
@@ -2198,7 +2201,7 @@ async fn publish_batch(
                     match publish_group(&owned, &identity, &members, &protect, None).await {
                         Ok(outcomes) => {
                             for ((index, _), result) in chunk.iter().zip(outcomes) {
-                                results[*index] = result;
+                                results[*index] = Some(result);
                             }
                         }
                         Err(_) => {
@@ -2209,7 +2212,6 @@ async fn publish_batch(
                                 results[*index] = result_value(
                                     &p.session.id,
                                     publish(&owned, &identity, p, &protect).await,
-                                    true,
                                 );
                             }
                         }
@@ -2225,60 +2227,64 @@ async fn publish_batch(
     }
 }
 
-fn prepared_value(ready: &Prepared) -> Value {
-    json!({"sessionId":ready.session.id,"storePathHash":ready.session.store_path_hash,
-        "prepared":true,"published":false,"status":202})
+fn prepared_value(ready: &Prepared) -> UploadResult {
+    UploadResult::prepared(&ready.session.id, &ready.session.store_path_hash)
 }
 
-fn result_value(id: &str, result: Result<Value, ApiError>, finalize: bool) -> Value {
-    match result {
-        Ok(mut v) => {
-            v["sessionId"] = json!(id);
-            v
+/// A completed session replays its stored result. Only this module writes
+/// that column, always as an `UploadResult`.
+fn completed_result(s: &Session) -> UploadResult {
+    s.publication_result
+        .clone()
+        .and_then(|stored| serde_json::from_value(stored).ok())
+        .unwrap_or_else(|| UploadResult::published(&s.id, &s.store_path_hash))
+}
+
+/// The filled result slot for one upload, under the session ID it was sent as.
+fn result_value(id: &str, result: Result<UploadResult, ApiError>) -> Option<UploadResult> {
+    Some(match result {
+        Ok(mut row) => {
+            row.session_id = id.to_owned();
+            row
         }
-        Err(e) => {
-            let mut v = json!({"sessionId":id,"error":e.message,"status":e.status.as_u16()});
-            if finalize {
-                v["published"] = json!(false);
-            }
-            v
-        }
+        Err(e) => UploadResult::failed(id, e.status.as_u16(), &e.message),
+    })
+}
+
+/// The response for a batch whose every slot is filled. An empty slot would
+/// be a bug; it reports a failed publication rather than a malformed row.
+fn upload_results(results: Vec<Option<UploadResult>>, ids: &[String]) -> UploadResults {
+    UploadResults {
+        results: results
+            .into_iter()
+            .zip(ids)
+            .map(|(row, id)| {
+                row.unwrap_or_else(|| UploadResult::failed(id, 500, "Publication failed"))
+            })
+            .collect(),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InlineInput {
-    session_id: String,
-    file_hash: String,
-    file_size: usize,
-}
-
-#[derive(Deserialize)]
-struct InlineBatch {
-    uploads: Vec<InlineInput>,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn seal_inline(
     state: &AppState,
     identity: &Identity,
-    input: &InlineInput,
+    input: &InlineEntry,
     bytes: axum::body::Bytes,
     options: &Finalization,
 ) -> Result<Prepared, ApiError> {
     let id = &input.session_id;
     let s = load(&state.pool, id, identity).await?;
     options.validate(&s)?;
-    if s.r2_upload_id.is_some() || s.part_size != Some(MIB as i32) || s.nar_size > MIB {
+    if s.r2_upload_id.is_some() || s.part_size != Some(INLINE as i32) || s.nar_size > INLINE {
         return Err(error(409, "Not an inline upload"));
     }
     let receipt = Receipt {
         session_id: id.clone(),
         nar_hash: s.nar_hash.clone(),
-        nar_size: s.nar_size,
+        nar_size: unsigned(s.nar_size),
         file_hash: input.file_hash.clone(),
-        file_size: input.file_size as i64,
+        file_size: input.file_size,
         parts: vec![ReceiptPart {
             part_number: 1,
             etag: input.file_hash.clone(),
@@ -2327,42 +2333,50 @@ async fn inline_batch(
     if !(1..=MAX_INLINE_MANIFEST).contains(&manifest_size) || 4 + manifest_size >= length {
         return Err(error(400, "Invalid inline manifest length"));
     }
-    let body: InlineBatch = serde_json::from_slice(&frame[4..4 + manifest_size])
+    let body: InlineManifest = serde_json::from_slice(&frame[4..4 + manifest_size])
         .map_err(|_| error(400, "Invalid inline manifest"))?;
     if body.uploads.is_empty()
-        || body.uploads.len() > 8
+        || body.uploads.len() > limits::INLINE_BATCH_MAX
         || body.uploads.iter().any(|u| {
             u.session_id.is_empty()
                 || !hash_valid(&u.file_hash)
-                || !(1..=MIB as usize).contains(&u.file_size)
+                || !(1..=limits::INLINE_MAX_BYTES).contains(&u.file_size)
         })
     {
         return Err(error(400, "Invalid inline manifest"));
     }
     distinct(body.uploads.iter().map(|u| u.session_id.as_str()))?;
-    if 4 + manifest_size + body.uploads.iter().map(|u| u.file_size).sum::<usize>() != length {
+    if 4 + manifest_size
+        + body
+            .uploads
+            .iter()
+            .map(|u| u.file_size as usize)
+            .sum::<usize>()
+        != length
+    {
         return Err(error(400, "Frame size mismatch"));
     }
     // Validate the entire envelope and every checksum before any durable work.
     let mut offset = 4 + manifest_size;
     for input in &body.uploads {
-        let bytes = &frame[offset..offset + input.file_size];
+        let bytes = &frame[offset..offset + input.file_size as usize];
         if hex::encode(Sha256::digest(bytes)) != input.file_hash {
             return Err(error(400, "File hash mismatch"));
         }
-        offset += input.file_size;
+        offset += input.file_size as usize;
     }
-    let mut results = vec![Value::Null; body.uploads.len()];
+    let ids: Vec<_> = body.uploads.iter().map(|u| u.session_id.clone()).collect();
+    let mut results = vec![None; body.uploads.len()];
     let mut ready = Vec::with_capacity(body.uploads.len());
     let mut sealed = Vec::with_capacity(body.uploads.len());
     offset = 4 + manifest_size;
     // As with streamed batches, do not race this request's own SQL admissions.
     for (index, input) in body.uploads.into_iter().enumerate() {
-        let bytes = frame.slice(offset..offset + input.file_size);
-        offset += input.file_size;
+        let bytes = frame.slice(offset..offset + input.file_size as usize);
+        offset += input.file_size as usize;
         match seal_inline(state, identity, &input, bytes, &options).await {
             Ok(prepared) => sealed.push((index, input.session_id, prepared)),
-            Err(e) => results[index] = result_value(&input.session_id, Err(e), true),
+            Err(e) => results[index] = result_value(&input.session_id, Err(e)),
         }
     }
     let preparations = stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
@@ -2373,11 +2387,11 @@ async fn inline_batch(
     while let Some((index, id, result)) = preparations.next().await {
         match result {
             Ok(prepared) => ready.push((index, prepared)),
-            Err(e) => results[index] = result_value(&id, Err(e), true),
+            Err(e) => results[index] = result_value(&id, Err(e)),
         }
     }
     let results = publish_batch(state, identity, ready, results, options).await;
-    Ok(json_response(StatusCode::OK, json!({"results":results})))
+    Ok(respond(StatusCode::OK, &upload_results(results, &ids)))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -2393,7 +2407,7 @@ async fn inline(
     let identity = &identity;
     let id = id.as_str();
     let s = load(&state.pool, id, identity).await?;
-    if s.r2_upload_id.is_some() || s.part_size != Some(MIB as i32) || s.nar_size > MIB {
+    if s.r2_upload_id.is_some() || s.part_size != Some(INLINE as i32) || s.nar_size > INLINE {
         return Err(error(409, "Not an inline upload"));
     }
     let hash = request
@@ -2414,7 +2428,7 @@ async fn inline(
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|n| *n > 0)
         .ok_or_else(|| error(400, "Invalid Content-Length"))?;
-    if length > MIB {
+    if length > INLINE {
         return Err(error(413, "Inline upload exceeds 1 MiB"));
     }
     let bytes = to_bytes(request.into_body(), length as usize)
@@ -2426,10 +2440,10 @@ async fn inline(
     if hex::encode(Sha256::digest(&bytes)) != hash {
         return Err(error(400, "File hash mismatch"));
     }
-    let input = InlineInput {
+    let input = InlineEntry {
         session_id: id.into(),
         file_hash: hash,
-        file_size: length as usize,
+        file_size: unsigned(length),
     };
     let result = async {
         let ready = seal_inline(state, identity, &input, bytes, &options).await?;
@@ -2453,10 +2467,7 @@ async fn inline(
         publish_prepared(state, identity, ready, protect).await
     }
     .await;
-    Ok(json_response(
-        StatusCode::OK,
-        result_value(id, result, true),
-    ))
+    Ok(respond(StatusCode::OK, &result_value(id, result)))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -2512,7 +2523,7 @@ async fn abort(
     for key in old.into_iter().filter_map(|p| p.storage_key) {
         let _ = state.storage.delete(true, &key).await;
     }
-    Ok(json_response(StatusCode::OK, json!({"aborted":true})))
+    Ok(respond(StatusCode::OK, &Aborted { aborted: true }))
 }
 
 fn request_origin(state: &AppState, request: &Request) -> Result<String, ApiError> {
@@ -2555,7 +2566,7 @@ async fn reserve_parts_batch(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let body: ReserveBatch = json_body(request).await?;
+    let body: ReservePartsBatch<Value> = json_body(request).await?;
     batch(&body.uploads)?;
     distinct(body.uploads.iter().map(|u| u.session_id.as_str()))?;
     let mut results = Vec::with_capacity(body.uploads.len());
@@ -2569,9 +2580,22 @@ async fn reserve_parts_batch(
             &authorization,
         )
         .await;
-        results.push(result_value(&u.session_id, r, false));
+        results.push(match r {
+            Ok(grants) => ReservationResult {
+                session_id: u.session_id,
+                parts: Some(grants.parts),
+                status: None,
+                error: None,
+            },
+            Err(e) => ReservationResult {
+                session_id: u.session_id,
+                parts: None,
+                status: Some(e.status.as_u16()),
+                error: Some(e.message),
+            },
+        });
     }
-    Ok(json_response(StatusCode::OK, json!({"results":results})))
+    Ok(respond(StatusCode::OK, &ReservationResults { results }))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -2582,19 +2606,19 @@ async fn finalize(
     request: Request,
 ) -> Result<Response, ApiError> {
     request_origin(&state, &request)?;
-    let body: Finalize = json_body(request).await?;
+    let body: FinalizeBatch = json_body(request).await?;
     batch(&body.uploads)?;
     distinct(body.uploads.iter().map(|u| u.session_id.as_str()))?;
     // Validate the envelope before doing any durable work.
     for u in &body.uploads {
         let mut numbers = HashSet::new();
         if !hash_valid(&u.file_hash)
-            || !bounded(u.file_size)
-            || !bounded(u.nar_size)
+            || !bounded(signed(u.file_size))
+            || !bounded(signed(u.nar_size))
             || u.parts.is_empty()
-            || u.parts.len() > 10_000
+            || u.parts.len() > limits::MAX_PARTS as usize
             || u.parts.iter().any(|p| {
-                !(1..=10_000).contains(&p.part_number)
+                !(1..=limits::MAX_PARTS).contains(&p.part_number)
                     || p.etag.is_empty()
                     || !numbers.insert(p.part_number)
             })
@@ -2603,6 +2627,7 @@ async fn finalize(
             return Err(error(400, "Invalid stream receipt"));
         }
     }
+    let ids: Vec<_> = body.uploads.iter().map(|u| u.session_id.clone()).collect();
     // Own the entire batch before allocating destinations. A disconnected
     // caller must not strand its later, not-yet-streamed reservations.
     let owned = state.clone();
@@ -2611,7 +2636,7 @@ async fn finalize(
         .spawn(async move { finalize_batch(&owned, &identity, body.uploads, options).await })
         .await
         .map_err(|_| error(500, "Finalization failed"))?;
-    Ok(json_response(StatusCode::OK, json!({"results":results})))
+    Ok(respond(StatusCode::OK, &upload_results(results, &ids)))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -2628,16 +2653,8 @@ async fn reserve_parts(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let body: Reservations = json_body(request).await?;
-    let result = reserve(
-        &state,
-        &identity,
-        &id,
-        serde_json::to_value(body.parts).unwrap(),
-        &origin,
-        &authorization,
-    )
-    .await?;
-    Ok(json_response(StatusCode::OK, result))
+    let result = reserve(&state, &identity, &id, body.parts, &origin, &authorization).await?;
+    Ok(respond(StatusCode::OK, &result))
 }
 
 #[cfg(test)]

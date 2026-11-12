@@ -11,25 +11,29 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
+use snowstead_protocol::{MissingPaths, limits, routes};
 
 use crate::{
     AppState, auth,
     authz::{self, Action, Principal as Identity, Resource},
-    error::{ApiError, json_response},
+    error::ApiError,
     protocol_policy::CallerLimit,
+    wire::respond,
 };
 
 /// Full API paths: merge this router rather than nesting and stripping the URI.
 pub(crate) fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route(
-            "/_api/v1/get-missing-paths",
+            routes::MISSING_PATHS,
             post(get_missing_paths)
                 .put(get_missing_paths)
                 .route_layer(middleware::from_fn_with_state(state.clone(), write_access)),
         )
         .merge(crate::uploads::router(state.clone()))
         .merge(crate::push_jobs::router(state))
+        // Outermost: refuse an incompatible client before authentication.
+        .route_layer(middleware::from_fn(crate::wire::negotiate))
 }
 
 pub(crate) async fn write_access(
@@ -237,12 +241,14 @@ async fn get_missing_paths(
         missing.clone()
     };
     warm_upstreams(&state, unchecked.clone());
-    Ok(json_response(
+    Ok(respond(
         StatusCode::OK,
-        json!({
-            "missing": missing, "upstream": upstream,
-            "unchecked": unchecked, "upstreams": state.config.upstreams,
-        }),
+        &MissingPaths {
+            missing,
+            upstream,
+            unchecked,
+            upstreams: state.config.upstreams.clone(),
+        },
     ))
 }
 
@@ -295,7 +301,7 @@ fn parse_missing(body: &Value) -> Result<(&str, Vec<String>), ApiError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if hashes.len() > 1000 {
+    if hashes.len() > limits::MISSING_PATHS_MAX {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "storePathHashes exceeds maximum of 1000",

@@ -1,0 +1,13 @@
+[package]
+name = "snowstead-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "../../LICENSE"
+description = "Wire types shared by the Snowstead CLI and cache server"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json.workspace = true

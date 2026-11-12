@@ -13,41 +13,36 @@ use axum::{
     response::Response,
     routing::{get, post, put},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use snowstead_protocol::{
+    Capabilities, CreatePushJob, JobSession, ManifestChunk, PUSH_JOB_CAPABILITIES,
+    PUSH_JOB_PROTOCOL_VERSION, PushJob, PushJobEnvelope, PushJobLimits, PushJobMode, PushJobPage,
+    PushJobState, RetainedSession, SessionStatus, UploadSession, routes,
+};
 use sqlx::{FromRow, types::Json};
 
 use crate::{
     AppState,
     authz::{Action, Principal as Identity, Resource, authorize},
     db::{self, Transaction},
-    error::{ApiError, json_response},
-    uploads::{PathInput, basename},
+    error::ApiError,
+    lifecycle::UploadStatus,
+    uploads::{PathInput, PathInputExt, basename},
+    wire::{member, respond, stored},
 };
 
 pub(crate) fn router(state: AppState) -> Router<AppState> {
     let access = middleware::from_fn_with_state(state.clone(), crate::nix::write_access);
     Router::new()
-        .route("/_api/v1/caches/{cache}/push-jobs", post(create))
-        .route("/_api/v1/caches/{cache}/push-jobs/{job}", get(progress))
-        .route(
-            "/_api/v1/caches/{cache}/push-jobs/{job}/manifest/{chunk}",
-            put(chunk),
-        )
-        .route("/_api/v1/caches/{cache}/push-jobs/{job}/seal", post(seal))
-        .route(
-            "/_api/v1/caches/{cache}/push-jobs/{job}/resume",
-            post(resume),
-        )
-        .route(
-            "/_api/v1/caches/{cache}/push-jobs/{job}/cancel",
-            post(cancel),
-        )
-        .route(
-            "/_api/v1/caches/{cache}/push-jobs/{job}/complete",
-            post(complete),
-        )
+        .route(routes::PUSH_JOBS_ROUTE, post(create))
+        .route(routes::PUSH_JOB_ROUTE, get(progress))
+        .route(routes::MANIFEST_CHUNK_ROUTE, put(chunk))
+        .route(routes::SEAL_ROUTE, post(seal))
+        .route(routes::RESUME_ROUTE, post(resume))
+        .route(routes::CANCEL_ROUTE, post(cancel))
+        .route(routes::COMPLETE_ROUTE, post(complete))
         .route_layer(middleware::from_fn_with_state(state, admit))
         .route_layer(access)
 }
@@ -131,8 +126,7 @@ async fn writer(
     Ok((tx, id))
 }
 
-#[derive(FromRow, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(FromRow)]
 struct Job {
     id: String,
     mode: String,
@@ -149,7 +143,6 @@ struct Job {
     authorization_expires_at: Option<i64>,
     completed_at: Option<i64>,
     protection_expires_at: Option<i64>,
-    #[serde(skip)]
     valid: bool,
 }
 async fn load(
@@ -177,22 +170,50 @@ async fn load(
     Ok(job)
 }
 
-fn response(status: StatusCode, job: Job, state: &AppState) -> Response {
-    json_response(
-        status,
-        json!({"protocolVersion":1,"capabilities":["manifest","prepareOnly","completion","readiness"],"job":job,
-        "limits":{"members":state.config.push_jobs.members,"chunkMembers":state.config.push_jobs.chunk_members,
-            "manifestBytes":state.config.push_jobs.manifest_bytes,
-            "backgroundPublication":state.config.push_jobs.publication_workers>0}}),
-    )
+impl Job {
+    /// The wire form. The columns' CHECK constraints admit only the
+    /// protocol's modes and states.
+    fn wire(self) -> Result<PushJob, ApiError> {
+        let invalid = |_| error(500, "Invalid push job state");
+        Ok(PushJob {
+            mode: PushJobMode::try_from(self.mode.as_str()).map_err(invalid)?,
+            state: PushJobState::try_from(self.state.as_str()).map_err(invalid)?,
+            id: self.id,
+            roots: self.roots.0,
+            revision: self.revision,
+            manifest_digest: self.manifest_digest,
+            manifest_bytes: self.manifest_bytes,
+            input_members: self.input_members,
+            expires_at: self.expires_at,
+            hard_expires_at: self.hard_expires_at,
+            grant_generation: self.grant_generation,
+            authorization_expires_at: self.authorization_expires_at,
+            completed_at: self.completed_at,
+            protection_expires_at: self.protection_expires_at,
+        })
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Create {
-    idempotency_key: String,
-    mode: String,
-    roots: Vec<String>,
+fn envelope(job: Job, state: &AppState) -> Result<PushJobEnvelope, ApiError> {
+    let limits = &state.config.push_jobs;
+    Ok(PushJobEnvelope {
+        protocol_version: PUSH_JOB_PROTOCOL_VERSION,
+        capabilities: Capabilities::of(&PUSH_JOB_CAPABILITIES),
+        job: job.wire()?,
+        limits: Some(PushJobLimits {
+            members: limits.members,
+            chunk_members: limits.chunk_members,
+            manifest_bytes: limits.manifest_bytes,
+            background_publication: limits.publication_workers > 0,
+        }),
+    })
+}
+
+fn response(status: StatusCode, job: Job, state: &AppState) -> Response {
+    match envelope(job, state) {
+        Ok(envelope) => respond(status, &envelope),
+        Err(error) => axum::response::IntoResponse::into_response(error),
+    }
 }
 
 // Call under writer()'s org fence. Reserve metadata before accepting it, not
@@ -238,14 +259,13 @@ async fn create(
     Path(name): Path<String>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let mut input: Create = body(request, state.config.push_jobs.manifest_bytes).await?;
+    let mut input: CreatePushJob = body(request, state.config.push_jobs.manifest_bytes).await?;
     if input.idempotency_key.is_empty()
         || input.idempotency_key.len() > 128
         || !input
             .idempotency_key
             .bytes()
             .all(|b| (33..=126).contains(&b))
-        || !matches!(input.mode.as_str(), "closure" | "selected")
         || input.roots.is_empty()
         || input.roots.len() > state.config.push_jobs.members
         || input
@@ -277,7 +297,7 @@ async fn create(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(job) = existing {
-        if job.mode != input.mode || job.roots.0 != roots.0 {
+        if job.mode != input.mode.as_str() || job.roots.0 != roots.0 {
             return Err(error(
                 409,
                 "Idempotency key has different manifest identity",
@@ -300,17 +320,11 @@ async fn create(
     .await?;
     let id = uuid::Uuid::now_v7().to_string();
     sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes) VALUES($1,$2,$3,$4,$5,$6,$7)")
-        .bind(&id).bind(cache_id).bind(&actor).bind(input.idempotency_key).bind(input.mode).bind(roots).bind(size as i32)
+        .bind(&id).bind(cache_id).bind(&actor).bind(input.idempotency_key).bind(input.mode.as_str()).bind(roots).bind(size as i32)
         .execute(&mut *tx).await?;
     let job = load(&mut *tx, cache_id, &actor, &id).await?;
     tx.commit().await?;
     Ok(response(StatusCode::CREATED, job, &state))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Chunk {
-    members: Vec<PathInput>,
 }
 
 async fn chunk(
@@ -319,7 +333,7 @@ async fn chunk(
     Path((name, id, ordinal)): Path<(String, String, i32)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let mut input: Chunk = body(request, state.config.push_jobs.manifest_bytes).await?;
+    let mut input: ManifestChunk = body(request, state.config.push_jobs.manifest_bytes).await?;
     if ordinal < 0
         || ordinal as usize >= state.config.push_jobs.members
         || input.members.is_empty()
@@ -576,7 +590,7 @@ pub(crate) async fn upload_members(
     cache: i32,
     id: &str,
     paths: &[PathInput],
-) -> Result<HashMap<String, Value>, ApiError> {
+) -> Result<HashMap<String, UploadSession>, ApiError> {
     if !matches!(identity, Identity::ApiToken(_)) {
         return Err(error(409, "Job uploads require the owning API token"));
     }
@@ -599,7 +613,7 @@ pub(crate) async fn upload_members(
         id: Option<String>,
         part_size: Option<i32>,
         inline: Option<bool>,
-        status: Option<String>,
+        status: Option<UploadStatus>,
         publication_result: Option<Value>,
         receipt: Option<Value>,
         prepared: bool,
@@ -639,12 +653,27 @@ pub(crate) async fn upload_members(
             return Err(error(409, "Upload metadata conflicts with sealed manifest"));
         }
         if let Some(session) = member.id {
+            // The joined row exists, so its NOT NULL columns are present.
+            let (Some(part_size), Some(inline), Some(status)) =
+                (member.part_size, member.inline, member.status)
+            else {
+                return Err(error(500, "Invalid upload session"));
+            };
             reused.insert(
                 path.store_path_hash.clone(),
-                json!({"sessionId":session,
-                "partSize":member.part_size,"inline":member.inline,"status":member.status,
-                "publicationResult":member.publication_result,"prepared":member.prepared,
-                "receipt":member.receipt}),
+                UploadSession {
+                    session_id: session,
+                    part_size: part_size.unsigned_abs().into(),
+                    inline,
+                    job: Some(JobSession {
+                        status: SessionStatus::from(status),
+                        publication_result: stored(member.publication_result),
+                        retained: Some(RetainedSession {
+                            prepared: member.prepared,
+                            receipt: stored(member.receipt),
+                        }),
+                    }),
+                },
             );
         }
     }
@@ -880,15 +909,18 @@ async fn progress(
     let next = more.then(|| {
         members.0.last().unwrap()["storePathHash"]
             .as_str()
-            .unwrap()
+            .unwrap_or_default()
             .to_owned()
     });
-    Ok(json_response(
+    Ok(respond(
         StatusCode::OK,
-        json!({"protocolVersion":1,"capabilities":["manifest","prepareOnly","completion","readiness"],"job":job,
-        "chunks":chunks,"members":members,"next":next,"available":available,"blocked":blocked,
-        "limits":{"members":state.config.push_jobs.members,"chunkMembers":state.config.push_jobs.chunk_members,
-            "manifestBytes":state.config.push_jobs.manifest_bytes,
-            "backgroundPublication":state.config.push_jobs.publication_workers>0}}),
+        &PushJobPage::<Value> {
+            envelope: envelope(job, &state)?,
+            chunks: chunks.0,
+            members: members.0.into_iter().map(member).collect(),
+            next,
+            available,
+            blocked,
+        },
     ))
 }

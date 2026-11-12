@@ -196,6 +196,10 @@ pub fn router(state: AppState) -> Router {
             }),
         )
         .route("/healthz", any(health))
+        .route(
+            snowstead_protocol::routes::PROTOCOL,
+            axum::routing::get(crate::wire::info),
+        )
         .merge(crate::nix::router(state.clone()))
         .merge(crate::go::router())
         .merge(crate::sccache::router())
@@ -327,6 +331,51 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_versions_are_advertised_and_checked_before_authentication() {
+        use snowstead_protocol::{PROTOCOL_VERSION_HEADER, ProtocolInfo};
+        let app = router(state());
+        let response = app
+            .clone()
+            .oneshot(request(snowstead_protocol::routes::PROTOCOL))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ProtocolInfo>(&body).unwrap(),
+            ProtocolInfo::current()
+        );
+        let send = |version: Option<&str>| {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(snowstead_protocol::routes::MISSING_PATHS);
+            if let Some(version) = version {
+                request = request.header(PROTOCOL_VERSION_HEADER, version);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+        // Unversioned and current clients reach authentication, which refuses them.
+        for version in [None, Some("1")] {
+            let response = send(version).await.unwrap();
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ),
+                "{}",
+                response.status()
+            );
+            assert_eq!(response.headers()[PROTOCOL_VERSION_HEADER], "1");
+        }
+        assert_eq!(
+            send(Some("99")).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

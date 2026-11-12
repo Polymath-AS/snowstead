@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "workers/server"]
+members = ["apps/cli", "pkg/protocol", "workers/server"]
 default-members = ["apps/cli"]
 
 [workspace.dependencies]

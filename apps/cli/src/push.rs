@@ -1,11 +1,12 @@
 use crate::{
-    api::{self, Client, SessionParams},
+    api::{self, Client},
     batch::Batcher,
     nar, nix,
     progress::Progress,
 };
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, TryStreamExt};
+use snowstead_protocol::{PathInput, Receipt, SessionStatus, limits};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
@@ -275,15 +276,15 @@ pub(crate) async fn transfer(
         async move {
             let specs: Vec<_> = chunk
                 .iter()
-                .map(|(info, _)| SessionParams {
+                .map(|(info, _)| PathInput {
                     store_path: info.store_path.clone(),
                     store_path_hash: info.store_path_hash.clone(),
                     nar_hash: info.nar_hash.clone(),
                     nar_size: info.nar_size,
-                    compression: "zstd".into(),
-                    references: info.references.clone(),
+                    compression: snowstead_protocol::COMPRESSION_ZSTD.into(),
+                    references: Some(info.references.clone()),
                     deriver: info.deriver.clone(),
-                    inline: inline_capacity(info.nar_size).map(|_| true),
+                    inline: inline_capacity(info.nar_size).is_some(),
                 })
                 .collect();
             let rows = client.create_sessions(&cache, &specs).await?;
@@ -306,9 +307,7 @@ pub(crate) async fn transfer(
                 if session.part_size == 0 || session.part_size > 1024 * 1024 * 1024 {
                     bail!("invalid multipart part size");
                 }
-                if session.inline
-                    && (spec.inline != Some(true) || session.part_size != INLINE_LIMIT)
-                {
+                if session.inline && (!spec.inline || session.part_size != INLINE_LIMIT) {
                     bail!("invalid inline session");
                 }
                 let next = largest.max(session.part_size as usize);
@@ -321,7 +320,7 @@ pub(crate) async fn transfer(
     let mut pending = ordered.into_iter().zip(outcomes);
     let mut negotiations = tokio::task::JoinSet::new();
     negotiations.spawn(negotiate(
-        pending.by_ref().take(100).collect(),
+        pending.by_ref().take(limits::BATCH_MAX).collect(),
         64 * 1024 * 1024usize,
     ));
     let sessions = futures_util::stream::try_unfold(
@@ -333,7 +332,7 @@ pub(crate) async fn transfer(
                     return Ok::<_, anyhow::Error>(None);
                 };
                 let (batch, largest) = result??;
-                let next: Vec<_> = pending.by_ref().take(100).collect();
+                let next: Vec<_> = pending.by_ref().take(limits::BATCH_MAX).collect();
                 if !next.is_empty() {
                     negotiations.spawn(negotiate(next, largest));
                 }
@@ -355,7 +354,7 @@ pub(crate) async fn transfer(
         },
     );
     let multipart_client = client.clone();
-    let finalize = move |uploads: Vec<api::Finalize>| {
+    let finalize = move |uploads: Vec<Receipt>| {
         let client = multipart_client.clone();
         async move { client.finalize(&uploads).await }
     };
@@ -397,19 +396,23 @@ pub(crate) async fn transfer(
                 let start = Instant::now();
                 let result = async {
                     if client.prepares_only()
-                        && (session.prepared || session.status.as_deref() == Some("completed"))
+                        && (session.prepared()
+                            || session.status() == Some(SessionStatus::Completed))
                     {
                         guard.disarm();
                         return Ok(());
                     }
                     if client.prepares_only()
                         && !session.inline
-                        && session.status.as_deref() == Some("finalizing")
+                        && session.status() == Some(SessionStatus::Finalizing)
                     {
                         // Sealed multipart bytes survive a preparation crash.
                         // Replay their receipt without reading local Nix data
                         // or trying to reserve immutable parts again.
-                        let receipt = session.receipt.context("sealed upload has no receipt")?;
+                        let receipt = session
+                            .receipt()
+                            .cloned()
+                            .context("sealed upload has no receipt")?;
                         if receipt.session_id != session.session_id {
                             bail!("sealed upload receipt has a different session");
                         }
@@ -458,7 +461,7 @@ pub(crate) async fn transfer(
                     };
                     // Wait for output capacity before allocating a codec. A slow
                     // upload must not park every producer with live zstd state.
-                    let part_limit = if session.inline { 1 } else { 10_000 };
+                    let part_limit = if session.inline { 1 } else { limits::MAX_PARTS };
                     let mut writer = Bridge::new(capacity, part_limit, buffers, sender).await?;
                     if !session.inline {
                         progress.phase("Uploading");
@@ -532,7 +535,7 @@ pub(crate) async fn transfer(
                             .await?
                     } else {
                         commits
-                            .request(api::Finalize {
+                            .request(Receipt {
                                 session_id: session.session_id.clone(),
                                 nar_hash: info.nar_hash,
                                 nar_size: digest.nar_size,
@@ -631,7 +634,7 @@ pub(crate) async fn transfer(
     Ok(summary)
 }
 
-const INLINE_LIMIT: u64 = 1024 * 1024;
+const INLINE_LIMIT: u64 = limits::INLINE_MAX_BYTES;
 
 async fn wait_dependencies(
     info: &nix::PathInfo,
@@ -827,8 +830,8 @@ async fn upload_parts(
     id: &str,
     receiver: mpsc::Receiver<(u32, bytes::Bytes)>,
     limit: Arc<Semaphore>,
-    reservations: &Batcher<api::PartReservation, Result<api::Part, String>>,
-) -> anyhow::Result<Vec<api::UploadedPart>> {
+    reservations: &Batcher<api::PartReservation, Result<snowstead_protocol::PartGrant, String>>,
+) -> anyhow::Result<Vec<snowstead_protocol::ReceiptPart>> {
     let mut parts: Vec<_> = futures_util::stream::unfold(receiver, |mut receiver| async {
         receiver.recv().await.map(|part| (part, receiver))
     })
