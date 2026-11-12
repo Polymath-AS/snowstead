@@ -87,9 +87,15 @@ mod tests {
                 reply(&mut socket, 200, &response.to_string(), "").await;
             }
         });
+        let progress = crate::progress::Progress::new(true, false);
+        let options = push::Options {
+            jobs: 2,
+            level: 3,
+            progress: &progress,
+        };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            push(&client, "main", vec![], false, Some("job-1"), 2, 3),
+            push(&client, "main", vec![], false, Some("job-1"), &options),
         )
         .await
         .unwrap()
@@ -222,9 +228,15 @@ mod tests {
             // None of these paths exists locally. A prepared member must not
             // invoke the encoder, reserve parts, finalize again, or be aborted.
             // A sealed multipart member must replay only its retained receipt.
+            let progress = crate::progress::Progress::new(true, false);
+            let options = push::Options {
+                jobs: 2,
+                level: 3,
+                progress: &progress,
+            };
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                push(&client, "main", vec![], false, Some("job-1"), 2, 3),
+                push(&client, "main", vec![], false, Some("job-1"), &options),
             )
             .await
             .unwrap()
@@ -423,9 +435,9 @@ pub async fn push(
     roots: Vec<String>,
     selected: bool,
     resume: Option<&str>,
-    jobs: usize,
-    level: i32,
+    options: &push::Options<'_>,
 ) -> Result<push::Summary> {
+    options.progress.phase("Preparing push job...");
     let base = format!("/_api/v1/caches/{}/push-jobs", segment(cache)?);
     let mut envelope: Envelope = if let Some(id) = resume {
         request(
@@ -449,8 +461,10 @@ pub async fn push(
     envelope.validate()?;
     let id = envelope.job.id.clone();
     let path = format!("{base}/{id}");
-    println!("Push job: {id}");
-    println!("Resume with: snowstead push {cache} --resume {id}");
+    options.progress.println(&format!("Push job: {id}"));
+    options.progress.println(&format!(
+        "Resume with: snowstead push {cache} --resume {id}"
+    ));
     let limits = envelope
         .limits
         .take()
@@ -513,6 +527,9 @@ pub async fn push(
         .filter(|m| m.available)
         .map(|m| m.input.store_path_hash.clone())
         .collect();
+    options
+        .progress
+        .start("Preparing", initial.len(), skipped.len());
     if envelope.job.state == "completed" {
         if initial.iter().any(|m| !m.available) {
             bail!("completed push is no longer fully available; start a new push");
@@ -534,7 +551,7 @@ pub async fn push(
     let job_client = client.for_job(&id)?;
     // A job reports through its manifest, not a partial transfer summary.
     let mut unreported = None;
-    let transfer = push::transfer(&job_client, cache, pending, jobs, level, &mut unreported);
+    let transfer = push::transfer(&job_client, cache, pending, options, &mut unreported);
     tokio::pin!(transfer);
     let mut renew = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(300),
@@ -546,6 +563,7 @@ pub async fn push(
             _ = renew.tick() => { envelope = action(client, &path, "resume").await?; }
         }
     };
+    options.progress.phase("Waiting for publication...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     // A prepared receipt can arrive just before its publication commits.
     // Probe readiness promptly without repeatedly downloading the manifest,
@@ -635,7 +653,10 @@ pub async fn push(
         tokio::select! {
             _ = tokio::time::sleep(poll_delay) => (),
             _ = renew.tick() => { envelope = action(client, &path, "resume").await?; }
-            _ = tokio::signal::ctrl_c() => bail!("upload cancelled; resume push job {id}"),
+            _ = tokio::signal::ctrl_c() => {
+                options.progress.finish("idle", "Push cancelled");
+                return Err(anyhow::Error::new(push::Cancelled).context(format!("resume push job {id}")));
+            },
         }
         poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
     }

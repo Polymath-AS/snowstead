@@ -37,3 +37,21 @@ snowstead login --token-stdin --url https://cache.example.com --name self-hosted
 This saves the token without claiming remote validation. Positional login tokens
 are no longer accepted. Verbose tracing remains opt-in with `--verbose`, goes to
 stderr, and does not log authentication requests or credentials.
+
+## Push progress
+
+In an interactive terminal, `snowstead push` shows an indicatif progress bar on
+stderr: completed paths out of the closure, the percentage processed, skips,
+and failures. Each path counts once when it is skipped, published, or fails;
+this is path progress, not bytes transferred. Resumable pushes count prepared
+paths, then show a separate waiting phase until publication completes.
+
+The CLI also sends OSC 7501 program status reports to the terminal: `working`
+with a percentage during transfer, `done` on success, `error` on failure, and
+`idle` on cancellation. Reports include `app=snowstead` and a base64-encoded
+message. Unsupported terminals ignore these sequences; stdin is never read
+for terminal capability replies.
+
+Redirected stderr, `TERM=dumb`, and `--json` disable the bar and OSC reports.
+`--json` keeps stdout to the result object alone. `--verbose` disables the bar
+so tracing stays readable, but still sends terminal status reports.

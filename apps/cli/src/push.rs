@@ -2,6 +2,7 @@ use crate::{
     api::{self, Client, SessionParams},
     batch::Batcher,
     nar, nix,
+    progress::Progress,
 };
 use anyhow::{Context, bail};
 use futures_util::{StreamExt, TryStreamExt};
@@ -25,6 +26,13 @@ pub struct Summary {
     pub errors: Vec<PathError>,
     pub cancelled: bool,
 }
+
+pub struct Options<'a> {
+    pub jobs: usize,
+    pub level: i32,
+    pub progress: &'a Progress,
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct PathError {
     pub path: String,
@@ -68,11 +76,10 @@ pub async fn push(
     client: &Client,
     cache: &str,
     paths: Vec<String>,
-    jobs: usize,
-    level: i32,
+    options: &Options<'_>,
 ) -> Result<Summary, Stopped> {
     let mut partial = None;
-    let result = upload(client, cache, paths, jobs, level, &mut partial).await;
+    let result = upload(client, cache, paths, options, &mut partial).await;
     result.map_err(|error| Stopped { partial, error })
 }
 
@@ -80,11 +87,10 @@ async fn upload(
     client: &Client,
     cache: &str,
     paths: Vec<String>,
-    jobs: usize,
-    level: i32,
+    options: &Options<'_>,
     partial: &mut Option<Summary>,
 ) -> anyhow::Result<Summary> {
-    if jobs == 0 {
+    if options.jobs == 0 {
         bail!("--jobs must be positive")
     }
     let mut unique = BTreeMap::new();
@@ -171,6 +177,9 @@ async fn upload(
         upstream = summary.upstream,
         "checked remote availability"
     );
+    options
+        .progress
+        .start("Uploading", unique.len(), summary.skipped);
     if todo.is_empty() {
         return Ok(summary);
     }
@@ -183,7 +192,7 @@ async fn upload(
                 .with_context(|| format!("missing path info for {path}"))?,
         );
     }
-    let transferred = match transfer(client, cache, ordered, jobs, level, partial).await {
+    let transferred = match transfer(client, cache, ordered, options, partial).await {
         Ok(transferred) => transferred,
         Err(error) => {
             // What stopped early still counts the paths this push never had to send.
@@ -205,10 +214,11 @@ pub(crate) async fn transfer(
     client: &Client,
     cache: &str,
     ordered: Vec<nix::PathInfo>,
-    jobs: usize,
-    level: i32,
+    options: &Options<'_>,
     partial: &mut Option<Summary>,
 ) -> anyhow::Result<Summary> {
+    let jobs = options.jobs;
+    let level = options.level;
     let mut summary = Summary {
         pushed: 0,
         skipped: 0,
@@ -575,10 +585,14 @@ pub(crate) async fn transfer(
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
                 summary.cancelled = error.is::<Cancelled>();
+                if summary.cancelled {
+                    options.progress.finish("idle", "Push cancelled");
+                }
                 *partial = Some(summary);
                 return Err(error);
             }
         };
+        options.progress.path_finished(result.is_err());
         match result {
             Ok(()) => summary.pushed += 1,
             Err(error) => {
@@ -949,7 +963,13 @@ mod tests {
             }
         });
         let summary = tokio::time::timeout(Duration::from_secs(10), async {
-            let result = transfer(&client, "main", infos, 1, 3, &mut None)
+            let progress = Progress::new(true, false);
+            let options = Options {
+                jobs: 1,
+                level: 3,
+                progress: &progress,
+            };
+            let result = transfer(&client, "main", infos, &options, &mut None)
                 .await
                 .unwrap();
             server.await.unwrap();

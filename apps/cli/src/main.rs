@@ -6,6 +6,7 @@ mod config;
 mod local;
 mod nar;
 mod nix;
+mod progress;
 mod push;
 mod push_job;
 
@@ -258,15 +259,6 @@ fn main() {
     }
 }
 
-/// Progress lines leave stdout to the JSON object when one was requested.
-fn progress(json: bool, line: &str) {
-    if json {
-        eprintln!("{line}");
-    } else {
-        println!("{line}");
-    }
-}
-
 /// The store paths to push, from arguments or else stdin, without consulting Nix.
 fn push_roots(paths: Vec<String>, allow_drv: bool) -> Result<Vec<String>> {
     let paths = if paths.is_empty() {
@@ -381,30 +373,30 @@ async fn run(mut cli: Cli) -> Result<()> {
             jobs,
             compression_level,
         } => {
+            let progress = progress::Progress::new(json, cli.verbose);
+            let options = push::Options {
+                jobs,
+                level: compression_level,
+                progress: &progress,
+            };
             // A push that stops early still reports what it had published.
             let (summary, stopped) = if resumable || resume.is_some() {
-                let summary = push_job::push(
-                    &client,
-                    &cache,
-                    paths,
-                    no_deps,
-                    resume.as_deref(),
-                    jobs,
-                    compression_level,
-                )
-                .await?;
+                let summary =
+                    push_job::push(&client, &cache, paths, no_deps, resume.as_deref(), &options)
+                        .await?;
                 (summary, None)
             } else {
                 let paths = if no_deps {
                     paths
                 } else {
-                    progress(json, "Resolving closure...");
+                    progress.phase("Resolving closure...");
                     let paths = nix::closure(&paths).await?;
-                    progress(json, &format!("Found {} paths in closure", paths.len()));
+                    progress.phase(&format!("Found {} paths in closure", paths.len()));
                     paths
                 };
+                progress.phase("Checking remote availability...");
                 tracing::debug!(target: "snowstead", paths = paths.len(), jobs, compression_level, "Starting push");
-                match push::push(&client, &cache, paths, jobs, compression_level).await {
+                match push::push(&client, &cache, paths, &options).await {
                     Ok(summary) => (summary, None),
                     Err(push::Stopped {
                         partial: Some(summary),
@@ -416,6 +408,14 @@ async fn run(mut cli: Cli) -> Result<()> {
                     }) => return Err(error),
                 }
             };
+            let (state, message) = if summary.cancelled {
+                ("idle", "Push cancelled")
+            } else if summary.failed > 0 || stopped.is_some() {
+                ("error", "Push failed")
+            } else {
+                ("done", "Push complete")
+            };
+            progress.finish(state, message);
             if json {
                 println!("{}", serde_json::to_string(&summary)?);
             } else {

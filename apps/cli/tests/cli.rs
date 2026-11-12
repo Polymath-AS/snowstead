@@ -97,6 +97,7 @@ fn push_reads_stdin_and_includes_each_paths_closure() {
         // With --json, stdout is the result object alone; progress moves to stderr.
         let stdout = String::from_utf8(result.stdout).unwrap();
         let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(!stdout.contains('\x1b') && !stderr.contains('\x1b'));
         if json {
             assert_eq!(
                 serde_json::from_str::<Value>(&stdout).unwrap(),
@@ -106,6 +107,110 @@ fn push_reads_stdin_and_includes_each_paths_closure() {
         } else {
             assert!(stdout.contains("Found 2 paths in closure"));
             assert!(stdout.contains("Done: 0 pushed, 2 skipped (0 served upstream), 0 failed"));
+        }
+    }
+}
+
+/// Attach stderr to a real terminal while retaining a separately piped stdout.
+fn terminal_output(mut command: Command) -> Output {
+    use std::{fs::File, os::fd::FromRawFd};
+    let mut master = -1;
+    let mut slave = -1;
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty initializes both descriptors; the optional name and
+    // termios pointers are null, and size is valid for this call.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0
+    );
+    // SAFETY: these are newly opened descriptors, each owned by exactly one File.
+    let mut master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut bytes = [0; 4096];
+        loop {
+            match master.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&bytes[..n]),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("reading terminal: {e}"),
+            }
+        }
+        output
+    });
+    let mut output = command.stderr(Stdio::from(slave)).output().unwrap();
+    drop(command);
+    output.stderr = reader.join().unwrap();
+    output
+}
+
+#[test]
+fn terminal_status_reports_success_and_errors_but_not_json_or_dumb_output() {
+    for (json, term, status) in [
+        (false, "xterm-256color", 200),
+        (false, "xterm-256color", 403),
+        (true, "xterm-256color", 200),
+        (false, "dumb", 200),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let (url, request) = mock(status, json!({"missing":[]}));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_snowstead"));
+        command
+            .env("HOME", home.path())
+            .env("SNOWSTEAD_TOKEN", TOKEN)
+            .env("SNOWSTEAD_URL", url)
+            .env("TERM", term)
+            .args([
+                "push",
+                "main",
+                "/nix/store/00000000000000000000000000000000-missing",
+                "--no-deps",
+            ])
+            .args(json.then_some("--json"));
+        let output = terminal_output(command);
+        request.join().unwrap();
+        assert_eq!(output.status.success(), status == 200);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains(TOKEN));
+        assert!(!output.stdout.contains(&0x1b));
+        if json || term == "dumb" {
+            assert!(!stderr.contains('\x1b'), "{stderr:?}");
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output.stdout).unwrap()["skipped"],
+                    1
+                );
+            }
+        } else {
+            assert!(
+                stderr.contains("\x1b]7501;state=working:app=snowstead:"),
+                "{stderr:?}"
+            );
+            if status == 200 {
+                assert!(stderr.contains(":progress=100:"), "{stderr:?}");
+                assert!(
+                    stderr.contains(
+                        "\x1b]7501;state=done:app=snowstead:msg=UHVzaCBjb21wbGV0ZQ==\x1b\\"
+                    )
+                );
+            } else {
+                assert!(stderr.contains("\x1b]7501;state=error:app=snowstead:"));
+                assert!(!stderr.contains("state=done"));
+            }
         }
     }
 }
@@ -556,20 +661,28 @@ fn encoder_failure(inline: bool, json: bool) -> Output {
     });
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_snowstead"));
+    command
         .env("HOME", home.path())
         .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("TERM", "xterm-256color")
         .env("TMPDIR", home.path().join("no-spooling-here"))
         .env("SNOWSTEAD_URL", url)
         .env("SNOWSTEAD_TOKEN", TOKEN)
         .args(["push", "main", path, "--no-deps", "--jobs", "1"])
-        .args(json.then_some("--json"))
-        .output()
-        .unwrap();
+        .args(json.then_some("--json"));
+    let result = terminal_output(command);
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("NAR encoding failed") || stderr.contains("nix-store --dump failed"));
     assert!(!stderr.contains(TOKEN));
+    if json {
+        assert!(!stderr.contains('\x1b'));
+    } else {
+        assert!(stderr.contains(":progress=100:"));
+        assert!(stderr.contains("state=error"));
+        assert!(!stderr.contains("state=done"));
+    }
     server.join().unwrap();
     assert!(!home.path().join("no-spooling-here").exists());
     result
@@ -720,9 +833,11 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
     });
     let mut search = vec![bin];
     search.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_snowstead"));
+    command
         .env("HOME", home.path())
         .env("PATH", std::env::join_paths(search).unwrap())
+        .env("TERM", "xterm-256color")
         .env("SNOWSTEAD_URL", &url)
         .env("SNOWSTEAD_TOKEN", TOKEN)
         .args([
@@ -733,9 +848,8 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
             "--no-deps",
             "--jobs",
             "2",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let result = terminal_output(command);
     assert!(
         result.status.success(),
         "{}",
@@ -743,6 +857,12 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
     );
     assert!(String::from_utf8_lossy(&result.stdout).contains("2 pushed"));
     assert!(!String::from_utf8_lossy(&result.stderr).contains(TOKEN));
+    let terminal = String::from_utf8_lossy(&result.stderr);
+    assert!(terminal.contains("Uploading ") && terminal.contains("paths ("));
+    assert!(terminal.contains(":progress=0:"));
+    assert!(terminal.contains(":progress=50:"));
+    assert!(terminal.contains(":progress=100:"));
+    assert!(terminal.contains("state=done"));
     server.join().unwrap();
 }
 
