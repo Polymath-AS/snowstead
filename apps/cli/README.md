@@ -40,11 +40,19 @@ stderr, and does not log authentication requests or credentials.
 
 ## Push progress
 
-In an interactive terminal, `snowstead push` shows an indicatif progress bar on
-stderr: completed paths out of the closure, the percentage processed, skips,
-and failures. Each path counts once when it is skipped, published, or fails;
-this is path progress, not bytes transferred. Resumable pushes count prepared
-paths, then show a separate waiting phase until publication completes.
+In an interactive terminal, `snowstead push` shows an overall path-progress bar
+and up to four active paths on stderr, with a count of additional active paths.
+Each path shows confirmed compressed bytes and, on wider terminals, upload speed.
+The final compressed size appears once encoding finishes. Multipart bytes count
+only after acknowledgement; retrying a part never counts its bytes twice.
+Inline uploads send bytes and publish together, so their byte count advances
+only when that combined request succeeds.
+
+Rows distinguish preparation, upload retries, dependency waits, and publication.
+A full byte count is not publication. Successful rows disappear; errors stay
+above the live rows and appear again in the final report. Each path counts once
+in the overall bar when it is skipped, published, or fails. Resumable pushes
+count prepared paths, then wait separately for publication to complete.
 
 The CLI also sends OSC 7501 program status reports to the terminal: `working`
 with a percentage during transfer, `done` on success, `error` on failure, and

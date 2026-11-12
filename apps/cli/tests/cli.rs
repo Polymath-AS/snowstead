@@ -861,12 +861,152 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
     assert!(String::from_utf8_lossy(&result.stdout).contains("2 pushed"));
     assert!(!String::from_utf8_lossy(&result.stderr).contains(TOKEN));
     let terminal = String::from_utf8_lossy(&result.stderr);
-    assert!(terminal.contains("Uploading ") && terminal.contains("paths ("));
+    assert!(terminal.contains("Processed ") && terminal.contains("paths ("));
+    assert!(terminal.contains("Uploading and publishing"));
+    assert!(terminal.contains("retry 2/4"));
     assert!(terminal.contains(":progress=0:"));
     assert!(terminal.contains(":progress=50:"));
     assert!(terminal.contains(":progress=100:"));
     assert!(terminal.contains("state=done"));
     server.join().unwrap();
+}
+
+#[test]
+fn multipart_progress_counts_acknowledged_bytes_once_and_waits_for_publication() {
+    use sha2::{Digest, Sha256};
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+    let path = std::fs::read_dir("/nix/store")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            !path.to_string_lossy().ends_with(".drv")
+                && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() < 128)
+        })
+        .expect("Nix shell must contain a small file output");
+    let path = path.to_str().unwrap();
+    let raw = Command::new("nix-store")
+        .args(["--dump", path])
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    let metadata = json!({path:{"narHash":format!("sha256:{}", hex::encode(Sha256::digest(&raw.stdout))),"narSize":raw.stdout.len(),"references":[]}});
+
+    for json in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let nix = home.path().join("nix");
+        std::fs::write(
+            &nix,
+            format!("#!/bin/sh\ncat <<'METADATA'\n{metadata}\nMETADATA\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let origin = url.clone();
+        let hash = path[11..43].to_owned();
+        let server = thread::spawn(move || {
+            let mut uploaded = None;
+            let mut puts = 0;
+            let mut publications = 0;
+            loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let mut status = 200;
+                let response = if headers.starts_with("POST /_api/v1/get-missing-paths ") {
+                    json!({"missing":[hash]})
+                } else if headers.starts_with("POST /_api/v1/caches/main/upload-streams/batch ") {
+                    json!({"sessions":[{"sessionId":"s1","partSize":8388608,"inline":false}]})
+                } else if headers.starts_with("POST /_api/v1/uploads/parts ") {
+                    json!({"results":[{"sessionId":"s1","parts":[{"partNumber":1,"url":format!("{origin}/part"),"headers":{}}]}]})
+                } else if headers.starts_with("PUT /part ") {
+                    puts += 1;
+                    if let Some(previous) = &uploaded {
+                        assert_eq!(&body, previous, "a retry must retain the same payload");
+                    } else {
+                        uploaded = Some(body);
+                        status = 503;
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                    json!({})
+                } else {
+                    assert!(headers.starts_with("POST /_api/v1/uploads/finalize "), "{headers}");
+                    publications += 1;
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["uploads"][0]["fileSize"], uploaded.as_ref().unwrap().len());
+                    thread::sleep(Duration::from_millis(150));
+                    json!({"results":[{"sessionId":"s1","published":publications == 2,"status":if publications == 2 {200} else {503}}]})
+                }.to_string();
+                write!(socket, "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nETag: fixture\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+                if publications == 2 {
+                    assert_eq!(puts, 2);
+                    return uploaded.unwrap();
+                }
+            }
+        });
+        let mut search = vec![home.path().to_owned()];
+        search.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_snowstead"));
+        command
+            .env("HOME", home.path())
+            .env("PATH", std::env::join_paths(search).unwrap())
+            .env("TERM", "xterm-256color")
+            .env("SNOWSTEAD_URL", url)
+            .env("SNOWSTEAD_TOKEN", TOKEN)
+            .args(["push", "main", path, "--no-deps", "--jobs", "1"])
+            .args(json.then_some("--json"));
+        let result = terminal_output(command);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "{stderr}");
+        let bytes = server.join().unwrap();
+        assert_eq!(zstd::stream::decode_all(&bytes[..]).unwrap(), raw.stdout);
+        assert!(bytes.len() < 1024);
+        assert!(!stderr.contains(TOKEN));
+        if json {
+            assert!(!stderr.contains('\x1b'));
+            assert!(!stderr.contains("Retrying part"));
+            let summary: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(summary["pushed"], 1);
+            assert_eq!(summary["failed"], 0);
+        } else {
+            let total = bytes.len();
+            assert!(stderr.contains("Retrying part 1 · attempt 2/4"), "{stderr}");
+            assert!(stderr.contains(&format!("0 B / {total} B")), "{stderr}");
+            assert!(
+                stderr.contains(&format!("{total} B / {total} B")),
+                "{stderr}"
+            );
+            assert!(
+                !stderr.contains(&format!("{} B / {total} B", total * 2)),
+                "{stderr}"
+            );
+            assert!(stderr.contains("Publishing · retry 2/4"), "{stderr}");
+            let publishing = stderr.find("Publishing").unwrap();
+            let complete = stderr.find(":progress=100:").unwrap();
+            assert!(publishing < complete);
+            assert!(stderr.contains("state=done"));
+        }
+    }
 }
 
 #[test]

@@ -15,6 +15,7 @@ pub struct Client {
     http: reqwest::Client,
     upstream: reqwest::Client,
     push_job: Option<String>,
+    progress: Option<crate::progress::Progress>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +293,9 @@ impl Budget {
 
 trait Upload {
     fn session_id(&self) -> &str;
+    fn inline_size(&self) -> Option<u64> {
+        None
+    }
 }
 impl Upload for Finalize {
     fn session_id(&self) -> &str {
@@ -301,6 +305,9 @@ impl Upload for Finalize {
 impl Upload for InlineUpload {
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+    fn inline_size(&self) -> Option<u64> {
+        Some(self.bytes.len() as u64)
     }
 }
 #[derive(Deserialize)]
@@ -328,15 +335,22 @@ struct Publication<'a, U> {
     pending: Vec<(usize, &'a U)>,
     outcomes: Vec<Option<RowOutcome>>,
     budget: Budget,
+    progress: Option<crate::progress::Progress>,
 }
 impl<'a, U: Upload> Publication<'a, U> {
-    fn new(operation: &'static str, prepares: bool, uploads: &'a [U]) -> Self {
+    fn new(
+        operation: &'static str,
+        prepares: bool,
+        uploads: &'a [U],
+        progress: Option<crate::progress::Progress>,
+    ) -> Self {
         Self {
             operation,
             prepares,
             pending: uploads.iter().enumerate().collect(),
             outcomes: vec![None; uploads.len()],
             budget: Budget::new(),
+            progress,
         }
     }
     fn pending(&self) -> Vec<&'a U> {
@@ -370,6 +384,14 @@ impl<'a, U: Upload> Publication<'a, U> {
                         && row.prepared
                         && row.status == Some(202)
                         && row.error.is_none();
+                    if (row.published || prepared)
+                        && let Some(path) = self
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.path(upload.session_id()))
+                    {
+                        path.published(upload.inline_size(), prepared);
+                    }
                     self.outcomes[index] = Some(match (row.published, row.status) {
                         (true, _) => RowOutcome::Published,
                         _ if prepared => RowOutcome::Prepared,
@@ -382,6 +404,18 @@ impl<'a, U: Upload> Publication<'a, U> {
                             RowOutcome::Failed(format!("{}: invalid result", self.operation))
                         }
                     });
+                    // A resolved row must not remain live while its batch mates
+                    // retry. The transfer collector still owns the final summary.
+                    if let Some(progress) = &self.progress {
+                        let error = match &self.outcomes[index] {
+                            Some(RowOutcome::Rejected { status }) => {
+                                Some(HttpError::new("publication", *status).to_string())
+                            }
+                            Some(RowOutcome::Failed(message)) => Some(message.clone()),
+                            _ => None,
+                        };
+                        progress.finish_path(upload.session_id(), error.as_deref());
+                    }
                 }
                 self.pending = retry;
                 if self.pending.is_empty() {
@@ -390,6 +424,27 @@ impl<'a, U: Upload> Publication<'a, U> {
                 None
             }
         };
+        if self.budget.attempt < ATTEMPTS {
+            for (_, upload) in &self.pending {
+                if let Some(path) = self
+                    .progress
+                    .as_ref()
+                    .and_then(|p| p.path(upload.session_id()))
+                {
+                    let phase = if self.prepares {
+                        "Preparing receipt"
+                    } else if upload.inline_size().is_some() {
+                        "Uploading and publishing"
+                    } else {
+                        "Publishing"
+                    };
+                    path.phase(&format!(
+                        "{phase} · retry {}/{ATTEMPTS}",
+                        self.budget.attempt + 1
+                    ));
+                }
+            }
+        }
         if self.budget.wait(after).await {
             None
         } else {
@@ -438,6 +493,7 @@ impl Client {
             server: server.server.trim_end_matches('/').to_owned(),
             authorization,
             push_job: None,
+            progress: None,
             http: reqwest::Client::builder()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(300))
@@ -447,6 +503,12 @@ impl Client {
                 .build()?,
         })
     }
+    pub fn with_progress(&self, progress: &crate::progress::Progress) -> Self {
+        let mut client = self.clone();
+        client.progress = Some(progress.clone());
+        client
+    }
+
     pub(crate) async fn request(
         &self,
         operation: &str,
@@ -553,7 +615,12 @@ impl Client {
     /// replay together; an error means no row resolved at all.
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
     pub async fn finalize(&self, uploads: &[Finalize]) -> Result<Vec<RowOutcome>> {
-        let mut batch = Publication::new("finalize", self.prepares_only(), uploads);
+        let mut batch = Publication::new(
+            "finalize",
+            self.prepares_only(),
+            uploads,
+            self.progress.clone(),
+        );
         loop {
             let attempt = self
                 .post(
@@ -595,7 +662,12 @@ impl Client {
                 bail!("inline upload: invalid bytes, hash, or duplicate session");
             }
         }
-        let mut batch = Publication::new("inline upload", self.prepares_only(), uploads);
+        let mut batch = Publication::new(
+            "inline upload",
+            self.prepares_only(),
+            uploads,
+            self.progress.clone(),
+        );
         loop {
             let attempt = self.inline_attempt(&batch.pending()).await;
             if let Some(outcomes) = batch.settle(attempt).await {
@@ -765,7 +837,13 @@ impl Client {
     /// Send only the headers supplied with this grant. Retries retain the same
     /// immutable allocation, never copying the body or adding API credentials.
     #[cfg_attr(snowstead_hotpath, hotpath::measure)]
-    pub async fn upload_part(&self, part: Part, bytes: bytes::Bytes) -> Result<UploadedPart> {
+    pub async fn upload_part(
+        &self,
+        id: &str,
+        part: Part,
+        bytes: bytes::Bytes,
+    ) -> Result<UploadedPart> {
+        let progress = self.progress.as_ref().and_then(|p| p.path(id));
         if !(1..=10_000).contains(&part.part_number) || bytes.is_empty() {
             bail!("invalid upload part");
         }
@@ -807,6 +885,12 @@ impl Client {
                 Err(_) => tracing::debug!(attempt = budget.attempt, "part PUT transport failed"),
             }
             let attempt = classify("part upload", Replay::Idempotent, result);
+            if matches!(attempt, Attempt::Retry { .. })
+                && budget.attempt < ATTEMPTS
+                && let Some(progress) = &progress
+            {
+                progress.retry_part(part.part_number, budget.attempt + 1, ATTEMPTS);
+            }
             if let Some(response) = budget.settle("part upload", attempt).await? {
                 let etag = response
                     .headers()
@@ -815,6 +899,9 @@ impl Client {
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| anyhow!("part upload returned no ETag"))?
                     .to_owned();
+                if let Some(progress) = &progress {
+                    progress.part_uploaded(part.part_number, bytes.len() as u64);
+                }
                 return Ok(UploadedPart {
                     part_number: part.part_number,
                     etag,
@@ -939,7 +1026,7 @@ pub(crate) mod tests {
             .await?
             .remove(0)
             .map_err(anyhow::Error::msg)?;
-        client.upload_part(part, bytes).await
+        client.upload_part("s1", part, bytes).await
     }
     #[tokio::test]
     async fn inline_retries_share_four_attempts_and_reject_wrong_identity_and_permanent_errors() {

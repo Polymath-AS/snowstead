@@ -179,7 +179,7 @@ async fn upload(
     );
     options
         .progress
-        .start("Uploading", unique.len(), summary.skipped);
+        .start("Processed", unique.len(), summary.skipped);
     if todo.is_empty() {
         return Ok(summary);
     }
@@ -217,6 +217,8 @@ pub(crate) async fn transfer(
     options: &Options<'_>,
     partial: &mut Option<Summary>,
 ) -> anyhow::Result<Summary> {
+    let client = client.with_progress(options.progress);
+    let client = &client;
     let jobs = options.jobs;
     let level = options.level;
     let mut summary = Summary {
@@ -391,6 +393,7 @@ pub(crate) async fn transfer(
             let span = tracing::debug_span!("push_path",path=%info.store_path);
             async move {
                 let path = info.store_path.clone();
+                let progress = options.progress.add_path(&session.session_id, &path);
                 let start = Instant::now();
                 let result = async {
                     if client.prepares_only()
@@ -410,6 +413,8 @@ pub(crate) async fn transfer(
                         if receipt.session_id != session.session_id {
                             bail!("sealed upload receipt has a different session");
                         }
+                        progress.encoded(receipt.file_size);
+                        progress.phase("Recovering prepared receipt…");
                         match large_commits.request(receipt).await? {
                             api::RowOutcome::Published | api::RowOutcome::Prepared => (),
                             other => bail!("sealed upload recovery failed: {other:?}"),
@@ -427,6 +432,7 @@ pub(crate) async fn transfer(
                     // budget needed by an earlier streaming dependency.
                     let mut dependency_wait_ms = 0;
                     if session.inline && !client.prepares_only() {
+                        progress.phase("Waiting for dependencies…");
                         let started = Instant::now();
                         wait_dependencies(&info, published).await?;
                         dependency_wait_ms = started.elapsed().as_millis();
@@ -436,6 +442,7 @@ pub(crate) async fn transfer(
                     } else {
                         0
                     };
+                    progress.phase("Preparing…");
                     let permit = compression.acquire_many_owned(threads as u32 + 1).await?;
                     let file_path = path.clone();
                     let expected = info.nar_hash.clone();
@@ -453,6 +460,10 @@ pub(crate) async fn transfer(
                     // upload must not park every producer with live zstd state.
                     let part_limit = if session.inline { 1 } else { 10_000 };
                     let mut writer = Bridge::new(capacity, part_limit, buffers, sender).await?;
+                    if !session.inline {
+                        progress.phase("Uploading");
+                    }
+                    let encoding_progress = progress.clone();
                     let producer = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         let digest =
@@ -462,6 +473,7 @@ pub(crate) async fn transfer(
                         {
                             bail!("NAR hash or size differs from the Nix database for {file_path}");
                         }
+                        encoding_progress.encoded(digest.file_size);
                         writer.finish()?;
                         Ok::<_, anyhow::Error>(digest)
                     });
@@ -492,6 +504,7 @@ pub(crate) async fn transfer(
                     drop(preparation);
                     let upload_elapsed_ms = start.elapsed().as_millis();
                     if !session.inline && !client.prepares_only() {
+                        progress.phase("Waiting for dependencies…");
                         let started = Instant::now();
                         wait_dependencies(&info, published).await?;
                         dependency_wait_ms = started.elapsed().as_millis();
@@ -502,6 +515,13 @@ pub(crate) async fn transfer(
                     } else {
                         &large_commits
                     };
+                    progress.phase(if client.prepares_only() {
+                        "Preparing receipt…"
+                    } else if session.inline {
+                        "Uploading and publishing…"
+                    } else {
+                        "Publishing…"
+                    });
                     let published = if let Some(bytes) = inline_bytes {
                         inline_commits
                             .request(api::InlineUpload {
@@ -547,6 +567,10 @@ pub(crate) async fn transfer(
                 }
                 .await;
                 outcome.send_replace(Some(result.is_ok()));
+                let message = result.as_ref().err().map(|error| format!("{error:#}"));
+                options
+                    .progress
+                    .finish_path(&session.session_id, message.as_deref());
                 if result.is_err() {
                     guard.abort().await;
                 }
@@ -820,7 +844,7 @@ async fn upload_parts(
                 })
                 .await?
                 .map_err(anyhow::Error::msg)?;
-            client.upload_part(part, bytes).await
+            client.upload_part(id, part, bytes).await
         }
     })
     .buffer_unordered(4)
