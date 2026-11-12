@@ -1,5 +1,6 @@
 use crate::config;
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Args;
 use serde::Deserialize;
 use serde_json::json;
@@ -47,9 +48,83 @@ struct Authorized {
 }
 
 pub fn status(profile: Option<&str>) -> Result<()> {
-    let (name, _) = config::local_server(profile)?;
-    println!("Local profile '{name}' is configured. Remote credentials have not been verified.");
+    let (name, server) = config::server_with_source(profile)?;
+    // Validate saved addresses too: never display embedded URL credentials.
+    let url = config::validate_url(&server.server)?;
+    match name {
+        Some(name) => println!("Credential source: saved profile '{}'", printable(&name)),
+        None => println!("Credential source: SNOWSTEAD_TOKEN / SNOWSTEAD_URL"),
+    }
+    println!("API address: {}", printable(url.as_str()));
+    println!(
+        "Offline only. Credentials and claims have not been verified remotely; JWT signatures and revocation have not been checked."
+    );
+    let claims = status_claims(&server.token);
+    println!(
+        "Permissions (unverified claims): {}",
+        claim_list(claims.as_ref().and_then(|c| c.perms.as_deref()))
+    );
+    println!(
+        "Cache scope (unverified claims): {}",
+        claim_list(claims.as_ref().and_then(|c| c.caches.as_deref()))
+    );
+    println!(
+        "Organization (unverified claim): {}",
+        claims
+            .as_ref()
+            .and_then(|c| c.org.as_deref())
+            .map(printable)
+            .unwrap_or_else(|| "unknown".into())
+    );
+    println!(
+        "Expiry (unverified claim): {}",
+        claims
+            .and_then(|c| c.exp)
+            .map(|exp| format!("{exp} (Unix seconds)"))
+            .unwrap_or_else(|| "unknown".into())
+    );
     Ok(())
+}
+
+// Decode only the fields we display. This is deliberately not an authentication
+// parser: no key, signature verification, network request, or inferred admin role.
+#[derive(Deserialize)]
+struct StatusClaims {
+    perms: Option<Vec<String>>,
+    caches: Option<Vec<String>>,
+    org: Option<String>,
+    exp: Option<i64>,
+}
+
+fn status_claims(token: &str) -> Option<StatusClaims> {
+    if token.len() > 64 * 1024 {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() || signature.is_empty() {
+        return None;
+    }
+    let header: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
+    if !header.is_object() || URL_SAFE_NO_PAD.decode(signature).is_err() {
+        return None;
+    }
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
+}
+
+fn claim_list(values: Option<&[String]>) -> String {
+    match values {
+        None => "unknown".into(),
+        Some([]) => "none".into(),
+        Some(values) => values
+            .iter()
+            .map(|v| printable(v))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 pub fn logout(profile: Option<&str>) -> Result<()> {

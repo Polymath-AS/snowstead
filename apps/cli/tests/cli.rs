@@ -559,10 +559,13 @@ fn ci_credentials_require_a_pair_and_do_not_write_local_config() {
         .args(["auth", "status"])
         .output()
         .unwrap();
-    assert!(
-        !result.status.success(),
-        "auth status must describe local config only"
-    );
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("Credential source: SNOWSTEAD_TOKEN / SNOWSTEAD_URL"));
+    assert!(stdout.contains(&format!("API address: {url}")));
+    assert!(stdout.contains("Cache scope (unverified claims): unknown"));
+    assert!(!stdout.contains(TOKEN));
+    assert!(!home.path().join(".config/snowstead/config.json").exists());
 }
 
 #[test]

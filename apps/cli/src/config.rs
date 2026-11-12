@@ -98,20 +98,29 @@ fn save(config: &Config) -> Result<()> {
 }
 
 pub fn server(name: Option<&str>) -> Result<Server> {
+    Ok(server_with_source(name)?.1)
+}
+
+/// Resolve credentials exactly as commands do. `None` denotes the environment pair.
+pub fn server_with_source(name: Option<&str>) -> Result<(Option<String>, Server)> {
     let token = std::env::var("SNOWSTEAD_TOKEN");
     let url = std::env::var("SNOWSTEAD_URL");
     match (token, url) {
         (Ok(token), Ok(server)) if !token.trim().is_empty() => {
             validate_url(&server)?;
-            return Ok(Server {
-                server: server.trim_end_matches('/').into(),
-                token,
-            });
+            return Ok((
+                None,
+                Server {
+                    server: server.trim_end_matches('/').into(),
+                    token,
+                },
+            ));
         }
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => (),
         _ => bail!("Set SNOWSTEAD_TOKEN and SNOWSTEAD_URL together, with nonempty values"),
     }
-    Ok(local_server(name)?.1)
+    let (name, server) = local_server(name)?;
+    Ok((Some(name), server))
 }
 
 impl Config {
