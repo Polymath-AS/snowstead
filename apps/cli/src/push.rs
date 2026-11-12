@@ -1169,18 +1169,26 @@ mod tests {
             let budget = Arc::new(Semaphore::new(2048));
             let mut producers = Vec::new();
             let mut receivers = Vec::new();
+            // Both encoders hold their first part before either runs. One
+            // started alone can take the whole budget and block on its full
+            // channel, and the second would then wait here forever.
+            let mut writers = Vec::new();
             for _ in 0..2 {
                 let (sender, receiver) = mpsc::channel(1);
-                let mut writer = Bridge::new(1024, 10_000, budget.clone(), sender)
-                    .await
-                    .unwrap();
+                writers.push(
+                    Bridge::new(1024, 10_000, budget.clone(), sender)
+                        .await
+                        .unwrap(),
+                );
+                receivers.push(receiver);
+            }
+            for mut writer in writers {
                 let path = path.clone();
                 producers.push(tokio::task::spawn_blocking(move || {
                     nar::dump(&path, 0, 3, 0, &mut writer)?;
                     writer.finish()?;
                     Ok::<_, anyhow::Error>(())
                 }));
-                receivers.push(receiver);
             }
             let client = client(&url);
             let live = Arc::new(std::sync::Mutex::new(HashSet::new()));
