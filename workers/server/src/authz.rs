@@ -100,8 +100,10 @@ impl Role {
         }
     }
 
-    fn manages(self) -> bool {
-        matches!(self, Self::Owner | Self::Admin)
+    /// The dashboard reserves these to the org's owner; a WorkOS admin has
+    /// no more say here than a member.
+    fn owns(self) -> bool {
+        self == Self::Owner
     }
 }
 
@@ -154,6 +156,12 @@ pub enum Principal {
     /// A self-hosted installation's shared `AUTH_TOKEN`, only when explicitly
     /// enabled. It pushes to the `default` org's caches and nothing else.
     SharedToken,
+    /// Transitional: the dashboard's old `ADMIN_SECRET` call on an org route,
+    /// naming its user in an unverified `x-snowstead-actor` header. Accepted
+    /// only with `ALLOW_LEGACY_WEB_ADMIN=true`, until the web signs assertions.
+    LegacyWeb {
+        actor: Option<String>,
+    },
 }
 
 pub(crate) const SHARED_TOKEN_ORG: &str = "default";
@@ -169,6 +177,7 @@ impl Principal {
             Self::ApiToken(token) => &token.org,
             Self::OrgKey { org, .. } => org,
             Self::SharedToken => SHARED_TOKEN_ORG,
+            Self::LegacyWeb { .. } => "",
         }
     }
 
@@ -180,6 +189,8 @@ impl Principal {
             Self::ApiToken(token) => token.id.clone(),
             Self::OrgKey { key_id, .. } => format!("key:{key_id}"),
             Self::SharedToken => "legacy".into(),
+            Self::LegacyWeb { actor: Some(email) } => format!("user:{email}"),
+            Self::LegacyWeb { actor: None } => "admin".into(),
         }
     }
 }
@@ -294,7 +305,7 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
                     OrgRead | CacheWrite | TokenRead | TokenWrite | ApiKeyRead | SigningKeyRead
                     | AuditRead | PinWrite => true,
                     OrgSlugWrite | OrgMove | ApiKeyCreate | ApiKeyRevoke | SigningKeyWrite => {
-                        user.role.manages()
+                        user.role.owns()
                     }
                     Operate | OrgLimitsWrite | NixPull | NixPush | GoRead | GoWrite
                     | SccacheRead | SccacheWrite => false,
@@ -333,6 +344,14 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
                 }
         }
         Principal::SharedToken => action == NixPush && own(SHARED_TOKEN_ORG),
+        // Exactly what the operator secret could do on org routes before.
+        Principal::LegacyWeb { .. } => {
+            resource.org().is_some()
+                && !matches!(
+                    action,
+                    Operate | NixPull | NixPush | GoRead | GoWrite | SccacheRead | SccacheWrite
+                )
+        }
     };
     if allowed { Ok(()) } else { Err(Denied) }
 }
@@ -405,7 +424,7 @@ mod tests {
         AuditRead,
         PinWrite,
     ];
-    const MANAGER: &[Action] = &[
+    const OWNER: &[Action] = &[
         OrgRead,
         CacheWrite,
         TokenRead,
@@ -419,6 +438,23 @@ mod tests {
         ApiKeyCreate,
         ApiKeyRevoke,
         SigningKeyWrite,
+    ];
+    // Every org-route action, as the operator secret had before.
+    const LEGACY_WEB: &[Action] = &[
+        OrgLimitsWrite,
+        OrgRead,
+        OrgSlugWrite,
+        OrgMove,
+        CacheWrite,
+        TokenRead,
+        TokenWrite,
+        ApiKeyRead,
+        ApiKeyCreate,
+        ApiKeyRevoke,
+        SigningKeyRead,
+        SigningKeyWrite,
+        AuditRead,
+        PinWrite,
     ];
     const ORG_KEY: &[Action] = &[
         OrgRead,
@@ -440,8 +476,10 @@ mod tests {
         let all = Permission::ALL.to_vec();
         vec![
             ("operator", Principal::Operator, &[Operate, OrgLimitsWrite]),
-            ("owner", user(Role::Owner), MANAGER),
-            ("admin", user(Role::Admin), MANAGER),
+            ("owner", user(Role::Owner), OWNER),
+            // The dashboard reserves owner actions to the owner, so a WorkOS
+            // admin gets no more than a member.
+            ("admin", user(Role::Admin), MEMBER),
             ("member", user(Role::Member), MEMBER),
             (
                 "org key",
@@ -522,6 +560,18 @@ mod tests {
             ),
             // The shared token belongs to the default org only.
             ("shared token", Principal::SharedToken, &[]),
+            (
+                "legacy dashboard",
+                Principal::LegacyWeb {
+                    actor: Some("dev@example.test".into()),
+                },
+                LEGACY_WEB,
+            ),
+            (
+                "legacy dashboard without actor",
+                Principal::LegacyWeb { actor: None },
+                LEGACY_WEB,
+            ),
         ]
     }
 
@@ -575,7 +625,7 @@ mod tests {
     #[test]
     fn scoped_principals_never_reach_another_org() {
         for (name, principal, _) in table() {
-            if matches!(principal, Principal::Operator) {
+            if matches!(principal, Principal::Operator | Principal::LegacyWeb { .. }) {
                 continue;
             }
             for action in Action::ALL {

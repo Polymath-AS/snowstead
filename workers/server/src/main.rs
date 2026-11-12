@@ -86,6 +86,11 @@ async fn run_server() -> anyhow::Result<()> {
     }
     let config = Config::from_env();
     config.validate_auth()?;
+    if config.allow_legacy_web_admin {
+        tracing::warn!(
+            "ALLOW_LEGACY_WEB_ADMIN=true: org routes accept ADMIN_SECRET with an unverified actor; turn it off once the dashboard signs assertions"
+        );
+    }
     if config.jwt_secret.is_empty() {
         // Without the secret, every live JWT-era token would be rejected.
         let live: bool = sqlx::query_scalar(

@@ -446,7 +446,9 @@ async fn central_auth_backfills_token_scope_from_issued_claims() -> Result<()> {
             "INSERT INTO caches (id, name) OVERRIDING SYSTEM VALUE VALUES (41, 'main');
             INSERT INTO api_tokens (jti, subject, caches_json, perms_json, created_by)
             VALUES ('modern', 'ci', '[\"id:41\"]', '[\"push\",\"pull\"]', 'admin'),
-                ('older', 'ci', '[\"ci-*\",\"id:41\",\"id:999\",\"exact\"]', '[\"pull\",\"admin\",\"pull\"]', 'admin');
+                ('older', 'ci', '[\"ci-*\",\"id:41\",\"id:999\",\"exact\"]', '[\"pull\",\"admin\",\"pull\"]', 'admin'),
+                ('broken', 'ci', 'not json', '{\"push\":', 'admin'),
+                ('empty', 'ci', '[]', '[]', 'admin');
             INSERT INTO token_caches (token_jti, cache_id) VALUES ('modern', 41);",
         )
         .await?;
@@ -486,6 +488,16 @@ async fn central_auth_backfills_token_scope_from_issued_claims() -> Result<()> {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(hashes, 0, "JWT-era rows have no secret");
+        // Invalid or empty claims grant nothing, and the documented query finds them.
+        let ungranted: Vec<String> = sqlx::query_scalar(
+            "SELECT t.jti FROM api_tokens t WHERE t.secret_hash IS NULL AND t.revoked_at IS NULL \
+             AND (t.expires_at IS NULL OR t.expires_at > now()) \
+             AND (NOT EXISTS (SELECT 1 FROM token_permissions p WHERE p.token_jti = t.jti) \
+             OR NOT EXISTS (SELECT 1 FROM token_caches c WHERE c.token_jti = t.jti)) ORDER BY t.jti",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(ungranted, ["broken", "empty"]);
         Ok(())
     })
     .await

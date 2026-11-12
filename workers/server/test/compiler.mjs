@@ -50,7 +50,7 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
   database.pathname = `/${name}`;
   const env = {
     ...process.env, DATABASE_URL: database.toString(),
-    JWT_SECRET: "", ADMIN_SECRET: randomBytes(32).toString("hex"), SIGNING_MASTER_KEY: "",
+    JWT_SECRET: "", ADMIN_SECRET: randomBytes(32).toString("hex"), WEB_ASSERTIONS_DISABLED: "true", SIGNING_MASTER_KEY: "",
     SIGNING_PRIVATE_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false", PUBLIC_URL: "", UPSTREAM_CACHES: "",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",

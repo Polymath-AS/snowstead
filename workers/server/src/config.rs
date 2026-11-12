@@ -16,6 +16,15 @@ pub struct Config {
     /// Base64 raw Ed25519 public keys, separated by whitespace, that sign the
     /// web's per-request assertions. Empty accepts no dashboard users.
     pub web_assertion_public_keys: String,
+    /// Transitional, default off: accept the dashboard's old `ADMIN_SECRET`
+    /// calls on org routes (`ALLOW_LEGACY_WEB_ADMIN=true`) during rollout.
+    pub allow_legacy_web_admin: bool,
+    /// Run without a dashboard and so without assertion keys
+    /// (`WEB_ASSERTIONS_DISABLED=true`), as self-hosters may.
+    pub web_assertions_disabled: bool,
+    /// Accept the local-only dashboard key whose private half is public
+    /// (`SNOWSTEAD_LOCAL_DEV_WEB_KEY=true`); only `pnpm dev` sets it.
+    pub allow_dev_web_key: bool,
     pub upstreams: Vec<String>,
     pub r2_endpoint: String,
     pub r2_access_key_id: String,
@@ -193,6 +202,12 @@ impl Config {
             admin_secret: std::env::var("ADMIN_SECRET").unwrap_or_default(),
             web_assertion_public_keys: std::env::var("WEB_ASSERTION_PUBLIC_KEYS")
                 .unwrap_or_default(),
+            allow_legacy_web_admin: std::env::var("ALLOW_LEGACY_WEB_ADMIN")
+                .is_ok_and(|v| v == "true"),
+            web_assertions_disabled: std::env::var("WEB_ASSERTIONS_DISABLED")
+                .is_ok_and(|v| v == "true"),
+            allow_dev_web_key: std::env::var("SNOWSTEAD_LOCAL_DEV_WEB_KEY")
+                .is_ok_and(|v| v == "true"),
             upstreams: std::env::var("UPSTREAM_CACHES")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -250,7 +265,15 @@ impl Config {
             self.jwt_secret != self.admin_secret,
             "JWT_SECRET must differ from ADMIN_SECRET"
         );
-        crate::auth::assertion_keys(&self.web_assertion_public_keys)?;
+        let keys = crate::auth::assertion_keys(&self.web_assertion_public_keys)?;
+        anyhow::ensure!(
+            !keys.is_empty() || self.allow_legacy_web_admin || self.web_assertions_disabled,
+            "WEB_ASSERTION_PUBLIC_KEYS must be set, or WEB_ASSERTIONS_DISABLED=true without a dashboard"
+        );
+        anyhow::ensure!(
+            self.allow_dev_web_key || !keys.contains(&crate::auth::local_dev_web_key()),
+            "WEB_ASSERTION_PUBLIC_KEYS contains the published local development key"
+        );
         Ok(())
     }
 }
@@ -289,13 +312,47 @@ mod tests {
 
     #[test]
     fn auth_configuration_fails_closed_at_startup() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let key = STANDARD.encode(
+            ed25519_dalek::SigningKey::from_bytes(&[3; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let dev_key = "2aLdazRgIkJp0m0Ik8oS5B0sUJQvwU6jvSaO4wWP/o0=";
         let valid = Config {
             admin_secret: "operator-secret-1234".into(),
+            web_assertion_public_keys: key,
             ..Default::default()
         };
-        assert!(valid.validate_auth().is_ok());
+        let without_keys = Config {
+            web_assertion_public_keys: String::new(),
+            ..valid.clone()
+        };
+        let with_dev_key = Config {
+            web_assertion_public_keys: format!("{} {dev_key}", valid.web_assertion_public_keys),
+            ..valid.clone()
+        };
+        for ok in [
+            valid.clone(),
+            Config {
+                allow_legacy_web_admin: true,
+                ..without_keys.clone()
+            },
+            Config {
+                web_assertions_disabled: true,
+                ..without_keys.clone()
+            },
+            Config {
+                allow_dev_web_key: true,
+                ..with_dev_key.clone()
+            },
+        ] {
+            assert!(ok.validate_auth().is_ok());
+        }
         for invalid in [
             Config::default(),
+            without_keys,
+            with_dev_key,
             Config {
                 admin_secret: "short".into(),
                 ..Default::default()

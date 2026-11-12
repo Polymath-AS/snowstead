@@ -110,8 +110,7 @@ async function recovery(fault) {
   proxy.listen(0, "127.0.0.1");
   await once(proxy, "listening");
   const env = { ...process.env, DATABASE_URL: serverDatabase.toString(),
-    ALLOW_SHARED_AUTH_TOKEN: "true", AUTH_TOKEN: randomBytes(32).toString("hex"), ADMIN_SECRET: randomBytes(32).toString("hex"),
-    JWT_SECRET: "", SIGNING_MASTER_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false",
+    ALLOW_SHARED_AUTH_TOKEN: "true", AUTH_TOKEN: randomBytes(32).toString("hex"), ADMIN_SECRET: randomBytes(32).toString("hex"), WEB_ASSERTIONS_DISABLED: "true",    JWT_SECRET: "", SIGNING_MASTER_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "", ANALYTICS_TOKEN: "",
     TRUSTED_PROXY_IPS: "", PUBLIC_URL: "", UPSTREAM_CACHES: "",
     DATABASE_MAX_CONNECTIONS: "1",

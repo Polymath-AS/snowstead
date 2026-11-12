@@ -13,6 +13,8 @@ exec env -u SNOWSTEAD_TEST_DATABASE_URL -u DATABASE_READ_URL -u DATABASE_READ_MA
     # Pairs with the dashboard's local-only CACHE_ASSERTION_PRIVATE_KEY in its
     # .env.example. SNOWSTEAD_DEV_WEB_KEYS overrides it, as `pnpm fuzz` does.
     export WEB_ASSERTION_PUBLIC_KEYS="${SNOWSTEAD_DEV_WEB_KEYS:-2aLdazRgIkJp0m0Ik8oS5B0sUJQvwU6jvSaO4wWP/o0=}"
+    # That key is published, so the server accepts it only when told this is dev.
+    export SNOWSTEAD_LOCAL_DEV_WEB_KEY=true
     export REQUIRE_CACHE_SIGNING_KEYS=true UPSTREAM_CACHES="" PUBLIC_URL=""
     export PUBLIC_CACHE_ORIGIN="" CDN_ZONE_ID="" CDN_PURGE_TOKEN="" ANALYTICS_TOKEN=""
     export POSTHOG_HOST="" POSTHOG_PROJECT_TOKEN="" TRUSTED_PROXY_IPS=""

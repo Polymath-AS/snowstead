@@ -18,6 +18,7 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::{
@@ -246,7 +247,13 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
 /// What each management route does, for [`authz::authorize`]. Routes not
 /// listed here are denied.
 fn route_action(method: &Method, endpoint: &str) -> Option<Action> {
-    Some(match (method.as_str(), endpoint) {
+    // Axum answers HEAD with the GET handler.
+    let method = if method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    Some(match (method, endpoint) {
         ("GET", "" | "/" | "/overview" | "/caches" | "/caches/{cache}" | "/eviction") => {
             Action::OrgRead
         }
@@ -289,7 +296,7 @@ async fn authorize_and_audit(
     Path(params): Path<RouteParams>,
     matched: MatchedPath,
     OriginalUri(uri): OriginalUri,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let admin = matched.as_str().starts_with("/_api/v1/admin");
@@ -305,13 +312,31 @@ async fn authorize_and_audit(
             "/_api/v1/orgs/{org}"
         })
         .ok_or_else(not_found)?;
+    // An assertion signs a hash of the body, so a captured one can't carry
+    // another. Management bodies are at most 1 MiB.
+    let mut body_sha256 = hex::encode(Sha256::digest(b""));
+    if auth::is_assertion(request.headers()) {
+        let (parts, stream) = request.into_parts();
+        let bytes = to_bytes(stream, 1024 * 1024).await.map_err(|_| {
+            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Request body is too large")
+        })?;
+        body_sha256 = hex::encode(Sha256::digest(&bytes));
+        request = Request::from_parts(parts, Body::from(bytes));
+    }
     let target = auth::Target {
         method: request.method(),
         path: uri
             .path_and_query()
             .map_or_else(|| uri.path(), |p| p.as_str()),
+        body_sha256: &body_sha256,
     };
-    let principal = auth::authenticate(request.headers(), &state, Some(target)).await?;
+    let mut principal = auth::authenticate(request.headers(), &state, Some(target)).await?;
+    // Transitional: the old dashboard's operator-secret calls on org routes.
+    if !admin && state.config.allow_legacy_web_admin && matches!(principal, Principal::Operator) {
+        principal = Principal::LegacyWeb {
+            actor: auth::legacy_actor(request.headers()),
+        };
+    }
     let action = if admin {
         Some(Action::Operate)
     } else {
@@ -358,7 +383,10 @@ async fn authorize_and_audit(
     // against them, as is everything an API key or token does.
     let limited = match &principal {
         Principal::Operator => false,
-        Principal::WebUser(_) => !matches!(*request.method(), Method::GET | Method::HEAD),
+        Principal::WebUser(_) | Principal::LegacyWeb { actor: Some(_) } => {
+            !matches!(*request.method(), Method::GET | Method::HEAD)
+        }
+        Principal::LegacyWeb { actor: None } => false,
         _ => true,
     };
     if limited {
@@ -464,6 +492,10 @@ async fn authorize_and_audit(
         } else {
             None
         };
+        // Mark what the transitional path did, so its use is easy to find.
+        if matches!(principal, Principal::LegacyWeb { .. }) {
+            detail["legacyWeb"] = json!(true);
+        }
         let actual_action = if action == "pin.create" && parts.status == StatusCode::OK {
             "pin.update"
         } else {

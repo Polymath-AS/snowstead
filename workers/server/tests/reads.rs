@@ -95,7 +95,13 @@ async fn text(response: Response) -> String {
 }
 
 async fn signing_post(app: &Router, path: &str, body: Value) -> Value {
-    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
+    let (path, credential) = web::dashboard(
+        "POST",
+        path,
+        "operator-secret",
+        None,
+        body.to_string().as_bytes(),
+    );
     let response = app
         .clone()
         .oneshot(

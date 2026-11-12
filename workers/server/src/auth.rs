@@ -45,6 +45,8 @@ pub struct Target<'a> {
     pub method: &'a Method,
     /// Path and query exactly as received.
     pub path: &'a str,
+    /// Hex SHA-256 of the request body; of the empty string when it has none.
+    pub body_sha256: &'a str,
 }
 
 fn auth_error(status: StatusCode, read: bool) -> ApiError {
@@ -107,6 +109,31 @@ pub(crate) fn issue_token() -> std::io::Result<(String, String, String)> {
     Ok((id.clone(), format!("{TOKEN_PREFIX}{id}_{secret}"), hash))
 }
 
+/// The local development key: its private half is published in the
+/// dashboard's `.env.example`, so only `pnpm dev` may accept it.
+pub fn local_dev_web_key() -> VerifyingKey {
+    assertion_keys("2aLdazRgIkJp0m0Ik8oS5B0sUJQvwU6jvSaO4wWP/o0=").expect("a valid key")[0]
+}
+
+/// Whether the request presents a web assertion, whose body must be hashed.
+pub fn is_assertion(headers: &HeaderMap) -> bool {
+    bearer(headers).is_ok_and(|credential| credential.starts_with(ASSERTION_PREFIX))
+}
+
+/// The old dashboard's unverified `x-snowstead-actor`, for the transitional
+/// `ALLOW_LEGACY_WEB_ADMIN` path only.
+pub fn legacy_actor(headers: &HeaderMap) -> Option<String> {
+    let actor = headers
+        .get("x-snowstead-actor")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    (!actor.is_empty()
+        && actor.encode_utf16().count() <= 254
+        && !actor.chars().any(|c| c.is_whitespace() || c.is_control()))
+    .then(|| actor.to_owned())
+}
+
 /// Parse `WEB_ASSERTION_PUBLIC_KEYS`.
 pub fn assertion_keys(value: &str) -> anyhow::Result<Vec<VerifyingKey>> {
     value
@@ -145,6 +172,7 @@ struct Assertion {
     exp: i64,
     method: String,
     path: String,
+    body: String,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -187,6 +215,7 @@ fn verify_assertion(
         && now < claims.exp.saturating_add(ASSERTION_SKEW_SECONDS)
         && claims.method == target.method.as_str()
         && claims.path == target.path
+        && claims.body == target.body_sha256
         && valid_id(&claims.org)
         && valid_id(&claims.sub)
         && email == claims.email
@@ -657,11 +686,14 @@ mod tests {
 
     fn claims() -> Value {
         json!({"aud":"snowstead-cache","org":"org_a","sub":"user_1","email":"dev@example.test","role":"member",
-            "iat":1000,"exp":1030,"method":"POST","path":"/_api/v1/orgs/org_a/tokens?x=1"})
+            "iat":1000,"exp":1030,"method":"POST","path":"/_api/v1/orgs/org_a/tokens?x=1","body":BODY})
     }
 
+    // Hex SHA-256 of `{"subject":"ci"}`.
+    const BODY: &str = "d58c1d618af77c6b21971af2ee5da4a65f4ee8abd7c11f460384500f3ed9770a";
+
     #[test]
-    fn assertions_bind_key_lifetime_method_and_path() {
+    fn assertions_bind_key_lifetime_method_path_and_body() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let other = SigningKey::from_bytes(&[8; 32]);
         let keys = [key.verifying_key()];
@@ -669,6 +701,7 @@ mod tests {
         let target = Target {
             method: &post,
             path: "/_api/v1/orgs/org_a/tokens?x=1",
+            body_sha256: BODY,
         };
         let user = verify_assertion(&keys, &assertion(&key, &claims()), target, 1010).unwrap();
         assert_eq!(
@@ -686,15 +719,20 @@ mod tests {
         for wrong in [
             Target {
                 method: &get,
-                path: target.path,
+                ..target
             },
             Target {
-                method: &post,
                 path: "/_api/v1/orgs/org_a/tokens",
+                ..target
             },
             Target {
-                method: &post,
                 path: "/_api/v1/orgs/org_b/tokens?x=1",
+                ..target
+            },
+            // A captured assertion can't carry another body.
+            Target {
+                body_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                ..target
             },
         ] {
             assert!(verify_assertion(&keys, &assertion(&key, &claims()), wrong, 1010).is_none());
@@ -815,6 +853,7 @@ mod tests {
         let target = Target {
             method: &post,
             path: "/_api/v1/orgs/org_a/tokens?x=1",
+            body_sha256: BODY,
         };
         assert_eq!(
             authenticate(&headers, &state, Some(target))

@@ -25,14 +25,27 @@ CREATE TABLE token_permissions (
     PRIMARY KEY (token_jti, permission)
 );
 
+-- A row whose JSON is invalid or not an array backfills nothing, so that
+-- token is denied rather than widened. docs.md lists the query that finds
+-- live JWT-era tokens left without permissions or caches.
+CREATE FUNCTION pg_temp.json_array_or_empty(value text) RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    parsed jsonb;
+BEGIN
+    parsed := value::jsonb;
+    RETURN CASE WHEN jsonb_typeof(parsed) = 'array' THEN parsed ELSE '[]'::jsonb END;
+EXCEPTION WHEN others THEN
+    RETURN '[]'::jsonb;
+END
+$$;
+
 -- Backfill from the claims each JWT-era row recorded when it was issued.
 -- Unknown permissions were never accepted by the verifier and are skipped.
 INSERT INTO token_permissions (token_jti, permission, position)
 SELECT t.jti, p.permission, MIN(p.position)
 FROM api_tokens t
-CROSS JOIN LATERAL jsonb_array_elements_text(
-    CASE WHEN jsonb_typeof(t.perms_json::jsonb) = 'array' THEN t.perms_json::jsonb ELSE '[]'::jsonb END
-) WITH ORDINALITY AS p(permission, position)
+CROSS JOIN LATERAL jsonb_array_elements_text(pg_temp.json_array_or_empty(t.perms_json)) WITH ORDINALITY AS p(permission, position)
 WHERE p.permission IN ('pull', 'push', 'go:read', 'go:write', 'sccache:read', 'sccache:write')
 GROUP BY t.jti, p.permission;
 
@@ -49,9 +62,7 @@ FROM (
         CASE WHEN e.entry ~ '^id:[0-9]{1,9}$' THEN substr(e.entry, 4)::integer END AS cache_id,
         CASE WHEN e.entry !~ '^id:[0-9]{1,9}$' THEN e.entry END AS pattern
     FROM api_tokens t
-    CROSS JOIN LATERAL jsonb_array_elements_text(
-        CASE WHEN jsonb_typeof(t.caches_json::jsonb) = 'array' THEN t.caches_json::jsonb ELSE '[]'::jsonb END
-    ) WITH ORDINALITY AS e(entry, position)
+    CROSS JOIN LATERAL jsonb_array_elements_text(pg_temp.json_array_or_empty(t.caches_json)) WITH ORDINALITY AS e(entry, position)
     WHERE e.entry <> ''
         AND NOT EXISTS (SELECT 1 FROM token_caches tc WHERE tc.token_jti = t.jti)
 ) g

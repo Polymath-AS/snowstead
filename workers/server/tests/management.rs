@@ -20,7 +20,13 @@ async fn call(
     input: Value,
     actor: Option<&str>,
 ) -> (StatusCode, HeaderMap, Value) {
-    let (path, credential) = web::dashboard(method, path, "operator", actor);
+    let (path, credential) = web::dashboard(
+        method,
+        path,
+        "operator",
+        actor,
+        input.to_string().as_bytes(),
+    );
     let request = Request::builder()
         .method(method)
         .uri(path)

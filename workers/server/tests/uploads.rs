@@ -47,6 +47,11 @@ async fn send(
         .uri(path)
         .header("host", "backend.local");
     if let Some(token) = credential {
+        let token = if token == OWNER {
+            web::dashboard(method, path, "admin", None, &bytes).1
+        } else {
+            token.to_owned()
+        };
         request = request.header("authorization", format!("Bearer {token}"));
     }
     for (name, value) in headers {
@@ -146,10 +151,9 @@ mod tokens;
 #[path = "support/web.rs"]
 mod web;
 
-/// The dashboard, as the default org's owner, for `method path`.
-fn owner(method: &str, path: &str) -> String {
-    web::dashboard(method, path, "admin", None).1
-}
+/// Stands in for the dashboard, as the default org's owner; `send` signs
+/// the assertion for the exact method, path, and body it sends.
+const OWNER: &str = "dashboard-owner";
 
 /// A listed JWT-era token, which works with the scope its row records.
 async fn token(pool: &PgPool, org: &str, cache: &str) -> String {
@@ -582,31 +586,19 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(
-        post(
-            &app,
-            revoke,
-            &owner("POST", revoke),
-            json!({"reason":"test revocation"})
-        )
-        .await
-        .0,
+        post(&app, revoke, OWNER, json!({"reason":"test revocation"}))
+            .await
+            .0,
         StatusCode::SERVICE_UNAVAILABLE
     );
     fence.rollback().await.unwrap();
     let resume = format!("{job}/resume");
-    let revoker = owner("POST", revoke);
     let (revoked, renewed) = tokio::join!(
-        post(&app, revoke, &revoker, json!({"reason":"test revocation"})),
+        post(&app, revoke, OWNER, json!({"reason":"test revocation"})),
         post(&app, &resume, &auth, json!({}))
     );
     let revoked = if revoked.0 == StatusCode::SERVICE_UNAVAILABLE {
-        post(
-            &app,
-            revoke,
-            &owner("POST", revoke),
-            json!({"reason":"test revocation"}),
-        )
-        .await
+        post(&app, revoke, OWNER, json!({"reason":"test revocation"})).await
     } else {
         revoked
     };
@@ -697,8 +689,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
         SELECT c.id,p.store_path_hash,p.store_path,p.nar_hash,p.nar_size,p.blob_object_id,p.references_json
         FROM published_paths p CROSS JOIN caches c WHERE c.name='other'").execute(&pool).await.unwrap();
     let eviction = "/_api/v1/orgs/default/eviction";
-    let viewer = owner("GET", eviction);
-    let inventory = || send(&app, "GET", eviction, Some(&viewer), &[], vec![]);
+    let inventory = || send(&app, "GET", eviction, Some(OWNER), &[], vec![]);
     let (status, _, bytes) = inventory().await;
     assert_eq!(status, StatusCode::OK);
     let visible = serde_json::from_slice::<Value>(&bytes).unwrap();
@@ -743,7 +734,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
     let (status, result) = post(
         &app,
         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
+        OWNER,
         json!({"storePathHashes":[x["storePathHash"],z["storePathHash"]]}),
     )
     .await;
@@ -766,7 +757,7 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
         post(
             &app,
             "/_api/v1/orgs/default/caches/manifest/evict",
-            &owner("POST", "/_api/v1/orgs/default/caches/manifest/evict"),
+            OWNER,
             json!({})
         )
         .await
@@ -946,13 +937,12 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
         StatusCode::CONFLICT,
         "completion must not issue more upload grants"
     );
-    let viewer = owner("GET", "/_api/v1/orgs/default/eviction");
     let inventory = || {
         send(
             &app,
             "GET",
             "/_api/v1/orgs/default/eviction",
-            Some(&viewer),
+            Some(OWNER),
             &[],
             vec![],
         )
@@ -1092,7 +1082,7 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
     let (status, deleted) = post(
         &app,
         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
+        OWNER,
         json!({"storePathHashes":[member["storePathHash"]]}),
     )
     .await;
@@ -2871,7 +2861,7 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
                     post(
                         &app,
                         "/_api/v1/orgs/default/caches/manifest/paths/delete",
-                        &owner("POST", "/_api/v1/orgs/default/caches/manifest/paths/delete"),
+                        OWNER,
                         json!({"storePathHashes":[root_hash]})
                     )
                     .await
@@ -2892,7 +2882,7 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
                     post(
                         &app,
                         "/_api/v1/orgs/default/tokens/default-*/revoke",
-                        &owner("POST", "/_api/v1/orgs/default/tokens/default-*/revoke"),
+                        OWNER,
                         json!({"reason":"job upload fence test"})
                     )
                     .await
@@ -4431,7 +4421,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     let (status, _) = post(
         &app,
         "/_api/v1/orgs/default/caches/main/paths/delete",
-        &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
+        OWNER,
         json!({"storePathHashes":[hash]}),
     )
     .await;
@@ -4853,7 +4843,7 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
     let (status, deleted) = post(
         &app,
         "/_api/v1/orgs/default/caches/main/paths/delete",
-        &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
+        OWNER,
         json!({"storePathHashes":["0".repeat(32)]}),
     )
     .await;
@@ -5147,7 +5137,7 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
 
     // Pinning A makes B inadmissible. Raising the limit to the exact combined
     // size then admits B, still without its deleted staging bytes.
-    let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", &owner("POST", "/_api/v1/orgs/default/caches/main/pins"),
+    let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", OWNER,
         json!({"name":"release","storePath":format!("/nix/store/{}-fixture", "a".repeat(32)),"keep":"forever"})).await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
     let (status, result) = post(
@@ -5850,10 +5840,7 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
             &app,
             "GET",
             &format!("/_api/v1/orgs/default/caches/{cache}"),
-            Some(&owner(
-                "GET",
-                &format!("/_api/v1/orgs/default/caches/{cache}"),
-            )),
+            Some(OWNER),
             &[],
             vec![],
         )
@@ -5876,10 +5863,7 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         let (status, deleted) = post(
             &app,
             &format!("/_api/v1/orgs/default/caches/{cache}/paths/delete"),
-            &owner(
-                "POST",
-                &format!("/_api/v1/orgs/default/caches/{cache}/paths/delete"),
-            ),
+            OWNER,
             json!({"storePathHashes":["0".repeat(32)]}),
         )
         .await;
@@ -6094,7 +6078,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         let (status, deleted) = post(
             &app,
             "/_api/v1/orgs/default/caches/main/paths/delete",
-            &owner("POST", "/_api/v1/orgs/default/caches/main/paths/delete"),
+            OWNER,
             json!({"storePathHashes":[hash]}),
         )
         .await;

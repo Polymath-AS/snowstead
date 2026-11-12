@@ -30,7 +30,7 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
   const master = randomBytes(32);
   const operator = randomBytes(32).toString("hex");
   const env = { ...process.env, DATABASE_URL: database.toString(),
-    ADMIN_SECRET: operator, JWT_SECRET: randomBytes(32).toString("hex"), AUTH_TOKEN: "",
+    ADMIN_SECRET: operator, WEB_ASSERTIONS_DISABLED: "true", JWT_SECRET: randomBytes(32).toString("hex"), AUTH_TOKEN: "",
     SIGNING_MASTER_KEY: master.toString("base64"), REQUIRE_CACHE_SIGNING_KEYS: "true",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",

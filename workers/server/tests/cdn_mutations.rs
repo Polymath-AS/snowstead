@@ -24,7 +24,8 @@ async fn call(app: &Router, path: &str, method: &str, value: Value) -> (StatusCo
     } else {
         "operator"
     };
-    let (path, credential) = web::dashboard(method, path, secret, None);
+    let (path, credential) =
+        web::dashboard(method, path, secret, None, value.to_string().as_bytes());
     let response = app
         .clone()
         .oneshot(

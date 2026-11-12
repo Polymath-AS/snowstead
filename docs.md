@@ -467,7 +467,7 @@ Anything it does not allow is denied.
 | Credential | Principal | May |
 | --- | --- | --- |
 | `ADMIN_SECRET` | operator | `/_api/v1/admin/...` only, including org creation and limits |
-| `snowstead_web.<claims>.<signature>` | dashboard user (owner, admin, or member) | its org's management API; members can't change the slug, API keys, or signing keys |
+| `snowstead_web.<claims>.<signature>` | dashboard user (owner, admin, or member) | its org's management API; only the owner changes the slug, API keys, or signing keys, or moves caches |
 | `snowstead_key_<id>_<secret>` | org API key | its org's management API, except creating keys and changing the slug |
 | `snowstead_tok_<id>_<secret>` | API token | Nix, Go, and sccache in its org, per its permissions and caches; pins with `push` |
 | JWT-era token | API token | the same, only while its `jti` is listed and unrevoked in `api_tokens` |
@@ -479,17 +479,53 @@ request; a JWT's own claims grant nothing. Migration `0015_central_auth.sql`
 backfills those tables from existing rows.
 
 The dashboard signs each org request with an Ed25519 key. The claims are
-`{aud: "snowstead-cache", org, sub, email, role, iat, exp, method, path}`,
+`{aud: "snowstead-cache", org, sub, email, role, iat, exp, method, path, body}`,
 base64url-encoded JSON signed over `snowstead_web.<claims>`. They live at most
-60 seconds and bind the request's method and path (with its query). The
+60 seconds and bind the request's method, path (with its query), and body
+(`body` is the hex SHA-256 of the request body, of the empty string when
+there is none). The
 route's org must match, and audit logs name `user:<email>` from the claims.
 `WEB_ASSERTION_PUBLIC_KEYS` holds the base64 raw public keys, separated by
 whitespace for rotation.
 
 The server refuses to start without an `ADMIN_SECRET` of at least 16
-characters, with a malformed `WEB_ASSERTION_PUBLIC_KEYS`, with
+characters, with a malformed or empty `WEB_ASSERTION_PUBLIC_KEYS`, with
 `ALLOW_SHARED_AUTH_TOKEN=true` but no `AUTH_TOKEN`, or without `JWT_SECRET`
-while unrevoked JWT-era tokens exist.
+while unrevoked JWT-era tokens exist. Self-hosters without a dashboard set
+`WEB_ASSERTIONS_DISABLED=true` instead of keys. The local development key,
+whose private half the dashboard's `.env.example` publishes, is refused
+unless `SNOWSTEAD_LOCAL_DEV_WEB_KEY=true`, which only `pnpm dev` sets.
+
+### Rolling out central authorization
+
+The previous dashboard calls org routes with `ADMIN_SECRET` and an
+unverified `x-snowstead-actor`. `ALLOW_LEGACY_WEB_ADMIN=true` accepts those
+calls again, as a transitional principal allowed exactly what the operator
+was on org routes. The server warns at startup while it is on, and audit
+entries it produces carry `"legacyWeb": true`. Deploy in this order:
+
+1. Apply migration `0015_central_auth.sql`. The previous server keeps
+   working against it.
+2. Deploy the server with `ALLOW_LEGACY_WEB_ADMIN=true` and
+   `WEB_ASSERTION_PUBLIC_KEYS`.
+3. Deploy the dashboard with its `CACHE_ASSERTION_PRIVATE_KEY`.
+4. Remove `ALLOW_LEGACY_WEB_ADMIN` and restart the server.
+
+Validly signed JWTs whose `jti` is not in `api_tokens` stop working at step
+2. That is intended: only listed tokens can be revoked. A JWT-era row whose
+`perms_json` or `caches_json` was invalid, or empty, gets no permissions or
+caches, so it is refused rather than widened. After migrating, list live
+JWT-era tokens left without either:
+
+```sql
+SELECT t.jti, t.org_id, t.subject
+FROM api_tokens t
+WHERE t.secret_hash IS NULL
+    AND t.revoked_at IS NULL
+    AND (t.expires_at IS NULL OR t.expires_at > now())
+    AND (NOT EXISTS (SELECT 1 FROM token_permissions p WHERE p.token_jti = t.jti)
+        OR NOT EXISTS (SELECT 1 FROM token_caches c WHERE c.token_jti = t.jti));
+```
 
 ## Audit logging
 
@@ -568,7 +604,7 @@ safe integer number of bytes, or `null` for unlimited; `0` refuses new storage.
 - `GET /_api/v1/admin/overview` retains the global operator overview.
 
 Admin endpoints require operator `ADMIN_SECRET` authentication. An org's
-owner or admin can change only its slug, with `PUT /_api/v1/orgs/:org` and
+owner can change only its slug, with `PUT /_api/v1/orgs/:org` and
 `{slug}`; org API keys cannot change limits or list all orgs. `org.put`
 records old/new slug and limits in the affected org's audit log, with the
 operator (`admin`) or the signed-in user as actor.

@@ -381,7 +381,13 @@ async fn private_stays_authenticated_and_streamed(pool: PgPool) {
 }
 
 async fn signing_post(app: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
-    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
+    let (path, credential) = web::dashboard(
+        "POST",
+        path,
+        "operator-secret",
+        None,
+        body.to_string().as_bytes(),
+    );
     let response = app
         .clone()
         .oneshot(

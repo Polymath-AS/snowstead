@@ -13,11 +13,21 @@ pub fn public_key() -> String {
     STANDARD.encode(SigningKey::from_bytes(&SEED).verifying_key().as_bytes())
 }
 
-/// The bearer credential for `method path`, as `email` with `role` in `org`.
-pub fn assertion(method: &str, path: &str, org: &str, role: &str, email: &str) -> String {
+/// The bearer credential for `method path` with `body`, as `email` with
+/// `role` in `org`.
+pub fn assertion(
+    method: &str,
+    path: &str,
+    org: &str,
+    role: &str,
+    email: &str,
+    body: &[u8],
+) -> String {
+    use sha2::Digest;
     let now = chrono::Utc::now().timestamp();
     let claims = serde_json::json!({"aud":"snowstead-cache","org":org,"sub":"user_test","email":email,
-        "role":role,"iat":now,"exp":now + 30,"method":method,"path":path});
+        "role":role,"iat":now,"exp":now + 30,"method":method,"path":path,
+        "body":hex::encode(sha2::Sha256::digest(body))});
     let signed = format!(
         "snowstead_web.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -35,6 +45,7 @@ pub fn dashboard(
     path: &str,
     operator: &str,
     actor: Option<&str>,
+    body: &[u8],
 ) -> (String, String) {
     let Some(rest) = path.strip_prefix("/_api/v1/orgs/") else {
         return (path.to_owned(), operator.to_owned());
@@ -47,6 +58,6 @@ pub fn dashboard(
     let email = actor.unwrap_or("dev@example.test");
     (
         path.to_owned(),
-        assertion(method, path, org, "owner", email),
+        assertion(method, path, org, "owner", email, body),
     )
 }

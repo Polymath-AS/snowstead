@@ -92,7 +92,13 @@ async fn send(
 ) -> (StatusCode, Value) {
     let (path, credential) = match credential {
         Some(credential) if credential == "operator-secret" => {
-            let (path, credential) = web::dashboard(method, path, credential, None);
+            let (path, credential) = web::dashboard(
+                method,
+                path,
+                credential,
+                None,
+                &serde_json::to_vec(&body).unwrap(),
+            );
             (path, Some(credential))
         }
         _ => (path.to_owned(), credential.map(str::to_owned)),

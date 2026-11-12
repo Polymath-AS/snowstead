@@ -62,7 +62,7 @@ async fn send(
     value: Value,
 ) -> (StatusCode, Value) {
     let (path, credential) = if credential == "policy-admin" {
-        web::dashboard(method, path, credential, None)
+        web::dashboard(method, path, credential, None, value.to_string().as_bytes())
     } else {
         (path.to_owned(), credential.to_owned())
     };
