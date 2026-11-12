@@ -10,12 +10,9 @@ let
     worker_processes 1;
     pid $RUNTIME_DIRECTORY/nginx.pid;
     error_log stderr warn;
-    events { worker_connections 128; }
+    events { worker_connections 1024; }
     http {
       access_log off;
-      limit_conn_zone \$server_name zone=origin_connections:64k;
-      limit_conn origin_connections 16;
-      limit_conn_status 503;
       client_header_buffer_size 1k;
       large_client_header_buffers 2 8k;
       client_header_timeout 10s;
