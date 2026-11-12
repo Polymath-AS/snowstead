@@ -126,9 +126,32 @@ pub struct HttpError {
     operation: String,
     pub status: u16,
 }
+impl HttpError {
+    pub(crate) fn new(operation: &str, status: u16) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            status,
+        }
+    }
+}
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} failed (HTTP {})", self.operation, self.status)
+        write!(f, "{} failed (HTTP {})", self.operation, self.status)?;
+        match (self.operation.as_str(), self.status) {
+            ("part upload", 401 | 403) => write!(
+                f,
+                ": upload URL rejected. Retry the push to request a new upload URL."
+            ),
+            (_, 401) => write!(
+                f,
+                ": authentication failed. Run `snowstead login` again. If SNOWSTEAD_TOKEN is set, replace it or unset it to use your saved login."
+            ),
+            (_, 403) => write!(
+                f,
+                ": permission denied. Check the token's permissions and access to this organization and cache. Confirm SNOWSTEAD_URL points to the intended server."
+            ),
+            _ => Ok(()),
+        }
     }
 }
 impl std::error::Error for HttpError {}
@@ -137,11 +160,7 @@ fn status_ok(operation: &str, response: Response) -> Result<Response> {
     if response.status().is_success() {
         Ok(response)
     } else {
-        Err(HttpError {
-            operation: operation.to_owned(),
-            status: response.status().as_u16(),
-        }
-        .into())
+        Err(HttpError::new(operation, response.status().as_u16()).into())
     }
 }
 async fn decode<T: DeserializeOwned>(operation: &str, response: Response) -> Result<T> {
@@ -714,9 +733,10 @@ impl Client {
                                 retry.push(group);
                             } else {
                                 for (index, _) in &group.1 {
-                                    results[*index] = Some(Err(format!(
-                                        "reserve parts: rejected (status {status})"
-                                    )));
+                                    results[*index] =
+                                        Some(Err(
+                                            HttpError::new("reserve parts", status).to_string()
+                                        ));
                                 }
                             }
                         }
@@ -1333,7 +1353,7 @@ pub(crate) mod tests {
     }
     #[tokio::test]
     async fn missing_etag_and_redirect_fail_without_leaking_credentials() {
-        for status in [200, 307, 403] {
+        for status in [200, 307, 401, 403] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let origin = url.clone();
@@ -1357,6 +1377,10 @@ pub(crate) mod tests {
             let text = format!("{error:#}");
             for secret in ["private", "secret-token", &url] {
                 assert!(!text.contains(secret));
+            }
+            if matches!(status, 401 | 403) {
+                assert!(text.contains("Retry the push"), "{text}");
+                assert!(!text.contains("snowstead login"), "{text}");
             }
             server.await.unwrap();
         }

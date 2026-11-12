@@ -195,6 +195,11 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
     let (status, headers, _) = request(&app, "POST", path, None, Value::Null).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    let (status, headers, error) =
+        request(&app, "POST", path, Some("wrong-secret"), Value::Null).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(error["error"], "Unauthorized");
     for (credential, cache, expected) in [
         (
             token(Some("org_beta"), &["main"], &["push"], "beta-token"),

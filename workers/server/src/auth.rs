@@ -311,22 +311,20 @@ pub async fn authenticate_write(
         return Err(auth_error(StatusCode::FORBIDDEN, false));
     }
     let token = bearer(headers)?;
-    if !state.config.jwt_secret.is_empty() {
-        if let Some(claims) = verify_jwt(token, &state.config.jwt_secret, now()) {
-            if check_revocation(state, &claims, false).await? {
-                record_use(state, &claims).await;
-            }
-            #[cfg(feature = "observability")]
-            crate::observability::identity(&Identity::Jwt(claims.clone()), None);
-            return Ok(Identity::Jwt(claims));
+    if !state.config.jwt_secret.is_empty()
+        && let Some(claims) = verify_jwt(token, &state.config.jwt_secret, now())
+    {
+        if check_revocation(state, &claims, false).await? {
+            record_use(state, &claims).await;
         }
-        if state.config.auth_token.is_empty() {
-            return Err(auth_error(StatusCode::UNAUTHORIZED, false));
-        }
+        #[cfg(feature = "observability")]
+        crate::observability::identity(&Identity::Jwt(claims.clone()), None);
+        return Ok(Identity::Jwt(claims));
     }
     if !state.config.auth_token.is_empty() && equal_secret(token, &state.config.auth_token) {
         return Ok(Identity::Legacy);
     }
+    authenticate(headers, state).await?;
     Err(auth_error(StatusCode::FORBIDDEN, false))
 }
 
@@ -338,10 +336,10 @@ pub async fn authenticate_admin(
     if state.config.admin_secret.is_empty() {
         return Err(auth_error(StatusCode::FORBIDDEN, false));
     }
-    if equal_secret(bearer(headers)?, &state.config.admin_secret) {
-        return Ok(admin_identity(headers));
+    match authenticate(headers, state).await? {
+        identity @ Identity::Admin { .. } => Ok(identity),
+        _ => Err(auth_error(StatusCode::FORBIDDEN, false)),
     }
-    Err(auth_error(StatusCode::FORBIDDEN, false))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -350,12 +348,35 @@ pub async fn authenticate_org(
     state: &AppState,
     org: &str,
 ) -> Result<Identity, ApiError> {
+    match authenticate(headers, state).await? {
+        identity @ Identity::Admin { .. } => Ok(identity),
+        identity @ Identity::OrgKey { .. } if identity.org() == org => Ok(identity),
+        _ => Err(auth_error(StatusCode::FORBIDDEN, false)),
+    }
+}
+
+async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Identity, ApiError> {
     let token = bearer(headers)?;
     if !state.config.admin_secret.is_empty() && equal_secret(token, &state.config.admin_secret) {
         return Ok(admin_identity(headers));
     }
-    let invalid = || auth_error(StatusCode::FORBIDDEN, false);
-    let rest = token.strip_prefix("snowstead_key_").ok_or_else(invalid)?;
+    let invalid = || auth_error(StatusCode::UNAUTHORIZED, false);
+    let Some(rest) = token.strip_prefix("snowstead_key_") else {
+        if !state.config.jwt_secret.is_empty()
+            && let Some(claims) = verify_jwt(token, &state.config.jwt_secret, now())
+        {
+            if check_revocation(state, &claims, false).await? {
+                record_use(state, &claims).await;
+            }
+            #[cfg(feature = "observability")]
+            crate::observability::identity(&Identity::Jwt(claims.clone()), None);
+            return Ok(Identity::Jwt(claims));
+        }
+        if !state.config.auth_token.is_empty() && equal_secret(token, &state.config.auth_token) {
+            return Ok(Identity::Legacy);
+        }
+        return Err(invalid());
+    };
     let (id, secret) = rest.split_once('_').ok_or_else(invalid)?;
     if id.len() != 16
         || !id
@@ -393,8 +414,8 @@ pub async fn authenticate_org(
         row.as_ref().map(|r| r.secret_hash.as_str()).unwrap_or(""),
     );
     match row {
-        Some(key) if valid && !key.revoked && key.org_id == org => Ok(Identity::OrgKey {
-            org: org.into(),
+        Some(key) if valid && !key.revoked => Ok(Identity::OrgKey {
+            org: key.org_id,
             key_id: id.into(),
         }),
         _ => Err(invalid()),

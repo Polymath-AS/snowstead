@@ -516,7 +516,7 @@ pub(crate) async fn transfer(
                     match published {
                         api::RowOutcome::Published | api::RowOutcome::Prepared => (),
                         api::RowOutcome::Rejected { status } => {
-                            bail!("publication failed (status {status})")
+                            return Err(api::HttpError::new("publication", status).into());
                         }
                         api::RowOutcome::TransientExhausted => {
                             bail!("publication failed: server still busy after retries")

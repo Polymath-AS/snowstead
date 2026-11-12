@@ -254,11 +254,6 @@ fn main() {
         };
         eprintln!("Error: {message}");
         let failure = Failure::of(&error);
-        if failure == Failure::Auth {
-            eprintln!(
-                "Hint: the token was rejected or lacks permission. Run `snowstead login`, or check SNOWSTEAD_TOKEN."
-            );
-        }
         std::process::exit(failure.exit_code());
     }
 }

@@ -83,12 +83,33 @@ async fn keys_scope_operator_boundary_and_idempotent_revoke(pool: PgPool) {
         call(&app, "GET", path, None, Value::Null).await.0,
         StatusCode::UNAUTHORIZED
     );
-    for token in ["legacy-secret", "bogus"] {
-        assert_eq!(
-            call(&app, "GET", path, Some(token), Value::Null).await.0,
-            StatusCode::FORBIDDEN
-        );
+    for token in [
+        "bogus".to_owned(),
+        "snowstead_key_0000000000000000_missing".to_owned(),
+        format!("{credential}wrong"),
+    ] {
+        let (status, body) = call(&app, "GET", path, Some(&token), Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "Unauthorized");
     }
+    assert_eq!(
+        call(&app, "GET", path, Some("legacy-secret"), Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            "/_api/v1/admin/tokens",
+            Some("bogus"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
     let (status, list) = call(&app, "GET", path, Some(credential), Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list["keys"].as_array().unwrap().len(), 1);
@@ -156,7 +177,7 @@ async fn keys_scope_operator_boundary_and_idempotent_revoke(pool: PgPool) {
         call(&app, "GET", path, Some(credential), Value::Null)
             .await
             .0,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     let stored: String = sqlx::query_scalar("SELECT secret_hash FROM org_api_keys WHERE id=$1")
         .bind(alpha["id"].as_str().unwrap())

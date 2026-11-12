@@ -1032,8 +1032,39 @@ fn exit_codes_distinguish_usage_authentication_and_other_failures() {
         assert_eq!(result.status.code(), Some(code), "HTTP {status}");
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(stderr.contains(&status.to_string()));
-        assert_eq!(stderr.contains("snowstead login"), code == 4, "{stderr}");
+        assert_eq!(
+            stderr.contains("snowstead login"),
+            status == 401,
+            "{stderr}"
+        );
+        if status == 401 {
+            assert!(
+                stderr.contains("SNOWSTEAD_TOKEN") && stderr.contains("unset"),
+                "{stderr}"
+            );
+        }
+        if status == 403 {
+            assert!(
+                stderr.contains("permission denied") && stderr.contains("organization and cache"),
+                "{stderr}"
+            );
+        }
         assert!(!stderr.contains(TOKEN));
+        if code == 4 {
+            let (url, request) = mock(status, json!({"error": TOKEN}));
+            login(home.path(), &url);
+            let result = run(home.path(), &["push", "main", "--resume", "job-test"]);
+            request.join().unwrap();
+            assert_eq!(result.status.code(), Some(4));
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains(&format!("HTTP {status}")), "{stderr}");
+            assert_eq!(
+                stderr.contains("snowstead login"),
+                status == 401,
+                "{stderr}"
+            );
+            assert!(!stderr.contains(TOKEN));
+        }
     }
     // A push refused before it starts is an authentication failure, not a partial push.
     let (url, request) = mock(403, json!({"error": TOKEN}));

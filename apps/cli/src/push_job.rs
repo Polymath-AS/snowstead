@@ -284,7 +284,9 @@ async fn request<T: DeserializeOwned>(
             let status = response.status();
             if !matches!(status.as_u16(), 429 | 502 | 503 | 504) {
                 if !status.is_success() {
-                    bail!("push job request failed (HTTP {})", status.as_u16());
+                    return Err(
+                        crate::api::HttpError::new("push job request", status.as_u16()).into(),
+                    );
                 }
                 match response.json().await {
                     Ok(value) => return Ok(value),
