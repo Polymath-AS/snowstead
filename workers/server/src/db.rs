@@ -33,29 +33,61 @@ impl Writers {
 /// The local org gate ends with the SQL transaction, including on cancellation.
 /// It never spans storage I/O. PostgreSQL still fences other server instances.
 pub(crate) struct Transaction {
-    inner: sqlx::Transaction<'static, Postgres>,
-    _writer: OwnedMutexGuard<()>,
+    inner: Option<sqlx::Transaction<'static, Postgres>>,
+    writer: Option<OwnedMutexGuard<()>>,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl Deref for Transaction {
     type Target = PgConnection;
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.inner.as_ref().unwrap()
     }
 }
 
 impl DerefMut for Transaction {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+        self.inner.as_mut().unwrap()
     }
 }
 
 impl Transaction {
     pub(crate) async fn commit(self) -> Result<(), sqlx::Error> {
-        self.inner.commit().await
+        self.finish(true).await
     }
     pub(crate) async fn rollback(self) -> Result<(), sqlx::Error> {
-        self.inner.rollback().await
+        self.finish(false).await
+    }
+
+    async fn finish(mut self, commit: bool) -> Result<(), sqlx::Error> {
+        // A cancelled caller must not release the local gate while COMMIT or
+        // ROLLBACK still owns the PostgreSQL organization fence.
+        self.tasks
+            .clone()
+            .spawn(async move {
+                let inner = self.inner.take().unwrap();
+                if commit {
+                    inner.commit().await
+                } else {
+                    inner.rollback().await
+                }
+            })
+            .await
+            .map_err(|_| sqlx::Error::Protocol("Transaction completion failed".into()))?
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let writer = self.writer.take();
+            // SQLx's Drop only queues ROLLBACK. Retain our gate until the
+            // server acknowledges it, including on handler errors/cancellation.
+            self.tasks.spawn(async move {
+                let _writer = writer;
+                let _ = inner.rollback().await;
+            });
+        }
     }
 }
 
@@ -123,6 +155,7 @@ async fn begin_admitted(
     .await
     .map_err(|_| busy("SQL capacity busy; retry"))?;
     let pool = state.pool.clone();
+    let tasks = state.tasks.clone();
     // SQLx 0.9 can return an open, untracked transaction to the pool if BEGIN
     // is cancelled before its response arrives. Finish startup even if the
     // caller leaves; dropping the completed result then rolls it back safely.
@@ -133,8 +166,9 @@ async fn begin_admitted(
             let _admission = admission;
             let inner = pool.begin().await?;
             Ok(Transaction {
-                inner,
-                _writer: writer,
+                inner: Some(inner),
+                writer: Some(writer),
+                tasks,
             })
         })
         .await

@@ -2680,6 +2680,38 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
     );
     let auth = token("default", "*");
     let base = "/_api/v1/caches/manifest/push-jobs";
+    // A rejected writer must finish its rollback before the next local
+    // writer can try the same PostgreSQL organization fence.
+    let input = json!({"idempotencyKey":"rollback-fence","mode":"selected",
+        "roots":[format!("/nix/store/{}-fixture", "a".repeat(32))]});
+    let (status, created) = post(&app, base, &auth, input.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut conflict = input;
+    conflict["mode"] = json!("closure");
+    let (status, rejected) = post(&app, base, &auth, conflict).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+    let (status, _, updated) = send(
+        &app,
+        "PUT",
+        &format!("{job}/manifest/0"),
+        Some(&auth),
+        &[("content-type", "application/json")],
+        serde_json::to_vec(
+            &json!({"members":[path_input(&"a".repeat(32), &nar(b"rollback fence"), true)]}),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&updated)
+    );
+    let (status, cancelled) = post(&app, &format!("{job}/cancel"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+
     let raws = [nar(b"batch root"), nar(b"batch dependency")];
     let payloads: Vec<_> = raws
         .iter()
