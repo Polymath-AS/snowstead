@@ -1019,16 +1019,46 @@ async fn put_org(
     let limits = |principal: &Principal| {
         authz::authorize(principal, Action::OrgLimitsWrite, &Resource::Org(id))
     };
-    if ["storageLimit", "privateCaches", "customSigningKeys"]
-        .iter()
-        .any(|field| raw.get(*field).is_some())
+    if [
+        "storageLimit",
+        "privateCaches",
+        "customSigningKeys",
+        "limitsVersion",
+    ]
+    .iter()
+    .any(|field| raw.get(*field).is_some())
     {
         limits(&context.principal)?;
     }
     if raw.as_object().unwrap().keys().any(|k| {
-        !["slug", "storageLimit", "privateCaches", "customSigningKeys"].contains(&k.as_str())
+        ![
+            "slug",
+            "storageLimit",
+            "privateCaches",
+            "customSigningKeys",
+            "limitsVersion",
+        ]
+        .contains(&k.as_str())
     }) {
         return Err(bad("Invalid organization settings"));
+    }
+    // Decimal strings preserve the full Postgres bigint range in JSON clients.
+    let version = raw
+        .get("limitsVersion")
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .ok_or_else(|| bad("limitsVersion must be a positive bigint string"))
+        })
+        .transpose()?;
+    if version.is_some()
+        && ["storageLimit", "privateCaches", "customSigningKeys"]
+            .iter()
+            .any(|field| raw.get(*field).is_none())
+    {
+        return Err(bad("limitsVersion requires the complete limits policy"));
     }
     for field in ["privateCaches", "customSigningKeys"] {
         if raw.get(field).is_some_and(|v| !v.is_boolean()) {
@@ -1064,6 +1094,27 @@ async fn put_org(
         label = "management.put_org_lock_wait"
     )
     .await?;
+    // Compare and write under the same org lock. Stale registrations cannot
+    // change slugs either; equal versions are safe transport retries.
+    let stored_version: Option<i64> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT limits_version FROM orgs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    if let Some(stored) = stored_version {
+        if version.is_some_and(|incoming| incoming <= stored) {
+            tx.commit().await?;
+            return org_response(state, id, None, false).await;
+        }
+        if version.is_none()
+            && ["storageLimit", "privateCaches", "customSigningKeys"]
+                .iter()
+                .any(|field| raw.get(*field).is_some())
+        {
+            return Err(bad("limitsVersion is required for this organization"));
+        }
+    }
     let current = sqlx::query!(
         r#"
         SELECT
@@ -1187,6 +1238,13 @@ async fn put_org(
     )
     .execute(&mut *tx)
     .await?;
+    if let Some(version) = version {
+        sqlx::query("UPDATE orgs SET limits_version = $2 WHERE id = $1")
+            .bind(id)
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     // Report the row this request just wrote, not the one read before it.
     org_response(state, id, None, false).await

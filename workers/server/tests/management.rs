@@ -1154,3 +1154,73 @@ async fn org_reports_read_the_org_once_and_share_round_trips(pool: PgPool) {
     without.as_object_mut().unwrap().remove("caches");
     assert_eq!(without, report);
 }
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn org_limit_versions_fence_delayed_writes_and_registration(pool: PgPool) {
+    let app = router(state(pool.clone()));
+    let base = "/_api/v1/orgs/org_fenced";
+    let policy = |version: &str, limit: i64| {
+        json!({
+            "slug":"fenced", "storageLimit":limit, "privateCaches":true,
+            "customSigningKeys":true, "limitsVersion":version
+        })
+    };
+    assert_eq!(
+        call(&app, "PUT", base, policy("1", 10), None).await.0,
+        StatusCode::OK
+    );
+    let newer = call(&app, "PUT", base, policy("3", 30), None).await;
+    assert_eq!(newer.0, StatusCode::OK);
+    // A delayed old HTTP request arrives only after the newer one commits.
+    let mut stale = policy("2", 20);
+    stale["slug"] = json!("stale-registration");
+    assert_eq!(call(&app, "PUT", base, stale, None).await.2, newer.2);
+    // A duplicate version cannot carry a different policy or rename the org.
+    assert_eq!(
+        call(&app, "PUT", base, policy("3", 99), None).await.2,
+        newer.2
+    );
+    assert_eq!(
+        call(&app, "PUT", base, json!({"storageLimit":99}), None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    for version in [
+        json!(null),
+        json!(4),
+        json!("0"),
+        json!("-1"),
+        json!("9223372036854775808"),
+    ] {
+        let mut invalid = policy("4", 40);
+        invalid["limitsVersion"] = version;
+        assert_eq!(
+            call(&app, "PUT", base, invalid, None).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        call(&app, "PUT", base, json!({"limitsVersion":"4"}), None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let newest = call(&app, "PUT", base, policy("9007199254740993", 40), None).await;
+    assert_eq!(newest.0, StatusCode::OK);
+    assert_eq!(newest.2["storageLimit"], 40);
+    // Member slug-only updates remain separate from the operator policy fence.
+    assert_eq!(
+        call(&app, "PUT", base, json!({"slug":"renamed"}), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT limits_version FROM orgs WHERE id = 'org_fenced'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        9007199254740993
+    );
+}
