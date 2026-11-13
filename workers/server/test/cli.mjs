@@ -3,23 +3,28 @@ import assert from "node:assert/strict";
 import { createCipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, verify } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdtemp, readdir, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { test } from "node:test";
+import { setTimeout } from "node:timers/promises";
 import { Client } from "pg";
 
 const exec = promisify(execFile);
-const cli = new URL("../../../target/debug/snowstead", import.meta.url).pathname;
-const serverBinary = new URL("../../../target/debug/snowstead-server", import.meta.url).pathname;
+const cli = process.env.SNOWSTEAD_TEST_CLI ?? new URL("../../../target/debug/snowstead", import.meta.url).pathname;
+const serverBinary = process.env.SNOWSTEAD_TEST_SERVER ?? new URL("../../../target/debug/snowstead-server", import.meta.url).pathname;
 
-test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and skips after restart", { timeout: 120_000 }, async () => {
+test("unchanged CLI uploads directly under bounded admission, verifies signed downloads, and resumes after restart", { timeout: 240_000 }, async t => {
   const base = process.env.SNOWSTEAD_TEST_DATABASE_URL;
   assert.ok(base, "run via scripts/with-postgres.sh");
   assert.equal(process.env.R2_ENDPOINT, process.env.SNOWSTEAD_TEST_R2_ENDPOINT, "run via scripts/with-r2.sh");
   assert.ok(process.env.SNOWSTEAD_TEST_R2_ENDPOINT, "requires disposable S3 buckets");
+  assert.equal(new URL(process.env.R2_ENDPOINT).hostname, "127.0.0.1");
+  assert.equal(process.env.R2_BUCKET_NAME, "snowstead-private");
+  assert.equal(process.env.R2_PUBLIC_BUCKET_NAME, "snowstead-public");
   const admin = new Client({ connectionString: base });
   await admin.connect();
   const name = `snowstead_server_cli_${process.pid}`;
@@ -34,7 +39,52 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     SIGNING_MASTER_KEY: master.toString("base64"), REQUIRE_CACHE_SIGNING_KEYS: "true",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",
+    R2_BUCKET_NAME: `snowstead-private-cli-${process.pid}`, R2_PUBLIC_BUCKET_NAME: `snowstead-public-cli-${process.pid}`,
+    UPLOAD_BUFFER_MIB: "32", MAX_UPLOAD_PART_MIB: "16", MAX_ACTIVE_VERIFICATIONS: "1",
     DATABASE_MAX_CONNECTIONS: "2", PUSH_JOB_PUBLICATION_WORKERS: "1", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info", PUBLIC_URL: "", UPSTREAM_CACHES: "" };
+  let origin;
+  const traffic = { relay: 0, inline: 0, grants: 0, sessions: new Set(), errors: [] };
+  // Observe the API byte path, without proxying or buffering S3 traffic. Old
+  // relay grants fail both the URL assertions and the no-relay request count.
+  const proxy = createServer((incoming, outgoing) => {
+    if (/\/uploads\/[^/]+\/part\/\d+/.test(incoming.url)) traffic.relay++;
+    if (/\/uploads\/(?:inline\/batch|[^/]+\/inline)/.test(incoming.url)) traffic.inline++;
+    const upstream = request(new URL(incoming.url, origin), {
+      method: incoming.method, headers: incoming.headers,
+    }, response => {
+      outgoing.writeHead(response.statusCode, response.headers);
+      if (incoming.method === "POST" && /\/uploads\/(?:parts|[^/]+\/parts)$/.test(incoming.url)) {
+        const chunks = [];
+        response.on("data", chunk => chunks.push(chunk));
+        response.on("end", () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks));
+            for (const item of body.results ?? [body]) {
+              for (const grant of item.parts ?? []) {
+                const url = new URL(grant.url);
+                assert.equal(url.origin, new URL(process.env.SNOWSTEAD_TEST_R2_ENDPOINT).origin);
+                assert.ok(url.pathname.startsWith(`/${env.R2_BUCKET_NAME}/`));
+                assert.ok(url.searchParams.has("uploadId"));
+                assert.ok(url.searchParams.has("partNumber"));
+                assert.ok(url.searchParams.has("X-Amz-Signature"));
+                assert.ok(url.searchParams.get("X-Amz-SignedHeaders").split(";").includes("content-length"));
+                const headers = new Headers(grant.headers);
+                assert.equal(headers.has("authorization"), false);
+                assert.ok(Number(headers.get("content-length")) > 0);
+                traffic.grants++;
+                traffic.sessions.add(url.searchParams.get("uploadId"));
+              }
+            }
+          } catch (error) { traffic.errors.push(error.message); }
+        });
+      }
+      response.pipe(outgoing);
+    });
+    upstream.on("error", error => { traffic.errors.push(error.message); outgoing.destroy(error); });
+    incoming.pipe(upstream);
+  });
+  proxy.listen(0, "127.0.0.1");
+  await once(proxy, "listening");
   let server;
   let closed;
   const stop = async () => {
@@ -51,15 +101,23 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     const [line] = await once(lines, "line");
     const address = /127\.0\.0\.1:\d+/.exec(line)?.[0];
     assert.ok(address, line);
-    return `http://${address}`;
+    origin = `http://${address}`;
+    return `http://127.0.0.1:${proxy.address().port}`;
   };
   try {
+    // Restarts run orphan cleanup. Do not share buckets with another test DB.
+    const storage = new URL(env.R2_ENDPOINT);
+    storage.username = env.R2_ACCESS_KEY_ID;
+    storage.password = env.R2_SECRET_ACCESS_KEY;
+    await exec("mc", ["--config-dir", join(home, "mc"), "mb",
+      `fixture/${env.R2_BUCKET_NAME}`, `fixture/${env.R2_PUBLIC_BUCKET_NAME}`],
+    { env: { ...process.env, MC_HOST_fixture: storage.href } });
     await exec(serverBinary, ["migrate"], { env });
     const db = new Client({ connectionString: database.toString() });
     await db.connect();
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
     try {
-      for (const cache of ["native", "pipeline"]) {
+      for (const cache of ["native", "pipeline", "direct"]) {
         const { rows: [{ id }] } = await db.query("INSERT INTO caches(name) VALUES ($1) RETURNING id", [cache]);
         await db.query("INSERT INTO cache_protocols(cache_id,protocol) VALUES ($1,'nix')", [id]);
         const seed = privateKey.export({ type: "pkcs8", format: "der" }).subarray(-32);
@@ -79,7 +137,7 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     const issued = await fetch(`${url}/_api/v1/admin/tokens`, {
       method: "POST",
       headers: { authorization: `Bearer ${operator}`, "content-type": "application/json" },
-      body: JSON.stringify({ subject: "cli-migration", caches: ["native", "pipeline"], perms: ["pull", "push"] }),
+      body: JSON.stringify({ subject: "cli-migration", caches: ["native", "pipeline", "direct"], perms: ["pull", "push"] }),
     });
     assert.equal(issued.status, 201);
     const { token: credential, jti } = await issued.json();
@@ -94,6 +152,47 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     // Existing immutable store content: no writes to the Nix store.
     const path = /^(\/nix\/store\/[^/]+)/.exec(process.execPath)?.[1];
     assert.ok(path, "run inside nix develop");
+    const nixBinary = await realpath((await exec("which", ["nix-store"])).stdout.trim());
+    const nixPath = /^(\/nix\/store\/[^/]+)/.exec(nixBinary)?.[1];
+    assert.ok(nixPath && nixPath !== path, "requires two distinct immutable Nix outputs");
+    const requisites = (await exec("nix-store", ["--query", "--requisites", path, nixPath])).stdout.trim().split("\n");
+    const closurePaths = [...new Set(requisites)].sort();
+    const sizes = JSON.parse((await exec("nix", [
+      "--extra-experimental-features", "nix-command", "path-info", "--json", ...closurePaths,
+    ], { maxBuffer: 4 * 1024 * 1024 })).stdout);
+    // Nix versions return either an array of records or an object keyed by
+    // store path. Select existing outputs only; never build or mutate fixtures.
+    const outputs = Array.isArray(sizes) ? sizes : Object.entries(sizes).map(([path, info]) => ({ ...info, path }));
+    const directPaths = outputs.filter(info => Number(info.narSize) > 1024 * 1024)
+      .sort((a, b) => Number(b.narSize) - Number(a.narSize) || a.path.localeCompare(b.path)).slice(0, 32);
+    assert.ok(directPaths.length > 8, "nix develop closures must exercise more than eight multipart preparations");
+    // Intentionally omit --jobs and retry overrides: exercise the production
+    // CLI default of 32 with the unchanged completion batching/retry policy.
+    const concurrent = await run("push", "direct", ...directPaths.map(info => info.path), "--no-deps");
+    assert.match(concurrent.stdout, new RegExp(`${directPaths.length} pushed, 0 skipped`));
+    assert.equal(concurrent.stderr, "");
+    assert.deepEqual(traffic.errors, []);
+    assert.equal(traffic.relay, 0, "NAR parts must never enter API body admission");
+    assert.equal(traffic.inline, 0, "large immutable fixtures must exercise multipart, not inline");
+    assert.ok(traffic.grants > directPaths.length, "must exercise multi-part NARs as well as concurrent outputs");
+    assert.equal(traffic.sessions.size, directPaths.length, "every concurrent path must upload directly");
+    t.diagnostic(`direct upload: ${directPaths.length} immutable outputs, ${traffic.grants} S3 grants, zero relay/inline API uploads, default jobs=32`);
+    for (const output of directPaths) {
+      const storePath = output.path;
+      const response = await fetch(`${url}/direct/${storePath.split("/").at(-1).slice(0, 32)}.narinfo`);
+      assert.equal(response.status, 200, storePath);
+      const metadata = await response.text();
+      const field = name => new RegExp(`^${name}: (.+)$`, "m").exec(metadata)?.[1];
+      assert.equal(field("StorePath"), storePath);
+      assert.equal(Number(field("NarSize")), Number(output.narSize));
+      assert.equal(field("Compression"), "zstd");
+      const downloaded = await fetch(new URL(field("URL"), response.url));
+      assert.equal(downloaded.status, 200, storePath);
+      const bytes = Buffer.from(await downloaded.arrayBuffer());
+      assert.equal(bytes.length, Number(field("FileSize")), storePath);
+      assert.equal(`sha256:${createHash("sha256").update(bytes).digest("hex")}`, field("FileHash"), storePath);
+      assert.equal(await digest("zstd", ["-d", "-q", "-c"], bytes), await digest("nix-store", ["--dump", storePath]), storePath);
+    }
     const pushed = await run("push", "native", path, "--no-deps", "--jobs", "2");
     assert.match(pushed.stdout, /1 pushed, 0 skipped/);
     assert.equal(pushed.stderr, "");
@@ -138,6 +237,29 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     // The explicit job mode must reach durable completion, not merely return a
     // preparation receipt. Resume needs neither paths on stdin nor local Nix queries.
     await stop();
+    const cutover = new Client({ connectionString: database.toString() });
+    await cutover.connect();
+    try {
+      // Simulate persisted relay receipts from the deployed release. A new
+      // server must refuse the cutover, not silently replace their source MPU.
+      await cutover.query(`INSERT INTO upload_sessions
+        (id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,r2_upload_id,part_size,expires_at)
+        SELECT 'relay-cutover',id,repeat('a',32),'/nix/store/'||repeat('a',32)||'-cutover',
+          'sha256:test',1,1,'zstd','streaming','relay-cutover',8388608,NOW()+INTERVAL '1 hour'
+        FROM caches WHERE name='native';
+        INSERT INTO upload_parts(session_id,part_number,size,etag,storage_key)
+        VALUES('relay-cutover',1,1,'old-receipt','staging/relay-cutover/old')`);
+      for (const status of ["streaming", "finalizing"]) {
+        await cutover.query("UPDATE upload_sessions SET status=$1 WHERE id='relay-cutover'", [status]);
+        await assert.rejects(exec(serverBinary, ["check-upload-cutover"], { env }), /1 active relayed upload sessions/);
+        await assert.rejects(exec(serverBinary, [], { env, timeout: 10_000 }), /1 active relayed upload sessions/);
+        const { rows: [row] } = await cutover.query(`SELECT u.status,p.etag FROM upload_sessions u
+          JOIN upload_parts p ON p.session_id=u.id WHERE u.id='relay-cutover'`);
+        assert.deepEqual(row, { status, etag: "old-receipt" }, "preflight and startup must not change old uploads");
+      }
+      await cutover.query("UPDATE upload_sessions SET status='aborted' WHERE id='relay-cutover'");
+      assert.match((await exec(serverBinary, ["check-upload-cutover"], { env })).stdout, /Upload cutover ready/);
+    } finally { await cutover.end(); }
     url = await start();
     await login();
     let small;
@@ -205,6 +327,49 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     assert.equal(removed.status, 200);
     await assert.rejects(run("push", "pipeline", "--resume", jobId), /no longer fully available/);
     assert.equal((await fetch(`${url}/pipeline/${hash}.narinfo`, { headers: jobHeaders })).status, 404);
+    // Expiry must revoke the actual provider upload, not only SQL receipts.
+    // A separate server process owns the startup maintenance sweep, avoiding
+    // contention with other integration tests' process-wide maintenance lock.
+    const expiryHash = "9".repeat(32);
+    const headers = { ...jobHeaders, "content-type": "application/json" };
+    const created = await fetch(`${url}/_api/v1/caches/native/upload-streams/batch`, {
+      method: "POST", headers, body: JSON.stringify({ paths: [{
+        storePath: `/nix/store/${expiryHash}-expiry`, storePathHash: expiryHash,
+        narHash: `sha256-${Buffer.alloc(32).toString("base64")}`, narSize: 32,
+        compression: "zstd", references: [], inline: false,
+      }] }),
+    });
+    assert.equal(created.status, 201);
+    const { sessions: [{ sessionId }] } = await created.json();
+    const part = Buffer.from("expired staging fixture");
+    const reserved = await fetch(`${url}/_api/v1/uploads/${sessionId}/parts`, {
+      method: "POST", headers,
+      body: JSON.stringify({ parts: [{ partNumber: 1, size: part.length }] }),
+    });
+    assert.equal(reserved.status, 200);
+    const { parts: [grant] } = await reserved.json();
+    const putPart = () => fetch(grant.url, { method: "PUT", headers: grant.headers, body: part });
+    const uploaded = await putPart();
+    assert.equal(uploaded.status, 200);
+    await uploaded.arrayBuffer();
+    await stop();
+    const expiry = new Client({ connectionString: database.toString() });
+    await expiry.connect();
+    try {
+      await expiry.query("UPDATE upload_sessions SET expires_at=NOW()-INTERVAL '1 second' WHERE id=$1", [sessionId]);
+    } finally { await expiry.end(); }
+    url = await start();
+    let denied;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      denied = await putPart();
+      if (denied.status === 404) break;
+      assert.equal(denied.status, 200);
+      await denied.arrayBuffer();
+      await setTimeout(50);
+    }
+    assert.equal(denied.status, 404, "expiry must cancel the provider MPU");
+    assert.match(await denied.text(), /NoSuchUpload/);
+    assert.equal((await fetch(`${url}/native/${expiryHash}.narinfo`, { headers: jobHeaders })).status, 404);
     const revoked = await fetch(`${url}/_api/v1/admin/tokens/${jti}/revoke`, {
       method: "POST",
       headers: { authorization: `Bearer ${operator}`, "content-type": "application/json" },
@@ -214,6 +379,8 @@ test("unchanged CLI pushes a real NAR to Rust, verifies its signed download, and
     await assert.rejects(run("push", "native", path, "--no-deps"), /401|[Rr]evoked|[Uu]nauthorized/);
   } finally {
     await stop();
+    proxy.closeAllConnections();
+    await new Promise((resolve, reject) => proxy.close(error => error ? reject(error) : resolve()));
     await rm(home, { recursive: true, force: true });
     await admin.query(`DROP DATABASE "${name}" WITH (FORCE)`);
     await admin.end();

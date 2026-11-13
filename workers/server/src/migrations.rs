@@ -24,6 +24,23 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     migrate(pool, false).await
 }
 
+/// Refuse a transport cutover while an old relay session owns uploaded bytes.
+/// This check is read-only: operators must drain or cancel those pushes first.
+pub async fn check_upload_cutover(pool: &PgPool) -> Result<()> {
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM upload_sessions u WHERE u.r2_upload_id=u.id \
+         AND u.status IN ('streaming','finalizing') AND u.expires_at>NOW() \
+         AND EXISTS (SELECT 1 FROM upload_parts p WHERE p.session_id=u.id AND p.etag IS NOT NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    ensure!(
+        active == 0,
+        "{active} active relayed upload sessions contain uploaded parts; drain or cancel their pushes before deploying presigned uploads"
+    );
+    Ok(())
+}
+
 /// Replace only the exact, fully applied legacy SQLx ledger. Schema and application
 /// data are untouched; the old ledger is retained as `_sqlx_migrations_legacy`.
 #[cfg_attr(feature = "profiling", hotpath::measure)]

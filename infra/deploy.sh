@@ -36,14 +36,19 @@ nix copy --no-check-sigs --to "ssh-ng://deploy@$host" "$closure"
 ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "deploy@$host" \
   'sudo -n test -s /etc/snowstead/environment && sudo -n test -s /etc/snowstead/origin-certificate && sudo -n test -s /etc/snowstead/origin-key && sudo -n test -s /etc/snowstead/origin-client-ca'
 
+server=$(nix build --no-link --print-out-paths .#server)
+nix copy --no-check-sigs --to "ssh-ng://deploy@$host" "$server"
 if [[ ${2:-} == --migrate ]]; then
-  server=$(nix build --no-link --print-out-paths .#server)
-  nix copy --no-check-sigs --to "ssh-ng://deploy@$host" "$server"
   # Run the candidate binary with separate DDL credentials, never the current
   # binary or the runtime role. Failure stops deployment; no down migrations.
   ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "deploy@$host" \
     "sudo -n systemd-run --unit=snowstead-migrate --wait --collect --pipe --property=Type=exec --property=User=snowstead --property=Group=snowstead --property=EnvironmentFile=/etc/snowstead/migration --property=Environment=DATABASE_MAX_CONNECTIONS=1 --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes --property=PrivateTmp=yes '$server/bin/snowstead-server' migrate"
 fi
+
+# Refuse a transport cutover before stopping the running generation. Startup
+# repeats this read-only check, closing the window if an old writer races it.
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "deploy@$host" \
+  "sudo -n systemd-run --unit=snowstead-upload-cutover --wait --collect --pipe --property=Type=exec --property=User=snowstead --property=Group=snowstead --property=EnvironmentFile=/etc/snowstead/environment --property=Environment=DATABASE_MAX_CONNECTIONS=1 --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes --property=PrivateTmp=yes '$server/bin/snowstead-server' check-upload-cutover"
 
 # Activation contains readiness checks, so failure triggers deploy-rs rollback.
 # The named checks have already run in CI; do not rerun unrelated flake checks.

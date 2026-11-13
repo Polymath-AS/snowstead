@@ -127,6 +127,47 @@ async fn create(app: &Router, cache: &str, credential: &str, input: Value) -> Va
     result["sessions"][0].clone()
 }
 
+fn grant_request(grant: &Value, bytes: Vec<u8>) -> reqwest::RequestBuilder {
+    let url = reqwest::Url::parse(grant["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    let bucket = url.path_segments().unwrap().next().unwrap();
+    assert!(
+        bucket == "snowstead-private" || bucket.starts_with("snowstead-private-"),
+        "{url}"
+    );
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert!(
+        query.contains_key("uploadId"),
+        "not an S3 UploadPart grant: {url}"
+    );
+    assert!(query.contains_key("partNumber"));
+    assert!(query.contains_key("X-Amz-Signature"));
+    assert!(
+        query["X-Amz-SignedHeaders"]
+            .split(';')
+            .any(|h| h == "content-length")
+    );
+    let mut request = reqwest::Client::new().put(url.clone());
+    for (name, value) in grant["headers"].as_object().unwrap() {
+        assert!(!name.eq_ignore_ascii_case("authorization"));
+        request = request.header(name.as_str(), value.as_str().unwrap());
+    }
+    request.body(bytes)
+}
+
+async fn upload_grant(grant: &Value, bytes: &[u8]) -> String {
+    let response = grant_request(grant, bytes.to_vec()).send().await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_owned()
+}
+
 async fn put_manifest(
     app: &Router,
     job: &str,
@@ -1125,6 +1166,7 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
 async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name,is_public) VALUES('manifest',true); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
@@ -1135,7 +1177,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
-    let storage = common::storage();
+    let storage = common::s3_storage();
     let fresh = || {
         router(
             AppState::new(
@@ -1250,33 +1292,16 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
 
     let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
     let file_hash = hex::encode(Sha256::digest(&compressed));
-    assert_eq!(
-        post(
-            &app,
-            &format!("/_api/v1/uploads/{parent_id}/parts"),
-            &auth,
-            json!({"parts":[{"partNumber":1,"size":compressed.len()}]})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    let (status, _, uploaded) = send(
+    let (status, grants) = post(
         &app,
-        "PUT",
-        &format!("/_api/v1/uploads/{parent_id}/part/1"),
-        Some(&auth),
-        &[("content-length", &compressed.len().to_string())],
-        compressed.clone(),
+        &format!("/_api/v1/uploads/{parent_id}/parts"),
+        &auth,
+        json!({"parts":[{"partNumber":1,"size":compressed.len()}]}),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&uploaded)
-    );
-    let receipt = json!({"uploads":[{"sessionId":parent_id,"narHash":parent["narHash"],"narSize":raw.len(),"fileHash":file_hash,"fileSize":compressed.len(),"parts":[{"partNumber":1,"etag":serde_json::from_slice::<Value>(&uploaded).unwrap()["etag"]}]}]});
+    assert_eq!(status, StatusCode::OK, "{grants}");
+    let etag = upload_grant(&grants["parts"][0], &compressed).await;
+    let receipt = json!({"uploads":[{"sessionId":parent_id,"narHash":parent["narHash"],"narSize":raw.len(),"fileHash":file_hash,"fileSize":compressed.len(),"parts":[{"partNumber":1,"etag":etag}]}]});
     // Interrupt after the immutable receipt commits, before a candidate can
     // start. A restarted caller must recover without rewriting sealed parts.
     pool_execute(&pool, "CREATE FUNCTION reject_preparation_start() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
@@ -4153,6 +4178,7 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
 async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let config = Config {
@@ -4162,7 +4188,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         public_url: "https://cache.example.test".into(),
         ..Default::default()
     };
-    let storage = common::storage();
+    let storage = common::s3_storage();
     let state = AppState::new(
         pool.clone(),
         config.clone(),
@@ -4205,48 +4231,43 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     assert_eq!(grants.len(), 2);
     let mut receipts = Vec::new();
     for (i, (grant, bytes)) in grants.iter().zip(compressed.chunks(size)).enumerate() {
-        let url = reqwest::Url::parse(grant["url"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            url.origin().ascii_serialization(),
-            "https://cache.example.test"
-        );
-        assert_eq!(grant["headers"]["authorization"], "Bearer legacy");
-        let (status, headers, result) = send(
-            &app,
-            "PUT",
-            url.path(),
-            Some("legacy"),
-            &[("content-length", &bytes.len().to_string())],
-            bytes.to_vec(),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&result)
-        );
-        let result: Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(
-            headers[header::ETAG],
-            format!("\"{}\"", result["etag"].as_str().unwrap())
-        );
-        receipts.push(json!({"partNumber":i+1,"etag":result["etag"]}));
-        let mut changed = bytes.to_vec();
-        changed[0] ^= 1;
-        assert_eq!(
-            send(
-                &app,
-                "PUT",
-                url.path(),
-                Some("legacy"),
-                &[("content-length", &bytes.len().to_string())],
-                changed
-            )
+        let etag = upload_grant(grant, bytes).await;
+        receipts.push(json!({"partNumber":i+1,"etag":etag}));
+        // A changed, internally consistent HTTP length must fail S3 signature
+        // validation, not just fail locally in the HTTP client's encoder.
+        let mut wrong_length = grant.clone();
+        let headers = wrong_length["headers"].as_object_mut().unwrap();
+        let length = headers
+            .keys()
+            .find(|h| h.eq_ignore_ascii_case("content-length"))
+            .unwrap()
+            .clone();
+        headers.insert(length, json!((bytes.len() - 1).to_string()));
+        let denied = grant_request(&wrong_length, bytes[..bytes.len() - 1].to_vec())
+            .send()
             .await
-            .0,
-            StatusCode::CONFLICT
-        );
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut tampered = grant.clone();
+        let mut url = reqwest::Url::parse(grant["url"].as_str().unwrap()).unwrap();
+        let query: Vec<_> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                let value = if k == "partNumber" {
+                    "99".to_owned()
+                } else {
+                    v.into_owned()
+                };
+                (k.into_owned(), value)
+            })
+            .collect();
+        url.query_pairs_mut().clear().extend_pairs(query);
+        tampered["url"] = json!(url.as_str());
+        let denied = grant_request(&tampered, bytes.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
     assert_eq!(
         post(
@@ -4261,7 +4282,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     );
     let receipt = json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),"fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),"parts":receipts});
     let staging_keys: Vec<String> =
-        sqlx::query_scalar("SELECT storage_key FROM upload_parts WHERE session_id=$1")
+        sqlx::query_scalar("SELECT r2_upload_key FROM upload_sessions WHERE id=$1")
             .bind(id)
             .fetch_all(&pool)
             .await
@@ -4289,6 +4310,16 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     .await;
     assert_eq!(failed["results"][0]["published"], false, "{failed}");
     assert_eq!(failed["results"][0]["status"], 500, "{failed}");
+    let mut changed = receipt.clone();
+    changed["parts"][0]["etag"] = json!("not-the-sealed-etag");
+    let (_, rejected) = post(
+        &app,
+        "/_api/v1/uploads/finalize",
+        "legacy",
+        json!({"uploads":[changed]}),
+    )
+    .await;
+    assert_eq!(rejected["results"][0]["status"], 409, "{rejected}");
     pool_execute(
         &pool,
         "DROP TRIGGER fail_candidate ON nar_installations; DROP FUNCTION fail_candidate();",
@@ -4469,7 +4500,7 @@ async fn final_nar_digest_failure_cannot_complete_a_multipart_destination(pool: 
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let mut config = Config::from_env();
     config.shared_auth_token = Some("legacy".into());
-    let storage = snowstead_server::storage::Storage::new(&config).unwrap();
+    let storage = common::s3_storage();
     let state = AppState::new(
         pool.clone(),
         config,
@@ -4513,18 +4544,8 @@ async fn final_nar_digest_failure_cannot_complete_a_multipart_destination(pool: 
     assert_eq!(status, StatusCode::OK, "{reserved}");
     let mut receipts = Vec::new();
     for (i, bytes) in compressed.chunks(part_size).enumerate() {
-        let (status, _, body) = send(
-            &app,
-            "PUT",
-            &format!("/_api/v1/uploads/{id}/part/{}", i + 1),
-            Some("legacy"),
-            &[("content-length", &bytes.len().to_string())],
-            bytes.to_vec(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let uploaded: Value = serde_json::from_slice(&body).unwrap();
-        receipts.push(json!({"partNumber":i+1,"etag":uploaded["etag"]}));
+        let etag = upload_grant(&reserved["parts"][i], bytes).await;
+        receipts.push(json!({"partNumber":i+1,"etag":etag}));
     }
     let file_hash = hex::encode(Sha256::digest(&compressed));
     let (status, result) = tokio::time::timeout(std::time::Duration::from_secs(30), post(
@@ -4578,6 +4599,7 @@ async fn final_nar_digest_failure_cannot_complete_a_multipart_destination(pool: 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
 async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_boundary(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO caches(name) VALUES ('main'); INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
     let app = router(
@@ -4587,7 +4609,7 @@ async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_bounda
                 shared_auth_token: Some("legacy".into()),
                 ..Default::default()
             },
-            common::storage(),
+            common::s3_storage(),
             reqwest::Client::new(),
         )
         .unwrap(),
@@ -4606,7 +4628,7 @@ async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_bounda
         let input = path_input(&hash, &raw, false);
         let session = create(&app, "main", "legacy", input.clone()).await;
         let id = session["sessionId"].as_str().unwrap();
-        let (status, _) = post(
+        let (status, grants) = post(
             &app,
             &format!("/_api/v1/uploads/{id}/parts"),
             "legacy",
@@ -4614,21 +4636,11 @@ async fn batch_capacity_rejects_the_whole_incoming_set_and_retries_at_the_bounda
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _, bytes) = send(
-            &app,
-            "PUT",
-            &format!("/_api/v1/uploads/{id}/part/1"),
-            Some("legacy"),
-            &[("content-length", &compressed.len().to_string())],
-            compressed.clone(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        let etag = upload_grant(&grants["parts"][0], &compressed).await;
         receipts.push(
             json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),
             "fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),
-            "parts":[{"partNumber":1,"etag":result["etag"]}]}),
+            "parts":[{"partNumber":1,"etag":etag}]}),
         );
         total += compressed.len() as i64;
     }
@@ -4883,6 +4895,7 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
 async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollback(pool: PgPool) {
     use std::time::Duration;
 
@@ -4892,7 +4905,7 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
     )
     .await;
-    let storage = common::storage();
+    let storage = common::s3_storage();
     let mut apps = Vec::new();
     let mut pools = Vec::new();
     for _ in 0..2 {
@@ -4940,26 +4953,11 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{result}");
-        let (status, _, bytes) = send(
-            &apps[index],
-            "PUT",
-            &format!("/_api/v1/uploads/{id}/part/1"),
-            Some("legacy"),
-            &[("content-length", &compressed.len().to_string())],
-            compressed.clone(),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let part: Value = serde_json::from_slice(&bytes).unwrap();
+        let etag = upload_grant(&result["parts"][0], &compressed).await;
         receipts.push(
             json!({"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),
             "fileHash":hex::encode(Sha256::digest(&compressed)),"fileSize":compressed.len(),
-            "parts":[{"partNumber":1,"etag":part["etag"]}]}),
+            "parts":[{"partNumber":1,"etag":etag}]}),
         );
         files.push(compressed);
     }
@@ -5004,10 +5002,12 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         2
     );
     // A repeated preparation would now fail: its original byte sources are gone.
-    let sources: Vec<String> = sqlx::query_scalar("SELECT storage_key FROM upload_parts")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    let sources: Vec<String> = sqlx::query_scalar(
+        "SELECT r2_upload_key FROM upload_sessions WHERE r2_upload_id IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(sources.len(), 2);
     for key in sources {
         storage.delete(true, &key).await.unwrap();
@@ -5199,7 +5199,12 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
             vec![],
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "download {index}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         assert_eq!(bytes, files[index]);
     }
     let retained: (i64, i64) =
@@ -5684,20 +5689,10 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                 )
                 .await;
                 assert_eq!(status, StatusCode::OK, "{reserved}");
-                let (status, _, uploaded) = send(
-                    &app,
-                    "PUT",
-                    &format!("/_api/v1/uploads/{id}/part/1"),
-                    Some("legacy"),
-                    &[("content-length", &bytes.len().to_string())],
-                    bytes.clone(),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK);
-                let uploaded: Value = serde_json::from_slice(&uploaded).unwrap();
+                let etag = upload_grant(&reserved["parts"][0], bytes).await;
                 item["narHash"] = inputs[index]["narHash"].clone();
                 item["narSize"] = inputs[index]["narSize"].clone();
-                item["parts"] = json!([{"partNumber":1,"etag":uploaded["etag"]}]);
+                item["parts"] = json!([{"partNumber":1,"etag":etag}]);
             }
             uploads.push(item);
         }
@@ -6379,4 +6374,157 @@ async fn sealed_sessions_can_be_aborted_without_racing_publication(pool: PgPool)
             .unwrap();
         assert_eq!(reservations, 0, "round {round}");
     }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
+async fn direct_grants_preserve_org_isolation_integrity_and_abort(pool: PgPool) {
+    pool_execute(&pool, "INSERT INTO orgs(id,slug) VALUES ('org_a','alpha'),('org_b','beta');
+        INSERT INTO caches(name,org_id,is_public) VALUES ('vault','org_a',false),('vault','org_b',false);
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let storage = common::s3_storage();
+    let fresh = || {
+        router(
+            AppState::new(
+                pool.clone(),
+                config.clone(),
+                storage.clone(),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        )
+    };
+    let app = fresh();
+    let a = token(&pool, "org_a", "*").await;
+    let b = token(&pool, "org_b", "*").await;
+    let raw = nar(b"private direct upload fixture");
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
+    for (index, mode) in ["abort", "invalid-zstd", "wrong-file-hash"]
+        .into_iter()
+        .enumerate()
+    {
+        let input = path_input(&format!("{index:032}"), &raw, false);
+        let session = create(&app, "vault", &a, input.clone()).await;
+        let id = session["sessionId"].as_str().unwrap();
+        let marker: String =
+            sqlx::query_scalar("SELECT r2_upload_id FROM upload_sessions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(marker, id, "session creation must remain lazy");
+        let bytes = if mode == "invalid-zstd" {
+            vec![0; compressed.len()]
+        } else {
+            compressed.clone()
+        };
+        let reserve = format!("/_api/v1/uploads/{id}/parts");
+        let request = json!({"parts":[{"partNumber":1,"size":bytes.len()}]});
+        // No API credential, or another org's credential, can obtain a grant.
+        assert_eq!(
+            send(
+                &app,
+                "POST",
+                &reserve,
+                None,
+                &[("content-type", "application/json")],
+                serde_json::to_vec(&request).unwrap()
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post(&app, &reserve, &b, request.clone()).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, granted) = post(&app, &reserve, &a, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        let etag = upload_grant(&granted["parts"][0], &bytes).await;
+        // Simulate losing the reservation response and recreating app state.
+        // Re-reservation must reuse the adopted provider MPU, not discard bytes.
+        let restarted = fresh();
+        let (status, renewed) = post(&restarted, &reserve, &a, request).await;
+        assert_eq!(status, StatusCode::OK, "{renewed}");
+        let upload_id = |grant: &Value| {
+            reqwest::Url::parse(grant["url"].as_str().unwrap())
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "uploadId")
+                .unwrap()
+                .1
+                .into_owned()
+        };
+        assert_eq!(
+            upload_id(&granted["parts"][0]),
+            upload_id(&renewed["parts"][0])
+        );
+        assert_ne!(upload_id(&renewed["parts"][0]), id);
+        assert_eq!(upload_grant(&renewed["parts"][0], &bytes).await, etag);
+        let file_hash = if mode == "wrong-file-hash" {
+            "0".repeat(64)
+        } else {
+            hex::encode(Sha256::digest(&bytes))
+        };
+        let receipt = json!({"uploads":[{"sessionId":id,"narHash":input["narHash"],"narSize":raw.len(),"fileHash":file_hash,"fileSize":bytes.len(),"parts":[{"partNumber":1,"etag":etag}]}]});
+        let (_, foreign) = post(&restarted, "/_api/v1/uploads/finalize", &b, receipt.clone()).await;
+        assert_eq!(foreign["results"][0]["status"], 403, "{foreign}");
+        let abort = format!("/_api/v1/uploads/{id}/abort");
+        assert_eq!(
+            post(&restarted, &abort, &b, json!({})).await.0,
+            StatusCode::FORBIDDEN
+        );
+        if mode != "abort" {
+            let (_, invalid) =
+                post(&restarted, "/_api/v1/uploads/finalize", &a, receipt.clone()).await;
+            assert_eq!(invalid["results"][0]["status"], 400, "{invalid}");
+            assert_eq!(invalid["results"][0]["published"], false);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                post(&restarted, &abort, &a, json!({})).await.0,
+                StatusCode::OK
+            );
+        }
+        if mode == "abort" {
+            // Abort must cancel the actual provider upload, not only SQL.
+            let denied = grant_request(&granted["parts"][0], bytes)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+            assert!(denied.text().await.unwrap().contains("NoSuchUpload"));
+        }
+        let (_, rejected) = post(&restarted, "/_api/v1/uploads/finalize", &a, receipt).await;
+        assert_eq!(rejected["results"][0]["status"], 409, "{rejected}");
+        assert_eq!(
+            post(
+                &restarted,
+                &reserve,
+                &a,
+                json!({"parts":[{"partNumber":1,"size":compressed.len()}]})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM published_paths")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blob_objects")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
 }

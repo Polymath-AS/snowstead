@@ -9,7 +9,7 @@ use object_store::{
     Attribute, Attributes, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
     PutMultipartOptions, PutOptions,
     aws::{AmazonS3, AmazonS3Builder},
-    multipart::MultipartStore,
+    multipart::{MultipartStore, PartId},
     path::Path,
 };
 use sha2::{Digest, Sha256};
@@ -36,6 +36,7 @@ pub struct Storage {
     public: Arc<dyn ObjectStore>,
     private: Arc<dyn ObjectStore>,
     multipart: Option<[Arc<AmazonS3>; 2]>,
+    private_url: Option<reqwest::Url>,
     upload_memory: Arc<Semaphore>,
     max_part_size: usize,
 }
@@ -80,6 +81,11 @@ impl Storage {
             public: public.clone(),
             private: private.clone(),
             multipart: Some([public, private]),
+            private_url: Some(reqwest::Url::parse(&format!(
+                "{}/{}/",
+                config.r2_endpoint.trim_end_matches('/'),
+                config.r2_bucket_name
+            ))?),
             upload_memory: Arc::new(Semaphore::new(config.resources.upload_buffer_mib)),
             max_part_size: config.resources.upload_part_mib * MEMORY_UNIT,
         })
@@ -90,6 +96,7 @@ impl Storage {
             public,
             private,
             multipart: None,
+            private_url: None,
             upload_memory: Arc::new(Semaphore::new(ResourceLimits::default().upload_buffer_mib)),
             max_part_size: ResourceLimits::default().upload_part_mib * MEMORY_UNIT,
         }
@@ -100,8 +107,138 @@ impl Storage {
         self.max_part_size = limits.upload_part_mib * MEMORY_UNIT;
     }
 
-    /// Abort a persisted provider upload from before the runtime cutover.
-    /// Backends without this API must retain its SQL cleanup record for retry.
+    /// Start a private staging upload. Only the server can complete or abort it.
+    pub(crate) async fn create_multipart(&self, key: &str) -> io::Result<String> {
+        let stores = self.multipart.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Multipart uploads require S3 storage",
+            )
+        })?;
+        MultipartStore::create_multipart(&*stores[1], &object_path(key)?)
+            .await
+            .map_err(io_error)
+    }
+
+    pub(crate) async fn sign_part(
+        &self,
+        key: &str,
+        upload: &str,
+        number: i32,
+        size: i64,
+    ) -> io::Result<String> {
+        let stores = self.multipart.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Multipart uploads require S3 storage",
+            )
+        })?;
+        use aws_sigv4::{
+            http_request::{
+                PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+                SigningSettings, UriPathNormalizationMode, sign,
+            },
+            sign::v4,
+        };
+        let credentials = stores[1]
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(io_error)?;
+        let identity = aws_credential_types::Credentials::new(
+            &credentials.key_id,
+            &credentials.secret_key,
+            credentials.token.clone(),
+            None,
+            "static R2",
+        )
+        .into();
+        let mut url = self
+            .private_url
+            .clone()
+            .expect("S3 storage has an endpoint");
+        url.path_segments_mut()
+            .map_err(|_| io::Error::other("Invalid S3 endpoint"))?
+            .pop_if_empty()
+            .extend(
+                object_path(key)?
+                    .parts()
+                    .map(|part| part.as_ref().to_owned()),
+            );
+        url.query_pairs_mut()
+            .append_pair("partNumber", &number.to_string())
+            .append_pair("uploadId", upload);
+        // object_store deliberately excludes Content-Length from signing. AWS's
+        // signer binds it, so a grant cannot exceed its SQL staging reservation.
+        let mut settings = SigningSettings::default();
+        settings.signature_location = SignatureLocation::QueryParams;
+        settings.expires_in = Some(Duration::from_secs(900));
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region("auto")
+            .name("s3")
+            .time(std::time::SystemTime::now())
+            .settings(settings)
+            .build()
+            .map_err(|_| io::Error::other("Cannot initialize upload signer"))?
+            .into();
+        let length = size.to_string();
+        let request = SignableRequest::new(
+            "PUT",
+            url.as_str(),
+            [("content-length", length.as_str())].into_iter(),
+            SignableBody::UnsignedPayload,
+        )
+        .map_err(|_| io::Error::other("Cannot sign upload part"))?;
+        let (instructions, _) = sign(request, &params)
+            .map_err(|_| io::Error::other("Cannot sign upload part"))?
+            .into_parts();
+        for (name, value) in instructions.params() {
+            url.query_pairs_mut().append_pair(name, value);
+        }
+        Ok(url.to_string())
+    }
+
+    /// A lost completion response is reconciled against the immutable staging
+    /// object. The caller has already frozen the part receipts in PostgreSQL.
+    pub(crate) async fn complete_multipart(
+        &self,
+        key: &str,
+        upload: &str,
+        etags: Vec<String>,
+        size: u64,
+    ) -> io::Result<()> {
+        let stores = self.multipart.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Multipart uploads require S3 storage",
+            )
+        })?;
+        let parts = etags
+            .into_iter()
+            .map(|etag| PartId {
+                content_id: format!("\"{etag}\""),
+            })
+            .collect();
+        let result = MultipartStore::complete_multipart(
+            &*stores[1],
+            &object_path(key)?,
+            &upload.to_owned(),
+            parts,
+        )
+        .await;
+        if let Err(failure) = result {
+            match self.head(true, key).await {
+                Ok(object) if object.size == size => return Ok(()),
+                _ => return Err(io_error(failure)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Backends without this API must retain the SQL cleanup record for retry.
     #[cfg_attr(
         feature = "observability",
         tracing::instrument(

@@ -814,8 +814,8 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
                 anyhow::bail!("Legacy canonical source has no identity")
             }
         } else {
-            // Rust stores immutable part objects; its upload ID equals the
-            // session ID and is not an R2 MPU. TS rows carry real provider IDs.
+            // The session ID marks a multipart upload not yet initialized.
+            // All other upload IDs belong to the provider and need aborting.
             let upload = s
                 .r2_upload_id
                 .as_ref()

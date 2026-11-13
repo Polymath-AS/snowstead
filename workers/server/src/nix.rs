@@ -78,7 +78,6 @@ pub(crate) async fn write_access(
         "/_api/v1/uploads/{id}/inline" => "inline-upload",
         "/_api/v1/uploads/{id}/parts" => "reserve-upload-parts",
         "/_api/v1/uploads/{id}/abort" => "abort-upload-stream",
-        "/_api/v1/uploads/{id}/part/{number}" => "upload-part",
         "/_api/v1/caches/{cache}/push-jobs" => "create-push-job",
         "/_api/v1/caches/{cache}/push-jobs/{job}" => "push-job-manifest",
         "/_api/v1/caches/{cache}/push-jobs/{job}/manifest/{chunk}" => "push-manifest-chunk",

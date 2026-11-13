@@ -77,6 +77,58 @@ Self-hosters may explicitly set it to `"false"` to use
 caches need trust-overlap activation before publishing under hosted policy;
 do not silently replace a key clients already trust.
 
+### Presigned-upload cutover
+
+This release replaces relayed multipart bodies with direct S3 UploadPart grants.
+It needs no additional schema migration, bucket, public route, or CLI credential.
+Keep the existing private-bucket S3 endpoint and credentials. Clients must be
+able to reach that endpoint over HTTPS. The storage credential must permit
+multipart creation, part upload, completion, abort, read, and delete. Do not
+replace the S3 API endpoint with a public bucket or CDN hostname.
+
+Before activation:
+
+1. Build both release packages and run the real CLI proof below against disposable
+   Postgres and S3. This checks the packaged binaries, not only debug builds.
+2. Verify direct part signing and completion against an isolated R2 test bucket.
+   Local MinIO tests do not prove provider compatibility or production capacity.
+   Never run the normal server with a disposable database and live buckets: its
+   maintenance process can classify live objects as orphans.
+3. Stop new pushes and let current pushes finish, or cancel them through the
+   existing authenticated API. Cancellation is an operator action, not part of
+   deployment. Restart cancelled pushes after the upgrade.
+4. Deploy through `infra/deploy.sh`. It runs the candidate's read-only
+   `snowstead-server check-upload-cutover` with the runtime environment before
+   activation. The command reports the count of active relay sessions containing
+   uploaded parts and exits unsuccessfully until those sessions drain or are
+   cancelled. Server startup repeats the guard in case an old writer races the
+   preflight. Do not bypass it by editing upload receipts or provider IDs.
+
+To verify the release packages locally, from the repository root:
+
+```bash
+server=$(nix build --no-link --print-out-paths .#server)
+cli=$(nix build --no-link --print-out-paths .#default)
+SNOWSTEAD_TEST_SERVER="$server/bin/snowstead-server" \
+SNOWSTEAD_TEST_CLI="$cli/bin/snowstead" \
+nix develop --command env -u SNOWSTEAD_TEST_DATABASE_URL \
+  scripts/with-postgres.sh scripts/with-r2.sh \
+  node --test workers/server/test/cli.mjs
+```
+
+The proof uses default CLI concurrency, checks that multipart bytes bypass the
+API, verifies downloaded NARs against the local Nix store, and exercises restart
+and cutover refusal. It creates only disposable databases and buckets.
+
+After activation, run a bounded CLI push before resuming bulk uploads. Verify
+completion and a signed download, not only a successful part PUT. Do not log
+presigned URLs: they grant temporary write access to a reserved part.
+
+Before rolling back to a relay-only server, drain or abort direct-storage
+sessions with the new server. Old code cannot resume their provider uploads.
+Keep the database, published objects, and signing keys intact; prefer a forward
+fix if an upload or publication has an ambiguous result.
+
 ### Public caches on a custom domain
 
 Use the Rust origin as the substituter URL, including for public caches.

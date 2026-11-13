@@ -84,6 +84,8 @@ async function recovery(fault) {
   }
   const mcHome = await mkdtemp(join(tmpdir(), "snowstead-recovery-s3-"));
   let storageWork = 0;
+  let stagingCompletions = 0;
+  let lostStagingReplies = 0;
   let holdWrite = unconfirmed;
   let storedCandidate;
   let releaseWrite;
@@ -92,13 +94,34 @@ async function recovery(fault) {
     if ((url.pathname.includes("/nar/objects/") || url.pathname.includes("/staging/"))
       && ["GET", "PUT", "POST"].includes(incoming.method) && !url.searchParams.has("delete")) storageWork++;
     const forwarded = request(url, { method: incoming.method, headers: incoming.headers }, response => {
-      if (holdWrite && incoming.method === "PUT" && url.pathname.includes("/nar/objects/")) {
+      if (incoming.method === "POST" && url.pathname.includes("/staging/") && url.searchParams.has("uploadId")) {
+        // A retry may receive NoSuchUpload and reconcile the existing staged
+        // object with HEAD. Only count the successful provider completion.
+        if (response.statusCode === 200) {
+          stagingCompletions++;
+          if (lostStagingReplies === 0) {
+            // Storage has committed, but the server never sees its XML reply.
+            // Retry must reconcile NoSuchUpload with the staged object's HEAD.
+            lostStagingReplies++;
+            response.resume();
+            response.on("end", () => outgoing.destroy());
+            return;
+          }
+        }
+      }
+      // The process/lease fault targets only the final immutable object,
+      // after the lost staging-completion response has been reconciled.
+      const candidateWrite = url.pathname.includes("/nar/objects/")
+        && ((incoming.method === "PUT" && !url.searchParams.has("partNumber"))
+          || (incoming.method === "POST" && url.searchParams.has("uploadId")));
+      if (holdWrite && candidateWrite) {
         assert.equal(response.statusCode, 200);
+        const chunks = [];
+        response.on("data", chunk => chunks.push(chunk));
         response.on("end", () => {
           storedCandidate = url.pathname;
-          releaseWrite = () => { outgoing.writeHead(response.statusCode, response.headers); outgoing.end(); };
+          releaseWrite = () => { outgoing.writeHead(response.statusCode, response.headers); outgoing.end(Buffer.concat(chunks)); };
         });
-        response.resume();
         return;
       }
       outgoing.writeHead(response.statusCode, response.headers);
@@ -183,11 +206,23 @@ async function recovery(fault) {
     id = created.body.sessions[0].sessionId;
     const reserved = await post(origin, `/_api/v1/uploads/${id}/parts`, { parts: [{ partNumber: 1, size: compressed.length }] });
     assert.equal(reserved.status, 200, JSON.stringify(reserved));
-    const uploaded = await fetch(`${origin}/_api/v1/uploads/${id}/part/1`, {
-      method: "PUT", headers: { authorization: `Bearer ${env.AUTH_TOKEN}` }, body: compressed,
+    const [grant] = reserved.body.parts;
+    const grantUrl = new URL(grant.url);
+    assert.equal(grantUrl.origin, env.R2_ENDPOINT);
+    assert.ok(grantUrl.pathname.startsWith(`/${env.R2_BUCKET_NAME}/staging/${id}/`));
+    assert.ok(grantUrl.searchParams.has("uploadId"));
+    assert.equal(grantUrl.searchParams.get("partNumber"), "1");
+    assert.ok(grantUrl.searchParams.has("X-Amz-Signature"));
+    assert.ok(grantUrl.searchParams.get("X-Amz-SignedHeaders").split(";").includes("content-length"));
+    const grantHeaders = new Headers(grant.headers);
+    assert.equal(grantHeaders.has("authorization"), false);
+    assert.equal(grantHeaders.get("content-length"), String(compressed.length));
+    const uploaded = await fetch(grantUrl, {
+      method: "PUT", headers: grantHeaders, body: compressed,
     });
-    assert.equal(uploaded.status, 200);
-    const { etag } = await uploaded.json();
+    assert.equal(uploaded.status, 200, await uploaded.text());
+    const etag = uploaded.headers.get("etag")?.replace(/^"|"$/g, "");
+    assert.ok(etag, "S3 UploadPart must return its receipt in the ETag header");
     const receipt = { sessionId: id, narHash, narSize: raw.length, fileHash, fileSize: compressed.length,
       parts: [{ partNumber: 1, etag }] };
 
@@ -220,6 +255,8 @@ async function recovery(fault) {
       await delay(10);
     }
     const { rows: [candidate] } = await db.query("SELECT key,phase FROM nar_installations WHERE session_id=$1", [id]);
+    assert.equal(lostStagingReplies, 1, "must lose the committed staging upload's reply");
+    assert.equal(stagingCompletions, 1, "must reconcile staging completion without repeating the upload");
     assert.equal(candidate.phase, unconfirmed ? "preparing" : "ready");
     let before = storageWork;
     assert.ok(before > 0);

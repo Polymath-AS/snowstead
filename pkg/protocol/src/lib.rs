@@ -60,7 +60,6 @@ pub mod routes {
     pub const FINALIZE: &str = "/_api/v1/uploads/finalize";
     pub const INLINE_BATCH: &str = "/_api/v1/uploads/inline/batch";
     pub const SESSION_PARTS_ROUTE: &str = "/_api/v1/uploads/{id}/parts";
-    pub const PART_ROUTE: &str = "/_api/v1/uploads/{id}/part/{number}";
     pub const INLINE_ROUTE: &str = "/_api/v1/uploads/{id}/inline";
     pub const ABORT_ROUTE: &str = "/_api/v1/uploads/{id}/abort";
     pub const PUSH_JOBS_ROUTE: &str = "/_api/v1/caches/{cache}/push-jobs";
@@ -78,10 +77,6 @@ pub mod routes {
 
     pub fn upload_streams(cache: &str) -> String {
         format!("/_api/v1/caches/{cache}/upload-streams/batch")
-    }
-    /// Where a granted part is uploaded, relative to the server's origin.
-    pub fn part(session: &str, number: u32) -> String {
-        format!("/_api/v1/uploads/{session}/part/{number}")
     }
     pub fn abort(session: &str) -> String {
         format!("/_api/v1/uploads/{session}/abort")
@@ -1149,12 +1144,6 @@ mod tests {
         assert_eq!(
             routes::abort("s1"),
             routes::ABORT_ROUTE.replace("{id}", "s1")
-        );
-        assert_eq!(
-            routes::part("s1", 7),
-            routes::PART_ROUTE
-                .replace("{id}", "s1")
-                .replace("{number}", "7")
         );
         let job = |route: &str| route.replace("{cache}", "main").replace("{job}", "j");
         assert_eq!(routes::push_jobs("main"), job(routes::PUSH_JOBS_ROUTE));

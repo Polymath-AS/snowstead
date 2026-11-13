@@ -12,10 +12,10 @@ use axum::{
     Extension, Router,
     body::{Body, to_bytes},
     extract::{Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{StatusCode, header},
     middleware,
     response::Response,
-    routing::{post, put},
+    routing::post,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,6 @@ use snowstead_protocol::{
     UploadResults, UploadSession, limits, routes,
 };
 use sqlx::Acquire;
-use tokio::io::AsyncReadExt;
 
 use crate::{
     AppState,
@@ -66,7 +65,6 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             routes::SESSION_PARTS_ROUTE,
             post(reserve_parts).route_layer(write.clone()),
         )
-        .route(routes::PART_ROUTE, put(put_part).route_layer(write.clone()))
         .route(
             routes::INLINE_BATCH,
             post(inline_batch).route_layer(write.clone()),
@@ -178,6 +176,7 @@ struct Session {
     system: Option<String>,
     status: UploadStatus,
     r2_upload_id: Option<String>,
+    r2_upload_key: Option<String>,
     part_size: Option<i32>,
     staging_capacity: Option<i64>,
     org_id: String,
@@ -233,6 +232,7 @@ async fn load_sessions(
             u.system,
             u.status AS "status: UploadStatus",
             u.r2_upload_id,
+            u.r2_upload_key,
             u.part_size,
             u.staging_capacity,
             c.org_id,
@@ -725,8 +725,6 @@ async fn reserve(
     identity: &Identity,
     id: &str,
     value: Value,
-    origin: &str,
-    authorization: &Option<String>,
 ) -> Result<PartGrants, ApiError> {
     let s = load(&state.pool, id, identity).await?;
     if s.r2_upload_id.is_none() {
@@ -736,139 +734,75 @@ async fn reserve(
     let (mut tx, s) = locked(state, &s, identity).await?;
     reserve_tx(&mut tx, &s, &requested).await?;
     tx.commit().await?;
-    // reserve_tx admitted only part numbers in 1..=MAX_PARTS.
-    Ok(PartGrants {
-        parts: requested
-            .iter()
-            .map(|p| {
-                let number = p.part_number.unsigned_abs();
-                let mut headers = std::collections::BTreeMap::from([(
-                    "content-length".to_owned(),
-                    p.size.to_string(),
-                )]);
-                if let Some(auth) = authorization {
-                    headers.insert("authorization".to_owned(), auth.clone());
-                }
-                PartGrant {
-                    part_number: number,
-                    url: format!("{origin}{}", routes::part(id, number)),
-                    headers,
-                }
-            })
-            .collect(),
-    })
+    let s = initialize_multipart(state, identity, s).await?;
+    let key = s
+        .r2_upload_key
+        .as_deref()
+        .ok_or_else(|| error(409, "Missing staging upload"))?;
+    let mut parts = Vec::with_capacity(requested.len());
+    for part in requested {
+        parts.push(PartGrant {
+            part_number: part.part_number.unsigned_abs(),
+            url: state
+                .storage
+                .sign_part(
+                    key,
+                    s.r2_upload_id.as_deref().unwrap(),
+                    part.part_number,
+                    part.size,
+                )
+                .await
+                .map_err(io_error)?,
+            headers: std::collections::BTreeMap::from([(
+                "content-length".to_owned(),
+                part.size.to_string(),
+            )]),
+        });
+    }
+    Ok(PartGrants { parts })
 }
 
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn put_part(
-    State(state): State<AppState>,
-    Extension(identity): Extension<Identity>,
-    Path((id, number)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, ApiError> {
-    request_origin(&state, &request)?;
-    let number: i32 = number
-        .parse()
-        .map_err(|_| error(400, "Invalid part number"))?;
-    let state = &state;
-    let identity = &identity;
-    let id = id.as_str();
-    let s = load(&state.pool, id, identity).await?;
-    if s.status != UploadStatus::Streaming || s.r2_upload_id.is_none() {
-        return Err(error(409, "Conflict"));
+/// Initialize outside SQL locks, then adopt exactly one provider upload. A
+/// disconnected caller cannot abandon a provider upload between create and adopt.
+async fn initialize_multipart(
+    state: &AppState,
+    identity: &Identity,
+    s: Session,
+) -> Result<Session, ApiError> {
+    if s.r2_upload_id.as_deref() != Some(s.id.as_str()) {
+        return Ok(s);
     }
-    let grant = sqlx::query_scalar!(
-        r#"
-        SELECT size
-        FROM upload_parts
-        WHERE session_id = $1
-            AND part_number = $2
-        "#,
-        id,
-        number,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
-    let size = grant.ok_or_else(|| error(400, "Part must match its reserved content-length"))?;
-    if request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        != Some(size.to_string().as_str())
-    {
-        return Err(error(400, "Part must match its reserved content-length"));
-    }
-    // Bound transfers and completed writes waiting for receipt admission.
-    // This permit is not a database connection or an organization fence.
-    let _admission = state
-        .preparation_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| error(503, "Preparation queue full; retry"))?;
-    // The unique key belongs only to this transfer until its receipt commits.
-    let key = format!("staging/{id}/{}", uuid::Uuid::now_v7());
-    let etag = state
-        .storage
-        .write_body(true, &key, request.into_body(), size as u64)
-        .await?;
-    let mut commit_attempted = false;
-    let admitted = async {
-        let tx = crate::db::begin_queued(state, &s.org_id).await?;
-        let (mut tx, s) = lock_session(tx, &s, identity).await?;
-        if s.status != UploadStatus::Streaming {
-            return Err(error(409, "Conflict"));
-        }
-        let old = parts(&mut tx, id)
-            .await?
-            .into_iter()
-            .find(|p| p.part_number == number)
-            .ok_or_else(|| error(409, "Conflict"))?;
-        if let Some(previous) = old.etag {
-            if previous != etag {
-                return Err(error(409, "Uploaded part cannot change"));
+    let owned = state.clone();
+    let identity = identity.clone();
+    state.tasks.spawn(async move {
+        let key = format!("staging/{}/{}", s.id, uuid::Uuid::now_v7());
+        let upload = owned.storage.create_multipart(&key).await.map_err(io_error)?;
+        let mut commit_attempted = false;
+        let adopted = async {
+            let (mut tx, mut current) = locked(&owned, &s, &identity).await?;
+            if current.status != UploadStatus::Streaming {
+                return Err(error(409, "Conflict"));
             }
-            return Ok(false);
+            if current.r2_upload_id.as_deref() == Some(s.id.as_str()) {
+                sqlx::query("UPDATE upload_sessions SET r2_upload_id=$2,r2_upload_key=$3 WHERE id=$1")
+                    .bind(&s.id).bind(&upload).bind(&key).execute(&mut *tx).await?;
+                current.r2_upload_id = Some(upload.clone());
+                current.r2_upload_key = Some(key.clone());
+            }
+            commit_attempted = true;
+            tx.commit().await?;
+            Ok(current)
+        }.await;
+        // Never abort an ambiguously committed upload. Session expiry cleans up
+        // adopted uploads; the provider lifecycle reclaims unadopted uploads.
+        if matches!(&adopted, Ok(current) if current.r2_upload_id.as_deref() != Some(upload.as_str()))
+            || (adopted.is_err() && !commit_attempted)
+        {
+            sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) ON CONFLICT DO NOTHING")
+                .bind(&key).bind(&upload).execute(&owned.pool).await?;
         }
-        sqlx::query!(
-            r#"
-            UPDATE upload_parts
-            SET etag = $3,
-                storage_key = $4
-            WHERE session_id = $1
-                AND part_number = $2
-            "#,
-            id,
-            number,
-            &etag,
-            &key,
-        )
-        .execute(&mut *tx)
-        .await?;
-        commit_attempted = true;
-        tx.commit().await?;
-        Ok(true)
-    }
-    .await;
-    // A failed COMMIT acknowledgement is ambiguous: never delete a source
-    // which PostgreSQL may have durably admitted. Orphan cleanup is separate.
-    if matches!(admitted, Ok(false)) || (admitted.is_err() && !commit_attempted) {
-        let _ = state.storage.delete(true, &key).await;
-    }
-    admitted?;
-    // A part is granted, so its number is in 1..=MAX_PARTS.
-    let mut response = respond(
-        StatusCode::OK,
-        &ReceiptPart {
-            part_number: number.unsigned_abs(),
-            etag: etag.clone(),
-        },
-    );
-    response.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&format!("\"{etag}\""))
-            .map_err(|_| error(500, "Invalid storage receipt"))?,
-    );
-    Ok(response)
+        adopted
+    }).await.map_err(|_| error(500, "Multipart initialization failed"))?
 }
 
 trait ReceiptExt {
@@ -961,7 +895,7 @@ async fn seal(
         .await?;
         s.file_size = signed(receipt.file_size);
     }
-    let stored = parts(&mut tx, &s.id).await?;
+    let mut stored = parts(&mut tx, &s.id).await?;
     let mut input = receipt.parts.clone();
     input.sort_by_key(|p| p.part_number);
     if s.file_size != signed(receipt.file_size)
@@ -981,6 +915,20 @@ async fn seal(
     }
     if s.status != UploadStatus::Streaming && s.file_hash.as_deref() != Some(&receipt.file_hash) {
         return Err(error(409, "Sealed stream cannot change"));
+    }
+    if !inline && s.status == UploadStatus::Streaming {
+        if s.r2_upload_id.as_deref() == Some(s.id.as_str()) {
+            return Err(error(400, "Upload incomplete"));
+        }
+        let numbers: Vec<_> = stored.iter().map(|p| p.part_number).collect();
+        let etags: Vec<_> = input.iter().map(|p| p.etag.clone()).collect();
+        sqlx::query("UPDATE upload_parts p SET etag=i.etag,storage_key=$4 FROM UNNEST($2::integer[],$3::text[]) AS i(number,etag) WHERE p.session_id=$1 AND p.part_number=i.number")
+            .bind(&s.id).bind(&numbers).bind(&etags).bind(&s.r2_upload_key)
+            .execute(&mut *tx).await?;
+        for (part, receipt) in stored.iter_mut().zip(&input) {
+            part.etag = Some(receipt.etag.clone());
+            part.storage_key = s.r2_upload_key.clone();
+        }
     }
     if stored.iter().zip(&input).any(|(p, i)| {
         p.etag.as_deref() != Some(i.etag.as_str()) || (!inline && p.storage_key.is_none())
@@ -1014,57 +962,11 @@ async fn seal(
     Ok(prepared)
 }
 
-/// Read sealed parts in order, without materializing an assembled object.
-fn part_reader(
-    state: &AppState,
-    parts: &[Part],
-) -> Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, ApiError> {
-    let keys: Vec<String> = parts
-        .iter()
-        .map(|p| {
-            p.storage_key
-                .clone()
-                .ok_or_else(|| error(400, "Upload incomplete"))
-        })
-        .collect::<Result<_, _>>()?;
-    let storage = state.storage.clone();
-    let stream = futures_util::stream::try_unfold(
-        (
-            storage,
-            keys.into_iter(),
-            None::<crate::storage::StoredObject>,
-        ),
-        |(storage, mut keys, mut file)| async move {
-            loop {
-                if file.is_none() {
-                    let Some(key) = keys.next() else {
-                        return Ok::<_, std::io::Error>(None);
-                    };
-                    file = Some(storage.open(true, &key).await?);
-                }
-                let mut buffer = vec![0; 64 * 1024];
-                let n = file.as_mut().unwrap().reader.read(&mut buffer).await?;
-                if n == 0 {
-                    file = None;
-                    continue;
-                }
-                buffer.truncate(n);
-                return Ok(Some((
-                    axum::body::Bytes::from(buffer),
-                    (storage, keys, file),
-                )));
-            }
-        },
-    );
-    Ok(Box::new(tokio_util::io::StreamReader::new(Box::pin(
-        stream,
-    ))))
-}
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn verify(
     state: &AppState,
     s: &Session,
-    mut file: Box<dyn Read + Send>,
+    file: impl Future<Output = Result<Box<dyn Read + Send>, ApiError>>,
     output: Option<(
         tokio::sync::mpsc::Sender<axum::body::Bytes>,
         tokio::sync::oneshot::Sender<()>,
@@ -1078,6 +980,9 @@ async fn verify(
         .acquire_owned()
         .await
         .map_err(|_| error(503, "Verification unavailable"))?;
+    // Open the source only after admission. An R2 response has a running
+    // body deadline even while another verifier keeps us queued.
+    let mut file = file.await?;
     let expected_file = s
         .file_hash
         .clone()
@@ -1872,35 +1777,55 @@ async fn prepare(
                         verify(
                             &owned,
                             &ready.session,
-                            Box::new(std::io::Cursor::new(bytes.clone())),
+                            std::future::ready(Ok(Box::new(std::io::Cursor::new(bytes.clone()))
+                                as Box<dyn Read + Send>)),
                             None,
                         )
                         .await
                     }
                     PreparedSource::Parts(parts) => {
-                        let reader = part_reader(&owned, parts)?;
-                        let (send, receive) = tokio::sync::mpsc::channel(2);
-                        let (complete, completed) = tokio::sync::oneshot::channel();
-                        let bytes = stream::unfold(receive, |mut receive| async {
-                            receive
-                                .recv()
-                                .await
-                                .map(|bytes| (Ok::<_, std::io::Error>(bytes), receive))
-                        })
-                        .chain(stream::once(async {
-                            completed
-                                .await
-                                .map(|()| axum::body::Bytes::new())
-                                .map_err(|_| std::io::Error::other("Verification failed"))
-                        }));
                         with_preparation_lease(&owned, &ready, async {
+                            let source = ready
+                                .session
+                                .r2_upload_key
+                                .as_deref()
+                                .ok_or_else(|| error(409, "Missing staging upload"))?;
+                            owned
+                                .storage
+                                .complete_multipart(
+                                    source,
+                                    ready.session.r2_upload_id.as_deref().unwrap(),
+                                    parts.iter().map(|p| p.etag.clone().unwrap()).collect(),
+                                    ready.session.file_size as u64,
+                                )
+                                .await
+                                .map_err(io_error)?;
+                            let reader = async {
+                                let reader = owned
+                                    .storage
+                                    .open(true, source)
+                                    .await
+                                    .map_err(io_error)?
+                                    .reader;
+                                Ok(Box::new(tokio_util::io::SyncIoBridge::new(reader))
+                                    as Box<dyn Read + Send>)
+                            };
+                            let (send, receive) = tokio::sync::mpsc::channel(2);
+                            let (complete, completed) = tokio::sync::oneshot::channel();
+                            let bytes = stream::unfold(receive, |mut receive| async {
+                                receive
+                                    .recv()
+                                    .await
+                                    .map(|bytes| (Ok::<_, std::io::Error>(bytes), receive))
+                            })
+                            .chain(stream::once(async {
+                                completed
+                                    .await
+                                    .map(|()| axum::body::Bytes::new())
+                                    .map_err(|_| std::io::Error::other("Verification failed"))
+                            }));
                             let (verified, written) = tokio::join!(
-                                verify(
-                                    &owned,
-                                    &ready.session,
-                                    Box::new(tokio_util::io::SyncIoBridge::new(reader)),
-                                    Some((send, complete))
-                                ),
+                                verify(&owned, &ready.session, reader, Some((send, complete))),
                                 owned.storage.write_body(
                                     !ready.session.is_public,
                                     &ready.key,
@@ -2518,8 +2443,21 @@ async fn abort(
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    let provider = s.r2_upload_id.as_deref().filter(|upload| *upload != s.id);
+    if let (Some(key), Some(upload)) = (s.r2_upload_key.as_deref(), provider) {
+        sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) ON CONFLICT(is_private,key) DO UPDATE SET upload_id=EXCLUDED.upload_id")
+            .bind(key).bind(upload).execute(&mut *tx).await?;
+    }
     let old = parts(&mut tx, id).await?;
     tx.commit().await?;
+    if let (Some(key), Some(upload)) = (s.r2_upload_key.as_deref(), provider) {
+        state
+            .storage
+            .abort_multipart(true, key, upload)
+            .await
+            .map_err(io_error)?;
+        state.storage.delete(true, key).await.map_err(io_error)?;
+    }
     for key in old.into_iter().filter_map(|p| p.storage_key) {
         let _ = state.storage.delete(true, &key).await;
     }
@@ -2560,26 +2498,13 @@ async fn reserve_parts_batch(
     Extension(identity): Extension<Identity>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let origin = request_origin(&state, &request)?;
-    let authorization = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    request_origin(&state, &request)?;
     let body: ReservePartsBatch<Value> = json_body(request).await?;
     batch(&body.uploads)?;
     distinct(body.uploads.iter().map(|u| u.session_id.as_str()))?;
     let mut results = Vec::with_capacity(body.uploads.len());
     for u in body.uploads {
-        let r = reserve(
-            &state,
-            &identity,
-            &u.session_id,
-            u.parts,
-            &origin,
-            &authorization,
-        )
-        .await;
+        let r = reserve(&state, &identity, &u.session_id, u.parts).await;
         results.push(match r {
             Ok(grants) => ReservationResult {
                 session_id: u.session_id,
@@ -2646,195 +2571,15 @@ async fn reserve_parts(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let origin = request_origin(&state, &request)?;
-    let authorization = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    request_origin(&state, &request)?;
     let body: Reservations = json_body(request).await?;
-    let result = reserve(&state, &identity, &id, body.parts, &origin, &authorization).await?;
+    let result = reserve(&state, &identity, &id, body.parts).await?;
     Ok(respond(StatusCode::OK, &result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
-    #[ignore = "requires disposable Postgres via DATABASE_URL"]
-    async fn part_receipts_wait_without_retransfer_and_recheck_withdrawal(pool: sqlx::PgPool) {
-        use object_store::memory::InMemory;
-        use std::{sync::Arc, time::Duration};
-        use tower::ServiceExt;
-
-        sqlx::raw_sql(
-            "INSERT INTO caches(name) VALUES ('main');
-             INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let single = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with((*pool.connect_options()).clone())
-            .await
-            .unwrap();
-        let config = crate::config::Config {
-            shared_auth_token: Some("legacy".into()),
-            ..Default::default()
-        };
-        let storage = crate::storage::Storage::from_stores(
-            Arc::new(InMemory::new()),
-            Arc::new(InMemory::new()),
-        );
-        let state = AppState::new(
-            single,
-            config.clone(),
-            storage.clone(),
-            reqwest::Client::new(),
-        )
-        .unwrap();
-        let app = crate::router(state.clone());
-        let other = crate::router(
-            AppState::new(
-                pool.clone(),
-                config,
-                storage.clone(),
-                reqwest::Client::new(),
-            )
-            .unwrap(),
-        );
-        for id in ["waiting", "withdrawn", "disconnected"] {
-            sqlx::query(
-                "INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,
-                    nar_size,file_size,compression,status,r2_upload_id,part_size,expires_at)
-                 SELECT $1,id,repeat('1',32),'/nix/store/'||repeat('1',32)||'-part',
-                    'sha256:test',4,4,'zstd','streaming','parts',8388608,now()+interval '1 hour'
-                 FROM caches WHERE name='main'",
-            )
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO upload_parts(session_id,part_number,size) VALUES($1,1,4)")
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
-            let admission = state.sql_waiters.clone().acquire_owned().await.unwrap();
-            let request = Request::builder()
-                .method("PUT")
-                .uri(format!("/_api/v1/uploads/{id}/part/1"))
-                .header("host", "backend.local")
-                .header("authorization", "Bearer legacy")
-                .header("content-length", "4")
-                .body(Body::from("part"))
-                .unwrap();
-            let mut pending = tokio::spawn(app.clone().oneshot(request));
-            let prefix = format!("staging/{id}");
-            let keys = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let keys = storage.list(true, &prefix, None, 10).await.unwrap();
-                    if !keys.is_empty() {
-                        break keys;
-                    }
-                    assert!(
-                        !pending.is_finished(),
-                        "Part failed instead of waiting for SQL"
-                    );
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(keys.len(), 1);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(25), &mut pending)
-                    .await
-                    .is_err()
-            );
-            // Waiting for admission cannot borrow even the only pool connection.
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                sqlx::query("SELECT 1").execute(&state.pool),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            if id == "withdrawn" {
-                let response = other
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/_api/v1/uploads/{id}/abort"))
-                            .header("host", "backend.local")
-                            .header("authorization", "Bearer legacy")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-            }
-            if id == "disconnected" {
-                pending.abort();
-                assert!(pending.await.unwrap_err().is_cancelled());
-                drop(admission);
-                state.finish_background().await;
-                continue;
-            }
-            drop(admission);
-            let response = pending.await.unwrap().unwrap();
-            assert_eq!(
-                response.status(),
-                if id == "waiting" {
-                    StatusCode::OK
-                } else {
-                    StatusCode::CONFLICT
-                }
-            );
-            if id == "waiting" {
-                assert!(response.headers().contains_key(header::ETAG));
-                assert_eq!(storage.list(true, &prefix, None, 10).await.unwrap(), keys);
-            } else {
-                assert!(
-                    storage
-                        .list(true, &prefix, None, 10)
-                        .await
-                        .unwrap()
-                        .is_empty()
-                );
-            }
-        }
-        // Exhausted preparation capacity rejects before inspecting another body.
-        let _full = state
-            .preparation_slots
-            .clone()
-            .acquire_many_owned(state.preparation_slots.available_permits() as u32)
-            .await
-            .unwrap();
-        let unread = stream::poll_fn(
-            |_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
-                panic!("An unadmitted part must not consume its body")
-            },
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/_api/v1/uploads/disconnected/part/1")
-                    .header("host", "backend.local")
-                    .header("authorization", "Bearer legacy")
-                    .header("content-length", "4")
-                    .body(Body::from_stream(unread))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
 
     #[tokio::test]
     async fn verification_waits_before_inspecting_input() {
@@ -2868,6 +2613,7 @@ mod tests {
             system: None,
             status: UploadStatus::Streaming,
             r2_upload_id: None,
+            r2_upload_key: None,
             part_size: None,
             staging_capacity: None,
             org_id: String::new(),
@@ -2884,10 +2630,14 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .unwrap();
+        let opened = std::sync::atomic::AtomicBool::new(false);
         let mut pending = Box::pin(verify(
             &state,
             &session,
-            Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            async {
+                opened.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(std::io::Cursor::new(Vec::<u8>::new())) as Box<dyn Read + Send>)
+            },
             None,
         ));
         assert!(
@@ -2895,10 +2645,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst));
         drop(permit);
         // Releasing a slot lets the same request inspect its unsealed receipt
         // without retrying admission.
         assert_eq!(pending.await.unwrap_err().status, StatusCode::CONFLICT);
+        assert!(opened.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

@@ -82,8 +82,17 @@ async fn run_server() -> anyhow::Result<()> {
             pool.close().await;
             return Ok(());
         }
-        _ => anyhow::bail!("Usage: snowstead-server [migrate [--rebaseline]]"),
+        ["check-upload-cutover"] => {
+            migrations::check_upload_cutover(&pool).await?;
+            pool.close().await;
+            println!("Upload cutover ready: no active relayed parts");
+            return Ok(());
+        }
+        _ => {
+            anyhow::bail!("Usage: snowstead-server [migrate [--rebaseline] | check-upload-cutover]")
+        }
     }
+    migrations::check_upload_cutover(&pool).await?;
     let config = Config::from_env();
     config.validate_auth()?;
     if config.allow_legacy_web_admin {

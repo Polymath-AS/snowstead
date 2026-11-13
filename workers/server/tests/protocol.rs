@@ -558,13 +558,6 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
             None,
             StatusCode::NOT_FOUND,
         ),
-        (
-            "PUT",
-            "/_api/v1/uploads/absent/part/1",
-            "upload-part",
-            None,
-            StatusCode::NOT_FOUND,
-        ),
     ] {
         let (status, _, _) = request(&app, method, path, Some("legacy-secret"), json!({})).await;
         assert_eq!(status, expected, "{endpoint}");
@@ -588,6 +581,11 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     // Method/route and authentication failures never reach the TS audit hook.
     for (method, path, credential) in [
         ("PUT", "/_api/v1/uploads/parts", Some("legacy-secret")),
+        (
+            "PUT",
+            "/_api/v1/uploads/absent/part/1",
+            Some("legacy-secret"),
+        ),
         ("POST", "/_api/v1/unknown", Some("legacy-secret")),
         ("POST", "/_api/v1/get-missing-paths", None),
     ] {
@@ -597,7 +595,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(count, 9);
+    assert_eq!(count, 8);
     // Audit storage failure must not change the already determined response.
     sqlx::query("DROP TABLE audit_logs")
         .execute(&pool)

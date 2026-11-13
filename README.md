@@ -230,8 +230,32 @@ if a very large NAR needs larger parts. Codec memory is additional. Slow
 uploads pause compression; queued and retrying parts keep their buffer
 reservation, so retries reuse the same bytes without recompression.
 
-The server grants exact-size parts from a separate, bounded staging budget,
-then checks the final size, compressed hash, and receipts before publishing.
+The server reserves exact-size parts from a separate, bounded staging budget
+and grants 15-minute presigned S3 UploadPart URLs for a private staging upload.
+The CLI sends part bodies directly to storage, without API credentials or a
+server-side upload buffer. The signature binds the staging key, upload ID,
+part number, and Content-Length. Re-reserving parts renews their grants without
+replacing the provider upload. Small inline uploads still use the API.
+
+Finalization freezes the ordered part receipts in PostgreSQL before completing
+the private staging object. The server verifies the compressed size and hash
+and the decompressed NAR size and hash before publication. Completed or aborted
+provider uploads no longer accept their old grants. Abort and expiry reclaim
+staging uploads through the durable cleanup queue; R2's incomplete-upload
+lifecycle is the backstop for a crash during provider initialization (seven
+days by default). Presigned URLs are bearer credentials: do not log or share
+them. Revoking an API token prevents finalization but does not revoke an
+already-issued URL; aborting its provider upload does.
+
+Deployment replaces the old relayed-part upload path. Drain or cancel in-flight
+push jobs before upgrading, then restart any cancelled pushes; their old
+multipart sessions cannot resume against the direct-storage server. The deploy
+script runs the candidate's read-only `check-upload-cutover` command before
+activation. Startup repeats the check and refuses active relayed sessions with
+uploaded parts rather than discarding their bytes. Published NARs are unaffected.
+See [the rollout procedure](docs.md#presigned-upload-cutover) for verification
+and rollback limits.
+
 Publication owns a unique immutable NAR key before copying bytes, without a
 retained-byte reservation or a borrowed SQL connection. One short transaction
 then admits current capacity, evicts eligible least-recently-used entries
