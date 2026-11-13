@@ -53,6 +53,8 @@ pub(crate) async fn drain(state: AppState, stopped: CancellationToken) {
                 let mut counts = Counts::default();
                 record(&mut counts.push_jobs, &mut counts.failed_stages,
                     "push manifests", expire_manifests(&state).await);
+                record(&mut counts.sessions, &mut counts.failed_stages,
+                    "finalization batches", crate::uploads::expire_finalizations(&state).await);
                 record(&mut counts.orphan_objects, &mut counts.failed_stages,
                     "publication reservations", expire_installations(&state).await);
                 record(&mut counts.orphan_objects, &mut counts.failed_stages,

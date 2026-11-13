@@ -156,29 +156,31 @@ mod tests {
             }
             app.clone().oneshot(request.body(Body::empty()).unwrap())
         };
-        for version in [None, Some("1")] {
+        for version in [Some("2")] {
             let response = send(version).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()[protocol::PROTOCOL_VERSION_HEADER], "1");
+            assert_eq!(response.headers()[protocol::PROTOCOL_VERSION_HEADER], "2");
             assert_eq!(
                 response.headers()[protocol::MIN_PROTOCOL_VERSION_HEADER],
-                "1"
+                "2"
             );
         }
         for (version, message) in [
             ("0", "Upgrade the Snowstead CLI"),
-            ("2", "server is too old"),
+            ("1", "Upgrade the Snowstead CLI"),
+            ("3", "server is too old"),
             ("one", "invalid Snowstead protocol version"),
         ] {
             let response = send(Some(version)).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(response.headers()[protocol::PROTOCOL_VERSION_HEADER], "1");
+            assert_eq!(response.headers()[protocol::PROTOCOL_VERSION_HEADER], "2");
             let body = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
             let body: UnsupportedProtocol = serde_json::from_slice(&body).unwrap();
             assert!(body.error.contains(message), "{}", body.error);
-            assert_eq!((body.protocol_version, body.min_protocol_version), (1, 1));
+            assert_eq!((body.protocol_version, body.min_protocol_version), (2, 2));
         }
+        assert_eq!(send(None).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 }

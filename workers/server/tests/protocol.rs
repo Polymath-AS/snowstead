@@ -10,6 +10,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use common::router;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,6 @@ use snowstead_server::{
     AppState, auth,
     authz::{self, Action, Resource},
     config::Config,
-    router,
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -54,6 +54,10 @@ async fn request(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
+        .header(
+            snowstead_protocol::PROTOCOL_VERSION_HEADER,
+            snowstead_protocol::PROTOCOL_VERSION,
+        )
         .header("content-type", "application/json");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
@@ -477,6 +481,10 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
             Request::builder()
                 .method("POST")
                 .uri("/_api/v1/get-missing-paths")
+                .header(
+                    snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                    snowstead_protocol::PROTOCOL_VERSION,
+                )
                 .header("authorization", format!("Bearer {pull}"))
                 .header("cf-connecting-ip", "198.51.100.99")
                 .extension(axum::extract::ConnectInfo(

@@ -23,6 +23,7 @@ observability = [
 [dependencies]
 aes-gcm.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 aws-credential-types = "1.3.1"
 aws-sigv4 = "1.6.5"
 axum = { workspace = true, features = ["http1", "http2", "tokio", "json", "matched-path", "original-uri", "query"] }
@@ -32,6 +33,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
+http-body-util = "0.1"
 hotpath = { workspace = true, optional = true, features = ["hotpath"] }
 httpdate.workspace = true
 log = { version = "0.4", optional = true }
@@ -61,7 +63,6 @@ zeroize.workspace = true
 pkg-config.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 hegeltest.workspace = true
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
 prost = "0.14"

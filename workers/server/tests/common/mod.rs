@@ -3,6 +3,14 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use snowstead_server::storage::Storage;
 
+#[allow(dead_code)]
+pub fn router(state: snowstead_server::AppState) -> axum::Router {
+    // The last router clone owns discovery, not a self-retaining worker.
+    // Dropping a test host must release its pool before the next SQLx test.
+    let stop = Arc::new(state.start_upload_finalizers().drop_guard());
+    snowstead_server::router(state).layer(axum::Extension(stop))
+}
+
 pub fn storage() -> Storage {
     Storage::from_stores(Arc::new(InMemory::new()), Arc::new(InMemory::new()))
 }

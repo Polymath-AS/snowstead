@@ -72,6 +72,10 @@ async fn send(
             Request::builder()
                 .method(method)
                 .uri(path.as_str())
+                .header(
+                    snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                    snowstead_protocol::PROTOCOL_VERSION,
+                )
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))

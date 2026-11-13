@@ -3135,6 +3135,7 @@ dependencies = [
  "hex",
  "hmac",
  "hotpath",
+ "http-body-util",
  "httpdate",
  "log",
  "object_store",

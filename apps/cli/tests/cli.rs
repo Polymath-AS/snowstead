@@ -255,7 +255,7 @@ fn mock(status: u16, response: Value) -> (String, thread::JoinHandle<(String, Va
             serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
         };
         let body_text = response.to_string();
-        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}", body_text.len()).unwrap();
+        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}", body_text.len()).unwrap();
         (headers.lines().next().unwrap().into(), body)
     });
     (url, handle)
@@ -659,7 +659,7 @@ fn encoder_failure(inline: bool, json: bool) -> Output {
                 assert!(body["paths"][0].get("fileSize").is_none());
             }
             let body = response.to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
     });
     let mut paths = vec![bin];
@@ -831,7 +831,7 @@ fn inline_push_preserves_metadata_and_bytes_replays_lost_ack_without_parts() {
                 json!({"results":[{"sessionId":id,"published":true}]})
             };
             let response = response.to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
         }
     });
     let mut search = vec![bin];
@@ -957,7 +957,7 @@ fn multipart_progress_counts_acknowledged_bytes_once_and_waits_for_publication()
                     thread::sleep(Duration::from_millis(150));
                     json!({"results":[{"sessionId":"s1","published":publications == 2,"status":if publications == 2 {200} else {503}}]})
                 }.to_string();
-                write!(socket, "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nETag: fixture\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+                write!(socket, "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nETag: fixture\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
                 if publications == 2 {
                     assert_eq!(puts, 2);
                     return uploaded.unwrap();
@@ -1221,7 +1221,7 @@ fn streamed_session_creation(late_failure: bool) {
                     let body = response.to_string();
                     // A timed-out cleanup can close the connection before our
                     // deliberately stalled response is ready.
-                    let sent = write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nETag: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let sent = write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nETag: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     if !late_failure {
                         sent.unwrap();
                     }
@@ -1436,7 +1436,7 @@ fn sigterm_aborts_live_sessions_reports_the_summary_and_exits_130() {
                     json!({})
                 }
                 .to_string();
-                write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nSnowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\nContent-Length: {}\r\n\r\n{response}", response.len()).unwrap();
             }
             aborts
         }

@@ -16,9 +16,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// The protocol version this build speaks. Version 1 is the protocol deployed
 /// before versioning existed, so a request without a version header is
 /// treated as version 1.
-pub const PROTOCOL_VERSION: u32 = 1;
-/// The oldest client protocol version a server built from this crate serves.
-pub const MIN_PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Asynchronous finalization requires clients to poll accepted uploads.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
 /// Request header carrying the client's protocol version; response header
 /// carrying the newest version the server speaks.
 pub const PROTOCOL_VERSION_HEADER: &str = "snowstead-protocol-version";
@@ -58,6 +58,7 @@ pub mod routes {
     pub const UPLOAD_STREAMS_ROUTE: &str = "/_api/v1/caches/{cache}/upload-streams/batch";
     pub const UPLOAD_PARTS: &str = "/_api/v1/uploads/parts";
     pub const FINALIZE: &str = "/_api/v1/uploads/finalize";
+    pub const UPLOAD_STATUS: &str = "/_api/v1/uploads/status";
     pub const INLINE_BATCH: &str = "/_api/v1/uploads/inline/batch";
     pub const SESSION_PARTS_ROUTE: &str = "/_api/v1/uploads/{id}/parts";
     pub const INLINE_ROUTE: &str = "/_api/v1/uploads/{id}/inline";
@@ -577,6 +578,9 @@ fn is_false(value: &bool) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct UploadResult {
     pub session_id: String,
+    /// Nonterminal progress. A 202 response without `prepared` is not success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<UploadStage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_path_hash: Option<String>,
     #[serde(default)]
@@ -594,10 +598,34 @@ pub struct UploadResult {
     pub error: Option<String>,
 }
 
+/// The durable finalizer's current stage, not a promise of publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UploadStage {
+    Queued,
+    Verifying,
+    Publishing,
+}
+
+/// A bounded status read in request order. Polling never resubmits receipts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadStatusRequest {
+    pub sessions: Vec<String>,
+}
+
 impl UploadResult {
+    pub fn pending(session_id: &str, stage: UploadStage) -> Self {
+        Self {
+            stage: Some(stage),
+            status: Some(202),
+            error: None,
+            ..Self::failed(session_id, 202, "")
+        }
+    }
     pub fn published(session_id: &str, store_path_hash: &str) -> Self {
         Self {
             session_id: session_id.to_owned(),
+            stage: None,
             store_path_hash: Some(store_path_hash.to_owned()),
             published: true,
             prepared: false,
@@ -617,6 +645,7 @@ impl UploadResult {
     pub fn failed(session_id: &str, status: u16, error: &str) -> Self {
         Self {
             session_id: session_id.to_owned(),
+            stage: None,
             store_path_hash: None,
             published: false,
             prepared: false,
@@ -1017,6 +1046,10 @@ mod tests {
                 r#"{"prepared":true,"published":false,"sessionId":"s","status":202,"storePathHash":"h"}"#,
             ),
             (
+                UploadResult::pending("s", UploadStage::Queued),
+                r#"{"published":false,"sessionId":"s","stage":"queued","status":202}"#,
+            ),
+            (
                 UploadResult::failed("s", 503, "Installation busy"),
                 r#"{"error":"Installation busy","published":false,"sessionId":"s","status":503}"#,
             ),
@@ -1168,14 +1201,17 @@ mod tests {
 
     #[test]
     fn versions_negotiate_in_both_directions() {
-        assert_eq!(client_version(None), Ok(1), "deployed CLIs send no header");
+        assert_eq!(
+            client_version(None),
+            Err(ProtocolMismatch::ClientTooOld { client: 1, min: 2 })
+        );
         assert_eq!(
             client_version(Some(&PROTOCOL_VERSION.to_string())),
             Ok(PROTOCOL_VERSION)
         );
         assert_eq!(
             client_version(Some("0")),
-            Err(ProtocolMismatch::ClientTooOld { client: 0, min: 1 })
+            Err(ProtocolMismatch::ClientTooOld { client: 0, min: 2 })
         );
         let newer = PROTOCOL_VERSION + 1;
         assert_eq!(
@@ -1188,12 +1224,16 @@ mod tests {
         for bad in ["", "v1", "-1", "1.0", "99999999999"] {
             assert_eq!(client_version(Some(bad)), Err(ProtocolMismatch::Invalid));
         }
-        assert_eq!(
-            check_server(None, None),
-            Ok(()),
-            "servers predating versions"
-        );
-        assert_eq!(check_server(Some("1"), Some("1")), Ok(()));
+        for headers in [(None, None), (Some("1"), Some("1"))] {
+            assert_eq!(
+                check_server(headers.0, headers.1),
+                Err(ProtocolMismatch::ServerTooOld {
+                    client: 2,
+                    server: 1
+                })
+            );
+        }
+        assert_eq!(check_server(Some("2"), Some("2")), Ok(()));
         assert!(matches!(
             check_server(Some("9"), Some("9")),
             Err(ProtocolMismatch::ClientTooOld { min: 9, .. })
@@ -1212,7 +1252,7 @@ mod tests {
         assert!(too_new.contains("server is too old"), "{too_new}");
         assert_eq!(
             wire(&ProtocolInfo::current()),
-            r#"{"capabilities":["manifest","prepareOnly","completion","readiness","uploadStreams","inlineBatch"],"minProtocolVersion":1,"protocolVersion":1}"#
+            r#"{"capabilities":["manifest","prepareOnly","completion","readiness","uploadStreams","inlineBatch"],"minProtocolVersion":2,"protocolVersion":2}"#
         );
     }
 }

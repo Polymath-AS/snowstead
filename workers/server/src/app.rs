@@ -33,6 +33,8 @@ pub struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) http: reqwest::Client,
     pub(crate) tasks: TaskTracker,
+    finalization_stop: CancellationToken,
+    finalization_started: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) storage: storage::Storage,
     pub(crate) upstream_slots: Arc<Semaphore>,
     pub(crate) management_limits: Arc<management::ApiLimits>,
@@ -93,6 +95,8 @@ impl AppState {
             config: Arc::new(config),
             http,
             tasks: TaskTracker::new(),
+            finalization_stop: CancellationToken::new(),
+            finalization_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             upstream_slots: Arc::new(Semaphore::new(4)),
             management_limits: Arc::default(),
             protocol_limits: Arc::default(),
@@ -100,8 +104,27 @@ impl AppState {
         })
     }
 
-    /// Finish tracked work without closing the caller's shared database pool.
+    /// Start the durable multipart consumers once. Tower hosts and tests use
+    /// this same lifecycle as serve(), rather than a request-local shortcut.
+    pub fn start_upload_finalizers(&self) -> CancellationToken {
+        if self
+            .finalization_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return self.finalization_stop.clone();
+        }
+        for _ in 0..self.config.resources.verifications.clamp(1, 4) {
+            self.tasks.spawn(crate::uploads::run_finalizations(
+                self.clone(),
+                self.finalization_stop.clone(),
+            ));
+        }
+        self.finalization_stop.clone()
+    }
+
+    /// Stop discovery, then finish tracked work without closing shared SQL.
     pub async fn finish_background(&self) {
+        self.finalization_stop.cancel();
         self.tasks.close();
         self.tasks.wait().await;
     }
@@ -118,6 +141,7 @@ pub async fn serve(
     state
         .tasks
         .spawn(maintenance::drain(state.clone(), retry_stop.clone()));
+    state.start_upload_finalizers();
     for _ in 0..state.config.push_jobs.publication_workers {
         let worker_state = state.clone();
         let stopped = retry_stop.clone();
@@ -360,8 +384,9 @@ mod tests {
             }
             app.clone().oneshot(request.body(Body::empty()).unwrap())
         };
-        // Unversioned and current clients reach authentication, which refuses them.
-        for version in [None, Some("1")] {
+        // Only current clients reach authentication. Old and missing versions
+        // are rejected before credentials or request bodies are considered.
+        for version in [Some("2")] {
             let response = send(version).await.unwrap();
             assert!(
                 matches!(
@@ -371,7 +396,13 @@ mod tests {
                 "{}",
                 response.status()
             );
-            assert_eq!(response.headers()[PROTOCOL_VERSION_HEADER], "1");
+            assert_eq!(response.headers()[PROTOCOL_VERSION_HEADER], "2");
+        }
+        for version in [None, Some("1")] {
+            assert_eq!(
+                send(version).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
         }
         assert_eq!(
             send(Some("99")).await.unwrap().status(),

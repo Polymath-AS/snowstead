@@ -32,6 +32,10 @@ async fn call(app: &Router, path: &str, method: &str, value: Value) -> (StatusCo
             Request::builder()
                 .method(method)
                 .uri(path.as_str())
+                .header(
+                    snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                    snowstead_protocol::PROTOCOL_VERSION,
+                )
                 .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))
@@ -173,6 +177,10 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
             Request::builder()
                 .method("POST")
                 .uri(format!("/_api/v1/uploads/{id}/inline?fileHash={file_hash}"))
+                .header(
+                    snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                    snowstead_protocol::PROTOCOL_VERSION,
+                )
                 .header("authorization", "Bearer shared-token")
                 .header("content-length", compressed.len())
                 .body(Body::from(compressed.clone()))

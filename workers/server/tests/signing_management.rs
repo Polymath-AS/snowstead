@@ -106,6 +106,10 @@ async fn send(
     let mut builder = Request::builder()
         .method(method)
         .uri(path.as_str())
+        .header(
+            snowstead_protocol::PROTOCOL_VERSION_HEADER,
+            snowstead_protocol::PROTOCOL_VERSION,
+        )
         .header("content-type", "application/json");
     if let Some(credential) = &credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));

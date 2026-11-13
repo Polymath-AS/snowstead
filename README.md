@@ -280,8 +280,20 @@ The CLI sends `User-Agent: snowstead-cli/<version>` and its protocol version in
 the server's supported range in `Snowstead-Protocol-Version` and
 `Snowstead-Min-Protocol-Version`; an unsupported client gets HTTP 400 and the
 CLI says whether to upgrade itself or the server. Requests without the header
-are served as version 1. `GET /_api/v1/protocol` reports the range and
-capabilities without credentials.
+are treated as version 1 and refused by version-2 servers. Deploy the server
+and update the CLI together: version 2 makes multipart finalization asynchronous.
+`GET /_api/v1/protocol` reports the range and capabilities without credentials.
+
+Multipart finalization first seals the immutable receipts and records durable
+work in PostgreSQL, then returns HTTP 202. The CLI polls
+`POST /_api/v1/uploads/status` with `{"sessions":["<session-id>"]}` until each
+upload is published, prepared for its push job, or rejected. Queued and verifying
+results are not successful publications and do not spend the CLI's transport
+retry budget. Bounded workers recover accepted work after a restart without
+requiring the client to resubmit its receipt. Storage reads have a network-stall
+deadline, not a whole-transfer deadline that counts downstream backpressure.
+Integrity verification and publication fences still apply before bytes become
+available; asynchronous finalization does not bypass them.
 
 Legacy canonical installations keep a durable source/destination pin that
 never expires automatically. An operator must reconcile an ambiguous R2

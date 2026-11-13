@@ -8,7 +8,7 @@ use snowstead_protocol::{
     self as protocol, CreateSessions, CreatedSessions, Empty, FinalizeBatch, InlineEntry,
     InlineManifest, MissingPaths, MissingPathsRequest, PartGrant, PartRequest, PathInput, Receipt,
     ReceiptPart, ReservationResults, ReservePartsBatch, SessionParts, UploadResults, UploadSession,
-    limits, routes,
+    UploadStage, UploadStatusRequest, limits, routes,
 };
 use std::time::{Duration, Instant};
 
@@ -135,8 +135,10 @@ impl std::fmt::Display for HttpError {
 }
 impl std::error::Error for HttpError {}
 
-fn status_ok(operation: &str, response: Response) -> Result<Response> {
-    check_protocol(&response)?;
+fn status_ok(operation: &str, response: Response, versioned: bool) -> Result<Response> {
+    if versioned {
+        check_protocol(&response)?;
+    }
     if response.status().is_success() {
         Ok(response)
     } else {
@@ -144,7 +146,8 @@ fn status_ok(operation: &str, response: Response) -> Result<Response> {
     }
 }
 async fn decode<T: DeserializeOwned>(operation: &str, response: Response) -> Result<T> {
-    status_ok(operation, response)?
+    // Operator endpoints do not use the Nix upload protocol negotiation.
+    status_ok(operation, response, false)?
         .json()
         .await
         .map_err(|_| anyhow!("{operation}: invalid response"))
@@ -192,6 +195,7 @@ fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
 fn classify<E>(
     operation: &str,
     replay: Replay,
+    versioned: bool,
     result: std::result::Result<Response, E>,
 ) -> Attempt<Response> {
     let response = match result {
@@ -200,7 +204,7 @@ fn classify<E>(
         Err(_) => return Attempt::Fatal(anyhow!("{operation}: HTTP transport failed")),
     };
     // An incompatible server refuses every replay the same way.
-    if let Err(error) = check_protocol(&response) {
+    if versioned && let Err(error) = check_protocol(&response) {
         return Attempt::Fatal(error);
     }
     let status = response.status().as_u16();
@@ -212,7 +216,7 @@ fn classify<E>(
             after: retry_after(response.headers()),
         };
     }
-    match status_ok(operation, response) {
+    match status_ok(operation, response, versioned) {
         Ok(response) => Attempt::Done(response),
         Err(error) => Attempt::Fatal(error),
     }
@@ -301,6 +305,9 @@ struct Publication<'a, U> {
     /// A push job's client stores verified bytes and leaves publication to the job.
     prepares: bool,
     pending: Vec<(usize, &'a U)>,
+    accepted: Vec<(usize, &'a U)>,
+    polling: bool,
+    poll_delay: Duration,
     outcomes: Vec<Option<RowOutcome>>,
     budget: Budget,
     progress: Option<crate::progress::Progress>,
@@ -316,6 +323,9 @@ impl<'a, U: Upload> Publication<'a, U> {
             operation,
             prepares,
             pending: uploads.iter().enumerate().collect(),
+            accepted: Vec::new(),
+            polling: false,
+            poll_delay: Duration::from_millis(250),
             outcomes: vec![None; uploads.len()],
             budget: Budget::new(),
             progress,
@@ -348,6 +358,27 @@ impl<'a, U: Upload> Publication<'a, U> {
                     .into_iter()
                     .zip(data.results)
                 {
+                    if self.operation == "finalize"
+                        && row.status == Some(202)
+                        && !row.published
+                        && !row.prepared
+                        && row.error.is_none()
+                        && let Some(stage) = row.stage
+                    {
+                        if let Some(path) = self
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.path(upload.session_id()))
+                        {
+                            path.phase(match stage {
+                                UploadStage::Queued => "Queued for verification",
+                                UploadStage::Verifying => "Verifying",
+                                UploadStage::Publishing => "Publishing",
+                            });
+                        }
+                        self.accepted.push((index, upload));
+                        continue;
+                    }
                     let prepared = self.prepares
                         && row.prepared
                         && row.status == Some(202)
@@ -387,7 +418,11 @@ impl<'a, U: Upload> Publication<'a, U> {
                 }
                 self.pending = retry;
                 if self.pending.is_empty() {
-                    return Some(self.finish(Ok(())));
+                    return if self.poll_accepted().await {
+                        None
+                    } else {
+                        Some(self.finish(Ok(())))
+                    };
                 }
                 None
             }
@@ -415,13 +450,33 @@ impl<'a, U: Upload> Publication<'a, U> {
         }
         if self.budget.wait(after).await {
             None
+        } else if !self.accepted.is_empty() {
+            // Rejected admissions must not exhaust healthy, already accepted work.
+            for (index, _) in self.pending.drain(..) {
+                self.outcomes[index] = Some(RowOutcome::TransientExhausted);
+            }
+            self.poll_accepted().await;
+            None
         } else {
             Some(self.finish(Ok(())))
         }
     }
+    async fn poll_accepted(&mut self) -> bool {
+        if self.accepted.is_empty() {
+            return false;
+        }
+        self.pending = std::mem::take(&mut self.accepted);
+        self.polling = true;
+        // Successful status reads do not spend the transport-failure budget.
+        self.budget = Budget::new();
+        tokio::time::sleep(self.poll_delay).await;
+        self.poll_delay = (self.poll_delay * 2).min(Duration::from_secs(2));
+        true
+    }
     /// The batch itself fails only when no row resolved. Otherwise the rows
     /// still pending take the reason the batch stopped.
     fn finish(&mut self, stopped: Result<()>) -> Result<Vec<RowOutcome>> {
+        self.pending.append(&mut self.accepted);
         if self.outcomes.iter().all(Option::is_none) {
             match stopped {
                 Err(error) => return Err(error),
@@ -530,7 +585,7 @@ impl Client {
         let result = self
             .request(operation, Method::POST, path, Some(body))
             .await;
-        classify(operation, replay, result)
+        classify(operation, replay, true, result)
             .json(operation, replay)
             .await
     }
@@ -604,12 +659,28 @@ impl Client {
         );
         let path = self.prepare_only(routes::FINALIZE);
         loop {
-            let request = FinalizeBatch {
-                uploads: batch.pending().into_iter().cloned().collect(),
+            let attempt = if batch.polling {
+                let request = UploadStatusRequest {
+                    sessions: batch
+                        .pending()
+                        .iter()
+                        .map(|upload| upload.session_id.clone())
+                        .collect(),
+                };
+                self.post(
+                    "finalize status",
+                    Replay::Idempotent,
+                    routes::UPLOAD_STATUS,
+                    &request,
+                )
+                .await
+            } else {
+                let request = FinalizeBatch {
+                    uploads: batch.pending().into_iter().cloned().collect(),
+                };
+                self.post("finalize", Replay::Idempotent, &path, &request)
+                    .await
             };
-            let attempt = self
-                .post("finalize", Replay::Idempotent, &path, &request)
-                .await;
             if let Some(outcomes) = batch.settle(attempt).await {
                 return outcomes;
             }
@@ -667,7 +738,7 @@ impl Client {
             .body(body)
             .send()
             .await;
-        classify("inline upload", Replay::Idempotent, result)
+        classify("inline upload", Replay::Idempotent, true, result)
             .json("inline upload", Replay::Idempotent)
             .await
     }
@@ -677,6 +748,7 @@ impl Client {
             "abort",
             self.request("abort", Method::POST, &path, Some(body(&Empty {})?))
                 .await?,
+            true,
         )?;
         Ok(())
     }
@@ -856,7 +928,7 @@ impl Client {
                 ),
                 Err(_) => tracing::debug!(attempt = budget.attempt, "part PUT transport failed"),
             }
-            let attempt = classify("part upload", Replay::Idempotent, result);
+            let attempt = classify("part upload", Replay::Idempotent, false, result);
             if matches!(attempt, Attempt::Retry { .. })
                 && budget.attempt < ATTEMPTS
                 && let Some(progress) = &progress
@@ -987,7 +1059,7 @@ pub(crate) mod tests {
         (headers, body)
     }
     pub async fn reply(socket: &mut tokio::net::TcpStream, status: u16, body: &str, extra: &str) {
-        socket.write_all(format!("HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        socket.write_all(format!("HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSnowstead-Protocol-Version: {}\r\nSnowstead-Min-Protocol-Version: {}\r\n{extra}\r\n{body}", body.len(), protocol::PROTOCOL_VERSION, protocol::MIN_PROTOCOL_VERSION).as_bytes()).await.unwrap();
     }
     async fn upload_one(client: &Client, bytes: bytes::Bytes) -> Result<ReceiptPart> {
         let part = client
@@ -1480,7 +1552,11 @@ pub(crate) mod tests {
                         .unwrap();
                 let (headers, body) = read(&mut socket).await;
                 assert!(headers.starts_with("POST /_api/v1/"));
-                requests.push(serde_json::from_slice(&body).unwrap());
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                if request.get("sessions").is_some() {
+                    assert!(headers.starts_with("POST /_api/v1/uploads/status "));
+                }
+                requests.push(request);
                 if status != 0 {
                     reply(&mut socket, status, &response.to_string(), "").await;
                 }
@@ -1606,6 +1682,83 @@ pub(crate) mod tests {
         assert_eq!(requests[2], json!({"uploads":[uploads[1]]}));
         assert_eq!(requests[2], requests[3]);
     }
+    #[tokio::test]
+    async fn accepted_finalizations_poll_beyond_retry_budget_without_resubmitting_receipts() {
+        for prepares in [false, true] {
+            let pending = json!({"sessionId":"slow","status":202,"stage":"verifying"});
+            let mut responses = vec![(
+                202,
+                json!({"results":[
+                    {"sessionId":"fast","published":true}, pending.clone(),
+                    {"sessionId":"bad","status":400}
+                ]}),
+            )];
+            // Healthy progress is not a transport retry, even beyond four polls.
+            responses.extend((0..5).map(|_| (200, json!({"results":[pending.clone()]}))));
+            responses.push((0, Value::Null)); // A lost status read never replays finalize.
+            responses.push((
+                200,
+                json!({"results":[if prepares {
+                    json!({"sessionId":"slow","status":202,"prepared":true})
+                } else {
+                    json!({"sessionId":"slow","published":true})
+                }]}),
+            ));
+            let (mut client, server) = scripted(responses).await;
+            if prepares {
+                client.push_job = Some("job".into());
+            }
+            let uploads = [upload("fast"), upload("slow"), upload("bad")];
+            let outcomes = client.finalize(&uploads).await.unwrap();
+            assert_eq!(
+                outcomes,
+                [
+                    RowOutcome::Published,
+                    if prepares {
+                        RowOutcome::Prepared
+                    } else {
+                        RowOutcome::Published
+                    },
+                    RowOutcome::Rejected { status: 400 }
+                ]
+            );
+            let requests = server.await.unwrap();
+            assert_eq!(requests[0], json!({"uploads":uploads}));
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|r| *r == json!({"sessions":["slow"]}))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_admissions_do_not_exhaust_already_accepted_finalizations() {
+        let pending = json!({"sessionId":"accepted","status":202,"stage":"queued"});
+        let busy = json!({"sessionId":"busy","status":503});
+        let (client, server) = scripted(vec![
+            (202, json!({"results":[pending,busy.clone()]})),
+            (200, json!({"results":[busy.clone()]})),
+            (200, json!({"results":[busy.clone()]})),
+            (200, json!({"results":[busy]})),
+            (
+                200,
+                json!({"results":[{"sessionId":"accepted","published":true}]}),
+            ),
+        ])
+        .await;
+        let outcomes = client
+            .finalize(&[upload("accepted"), upload("busy")])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            [RowOutcome::Published, RowOutcome::TransientExhausted]
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests[4], json!({"sessions":["accepted"]}));
+    }
+
     #[tokio::test]
     async fn post_retries_are_bounded_and_ambiguous_creation_is_not_replayed() {
         let mut scenarios = vec![
@@ -1786,9 +1939,14 @@ pub(crate) mod tests {
     async fn requests_name_the_cli_and_protocol_and_refuse_incompatible_servers() {
         // (advertised range, status, what the CLI should say)
         for (range, status, expected) in [
-            ("", 200, None),
+            ("", 200, Some("server is too old")),
             (
                 "Snowstead-Protocol-Version: 1\r\nSnowstead-Min-Protocol-Version: 1\r\n",
+                200,
+                Some("server is too old"),
+            ),
+            (
+                "Snowstead-Protocol-Version: 2\r\nSnowstead-Min-Protocol-Version: 2\r\n",
                 200,
                 None,
             ),
@@ -1809,7 +1967,8 @@ pub(crate) mod tests {
                 let server = tokio::spawn(async move {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let (headers, _) = read(&mut socket).await;
-                    reply(&mut socket, status, r#"{"missing":[]}"#, range).await;
+                    let body = r#"{"missing":[]}"#;
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Length: {}\r\n{range}\r\n{body}",body.len()).as_bytes()).await.unwrap();
                     headers.to_ascii_lowercase()
                 });
                 (client, server)

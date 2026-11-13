@@ -9,10 +9,11 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use common::router;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use snowstead_server::{AppState, config::Config, router};
+use snowstead_server::{AppState, config::Config};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -45,6 +46,10 @@ async fn send(
     let mut request = Request::builder()
         .method(method)
         .uri(path)
+        .header(
+            snowstead_protocol::PROTOCOL_VERSION_HEADER,
+            snowstead_protocol::PROTOCOL_VERSION,
+        )
         .header("host", "backend.local");
     if let Some(token) = credential {
         let token = if token == OWNER {
@@ -75,6 +80,53 @@ async fn send(
 }
 
 async fn post(app: &Router, path: &str, credential: &str, body: Value) -> (StatusCode, Value) {
+    let (status, mut value) = post_raw(app, path, credential, body).await;
+    if !path.starts_with("/_api/v1/uploads/finalize") || status != StatusCode::ACCEPTED {
+        return (status, value);
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while value["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row.get("stage").is_some())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "finalization did not settle: {value}"
+        );
+        let sessions: Vec<_> = value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["sessionId"].clone())
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let (status, current) = post_raw(
+            app,
+            "/_api/v1/uploads/status",
+            credential,
+            json!({"sessions":sessions}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        // Admission failures are terminal even if that ID already has other
+        // work. Poll only the accepted slots, never replace a rejection.
+        for (old, new) in value["results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(current["results"].as_array().unwrap())
+        {
+            if old.get("stage").is_some() {
+                *old = new.clone();
+            }
+        }
+    }
+    (StatusCode::OK, value)
+}
+
+async fn post_raw(app: &Router, path: &str, credential: &str, body: Value) -> (StatusCode, Value) {
     let (status, _, bytes) = send(
         app,
         "POST",
@@ -1307,7 +1359,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
     pool_execute(&pool, "CREATE FUNCTION reject_preparation_start() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         RAISE EXCEPTION 'injected preparation startup failure'; END $$;
         CREATE TRIGGER reject_preparation_start BEFORE INSERT ON nar_installations FOR EACH ROW EXECUTE FUNCTION reject_preparation_start();").await;
-    let (_, interrupted) = post(
+    let (_, interrupted) = post_raw(
         &app,
         "/_api/v1/uploads/finalize?prepareOnly=true",
         &auth,
@@ -1318,8 +1370,12 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         interrupted["results"][0]["published"], false,
         "{interrupted}"
     );
-    assert_eq!(interrupted["results"][0]["status"], 500);
-    pool_execute(&pool, "DROP TRIGGER reject_preparation_start ON nar_installations; DROP FUNCTION reject_preparation_start();").await;
+    assert_eq!(interrupted["results"][0]["status"], 202);
+    wait_sql(
+        &pool,
+        "SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE failures>0)",
+    )
+    .await;
     let (_, recovery) = post(&fresh(), allocate, &auth, request.clone()).await;
     assert_eq!(recovery["sessions"][0]["status"], "finalizing");
     assert_eq!(recovery["sessions"][0]["prepared"], false);
@@ -1329,6 +1385,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
     recovered_receipt["narHash"] = parent["narHash"].clone();
     assert_eq!(recovered_receipt, receipt["uploads"][0]);
     assert!(recovery["sessions"][1]["receipt"].is_null());
+    pool_execute(&pool, "DROP TRIGGER reject_preparation_start ON nar_installations; DROP FUNCTION reject_preparation_start();").await;
     let (status, prepared) = post(
         &app,
         "/_api/v1/uploads/finalize?prepareOnly=true",
@@ -1359,7 +1416,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
         blocked["results"][0]["error"]
             .as_str()
             .unwrap()
-            .contains("prerequisites missing"),
+            .contains("intent cannot change"),
         "{blocked}"
     );
     assert_eq!(
@@ -3099,6 +3156,10 @@ async fn manifest_admission_bounds_bodies_without_blocking_uploads(pool: PgPool)
         let request = Request::builder()
             .method("POST")
             .uri(base)
+            .header(
+                snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                snowstead_protocol::PROTOCOL_VERSION,
+            )
             .header("authorization", format!("Bearer {auth}"))
             .body(Body::from_stream(stream))
             .unwrap();
@@ -3710,6 +3771,23 @@ async fn pool_execute(pool: &PgPool, sql: &'static str) {
     sqlx::raw_sql(sql).execute(pool).await.unwrap();
 }
 
+async fn wait_sql(pool: &PgPool, sql: &'static str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if sqlx::query_scalar::<_, bool>(sql)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SQL condition did not become true: {sql}"));
+}
+
 // Matches the incoming CLI's inline_frames: one header frame, then payload frames.
 fn inline_frame(uploads: &Value, payloads: &[Vec<u8>]) -> Vec<u8> {
     let manifest = serde_json::to_vec(&json!({"uploads":uploads})).unwrap();
@@ -4301,7 +4379,7 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     // The same immutable receipt must still finalize after the fault clears.
     pool_execute(&pool, "CREATE FUNCTION fail_candidate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected candidate allocation failure'; END $$;
         CREATE TRIGGER fail_candidate BEFORE INSERT ON nar_installations FOR EACH ROW EXECUTE FUNCTION fail_candidate();").await;
-    let (_, failed) = post(
+    let (_, failed) = post_raw(
         &app,
         "/_api/v1/uploads/finalize",
         "legacy",
@@ -4309,7 +4387,12 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     )
     .await;
     assert_eq!(failed["results"][0]["published"], false, "{failed}");
-    assert_eq!(failed["results"][0]["status"], 500, "{failed}");
+    assert_eq!(failed["results"][0]["status"], 202, "{failed}");
+    wait_sql(
+        &pool,
+        "SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE failures>0)",
+    )
+    .await;
     let mut changed = receipt.clone();
     changed["parts"][0]["etag"] = json!("not-the-sealed-etag");
     let (_, rejected) = post(
@@ -4320,16 +4403,13 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     )
     .await;
     assert_eq!(rejected["results"][0]["status"], 409, "{rejected}");
-    pool_execute(
-        &pool,
-        "DROP TRIGGER fail_candidate ON nar_installations; DROP FUNCTION fail_candidate();",
-    )
-    .await;
     // Publication and staging retirement must commit together. A cleanup
     // queue failure cannot publish the path or discard its reusable sources.
-    pool_execute(&pool, "CREATE FUNCTION fail_staging_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF starts_with(NEW.key,'staging/') THEN RAISE EXCEPTION 'injected staging retirement failure'; END IF; RETURN NEW; END $$;
-        CREATE TRIGGER fail_staging_retirement BEFORE INSERT ON object_cleanup FOR EACH ROW EXECUTE FUNCTION fail_staging_retirement();").await;
-    let (_, failed) = post(
+    pool_execute(&pool, "BEGIN;
+        CREATE FUNCTION fail_staging_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF starts_with(NEW.key,'staging/') THEN RAISE EXCEPTION 'injected staging retirement failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER fail_staging_retirement BEFORE INSERT ON object_cleanup FOR EACH ROW EXECUTE FUNCTION fail_staging_retirement();
+        DROP TRIGGER fail_candidate ON nar_installations; DROP FUNCTION fail_candidate(); COMMIT;").await;
+    let (_, failed) = post_raw(
         &app,
         "/_api/v1/uploads/finalize",
         "legacy",
@@ -4337,7 +4417,12 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     )
     .await;
     assert_eq!(failed["results"][0]["published"], false, "{failed}");
-    assert_eq!(failed["results"][0]["status"], 500, "{failed}");
+    assert_eq!(failed["results"][0]["status"], 202, "{failed}");
+    wait_sql(
+        &pool,
+        "SELECT EXISTS(SELECT 1 FROM nar_installations WHERE phase='ready')",
+    )
+    .await;
     assert_eq!(
         send(
             &app,
@@ -4364,9 +4449,6 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
         ),
         post(&app, "/_api/v1/uploads/finalize", "legacy", envelope),
     );
-    assert!(
-        first.1["results"][0]["published"] == true || second.1["results"][0]["published"] == true
-    );
     for (status, result) in [first, second] {
         assert_eq!(status, StatusCode::OK);
         let result = &result["results"][0];
@@ -4377,6 +4459,21 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
             "{result}"
         );
     }
+    // Both duplicate requests may meet the durable publisher's org fence.
+    // The original accepted work must still finish without another receipt.
+    wait_sql(
+        &pool,
+        "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE status='completed')",
+    )
+    .await;
+    let (_, published) = post_raw(
+        &app,
+        "/_api/v1/uploads/status",
+        "legacy",
+        json!({"sessions":[id]}),
+    )
+    .await;
+    assert_eq!(published["results"][0]["published"], true, "{published}");
     let retired: Vec<String> =
         sqlx::query_scalar("SELECT key FROM object_cleanup WHERE is_private AND key=ANY($1)")
             .bind(&staging_keys)
@@ -4970,30 +5067,43 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         .await
         .unwrap();
 
-    // NAR fences reject publication, but permit both servers to finish storage
-    // preparation. Each server has its own pool and local admission gates.
-    let mut blocked = pool.begin().await.unwrap();
-    for receipt in &receipts {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-            .bind(format!(
-                "nar:{}:zstd",
-                receipt["fileHash"].as_str().unwrap()
-            ))
-            .execute(&mut *blocked)
-            .await
-            .unwrap();
-    }
+    // Fail publication without holding the org fence across a blocked NAR
+    // lock. Both independent pools must be free to prepare their candidates.
+    pool_execute(
+        &pool,
+        "CREATE FUNCTION defer_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'publication deferred by fixture'; END $$;
+        CREATE TRIGGER defer_publication BEFORE INSERT ON published_paths
+        FOR EACH ROW EXECUTE FUNCTION defer_publication();",
+    )
+    .await;
     for (app, receipt) in apps.iter().zip(&receipts) {
-        let (status, result) = post(
-            app,
-            "/_api/v1/uploads/finalize",
-            "legacy",
-            json!({"uploads":[receipt]}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{result}");
-        assert_eq!(result["results"][0]["status"], 503, "{result}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, result) = post_raw(
+                app,
+                "/_api/v1/uploads/finalize",
+                "legacy",
+                json!({"uploads":[receipt]}),
+            )
+            .await;
+            if status == StatusCode::ACCEPTED {
+                assert_eq!(result["results"][0]["status"], 202, "{result}");
+                break;
+            }
+            assert_eq!(result["results"][0]["status"], 503, "{result}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "admission did not recover: {result}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
+    wait_sql(
+        &pool,
+        "SELECT count(*)=2 FROM nar_installations WHERE phase='ready'",
+    )
+    .await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nar_installations WHERE phase='ready'")
             .fetch_one(&pool)
@@ -5013,7 +5123,15 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         storage.delete(true, &key).await.unwrap();
         assert!(storage.head(true, &key).await.is_err());
     }
-    blocked.rollback().await.unwrap();
+    // Fence the already admitted workers before removing the publication fault.
+    // Wake each durable batch explicitly below, so automatic retries cannot
+    // race installation of the SQL barrier used by this proof.
+    pool_execute(&pool, "UPDATE upload_finalization_batches SET work_id=NULL,lease_expires_at=NULL,work_at='infinity'").await;
+    pool_execute(
+        &pool,
+        "DROP TRIGGER defer_publication ON published_paths; DROP FUNCTION defer_publication();",
+    )
+    .await;
 
     // Pause A after capacity admission, while it still owns the org fence.
     // Disable only this test trigger's lock timeout, so the barrier does not
@@ -5034,15 +5152,18 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         .execute(&mut *barrier)
         .await
         .unwrap();
+    pool_execute(&pool, "UPDATE upload_finalization_batches SET work_at=NOW() WHERE id IN (SELECT f.batch_id FROM upload_finalizations f JOIN upload_sessions u ON u.id=f.session_id WHERE u.store_path_hash=repeat('a',32))").await;
     let mut first = tokio::spawn({
         let app = apps[0].clone();
         let receipt = receipts[0].clone();
+        let pool = pool.clone();
         async move {
-            post(
+            wait_sql(&pool, "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE store_path_hash=repeat('a',32) AND status='completed')").await;
+            post_raw(
                 &app,
-                "/_api/v1/uploads/finalize",
+                "/_api/v1/uploads/status",
                 "legacy",
-                json!({"uploads":[receipt]}),
+                json!({"sessions":[receipt["sessionId"]]}),
             )
             .await
         }
@@ -5070,15 +5191,12 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
     })
     .await
     .expect("first publisher must reach the SQL barrier");
-    let (status, result) = post(
-        &apps[1],
-        "/_api/v1/uploads/finalize",
-        "legacy",
-        json!({"uploads":[receipts[1]]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["results"][0]["status"], 503, "{result}");
+    // Either server may own A's durable work, including the only connection
+    // behind apps[1]. Observe B through the independent SQL observer rather
+    // than blocking on that pool before releasing this deliberate SQL barrier.
+    let waiting: bool = sqlx::query_scalar("SELECT u.status='finalizing' AND n.phase='ready' FROM upload_sessions u JOIN nar_installations n ON n.session_id=u.id WHERE u.id=$1")
+        .bind(receipts[1]["sessionId"].as_str().unwrap()).fetch_one(&pool).await.unwrap();
+    assert!(waiting);
     barrier.rollback().await.unwrap();
     let (status, result) = tokio::time::timeout(Duration::from_secs(5), first)
         .await
@@ -5098,15 +5216,16 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         FOR EACH ROW EXECUTE FUNCTION fail_publication();",
     )
     .await;
-    let (status, result) = post(
+    pool_execute(&pool, "UPDATE upload_finalization_batches SET work_at=NOW(),failures=0 WHERE id IN (SELECT f.batch_id FROM upload_finalizations f JOIN upload_sessions u ON u.id=f.session_id WHERE u.store_path_hash=repeat('b',32))").await;
+    let (status, result) = post_raw(
         &apps[1],
         "/_api/v1/uploads/finalize",
         "legacy",
         json!({"uploads":[receipts[1]]}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["results"][0]["status"], 500, "{result}");
+    assert_eq!(status, StatusCode::ACCEPTED, "{result}");
+    wait_sql(&pool, "SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE failures>0 AND id IN (SELECT f.batch_id FROM upload_finalizations f JOIN upload_sessions u ON u.id=f.session_id WHERE u.store_path_hash=repeat('b',32)))").await;
     assert_eq!(
         send(
             &apps[0],
@@ -5133,13 +5252,12 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
             .unwrap(),
         1
     );
-    pool_execute(&pool, "DROP TRIGGER fail_publication ON published_paths;").await;
-
     // Pinning A makes B inadmissible. Raising the limit to the exact combined
     // size then admits B, still without its deleted staging bytes.
     let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", OWNER,
         json!({"name":"release","storePath":format!("/nix/store/{}-fixture", "a".repeat(32)),"keep":"forever"})).await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
+    pool_execute(&pool, "DROP TRIGGER fail_publication ON published_paths;").await;
     let (status, result) = post(
         &apps[1],
         "/_api/v1/uploads/finalize",
@@ -5754,6 +5872,12 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
                 pending.abort();
                 assert!(pending.await.unwrap_err().is_cancelled());
                 release.notify_one();
+                wait_sql(&pool, "SELECT count(*)=6 FROM published_paths p JOIN caches c ON c.id=p.cache_id WHERE c.name='multipart'").await;
+                // A persistent SQL fault remains pending rather than becoming
+                // a terminal 500. Its deadline must still stop that member
+                // without undoing the independent commits or rereading bytes.
+                sqlx::query("UPDATE upload_sessions SET expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+                    .bind(uploads[7]["sessionId"].as_str().unwrap()).execute(&pool).await.unwrap();
                 state.finish_background().await;
                 post(
                     &app,
@@ -5801,7 +5925,7 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
             } else if !inline && index == 3 {
                 assert_eq!(row["status"], 404, "{result}");
             } else if !inline && index == 7 {
-                assert_eq!(row["status"], 500, "{result}");
+                assert_eq!(row["status"], 404, "{result}");
                 assert_eq!(row["published"], false, "{result}");
             } else {
                 assert_eq!(row["published"], true, "{result}");

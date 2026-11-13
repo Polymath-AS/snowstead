@@ -272,6 +272,10 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/_api/v1/get-missing-paths")
+                    .header(
+                        snowstead_protocol::PROTOCOL_VERSION_HEADER,
+                        snowstead_protocol::PROTOCOL_VERSION.to_string(),
+                    )
                     .header("authorization", "Bearer legacy-secret")
                     .body(Body::from("not JSON"))
                     .unwrap(),

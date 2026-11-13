@@ -32,6 +32,10 @@ async fn call(
     let mut request = Request::builder()
         .method(method)
         .uri(path.as_str())
+        .header(
+            snowstead_protocol::PROTOCOL_VERSION_HEADER,
+            snowstead_protocol::PROTOCOL_VERSION,
+        )
         .header("content-type", "application/json");
     if let Some(token) = &token {
         request = request.header("authorization", format!("Bearer {token}"));
@@ -856,7 +860,10 @@ async fn raw(
     headers: &[(&str, &str)],
     body: &str,
 ) -> StatusCode {
-    let mut request = Request::builder().method(method).uri(path);
+    let mut request = Request::builder().method(method).uri(path).header(
+        snowstead_protocol::PROTOCOL_VERSION_HEADER,
+        snowstead_protocol::PROTOCOL_VERSION,
+    );
     for (name, value) in headers {
         request = request.header(*name, *value);
     }

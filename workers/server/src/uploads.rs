@@ -25,9 +25,14 @@ use snowstead_protocol::{
     self as protocol, Aborted, CreateSessions, CreatedSessions, FinalizeBatch, InlineEntry,
     InlineManifest, JobSession, PartGrant, PartGrants, PartRequest, Receipt, ReceiptPart,
     ReservationResult, ReservationResults, ReservePartsBatch, SessionStatus, UploadResult,
-    UploadResults, UploadSession, limits, routes,
+    UploadResults, UploadSession, UploadStage, UploadStatusRequest, limits, routes,
 };
 use sqlx::Acquire;
+
+mod finalization;
+pub(crate) use finalization::expire as expire_finalizations;
+pub(crate) use finalization::run as run_finalizations;
+use finalization::{enqueue_finalizations, status};
 
 use crate::{
     AppState,
@@ -61,6 +66,10 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             post(reserve_parts_batch).route_layer(write.clone()),
         )
         .route(routes::FINALIZE, post(finalize).route_layer(write.clone()))
+        .route(
+            routes::UPLOAD_STATUS,
+            post(status).route_layer(write.clone()),
+        )
         .route(
             routes::SESSION_PARTS_ROUTE,
             post(reserve_parts).route_layer(write.clone()),
@@ -1096,6 +1105,91 @@ impl Finalization {
     }
 }
 
+fn shared_generation(state: &AppState) -> Option<String> {
+    state.config.shared_auth_token.as_ref().map(|secret| {
+        let mut hash = Sha256::new();
+        hash.update(b"snowstead-finalization-delegation-v1\0");
+        hash.update(secret.as_bytes());
+        hex::encode(hash.finalize())
+    })
+}
+
+/// Call under the org fence, which also orders token revocation. Never store
+/// the bearer credential, and never trust middleware's old token snapshot.
+async fn finalization_authority(
+    state: &AppState,
+    tx: &mut Transaction,
+    identity: &Identity,
+    session: &Session,
+    delegated: bool,
+) -> Result<(), ApiError> {
+    use crate::authz::{ApiToken, CacheGrant, Permission};
+    match identity {
+        Identity::ApiToken(token) => {
+            #[derive(sqlx::FromRow)]
+            struct Grant {
+                org: String,
+                expires_at: Option<chrono::DateTime<chrono::Utc>>,
+                permissions: Vec<String>,
+                caches: Vec<i32>,
+                patterns: Vec<String>,
+            }
+            let grant: Grant = sqlx::query_as(
+                "SELECT COALESCE(t.org_id,'default') AS org,t.expires_at, \
+                 ARRAY(SELECT permission FROM token_permissions WHERE token_jti=t.jti) AS permissions, \
+                 ARRAY(SELECT cache_id FROM token_caches WHERE token_jti=t.jti AND cache_id IS NOT NULL) AS caches, \
+                 ARRAY(SELECT pattern FROM token_caches WHERE token_jti=t.jti AND pattern IS NOT NULL) AS patterns \
+                 FROM api_tokens t WHERE t.jti=$1 AND t.revoked_at IS NULL \
+                 AND (t.expires_at IS NULL OR t.expires_at>NOW())",
+            ).bind(&token.id).fetch_optional(&mut **tx).await?
+                .ok_or_else(|| error(401, "Token revoked or expired"))?;
+            let current = Identity::ApiToken(ApiToken {
+                id: token.id.clone(),
+                org: grant.org,
+                expires_at: grant.expires_at,
+                permissions: grant
+                    .permissions
+                    .iter()
+                    .filter_map(|p| Permission::parse(p))
+                    .collect(),
+                caches: grant
+                    .caches
+                    .into_iter()
+                    .map(CacheGrant::Id)
+                    .chain(grant.patterns.into_iter().map(CacheGrant::Pattern))
+                    .collect(),
+            });
+            decide(
+                &current,
+                Action::NixPush,
+                &Resource::cache(&session.org_id, session.cache_id, &session.name),
+            )
+            .map_err(|_| error(403, "Forbidden"))?;
+        }
+        Identity::SharedToken if shared_generation(state).is_some() => {}
+        _ => return Err(error(403, "Forbidden")),
+    }
+    if delegated && session.status != UploadStatus::Completed {
+        let active: Option<bool> = sqlx::query_scalar(
+            "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND \
+             (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND \
+             (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND \
+             ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false) \
+             FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id \
+             WHERE f.session_id=$1",
+        )
+        .bind(&session.id)
+        .bind(identity.actor())
+        .bind(shared_generation(state))
+        .fetch_optional(&mut **tx)
+        .await?;
+        if active == Some(false) {
+            return Err(error(401, "Finalization authorization expired or replaced"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn seal(
     state: &AppState,
@@ -1103,10 +1197,37 @@ async fn seal(
     session: &Session,
     receipt: &Receipt,
     bytes: Option<axum::body::Bytes>,
+    admission: Option<(&str, usize, bool)>,
 ) -> Result<Prepared, ApiError> {
     let inline = bytes.is_some();
     let nar_hash = receipt.validate()?;
     let (mut tx, mut s) = locked(state, session, identity).await?;
+    finalization_authority(state, &mut tx, identity, &s, admission.is_none()).await?;
+    if let Some((batch, _, prepare_only)) = admission {
+        let existing: Option<bool> = sqlx::query_scalar(
+            "SELECT b.prepare_only FROM upload_finalizations f JOIN upload_finalization_batches b \
+             ON b.id=f.batch_id WHERE f.session_id=$1",
+        )
+        .bind(&s.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some_and(|saved| saved != prepare_only) {
+            return Err(error(409, "Finalization intent cannot change"));
+        }
+        if existing.is_none() {
+            // The same org fence orders this append against recovery closing
+            // an abandoned admission. Never strand a late member in settled work.
+            let open: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE id=$1 AND NOT admitted)",
+            )
+            .bind(batch)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !open {
+                return Err(error(503, "Finalization admission closed; retry"));
+            }
+        }
+    }
     if (s.r2_upload_id.is_none()) != inline {
         return Err(error(409, "Conflict"));
     }
@@ -1214,6 +1335,27 @@ async fn seal(
         .await?;
         s.file_hash = Some(receipt.file_hash.clone());
         s.status = UploadStatus::Finalizing;
+    }
+    if let Some((batch, ordinal, _)) = admission {
+        sqlx::query(
+            "INSERT INTO upload_finalizations(session_id,batch_id,ordinal,receipt) \
+            VALUES($1,$2,$3,$4) ON CONFLICT(session_id) DO NOTHING",
+        )
+        .bind(&s.id)
+        .bind(batch)
+        .bind(ordinal as i32)
+        .bind(sqlx::types::Json(receipt))
+        .execute(&mut *tx)
+        .await?;
+        // An explicit retry may reconsider changed capacity. It cannot renew
+        // a deadline, replace the actor, or change immutable verification.
+        sqlx::query(
+            "WITH retried AS (UPDATE upload_finalizations f SET result=NULL \
+             FROM upload_finalization_batches b WHERE f.session_id=$1 AND b.id=f.batch_id \
+             AND b.actor=$2 AND b.expires_at>clock_timestamp() \
+             AND (f.result->>'status')::integer IN (413,507) RETURNING f.batch_id) \
+             UPDATE upload_finalization_batches SET work_at=NOW(),failures=0 WHERE id IN (SELECT batch_id FROM retried)",
+        ).bind(&s.id).bind(identity.actor()).execute(&mut *tx).await?;
     }
     let prepared = prepare_sealed(&mut tx, s, stored, bytes).await?;
     tx.commit().await?;
@@ -1329,11 +1471,13 @@ fn nar(s: &Session) -> Result<signing::Narinfo, ApiError> {
 /// or evict anything: both decisions belong to the publication transaction.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn allocate_candidate(
+    state: &AppState,
     tx: Transaction,
     identity: &Identity,
     s: &Session,
 ) -> Result<(String, String), ApiError> {
     let (mut tx, current) = lock_session(tx, s, identity).await?;
+    finalization_authority(state, &mut tx, identity, &current, true).await?;
     if current.status == UploadStatus::Completed {
         return Err(error(503, "Publication completed; retry for its result"));
     }
@@ -1486,6 +1630,17 @@ async fn publish_group(
             results.push(completed_result(current));
             continue;
         }
+        finalization_authority(state, &mut tx, identity, current, true).await?;
+        if let Some(expected) = &p.finalization_claim {
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM upload_finalizations f JOIN upload_finalization_batches b \
+                 ON b.id=f.batch_id WHERE f.session_id=$1 AND b.work_id=$2 \
+                 AND b.lease_expires_at>clock_timestamp() AND b.expires_at>clock_timestamp())",
+            ).bind(&s.id).bind(expected).fetch_one(&mut *tx).await?;
+            if !owned {
+                return Err(error(409,"Finalization claim expired or replaced"));
+            }
+        }
         if current.status != UploadStatus::Finalizing || current.file_hash != s.file_hash {
             return Err(error(409, "Conflict"));
         }
@@ -1604,7 +1759,15 @@ async fn publish_group(
         }
     }
     if let Some(limit) = limit {
-        crate::capacity::admit(&mut tx, org, limit, bytes, protect).await?;
+        let mut protected = protect.to_vec();
+        // Keep earlier successes from the same durable batch through retries.
+        let batch_paths: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT u.cache_id,u.store_path_hash FROM upload_finalizations f \
+             JOIN upload_sessions u ON u.id=f.session_id JOIN caches c ON c.id=u.cache_id \
+             WHERE c.org_id=$2 AND f.batch_id IN (SELECT batch_id FROM upload_finalizations WHERE session_id=ANY($1))",
+        ).bind(&ids).bind(org).fetch_all(&mut *tx).await?;
+        protected.extend(batch_paths);
+        crate::capacity::admit(&mut tx, org, limit, bytes, &protected).await?;
     }
     // Deduplicate blobs separately from paths: multiple paths may share bytes,
     // and one batch may need both public and private pointers to those bytes.
@@ -1689,6 +1852,7 @@ struct Prepared {
     source: PreparedSource,
     key: String,
     operation: String,
+    finalization_claim: Option<String>,
 }
 
 /// Discover a bounded dependency-closed set of prepared members. This is only a
@@ -1850,6 +2014,7 @@ pub(crate) async fn publish_job(
                 source: PreparedSource::Ready,
                 key: key.clone(),
                 operation: operation.clone(),
+                finalization_claim: None,
             })
         })
         .collect();
@@ -1883,12 +2048,21 @@ async fn prepare_sealed(
     parts: Vec<Part>,
     inline: Option<axum::body::Bytes>,
 ) -> Result<Prepared, ApiError> {
+    let finalization_claim: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT b.work_id FROM upload_finalizations f JOIN upload_finalization_batches b \
+         ON b.id=f.batch_id WHERE f.session_id=$1",
+    )
+    .bind(&s.id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
     if s.status == UploadStatus::Completed {
         return Ok(Prepared {
             session: s,
             source: PreparedSource::Ready,
             key: String::new(),
             operation: String::new(),
+            finalization_claim,
         });
     }
     // The seal authenticated this session and checked its immutable receipt.
@@ -1913,6 +2087,7 @@ async fn prepare_sealed(
             source: PreparedSource::Ready,
             key,
             operation,
+            finalization_claim,
         });
     }
     Ok(Prepared {
@@ -1920,6 +2095,7 @@ async fn prepare_sealed(
         source: inline.map_or(PreparedSource::Parts(parts), PreparedSource::Inline),
         key: String::new(),
         operation: String::new(),
+        finalization_claim,
     })
 }
 
@@ -1949,12 +2125,21 @@ async fn with_preparation_lease(
     ready: &Prepared,
     work: impl Future<Output = Result<(), ApiError>>,
 ) -> Result<(), ApiError> {
+    let remaining: f64 = sqlx::query_scalar(
+        "SELECT GREATEST(0,EXTRACT(EPOCH FROM LEAST(u.expires_at,b.expires_at)-clock_timestamp()))::double precision \
+         FROM upload_sessions u LEFT JOIN upload_finalizations f ON f.session_id=u.id \
+         LEFT JOIN upload_finalization_batches b ON b.id=f.batch_id WHERE u.id=$1",
+    ).bind(&ready.session.id).fetch_optional(&state.pool).await?
+        .ok_or_else(|| error(409,"Preparation expired or cancelled"))?;
+    let deadline = tokio::time::sleep(Duration::from_secs_f64(remaining));
+    tokio::pin!(deadline);
     let period = Duration::from_secs(20);
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(work);
     loop {
         tokio::select! {
+            _ = &mut deadline => return Err(error(401,"Preparation deadline expired")),
             result = &mut work => {
                 result?;
                 return confirm_candidate(state, ready).await;
@@ -2027,7 +2212,7 @@ async fn prepare(
                 // Revalidate and own the destination only when work starts.
                 let tx = crate::db::begin_queued(&owned, &ready.session.org_id).await?;
                 (ready.key, ready.operation) =
-                    allocate_candidate(tx, &identity, &ready.session).await?;
+                    allocate_candidate(&owned, tx, &identity, &ready.session).await?;
             }
             let result = async {
                 match &ready.source {
@@ -2163,7 +2348,7 @@ async fn finish_preparation(
         return Ok(ready);
     }
     let tx = crate::db::begin(state, &ready.session.org_id).await?;
-    (ready.key, ready.operation) = allocate_candidate(tx, identity, &ready.session).await?;
+    (ready.key, ready.operation) = allocate_candidate(state, tx, identity, &ready.session).await?;
     let PreparedSource::Inline(bytes) = &ready.source else {
         unreachable!("ready candidate has ownership")
     };
@@ -2278,7 +2463,7 @@ async fn finalize_batch(
             input.validate()?;
             let session = load(&state.pool, &id, identity).await?;
             options.validate(&session)?;
-            seal(state, identity, &session, &input, None).await
+            seal(state, identity, &session, &input, None, None).await
         }
         .await;
         match reserved {
@@ -2473,7 +2658,7 @@ async fn seal_inline(
             etag: input.file_hash.clone(),
         }],
     };
-    seal(state, identity, &s, &receipt, Some(bytes)).await
+    seal(state, identity, &s, &receipt, Some(bytes), None).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -2818,16 +3003,20 @@ async fn finalize(
             return Err(error(400, "Invalid stream receipt"));
         }
     }
-    let ids: Vec<_> = body.uploads.iter().map(|u| u.session_id.clone()).collect();
-    // Own the entire batch before allocating destinations. A disconnected
-    // caller must not strand its later, not-yet-streamed reservations.
+    // Admission is SQL-only. The durable batch survives both disconnects and
+    // process loss, including loss halfway through its individual seals.
     let owned = state.clone();
     let results = state
         .tasks
-        .spawn(async move { finalize_batch(&owned, &identity, body.uploads, options).await })
+        .spawn(async move { enqueue_finalizations(&owned, &identity, body.uploads, options).await })
         .await
-        .map_err(|_| error(500, "Finalization failed"))?;
-    Ok(respond(StatusCode::OK, &upload_results(results, &ids)))
+        .map_err(|_| error(500, "Finalization admission failed"))??;
+    let status = if results.results.iter().any(|row| row.stage.is_some()) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok(respond(status, &results))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]

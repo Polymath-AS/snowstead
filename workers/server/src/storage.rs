@@ -5,10 +5,15 @@ use axum::{
     http::StatusCode,
 };
 use futures_util::{Stream, StreamExt, TryStreamExt};
+use http_body_util::StreamBody;
 use object_store::{
-    Attribute, Attributes, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    Attribute, Attributes, ClientOptions, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
     PutMultipartOptions, PutOptions,
     aws::{AmazonS3, AmazonS3Builder},
+    client::{
+        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
+        HttpResponseBody, HttpService, ReqwestConnector,
+    },
     multipart::{MultipartStore, PartId},
     path::Path,
 };
@@ -30,6 +35,61 @@ const PART_SIZE: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_SIZE: u64 = 5 * 1024_u64.pow(4);
 // Bound aggregate application-owned part buffers, including large legal objects.
 const MEMORY_UNIT: usize = 1024 * 1024;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reqwest's read timer stays armed between polls, including while verification
+/// or destination uploads backpressure a GET. Time only demanded reads instead.
+#[derive(Debug)]
+struct StreamingConnector;
+
+impl HttpConnector for StreamingConnector {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        let options = options
+            .clone()
+            .with_timeout_disabled()
+            .with_read_timeout_disabled()
+            .with_connect_timeout(CONNECT_TIMEOUT);
+        Ok(HttpClient::new(StreamingTransport {
+            inner: ReqwestConnector::default().connect(&options)?,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct StreamingTransport {
+    inner: HttpClient,
+}
+
+fn network_timeout(error: tokio::time::error::Elapsed) -> HttpError {
+    HttpError::new(HttpErrorKind::Timeout, error)
+}
+
+#[async_trait::async_trait]
+impl HttpService for StreamingTransport {
+    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        // PUT bodies are already bounded, buffered parts. Bound sending those
+        // parts and waiting for headers, but never the lifetime of a GET body.
+        let response = tokio::time::timeout(NETWORK_TIMEOUT, self.inner.execute(request))
+            .await
+            .map_err(network_timeout)??;
+        let (parts, body) = response.into_parts();
+        let frames = futures_util::stream::try_unfold(body, |mut body| async move {
+            let frame =
+                tokio::time::timeout(NETWORK_TIMEOUT, http_body_util::BodyExt::frame(&mut body))
+                    .await
+                    .map_err(network_timeout)?;
+            frame
+                .transpose()
+                .map(|frame| frame.map(|frame| (frame, body)))
+        });
+        Ok(HttpResponse::from_parts(
+            parts,
+            HttpResponseBody::new(StreamBody::new(frames)),
+        ))
+    }
+}
 
 #[derive(Clone)]
 pub struct Storage {
@@ -71,6 +131,7 @@ impl Storage {
                 .with_secret_access_key(&config.r2_secret_access_key)
                 .with_virtual_hosted_style_request(false)
                 .with_allow_http(allow_http)
+                .with_http_connector(StreamingConnector)
                 .build()
                 .map_err(|_| anyhow::anyhow!("Cannot initialize R2 storage; check R2 settings"))?;
             Ok(Arc::new(store))
@@ -756,6 +817,180 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    #[ignore = "requires disposable S3: scripts/with-r2.sh cargo test -p snowstead-server storage_transport_disposable_s3 -- --ignored"]
+    async fn storage_transport_disposable_s3() {
+        let endpoint = std::env::var("SNOWSTEAD_TEST_R2_ENDPOINT")
+            .expect("run through scripts/with-r2.sh, never against production storage");
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        let config = Config::from_env();
+        assert_eq!(config.r2_endpoint, endpoint);
+        assert_eq!(config.r2_bucket_name, "snowstead-private");
+        assert_eq!(config.r2_public_bucket_name, "snowstead-public");
+        let storage = Storage::new(&config).unwrap();
+        let key = format!("transport/{}", uuid::Uuid::now_v7());
+        let expected = vec![42; 16 * MEMORY_UNIT];
+        storage.put(true, &key, &expected).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(45), async {
+            let mut object = storage.open(true, &key).await.unwrap();
+            let mut first = [0];
+            object.reader.read_exact(&mut first).await.unwrap();
+            assert_eq!(first, [42]);
+            tokio::time::sleep(Duration::from_secs(33)).await;
+            let mut rest = Vec::new();
+            object.reader.read_to_end(&mut rest).await.unwrap();
+            assert_eq!(rest, expected[1..]);
+        })
+        .await;
+        storage.delete(true, &key).await.unwrap();
+        result.unwrap();
+    }
+
+    // A disposable, loopback-only S3 GET fixture exercises the production
+    // Storage::new client, including signing, transport, and ranged retries.
+    // No external service or production credentials are used.
+    async fn streaming_storage(
+        stall: bool,
+        recover: bool,
+    ) -> (
+        Storage,
+        Arc<AtomicUsize>,
+        tokio_util::task::AbortOnDropHandle<()>,
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = axum::Router::new().route(
+            "/private/object",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    if stall && attempt > 0 && !recover {
+                        return axum::http::Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    let ranged = headers.contains_key(axum::http::header::RANGE);
+                    if ranged {
+                        assert_eq!(headers[axum::http::header::RANGE], "bytes=1-2");
+                    }
+                    let chunks =
+                        stream::unfold(if ranged { 1 } else { 0 }, move |index| async move {
+                            if index == 3 {
+                                return None;
+                            }
+                            if index > 0 && attempt == 0 {
+                                if stall {
+                                    std::future::pending::<()>().await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_secs(16)).await;
+                                }
+                            }
+                            Some((
+                                Ok::<_, io::Error>(Bytes::from(vec![b'a' + index])),
+                                index + 1,
+                            ))
+                        });
+                    let mut response = axum::http::Response::builder()
+                        .status(if ranged {
+                            StatusCode::PARTIAL_CONTENT
+                        } else {
+                            StatusCode::OK
+                        })
+                        .header("content-length", if ranged { "2" } else { "3" })
+                        .header("etag", "\"stable\"")
+                        .header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT");
+                    if ranged {
+                        response = response.header("content-range", "bytes 1-2/3");
+                    }
+                    response.body(Body::from_stream(chunks)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let config = Config {
+            r2_endpoint: endpoint,
+            r2_access_key_id: "test".into(),
+            r2_secret_access_key: "test-secret".into(),
+            r2_bucket_name: "private".into(),
+            r2_public_bucket_name: "public".into(),
+            ..Default::default()
+        };
+        (Storage::new(&config).unwrap(), requests, server)
+    }
+
+    #[tokio::test]
+    async fn storage_transport_allows_healthy_transfer_past_thirty_seconds() {
+        let (storage, requests, _server) = streaming_storage(false, false).await;
+        let start = tokio::time::Instant::now();
+        let bytes = tokio::time::timeout(Duration::from_secs(45), async {
+            storage
+                .private
+                .get(&Path::from("object"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes.as_ref(), b"abc");
+        assert!(start.elapsed() > Duration::from_secs(30));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn storage_transport_does_not_count_consumer_backpressure_as_a_stall() {
+        let (storage, requests, _server) = streaming_storage(false, false).await;
+        let mut stream = storage
+            .private
+            .get(&Path::from("object"))
+            .await
+            .unwrap()
+            .into_stream();
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"a");
+        // Longer than both the former whole-request deadline and read timeout.
+        tokio::time::sleep(Duration::from_secs(33)).await;
+        let rest = tokio::time::timeout(Duration::from_secs(5), stream.try_collect::<Vec<_>>())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest.concat(), b"bc");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn storage_transport_times_out_stalled_reads_and_retries_remaining_range() {
+        for recover in [true, false] {
+            let (storage, requests, _server) = streaming_storage(true, recover).await;
+            let start = tokio::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(45), async {
+                storage
+                    .private
+                    .get(&Path::from("object"))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+            })
+            .await
+            .unwrap();
+            assert!(start.elapsed() >= NETWORK_TIMEOUT);
+            if recover {
+                assert_eq!(result.unwrap().as_ref(), b"abc");
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct Observations {

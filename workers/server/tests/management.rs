@@ -30,6 +30,10 @@ async fn call(
     let request = Request::builder()
         .method(method)
         .uri(path)
+        .header(
+            snowstead_protocol::PROTOCOL_VERSION_HEADER,
+            snowstead_protocol::PROTOCOL_VERSION,
+        )
         .header("authorization", format!("Bearer {credential}"))
         .header("content-type", "application/json");
     let response = app

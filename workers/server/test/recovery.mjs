@@ -136,6 +136,7 @@ async function recovery(fault) {
     ALLOW_SHARED_AUTH_TOKEN: "true", AUTH_TOKEN: randomBytes(32).toString("hex"), ADMIN_SECRET: randomBytes(32).toString("hex"), WEB_ASSERTIONS_DISABLED: "true",    JWT_SECRET: "", SIGNING_MASTER_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "", ANALYTICS_TOKEN: "",
     TRUSTED_PROXY_IPS: "", PUBLIC_URL: "", UPSTREAM_CACHES: "",
+    MAX_ACTIVE_VERIFICATIONS: "2",
     DATABASE_MAX_CONNECTIONS: "1",
     R2_BUCKET_NAME: `recovery-private-${process.pid}-${fault}`, R2_PUBLIC_BUCKET_NAME: `recovery-public-${process.pid}-${fault}`,
     R2_ENDPOINT: `http://127.0.0.1:${proxy.address().port}`,
@@ -163,7 +164,7 @@ async function recovery(fault) {
   };
   const post = async (origin, path, body) => {
     const response = await fetch(`${origin}${path}`, {
-      method: "POST", headers: { authorization: `Bearer ${env.AUTH_TOKEN}`, "content-type": "application/json" },
+      method: "POST", headers: { authorization: `Bearer ${env.AUTH_TOKEN}`, "content-type": "application/json", "snowstead-protocol-version": "2" },
       body: JSON.stringify(body),
     });
     return { status: response.status, body: await response.json() };
@@ -236,9 +237,32 @@ async function recovery(fault) {
       FOR EACH ROW EXECUTE FUNCTION pause_publication()`);
       await db.query("BEGIN; SELECT pg_advisory_xact_lock(78432::bigint)");
     }
-    // Handle the expected disconnect immediately to avoid an unhandled rejection.
-    const pending = post(origin, "/_api/v1/uploads/finalize", { uploads: [receipt] })
-      .then(result => ({ result }), error => ({ error }));
+    // Admission must finish while verification/publication is still blocked.
+    const accepted = await post(origin, "/_api/v1/uploads/finalize", { uploads: [receipt] });
+    assert.equal(accepted.status, 202, JSON.stringify(accepted));
+    const [queued] = accepted.body.results;
+    assert.equal(queued.sessionId, id);
+    assert.equal(queued.status, 202);
+    assert.equal(queued.prepared ?? false, false);
+    assert.equal(queued.error, undefined);
+    assert.ok(["queued", "verifying", "publishing"].includes(queued.stage));
+    const status = async () => {
+      const result = await post(origin, "/_api/v1/uploads/status", { sessions: [id] });
+      assert.equal(result.status, 200, JSON.stringify(result));
+      assert.equal(result.body.results[0].sessionId, id);
+      return result;
+    };
+    const published = async () => {
+      const deadline = Date.now() + 30_000;
+      for (;;) {
+        const result = await status();
+        if (result.body.results[0].published) return result;
+        assert.equal(result.body.results[0].status, 202, JSON.stringify(result));
+        assert.equal(result.body.results[0].error, undefined);
+        assert.ok(Date.now() < deadline, "durable work must publish without resubmitting receipts");
+        await delay(25);
+      }
+    };
     const deadline = Date.now() + 10_000;
     let backend;
     for (;;) {
@@ -266,7 +290,6 @@ async function recovery(fault) {
       assert.equal(stored.status, 0, stored.stderr.toString());
       assert.deepEqual(stored.stdout, compressed, "the immutable object must exist before killing its writer");
       assert.deepEqual(await stop("SIGKILL"), [null, "SIGKILL"]);
-      assert.ok((await pending).error, "the original caller must lose its response");
       if (!unconfirmed) await db.query("ROLLBACK; DROP TRIGGER pause_publication ON published_paths");
       holdWrite = false;
       // PostgreSQL must observe the closed socket and roll back the abandoned
@@ -279,17 +302,18 @@ async function recovery(fault) {
       assert.equal((await db.query("SELECT count(*)::int AS n FROM published_paths")).rows[0].n, 0);
       assert.equal((await db.query("SELECT status FROM upload_sessions WHERE id=$1", [id])).rows[0].status, "finalizing");
       assert.deepEqual((await db.query("SELECT key,phase FROM nar_installations WHERE session_id=$1", [id])).rows[0], candidate);
-
+      // Simulate passage of the dead consumer's scheduling lease only. Keep
+      // ready candidate bytes and session/authorization deadlines unchanged.
+      await db.query(`UPDATE upload_finalization_batches SET lease_expires_at=NOW()-INTERVAL '1 second'
+        WHERE id=(SELECT batch_id FROM upload_finalizations WHERE session_id=$1)`, [id]);
       origin = await start();
-      const missing = await fetch(`${origin}/recovery/${hash}.narinfo`);
-      assert.equal(missing.status, 404, "uncommitted metadata must not survive the crash");
-      await missing.arrayBuffer();
     } else if (fault === "commit") {
+      // Cross the batch heartbeat while publication owns the only connection.
+      // Renewal must not stop polling the transaction which releases that slot.
+      await delay(21_000);
       await db.query("ROLLBACK");
-      const original = await pending;
+      await published();
       assert.equal(lostCommits, 1, "the committed publication must lose its SQL acknowledgement");
-      assert.equal(original.result?.status, 200, JSON.stringify(original));
-      assert.equal(original.result.body.results[0].published, true, JSON.stringify(original));
       assert.equal(storageWork, before, "singleton recovery must not repeat preparation");
       assert.equal((await db.query("SELECT status FROM upload_sessions WHERE id=$1", [id])).rows[0].status, "completed");
       await db.query("DROP TRIGGER pause_publication ON published_paths");
@@ -307,37 +331,40 @@ async function recovery(fault) {
           await delay(100);
         }
       }
-      const busy = await post(origin, "/_api/v1/uploads/finalize", { uploads: [receipt] });
-      assert.equal(busy.body.results[0].status, 503, JSON.stringify(busy));
+      const busy = await status();
+      assert.equal(busy.body.results[0].status, 202, JSON.stringify(busy));
       assert.equal(storageWork, before, "a live lease must prevent duplicate preparation");
       // Advance only the execution deadline, not session expiry. No sleep or
       // test-only runtime setting changes the production heartbeat interval.
       await db.query("UPDATE nar_installations SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE session_id=$1", [id]);
       holdWrite = false;
+      if (fault === "lease") {
+        // Let a second durable consumer replace the expired worker while its
+        // successful storage reply is still withheld. No HTTP replay is used.
+        await db.query(`UPDATE upload_finalization_batches SET lease_expires_at=NOW()-INTERVAL '1 second'
+          WHERE id=(SELECT batch_id FROM upload_finalizations WHERE session_id=$1)`, [id]);
+        await published();
+        releaseWrite();
+        // Graceful drain waits for the stale execution too, so the following
+        // checks prove it cannot adopt or retire its replacement after return.
+        assert.deepEqual(await stop("SIGTERM"), [0, null]);
+        origin = await start();
+      }
       if (fault === "prepare") {
         assert.deepEqual(await stop("SIGTERM"), [0, null]);
         origin = await start();
-        const expiryDeadline = Date.now() + 5_000;
-        while ((await db.query("SELECT key FROM nar_installations WHERE session_id=$1", [id])).rowCount) {
-          assert.ok(Date.now() < expiryDeadline, "maintenance must retire an expired execution without a client retry");
-          await delay(10);
-        }
       }
     }
-    const retried = await post(origin, "/_api/v1/uploads/finalize", { uploads: [receipt] });
+    const retried = await published();
     assert.equal(retried.status, 200, JSON.stringify(retried));
     assert.equal(retried.body.results[0].published, true, JSON.stringify(retried));
     if (unconfirmed) {
       assert.ok(storageWork > before, "unconfirmed preparation must be verified again");
       before = storageWork;
     } else assert.equal(storageWork, before, "a fresh process must not read or write prepared bytes again");
-    if (fault === "lease") {
-      releaseWrite();
-      const stale = await pending;
-      assert.equal(stale.result?.body.results[0].status, 409, JSON.stringify(stale));
-      assert.equal(stale.result.body.results[0].published, false);
-    }
-    const replayed = await post(origin, "/_api/v1/uploads/finalize", { uploads: [receipt] });
+    // Status is read-only: repeated observations cannot publish a second path
+    // or trigger verification, even after recovery in another process.
+    const replayed = await status();
     assert.deepEqual(replayed, retried);
     assert.equal(storageWork, before);
     const { rows: [totals] } = await db.query("SELECT path_count::int AS path_count,size::int AS size FROM caches WHERE name='recovery'");

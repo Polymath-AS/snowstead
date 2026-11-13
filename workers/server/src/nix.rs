@@ -74,6 +74,7 @@ pub(crate) async fn write_access(
         "/_api/v1/caches/{cache}/upload-streams/batch" => "create-upload-streams",
         "/_api/v1/uploads/parts" => "reserve-upload-parts-batch",
         "/_api/v1/uploads/finalize" => "finalize-upload-streams",
+        "/_api/v1/uploads/status" => "upload-stream-status",
         "/_api/v1/uploads/inline/batch" => "inline-upload-batch",
         "/_api/v1/uploads/{id}/inline" => "inline-upload",
         "/_api/v1/uploads/{id}/parts" => "reserve-upload-parts",

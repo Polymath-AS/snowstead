@@ -17,7 +17,7 @@ const exec = promisify(execFile);
 const cli = process.env.SNOWSTEAD_TEST_CLI ?? new URL("../../../target/debug/snowstead", import.meta.url).pathname;
 const serverBinary = process.env.SNOWSTEAD_TEST_SERVER ?? new URL("../../../target/debug/snowstead-server", import.meta.url).pathname;
 
-test("unchanged CLI uploads directly under bounded admission, verifies signed downloads, and resumes after restart", { timeout: 240_000 }, async t => {
+test("real CLI uploads directly under bounded admission, verifies signed downloads, and resumes after restart", { timeout: 240_000 }, async t => {
   const base = process.env.SNOWSTEAD_TEST_DATABASE_URL;
   assert.ok(base, "run via scripts/with-postgres.sh");
   assert.equal(process.env.R2_ENDPOINT, process.env.SNOWSTEAD_TEST_R2_ENDPOINT, "run via scripts/with-r2.sh");
@@ -43,15 +43,41 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
     UPLOAD_BUFFER_MIB: "32", MAX_UPLOAD_PART_MIB: "16", MAX_ACTIVE_VERIFICATIONS: "1",
     DATABASE_MAX_CONNECTIONS: "2", PUSH_JOB_PUBLICATION_WORKERS: "1", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info", PUBLIC_URL: "", UPSTREAM_CACHES: "" };
   let origin;
-  const traffic = { relay: 0, inline: 0, grants: 0, sessions: new Set(), errors: [] };
-  // Observe the API byte path, without proxying or buffering S3 traffic. Old
-  // relay grants fail both the URL assertions and the no-relay request count.
+  let stallVerification = false;
+  let verificationStalled = false;
+  let restarting = false;
+  const storageProxy = createServer((incoming, outgoing) => {
+    // Only the service's verification GET is stalled. CLI UploadPart requests
+    // and their signed headers pass through unchanged to disposable loopback S3.
+    if (stallVerification && incoming.method === "GET" && incoming.url.includes("/staging/")) {
+      verificationStalled = true;
+      return;
+    }
+    const upstream = request(new URL(incoming.url, process.env.SNOWSTEAD_TEST_R2_ENDPOINT), {
+      method: incoming.method, headers: incoming.headers,
+    }, response => {
+      outgoing.writeHead(response.statusCode, response.headers);
+      response.pipe(outgoing);
+    });
+    upstream.on("error", error => outgoing.destroy(error));
+    incoming.pipe(upstream);
+  });
+  storageProxy.listen(0, "127.0.0.1");
+  await once(storageProxy, "listening");
+  env.R2_ENDPOINT = `http://127.0.0.1:${storageProxy.address().port}`;
+  const traffic = { relay: 0, inline: 0, grants: 0, sessions: new Set(), errors: [], finalize: 0, accepted: 0, polls: 0, deadlines: 0 };
+  // Observe the API separately from streaming S3 traffic. Old relay grants
+  // fail both the URL assertions and the no-relay request count.
   const proxy = createServer((incoming, outgoing) => {
     if (/\/uploads\/[^/]+\/part\/\d+/.test(incoming.url)) traffic.relay++;
     if (/\/uploads\/(?:inline\/batch|[^/]+\/inline)/.test(incoming.url)) traffic.inline++;
+    if (incoming.url === "/_api/v1/uploads/finalize") traffic.finalize++;
+    if (incoming.url === "/_api/v1/uploads/status") traffic.polls++;
     const upstream = request(new URL(incoming.url, origin), {
       method: incoming.method, headers: incoming.headers,
+      signal: /\/_api\/v1\/uploads\/(finalize|status)$/.test(incoming.url) ? AbortSignal.timeout(2_000) : undefined,
     }, response => {
+      if (incoming.url === "/_api/v1/uploads/finalize" && response.statusCode === 202) traffic.accepted++;
       outgoing.writeHead(response.statusCode, response.headers);
       if (incoming.method === "POST" && /\/uploads\/(?:parts|[^/]+\/parts)$/.test(incoming.url)) {
         const chunks = [];
@@ -62,7 +88,7 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
             for (const item of body.results ?? [body]) {
               for (const grant of item.parts ?? []) {
                 const url = new URL(grant.url);
-                assert.equal(url.origin, new URL(process.env.SNOWSTEAD_TEST_R2_ENDPOINT).origin);
+                assert.equal(url.origin, env.R2_ENDPOINT);
                 assert.ok(url.pathname.startsWith(`/${env.R2_BUCKET_NAME}/`));
                 assert.ok(url.searchParams.has("uploadId"));
                 assert.ok(url.searchParams.has("partNumber"));
@@ -80,7 +106,12 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
       }
       response.pipe(outgoing);
     });
-    upstream.on("error", error => { traffic.errors.push(error.message); outgoing.destroy(error); });
+    upstream.on("error", error => {
+      if (error.name === "AbortError") traffic.deadlines++;
+      else if (!restarting) traffic.errors.push(error.message);
+      if (!outgoing.headersSent) outgoing.writeHead(error.name === "AbortError" ? 524 : 503);
+      outgoing.end();
+    });
     incoming.pipe(upstream);
   });
   proxy.listen(0, "127.0.0.1");
@@ -106,7 +137,7 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
   };
   try {
     // Restarts run orphan cleanup. Do not share buckets with another test DB.
-    const storage = new URL(env.R2_ENDPOINT);
+    const storage = new URL(process.env.SNOWSTEAD_TEST_R2_ENDPOINT);
     storage.username = env.R2_ACCESS_KEY_ID;
     storage.password = env.R2_SECRET_ACCESS_KEY;
     await exec("mc", ["--config-dir", join(home, "mc"), "mb",
@@ -163,12 +194,14 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
     // Nix versions return either an array of records or an object keyed by
     // store path. Select existing outputs only; never build or mutate fixtures.
     const outputs = Array.isArray(sizes) ? sizes : Object.entries(sizes).map(([path, info]) => ({ ...info, path }));
-    const directPaths = outputs.filter(info => Number(info.narSize) > 1024 * 1024)
+    const directPaths = outputs.filter(info => info.path !== path && Number(info.narSize) > 1024 * 1024)
       .sort((a, b) => Number(b.narSize) - Number(a.narSize) || a.path.localeCompare(b.path)).slice(0, 32);
     assert.ok(directPaths.length > 8, "nix develop closures must exercise more than eight multipart preparations");
     // Intentionally omit --jobs and retry overrides: exercise the production
     // CLI default of 32 with the unchanged completion batching/retry policy.
+    const directStarted = performance.now();
     const concurrent = await run("push", "direct", ...directPaths.map(info => info.path), "--no-deps");
+    const directElapsed = performance.now() - directStarted;
     assert.match(concurrent.stdout, new RegExp(`${directPaths.length} pushed, 0 skipped`));
     assert.equal(concurrent.stderr, "");
     assert.deepEqual(traffic.errors, []);
@@ -176,7 +209,8 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
     assert.equal(traffic.inline, 0, "large immutable fixtures must exercise multipart, not inline");
     assert.ok(traffic.grants > directPaths.length, "must exercise multi-part NARs as well as concurrent outputs");
     assert.equal(traffic.sessions.size, directPaths.length, "every concurrent path must upload directly");
-    t.diagnostic(`direct upload: ${directPaths.length} immutable outputs, ${traffic.grants} S3 grants, zero relay/inline API uploads, default jobs=32`);
+    const narMiB = directPaths.reduce((sum, info) => sum + Number(info.narSize), 0) / 1024 ** 2;
+    t.diagnostic(`direct upload: ${directPaths.length} immutable outputs, ${narMiB.toFixed(1)} MiB NAR input in ${(directElapsed / 1000).toFixed(2)}s, ${traffic.grants} S3 grants, zero relay/inline API uploads, default jobs=32`);
     for (const output of directPaths) {
       const storePath = output.path;
       const response = await fetch(`${url}/direct/${storePath.split("/").at(-1).slice(0, 32)}.narinfo`);
@@ -193,9 +227,49 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
       assert.equal(`sha256:${createHash("sha256").update(bytes).digest("hex")}`, field("FileHash"), storePath);
       assert.equal(await digest("zstd", ["-d", "-q", "-c"], bytes), await digest("nix-store", ["--dump", storePath]), storePath);
     }
-    const pushed = await run("push", "native", path, "--no-deps", "--jobs", "2");
+    // Keep the real CLI alive across an actual service crash after durable
+    // acceptance, while verification has not read even one staged byte.
+    stallVerification = true;
+    const beforeRestart = { finalize: traffic.finalize, accepted: traffic.accepted, polls: traffic.polls };
+    let pushFinished = false;
+    const pendingPush = run("push", "native", path, "--no-deps", "--jobs", "2")
+      .then(result => ({ result }), error => ({ error }))
+      .finally(() => { pushFinished = true; });
+    const stallDeadline = Date.now() + 20_000;
+    while (!verificationStalled || traffic.accepted === beforeRestart.accepted) {
+      assert.equal(pushFinished, false, "CLI must wait for durable completion");
+      assert.ok(Date.now() < stallDeadline, "verification must reach the loopback storage barrier");
+      await setTimeout(25);
+    }
+    // Longer than the proxy's entire HTTP deadline, not just the CLI's retry
+    // interval: a blocking finalize would receive 524 here.
+    await setTimeout(2_250);
+    assert.equal(pushFinished, false);
+    assert.ok(traffic.polls > beforeRestart.polls, "CLI must poll accepted work");
+    assert.equal(traffic.deadlines, 0, "acceptance and polling must beat the short API deadline");
+    restarting = true;
+    server.kill("SIGKILL");
+    assert.deepEqual(await closed, [null, "SIGKILL"]);
+    server = undefined;
+    storageProxy.closeAllConnections();
+    stallVerification = false;
+    const recovery = new Client({ connectionString: database.toString() });
+    await recovery.connect();
+    try {
+      // Advance only dead execution leases, not retained data or delegation.
+      await recovery.query(`UPDATE upload_finalization_batches SET lease_expires_at=NOW()-INTERVAL '1 second';
+        UPDATE nar_installations SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE phase='preparing'`);
+    } finally { await recovery.end(); }
+    url = await start();
+    restarting = false;
+    const outcome = await pendingPush;
+    assert.ifError(outcome.error);
+    const pushed = outcome.result;
     assert.match(pushed.stdout, /1 pushed, 0 skipped/);
     assert.equal(pushed.stderr, "");
+    assert.equal(traffic.finalize, beforeRestart.finalize + 1, "restart must not replay finalize receipts");
+    assert.equal(traffic.deadlines, 0);
+    t.diagnostic("CLI completed through a 2-second API proxy after SIGKILL during stalled verification; one finalize, status-only recovery");
     await stop();
     url = await start();
     await login();
@@ -274,7 +348,7 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
     assert.match(pipeline.stdout, /2 pushed, 0 skipped.*0 failed/);
     const jobId = /Push job: ([a-z0-9-]+)/.exec(pipeline.stdout)?.[1];
     assert.ok(jobId, pipeline.stdout);
-    const jobHeaders = { authorization: `Bearer ${credential}` };
+    const jobHeaders = { authorization: `Bearer ${credential}`, "snowstead-protocol-version": "2" };
     const completed = await (await fetch(`${url}/_api/v1/caches/pipeline/push-jobs/${jobId}`, { headers: jobHeaders })).json();
     assert.equal(completed.job.state, "completed");
     assert.equal(completed.available, true);
@@ -378,9 +452,13 @@ test("unchanged CLI uploads directly under bounded admission, verifies signed do
     assert.equal(revoked.status, 200);
     await assert.rejects(run("push", "native", path, "--no-deps"), /401|[Rr]evoked|[Uu]nauthorized/);
   } finally {
+    stallVerification = false;
+    storageProxy.closeAllConnections();
     await stop();
     proxy.closeAllConnections();
     await new Promise((resolve, reject) => proxy.close(error => error ? reject(error) : resolve()));
+    storageProxy.closeAllConnections();
+    await new Promise((resolve, reject) => storageProxy.close(error => error ? reject(error) : resolve()));
     await rm(home, { recursive: true, force: true });
     await admin.query(`DROP DATABASE "${name}" WITH (FORCE)`);
     await admin.end();
