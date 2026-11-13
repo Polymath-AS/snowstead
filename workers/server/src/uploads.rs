@@ -190,13 +190,13 @@ struct Session {
     #[serde(skip)]
     push_job_id: Option<String>,
 }
-fn authorize(s: &Session, identity: &Identity) -> Result<(), ApiError> {
-    decide(
-        identity,
-        Action::NixPush,
-        &Resource::cache(&s.org_id, s.cache_id, &s.name),
-    )
-    .map_err(|_| error(403, "Forbidden"))
+struct ReservationSession {
+    id: String,
+    cache_id: i32,
+    org_id: String,
+    name: String,
+    r2_upload_id: Option<String>,
+    job_authorized: bool,
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn load(
@@ -217,14 +217,31 @@ async fn load_sessions(
 ) -> Result<Vec<Session>, ApiError> {
     let sessions = load_session_rows(executor, ids, identity).await?;
     for session in &sessions {
-        authorize_session(session, identity)?;
+        authorize_session(
+            identity,
+            &session.org_id,
+            session.cache_id,
+            &session.name,
+            session.job_authorized,
+        )?;
     }
     Ok(sessions)
 }
 
-fn authorize_session(session: &Session, identity: &Identity) -> Result<(), ApiError> {
-    authorize(session, identity)?;
-    if !session.job_authorized {
+fn authorize_session(
+    identity: &Identity,
+    org: &str,
+    cache_id: i32,
+    name: &str,
+    job_authorized: bool,
+) -> Result<(), ApiError> {
+    decide(
+        identity,
+        Action::NixPush,
+        &Resource::cache(org, cache_id, name),
+    )
+    .map_err(|_| error(403, "Forbidden"))?;
+    if !job_authorized {
         return Err(error(
             409,
             "Push job authorization is inactive; resume the job",
@@ -293,6 +310,50 @@ async fn load_session_rows(
     .await?;
     Ok(sessions)
 }
+
+async fn load_reservation_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    ids: &[String],
+    identity: &Identity,
+) -> Result<Vec<ReservationSession>, ApiError> {
+    let sessions = sqlx::query_as!(
+        ReservationSession,
+        r#"
+        SELECT
+            u.id,
+            u.cache_id,
+            c.org_id,
+            c.name,
+            u.r2_upload_id,
+            (u.push_job_id IS NULL OR EXISTS (
+                SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti
+                WHERE j.id=u.push_job_id AND j.cache_id=u.cache_id AND j.creator=$2 AND $3
+                    AND (j.state='sealed' OR (j.state='completed' AND u.status='completed'))
+                    AND j.idle_expires_at>NOW()
+                    AND j.hard_expires_at>NOW() AND j.authorization_expires_at>NOW()
+                    AND t.revoked_at IS NULL
+            )) AS "job_authorized!"
+        FROM upload_sessions u
+        JOIN caches c ON c.id = u.cache_id
+        JOIN orgs o ON o.id = c.org_id
+        WHERE u.id = ANY($1)
+            AND u.expires_at > NOW()
+            AND EXISTS (
+                SELECT 1
+                FROM cache_protocols p
+                WHERE p.cache_id = c.id
+                    AND p.protocol = 'nix'
+            )
+        "#,
+        ids,
+        identity.actor(),
+        matches!(identity, Identity::ApiToken(_)),
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(sessions)
+}
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn lock(tx: &mut Transaction, key: &str) -> Result<(), ApiError> {
     crate::profile_future!(
@@ -804,7 +865,7 @@ async fn reserve_batch(
     uploads: Vec<protocol::SessionParts<Value>>,
 ) -> Result<Vec<Result<PartGrants, ApiError>>, ApiError> {
     let ids: Vec<_> = uploads.iter().map(|u| u.session_id.clone()).collect();
-    let mut sessions: HashMap<_, _> = load_session_rows(&state.pool, &ids, identity)
+    let mut sessions: HashMap<_, _> = load_reservation_rows(&state.pool, &ids, identity)
         .await?
         .into_iter()
         .map(|s| (s.id.clone(), s))
@@ -815,13 +876,14 @@ async fn reserve_batch(
             let s = sessions
                 .remove(&u.session_id)
                 .ok_or_else(|| error(404, "Not found"))?;
-            authorize_session(&s, identity)?;
+            authorize_session(identity, &s.org_id, s.cache_id, &s.name, s.job_authorized)?;
             if s.r2_upload_id.is_none() {
                 return Err(error(409, "Not a multipart upload"));
             }
             Ok((s, Reservation::read(u.parts)?))
         })
         .collect::<Vec<Result<_, ApiError>>>();
+    let mut reserved: Vec<Option<Session>> = (0..pending.len()).map(|_| None).collect();
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     for (index, row) in pending.iter().enumerate() {
         if let Ok((s, _)) = row {
@@ -844,7 +906,7 @@ async fn reserve_batch(
             Ok(outcomes) => {
                 for (index, outcome) in indices.into_iter().zip(outcomes) {
                     match outcome {
-                        Ok(session) => pending[index].as_mut().unwrap().0 = session,
+                        Ok(session) => reserved[index] = Some(session),
                         Err(error) => pending[index] = Err(error),
                     }
                 }
@@ -861,9 +923,12 @@ async fn reserve_batch(
         }
     }
     let mut results = Vec::with_capacity(pending.len());
-    for row in pending {
+    for (index, row) in pending.into_iter().enumerate() {
         let result = async {
-            let (session, parts) = row?;
+            let (_, parts) = row?;
+            let session = reserved[index]
+                .take()
+                .ok_or_else(|| error(500, "Internal server error"))?;
             let session = initialize_multipart(state, identity, session).await?;
             grants(state, &session, &parts).await
         }
@@ -899,7 +964,7 @@ async fn reserve_org(
         .iter()
         .map(|(id, _)| {
             let s = sessions.remove(id).ok_or_else(|| error(404, "Not found"))?;
-            authorize_session(&s, identity)?;
+            authorize_session(identity, &s.org_id, s.cache_id, &s.name, s.job_authorized)?;
             Ok(s)
         })
         .collect::<Vec<Result<_, ApiError>>>();

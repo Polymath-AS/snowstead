@@ -1,0 +1,85 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            u.id,\n            u.cache_id,\n            c.org_id,\n            c.name,\n            u.r2_upload_id,\n            (u.push_job_id IS NULL OR EXISTS (\n                SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti\n                WHERE j.id=u.push_job_id AND j.cache_id=u.cache_id AND j.creator=$2 AND $3\n                    AND (j.state='sealed' OR (j.state='completed' AND u.status='completed'))\n                    AND j.idle_expires_at>NOW()\n                    AND j.hard_expires_at>NOW() AND j.authorization_expires_at>NOW()\n                    AND t.revoked_at IS NULL\n            )) AS \"job_authorized!\"\n        FROM upload_sessions u\n        JOIN caches c ON c.id = u.cache_id\n        JOIN orgs o ON o.id = c.org_id\n        WHERE u.id = ANY($1)\n            AND u.expires_at > NOW()\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cache_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "cache_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "r2_upload_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_sessions",
+            "name": "r2_upload_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "job_authorized!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "af44e2f21eea12ca836e895e8891025a717d4869db97b8161f62ba31df473866"
+}
