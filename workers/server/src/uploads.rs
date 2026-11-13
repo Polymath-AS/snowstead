@@ -652,7 +652,22 @@ async fn reserve_tx(
     }) {
         return Err(error(400, "Invalid part reservations"));
     }
-    let previous = parts(tx, &s.id).await?;
+    let numbers: Vec<_> = requested.iter().map(|p| p.part_number).collect();
+    let previous = sqlx::query!(
+        r#"
+        SELECT
+            part_number,
+            size
+        FROM upload_parts
+        WHERE session_id = $1
+            AND part_number = ANY($2)
+        ORDER BY part_number
+        "#,
+        &s.id,
+        &numbers
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     let previous: HashMap<_, _> = previous.iter().map(|p| (p.part_number, p.size)).collect();
     let added = requested
         .iter()
@@ -688,7 +703,6 @@ async fn reserve_tx(
     if staged + added > budget {
         return Err(error(429, "Upload staging is busy; retry"));
     }
-    let numbers: Vec<_> = requested.iter().map(|p| p.part_number).collect();
     let sizes: Vec<_> = requested.iter().map(|p| p.size).collect();
     sqlx::query!(
         r#"
