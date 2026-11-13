@@ -73,6 +73,7 @@ mod protocol_policy;
 mod push_job_worker;
 mod push_jobs;
 mod reads;
+pub mod runtime;
 mod sccache;
 pub mod signing;
 mod signing_management;
@@ -80,7 +81,7 @@ pub mod storage;
 mod uploads;
 mod wire;
 
-pub use app::{AppState, router, serve};
+pub use app::{AppState, router, serve, serve_router};
 
 /// Owns the process-wide native profiler. Create once, before native work,
 /// and drop only after requests and background jobs have drained.

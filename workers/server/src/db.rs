@@ -116,6 +116,31 @@ pub(crate) async fn begin_read(
         })??)
 }
 
+/// A coherent reporting snapshot without writer gates or primary connections.
+pub(crate) async fn view(state: &crate::AppState) -> Result<Transaction, ApiError> {
+    let pool = state.read_pool.clone();
+    let tasks = state.tasks.clone();
+    state
+        .tasks
+        .spawn(async move {
+            let inner = pool
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await?;
+            Ok(Transaction {
+                inner: Some(inner),
+                writer: None,
+                tasks,
+            })
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Transaction startup failed",
+            )
+        })?
+}
+
 /// Bound queued writers before borrowing a connection. Active SQL work remains
 /// bounded by the pool; storage work must not retain the returned transaction.
 pub(crate) async fn begin(state: &crate::AppState, org: &str) -> Result<Transaction, ApiError> {

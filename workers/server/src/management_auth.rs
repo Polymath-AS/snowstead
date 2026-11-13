@@ -398,7 +398,7 @@ async fn list_audit(
         before.map(|v| v as i64),
         limit as i64
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
     let mut entries = Vec::new();
     for r in &rows {

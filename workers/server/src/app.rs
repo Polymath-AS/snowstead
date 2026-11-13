@@ -137,6 +137,18 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let routes = router(state.clone());
+    serve_router(listener, state, routes, shutdown).await
+}
+
+/// Host composed routers with the cache's workers and graceful shutdown.
+/// The routes must contain `router(state.clone())` and use this same state.
+pub async fn serve_router(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    routes: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let retry_stop = CancellationToken::new();
     state
         .tasks
@@ -196,7 +208,7 @@ pub async fn serve(
                 tracing::warn!(%error, "Setting TCP_NODELAY failed");
             }
         }),
-        router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        routes.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await;

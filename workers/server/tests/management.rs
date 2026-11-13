@@ -303,7 +303,7 @@ async fn org_settings_inventory_and_cache_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn only_global_overview_uses_the_read_pool(pool: PgPool) {
+async fn reporting_uses_replica_but_policy_and_mutations_use_primary(pool: PgPool) {
     // Independent data models replica lag without a physical standby.
     sqlx::raw_sql(
         "CREATE SCHEMA replica;
@@ -314,6 +314,10 @@ async fn only_global_overview_uses_the_read_pool(pool: PgPool) {
         CREATE TABLE replica.bandwidth_daily (LIKE public.bandwidth_daily INCLUDING ALL);
         CREATE TABLE replica.api_tokens (LIKE public.api_tokens INCLUDING ALL);
         CREATE TABLE replica.org_api_keys (LIKE public.org_api_keys INCLUDING ALL);
+        CREATE TABLE replica.go_entries (LIKE public.go_entries INCLUDING ALL);
+        CREATE TABLE replica.sccache_entries (LIKE public.sccache_entries INCLUDING ALL);
+        CREATE TABLE replica.cache_protocols (LIKE public.cache_protocols INCLUDING ALL);
+        CREATE TABLE replica.published_paths (LIKE public.published_paths INCLUDING ALL);
         INSERT INTO replica.orgs(id,slug) VALUES ('old_alpha','old-alpha'),('old_beta','old-beta');
         INSERT INTO replica.caches(name,org_id,path_count,size) VALUES ('old','old_alpha',3,17);",
     )
@@ -361,7 +365,29 @@ async fn only_global_overview_uses_the_read_pool(pool: PgPool) {
         overview
     );
 
-    // Replica failure must not silently route the overview back to primary.
+    // Organization routing stays primary, even if the replica is behind.
+    let (status, _, inventory) = call(
+        &app,
+        "GET",
+        "/_api/v1/admin/orgs?id=fresh",
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inventory["orgs"][0]["slug"], "fresh");
+    let (status, _, caches) = call(
+        &app,
+        "GET",
+        "/_api/v1/admin/caches?org=old_alpha",
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{caches}");
+    assert_eq!(caches["caches"][0]["size"], 17);
+
+    // Replica failure must not silently send reporting traffic to primary.
     read_pool.close().await;
     assert_eq!(
         call(&app, "GET", "/_api/v1/admin/overview", Value::Null, None)
@@ -372,8 +398,8 @@ async fn only_global_overview_uses_the_read_pool(pool: PgPool) {
     assert_eq!(
         call(&app, "GET", "/_api/v1/orgs/fresh", Value::Null, None)
             .await
-            .2,
-        created
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
         call(&app, "GET", "/healthz", Value::Null, None).await.0,

@@ -208,14 +208,32 @@ struct FencedCache {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn load_cache(state: &AppState, org: &str, name: &str) -> Result<FencedCache, ApiError> {
+async fn load_cache(
+    state: &AppState,
+    org: &str,
+    name: &str,
+    read: bool,
+) -> Result<FencedCache, ApiError> {
+    if read {
+        let mut tx = crate::db::view(state).await?;
+        let (id, public, slug, moving_from): (i32, bool, String, Option<String>) = sqlx::query_as(
+            "SELECT c.id, c.is_public, o.slug, o.moving_from FROM caches c JOIN orgs o ON o.id = c.org_id WHERE c.org_id = $1 AND c.name = $2"
+        ).bind(org).bind(name).fetch_optional(&mut *tx).await?.ok_or_else(missing)?;
+        let metadata = MetadataTarget::new(public, &slug, moving_from.as_deref(), name);
+        return Ok(FencedCache {
+            tx,
+            id,
+            public,
+            metadata,
+        });
+    }
     let mut tx = crate::profile_future!(
         crate::db::begin(state, org),
         label = "management_policy.pool_begin"
     )
     .await?;
-    // Reads use the fence as well so multi-statement pin/stats responses are
-    // coherent with resets, cache deletion, and publication.
+    // Mutations retain the primary publication fence. Reporting uses a
+    // repeatable-read replica snapshot instead of blocking writers.
     fence(&mut tx, org).await?;
     let cache = sqlx::query!(
         r#"
@@ -290,7 +308,7 @@ async fn purge_cache(
         public,
         metadata,
         ..
-    } = load_cache(&state, org, &path.cache).await?;
+    } = load_cache(&state, org, &path.cache, false).await?;
     strict(&input, &["storePathHashes"])?;
     let hashes = input
         .get("storePathHashes")
@@ -331,7 +349,7 @@ async fn get_pins(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&path.cache)?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, true).await?;
     protocol(&mut tx, id, "nix").await?;
     let response = ok(json!({"pins":list_pins(&mut tx,id).await?}));
     tx.commit().await?;
@@ -347,7 +365,7 @@ async fn create_pin(
     let org = context_org(&context);
     valid_cache(&path.cache)?;
     let input = body(request).await?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, false).await?;
     protocol(&mut tx, id, "nix").await?;
     let response = put_pin(&mut tx, id, input).await?;
     tx.commit().await?;
@@ -361,7 +379,7 @@ async fn remove_pin(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&path.cache)?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, false).await?;
     protocol(&mut tx, id, "nix").await?;
     let pin = path.pin.as_str();
     if !name_valid(pin) {
@@ -425,7 +443,7 @@ async fn compiler_stats(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&name)?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &name).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &name, !reset).await?;
     if op == "sccache" || reset {
         protocol(&mut tx, id, op).await?;
     }
@@ -523,7 +541,7 @@ async fn get_paths(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&path.cache)?;
-    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, true).await?;
     let response = list_paths(&mut tx, id, params(&request)).await?;
     tx.commit().await?;
     Ok(response)
@@ -543,7 +561,7 @@ async fn remove_paths(
         id,
         metadata,
         ..
-    } = load_cache(&state, org, &path.cache).await?;
+    } = load_cache(&state, org, &path.cache, false).await?;
     let response = delete_paths(&metadata, &mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
@@ -580,7 +598,7 @@ async fn withdraw_cache(
         id,
         public,
         metadata,
-    } = load_cache(&state, org, &name).await?;
+    } = load_cache(&state, org, &name, false).await?;
     if !delete {
         sqlx::query!(
             r#"
@@ -1429,7 +1447,7 @@ async fn eviction(
     }) {
         return Err(bad("Invalid recentCursor"));
     }
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.read_pool.begin().await?;
     sqlx::query!(
         r#"
         SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY

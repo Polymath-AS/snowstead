@@ -116,6 +116,12 @@ pub struct WebUser {
     pub role: Role,
 }
 
+/// An embedding application's verified identity. Only in-process callers can
+/// set request extensions; HTTP headers never construct this value. Normal
+/// management policy checks and audit logging still apply.
+#[derive(Clone, Debug)]
+pub struct TrustedPrincipal(pub Principal);
+
 /// A listed, unrevoked API token with its scope as the database records it.
 #[derive(Clone, Debug)]
 pub struct ApiToken {

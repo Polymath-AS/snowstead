@@ -330,7 +330,10 @@ async fn authorize_and_audit(
             .map_or_else(|| uri.path(), |p| p.as_str()),
         body_sha256: &body_sha256,
     };
-    let mut principal = auth::authenticate(request.headers(), &state, Some(target)).await?;
+    let mut principal = match request.extensions().get::<authz::TrustedPrincipal>() {
+        Some(verified) => verified.0.clone(),
+        None => auth::authenticate(request.headers(), &state, Some(target)).await?,
+    };
     // Transitional: the old dashboard's operator-secret calls on org routes.
     if !admin && state.config.allow_legacy_web_admin && matches!(principal, Principal::Operator) {
         principal = Principal::LegacyWeb {
@@ -831,7 +834,7 @@ async fn org_response(
         "#,
             id
         )
-        .fetch_one(&state.pool),
+        .fetch_one(&state.read_pool),
         label = "management.org_usage_sql"
     );
     let caches = async {
@@ -843,7 +846,7 @@ async fn org_response(
     };
     let (usage, served, caches) = tokio::try_join!(
         async { usage.await.map_err(ApiError::from) },
-        bandwidth(&state.pool, Some(id), None),
+        bandwidth(&state.read_pool, Some(id), None),
         caches,
     )?;
     result["used"] = json!(usage.used);
@@ -941,7 +944,7 @@ async fn cache_summaries(
         "#,
         scope,
         name
-    ).fetch_all(&state.pool), label = "management.cache_summaries_sql").await?;
+    ).fetch_all(&state.read_pool), label = "management.cache_summaries_sql").await?;
     rows.iter()
         .map(|text| serde_json::from_str(text).map_err(|_| internal()))
         .collect()
@@ -995,7 +998,7 @@ async fn get_cache(
         "#,
         cache.id
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
     result["recentPaths"] = Value::Array(
         rows.iter()
