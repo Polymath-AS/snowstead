@@ -215,6 +215,29 @@ async fn load_sessions(
     ids: &[String],
     identity: &Identity,
 ) -> Result<Vec<Session>, ApiError> {
+    let sessions = load_session_rows(executor, ids, identity).await?;
+    for session in &sessions {
+        authorize_session(session, identity)?;
+    }
+    Ok(sessions)
+}
+
+fn authorize_session(session: &Session, identity: &Identity) -> Result<(), ApiError> {
+    authorize(session, identity)?;
+    if !session.job_authorized {
+        return Err(error(
+            409,
+            "Push job authorization is inactive; resume the job",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_session_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    ids: &[String],
+    identity: &Identity,
+) -> Result<Vec<Session>, ApiError> {
     let sessions = sqlx::query_as!(
         Session,
         r#"
@@ -268,15 +291,6 @@ async fn load_sessions(
     )
     .fetch_all(executor)
     .await?;
-    for session in &sessions {
-        authorize(session, identity)?;
-        if !session.job_authorized {
-            return Err(error(
-                409,
-                "Push job authorization is inactive; resume the job",
-            ));
-        }
-    }
     Ok(sessions)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -639,6 +653,96 @@ async fn reserve_tx(
     s: &Session,
     requested: &[Reservation],
 ) -> Result<(), ApiError> {
+    reserve_group(tx, &[(s, requested)]).await?.remove(0)
+}
+
+/// The org fence protects the staging total and every accepted size update.
+/// Validation failures exclude only their own session; SQL failures abort the group.
+async fn reserve_group(
+    tx: &mut Transaction,
+    requests: &[(&Session, &[Reservation])],
+) -> Result<Vec<Result<(), ApiError>>, ApiError> {
+    let ids: Vec<_> = requests
+        .iter()
+        .flat_map(|(s, parts)| parts.iter().map(|_| s.id.clone()))
+        .collect();
+    let numbers: Vec<_> = requests
+        .iter()
+        .flat_map(|(_, parts)| parts.iter().map(|p| p.part_number))
+        .collect();
+    let previous: Vec<(String, i32, i64)> = sqlx::query_as(
+        "SELECT p.session_id,p.part_number,p.size FROM upload_parts p \
+         JOIN UNNEST($1::text[],$2::integer[]) r(session_id,part_number) \
+         USING(session_id,part_number)",
+    )
+    .bind(&ids)
+    .bind(&numbers)
+    .fetch_all(&mut **tx)
+    .await?;
+    let previous: HashMap<_, _> = previous
+        .into_iter()
+        .map(|(id, number, size)| ((id, number), size))
+        .collect();
+    let mut staged: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(u.file_size),0)::bigint FROM upload_sessions u \
+         JOIN caches c ON c.id=u.cache_id WHERE c.org_id=$1 AND u.expires_at>NOW() \
+         AND u.status IN ('streaming','finalizing')",
+    )
+    .bind(&requests[0].0.org_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut ids = Vec::new();
+    let mut numbers = Vec::new();
+    let mut sizes = Vec::new();
+    let mut sessions = Vec::new();
+    let mut additions = Vec::new();
+    let mut results = Vec::with_capacity(requests.len());
+    for (s, requested) in requests {
+        let result = reservation_added(s, requested, &previous, staged);
+        match result {
+            Ok(added) => {
+                staged += added;
+                sessions.push(s.id.clone());
+                additions.push(added);
+                for part in *requested {
+                    ids.push(s.id.clone());
+                    numbers.push(part.part_number);
+                    sizes.push(part.size);
+                }
+                results.push(Ok(()));
+            }
+            Err(error) => results.push(Err(error)),
+        }
+    }
+    if !sessions.is_empty() {
+        sqlx::query(
+            "INSERT INTO upload_parts(session_id,part_number,size) \
+             SELECT * FROM UNNEST($1::text[],$2::integer[],$3::bigint[]) \
+             ON CONFLICT(session_id,part_number) DO NOTHING",
+        )
+        .bind(&ids)
+        .bind(&numbers)
+        .bind(&sizes)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE upload_sessions u SET file_size=u.file_size+r.added \
+             FROM UNNEST($1::text[],$2::bigint[]) r(id,added) WHERE u.id=r.id",
+        )
+        .bind(&sessions)
+        .bind(&additions)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(results)
+}
+
+fn reservation_added(
+    s: &Session,
+    requested: &[Reservation],
+    previous: &HashMap<(String, i32), i64>,
+    staged: i64,
+) -> Result<i64, ApiError> {
     if s.status != UploadStatus::Streaming {
         return Err(error(409, "Conflict"));
     }
@@ -652,49 +756,19 @@ async fn reserve_tx(
     }) {
         return Err(error(400, "Invalid part reservations"));
     }
-    let numbers: Vec<_> = requested.iter().map(|p| p.part_number).collect();
-    let previous = sqlx::query!(
-        r#"
-        SELECT
-            part_number,
-            size
-        FROM upload_parts
-        WHERE session_id = $1
-            AND part_number = ANY($2)
-        ORDER BY part_number
-        "#,
-        &s.id,
-        &numbers
-    )
-    .fetch_all(&mut **tx)
-    .await?;
-    let previous: HashMap<_, _> = previous.iter().map(|p| (p.part_number, p.size)).collect();
-    let added = requested
-        .iter()
-        .try_fold(0, |added, p| match previous.get(&p.part_number) {
+    let added = requested.iter().try_fold(0, |added, p| {
+        match previous.get(&(s.id.clone(), p.part_number)) {
             Some(size) if *size != p.size => Err(error(409, "Part size cannot change")),
             Some(_) => Ok(added),
             None => Ok(added + p.size),
-        })?;
+        }
+    })?;
     if s.file_size + added > MAX_OBJECT {
         return Err(error(400, "NAR exceeds the multipart object limit"));
     }
     if s.staging_capacity.is_some_and(|n| s.file_size + added > n) {
         return Err(error(413, "Object exceeds cache capacity"));
     }
-    let staged = sqlx::query_scalar!(
-        r#"
-        SELECT COALESCE(SUM(u.file_size), 0)::bigint AS "staged!"
-        FROM upload_sessions u
-        JOIN caches c ON c.id = u.cache_id
-        WHERE c.org_id = $1
-            AND u.expires_at > NOW()
-            AND u.status IN ('streaming', 'finalizing')
-        "#,
-        &s.org_id,
-    )
-    .fetch_one(&mut **tx)
-    .await?;
     let budget = s
         .staging_capacity
         .unwrap_or(256 * 1024 * MIB)
@@ -703,35 +777,7 @@ async fn reserve_tx(
     if staged + added > budget {
         return Err(error(429, "Upload staging is busy; retry"));
     }
-    let sizes: Vec<_> = requested.iter().map(|p| p.size).collect();
-    sqlx::query!(
-        r#"
-        INSERT INTO upload_parts (session_id, part_number, size)
-        SELECT
-            $1,
-            p.number,
-            p.size
-        FROM UNNEST($2::integer[], $3::bigint[]) AS p(number, size)
-        ON CONFLICT (session_id, part_number) DO NOTHING
-        "#,
-        &s.id,
-        &numbers,
-        &sizes,
-    )
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query!(
-        r#"
-        UPDATE upload_sessions
-        SET file_size = file_size + $2
-        WHERE id = $1
-        "#,
-        &s.id,
-        added,
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    Ok(added)
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn reserve(
@@ -740,15 +786,148 @@ async fn reserve(
     id: &str,
     value: Value,
 ) -> Result<PartGrants, ApiError> {
-    let s = load(&state.pool, id, identity).await?;
-    if s.r2_upload_id.is_none() {
-        return Err(error(409, "Not a multipart upload"));
+    reserve_batch(
+        state,
+        identity,
+        vec![protocol::SessionParts {
+            session_id: id.to_owned(),
+            parts: value,
+        }],
+    )
+    .await?
+    .remove(0)
+}
+
+async fn reserve_batch(
+    state: &AppState,
+    identity: &Identity,
+    uploads: Vec<protocol::SessionParts<Value>>,
+) -> Result<Vec<Result<PartGrants, ApiError>>, ApiError> {
+    let ids: Vec<_> = uploads.iter().map(|u| u.session_id.clone()).collect();
+    let mut sessions: HashMap<_, _> = load_session_rows(&state.pool, &ids, identity)
+        .await?
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let mut pending: Vec<_> = uploads
+        .into_iter()
+        .map(|u| {
+            let s = sessions
+                .remove(&u.session_id)
+                .ok_or_else(|| error(404, "Not found"))?;
+            authorize_session(&s, identity)?;
+            if s.r2_upload_id.is_none() {
+                return Err(error(409, "Not a multipart upload"));
+            }
+            Ok((s, Reservation::read(u.parts)?))
+        })
+        .collect::<Vec<Result<_, ApiError>>>();
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, row) in pending.iter().enumerate() {
+        if let Ok((s, _)) = row {
+            match groups.iter_mut().find(|(org, _)| org == &s.org_id) {
+                Some((_, indices)) => indices.push(index),
+                None => groups.push((s.org_id.clone(), vec![index])),
+            }
+        }
     }
-    let requested = Reservation::read(value)?;
-    let (mut tx, s) = locked(state, &s, identity).await?;
-    reserve_tx(&mut tx, &s, &requested).await?;
+    for (org, indices) in groups {
+        let requests: Vec<_> = indices
+            .iter()
+            .map(|i| {
+                let (s, parts) = pending[*i].as_ref().unwrap();
+                (s.id.clone(), parts.as_slice())
+            })
+            .collect();
+        let outcomes = reserve_org(state, identity, &org, &requests).await;
+        match outcomes {
+            Ok(outcomes) => {
+                for (index, outcome) in indices.into_iter().zip(outcomes) {
+                    match outcome {
+                        Ok(session) => pending[index].as_mut().unwrap().0 = session,
+                        Err(error) => pending[index] = Err(error),
+                    }
+                }
+            }
+            Err(error) => {
+                for index in indices {
+                    pending[index] = Err(ApiError {
+                        status: error.status,
+                        message: error.message.clone(),
+                        headers: error.headers.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let mut results = Vec::with_capacity(pending.len());
+    for row in pending {
+        let result = async {
+            let (session, parts) = row?;
+            let session = initialize_multipart(state, identity, session).await?;
+            grants(state, &session, &parts).await
+        }
+        .await;
+        results.push(result);
+    }
+    Ok(results)
+}
+
+async fn reserve_org(
+    state: &AppState,
+    identity: &Identity,
+    org: &str,
+    requests: &[(String, &[Reservation])],
+) -> Result<Vec<Result<Session, ApiError>>, ApiError> {
+    let mut tx = crate::db::begin(state, org).await?;
+    lock(&mut tx, &format!("org:{org}")).await?;
+    lock_set(
+        &mut tx,
+        requests
+            .iter()
+            .map(|(id, _)| format!("upload:{id}"))
+            .collect(),
+    )
+    .await?;
+    let ids: Vec<_> = requests.iter().map(|(id, _)| id.clone()).collect();
+    let mut sessions: HashMap<_, _> = load_session_rows(&mut *tx, &ids, identity)
+        .await?
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let mut results: Vec<_> = requests
+        .iter()
+        .map(|(id, _)| {
+            let s = sessions.remove(id).ok_or_else(|| error(404, "Not found"))?;
+            authorize_session(&s, identity)?;
+            Ok(s)
+        })
+        .collect::<Vec<Result<_, ApiError>>>();
+    let accepted: Vec<_> = results
+        .iter()
+        .zip(requests)
+        .filter_map(|(s, (_, parts))| s.as_ref().ok().map(|s| (s, *parts)))
+        .collect();
+    if !accepted.is_empty() {
+        let reserved = reserve_group(&mut tx, &accepted).await?;
+        let mut reserved = reserved.into_iter();
+        for result in &mut results {
+            if result.is_ok()
+                && let Err(error) = reserved.next().unwrap()
+            {
+                *result = Err(error);
+            }
+        }
+    }
     tx.commit().await?;
-    let s = initialize_multipart(state, identity, s).await?;
+    Ok(results)
+}
+
+async fn grants(
+    state: &AppState,
+    s: &Session,
+    requested: &[Reservation],
+) -> Result<PartGrants, ApiError> {
     let key = s
         .r2_upload_key
         .as_deref()
@@ -2516,24 +2695,32 @@ async fn reserve_parts_batch(
     let body: ReservePartsBatch<Value> = json_body(request).await?;
     batch(&body.uploads)?;
     distinct(body.uploads.iter().map(|u| u.session_id.as_str()))?;
-    let mut results = Vec::with_capacity(body.uploads.len());
-    for u in body.uploads {
-        let r = reserve(&state, &identity, &u.session_id, u.parts).await;
-        results.push(match r {
+    let ids: Vec<_> = body.uploads.iter().map(|u| u.session_id.clone()).collect();
+    let outcomes = match reserve_batch(&state, &identity, body.uploads).await {
+        Ok(outcomes) => outcomes,
+        Err(e) => ids
+            .iter()
+            .map(|_| Err(ApiError::new(e.status, e.message.clone())))
+            .collect(),
+    };
+    let results = ids
+        .into_iter()
+        .zip(outcomes)
+        .map(|(session_id, outcome)| match outcome {
             Ok(grants) => ReservationResult {
-                session_id: u.session_id,
+                session_id,
                 parts: Some(grants.parts),
                 status: None,
                 error: None,
             },
             Err(e) => ReservationResult {
-                session_id: u.session_id,
+                session_id,
                 parts: None,
                 status: Some(e.status.as_u16()),
                 error: Some(e.message),
             },
-        });
-    }
+        })
+        .collect();
     Ok(respond(StatusCode::OK, &ReservationResults { results }))
 }
 

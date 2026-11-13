@@ -6378,6 +6378,152 @@ async fn sealed_sessions_can_be_aborted_without_racing_publication(pool: PgPool)
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 #[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
+async fn reservation_batches_preserve_order_quota_replays_and_atomic_writes(pool: PgPool) {
+    const MIB: i64 = 1024 * 1024;
+    pool_execute(&pool, "INSERT INTO orgs(id,slug,storage_limit) VALUES ('reserve','reserve',268435456),('foreign','foreign',NULL);
+        INSERT INTO caches(name,org_id) VALUES ('main','reserve'),('main','foreign');
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;").await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::s3_storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let credential = token(&pool, "reserve", "*").await;
+    let foreign = token(&pool, "foreign", "*").await;
+    let raw = nar(b"reservation batch");
+    let mut ids = Vec::new();
+    for i in 0..6 {
+        let session = create(
+            &app,
+            "main",
+            &credential,
+            path_input(&format!("{i:032}"), &raw, false),
+        )
+        .await;
+        ids.push(session["sessionId"].as_str().unwrap().to_owned());
+    }
+    let other = create(
+        &app,
+        "main",
+        &foreign,
+        path_input(&format!("{:032}", 7), &raw, false),
+    )
+    .await;
+    // Reserve all but ten bytes of the org's 512 MiB staging budget.
+    let filling: Vec<_> = (0..2).map(|i| json!({"sessionId":ids[i],"parts":(1..=32).map(|number| json!({"partNumber":number,"size":8*MIB-if i==1 && number==32 {10}else{0}})).collect::<Vec<_>>()})).collect();
+    let (status, filled) = post(
+        &app,
+        "/_api/v1/uploads/parts",
+        &credential,
+        json!({"uploads":filling}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        filled["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["parts"].is_array()),
+        "{filled}"
+    );
+    let request = json!({"uploads":[
+        {"sessionId":ids[2],"parts":[{"partNumber":1,"size":7}]},
+        {"sessionId":ids[3],"parts":[{"partNumber":1,"size":6}]},
+        {"sessionId":ids[4],"parts":[{"partNumber":0,"size":1}]},
+        {"sessionId":other["sessionId"],"parts":[{"partNumber":1,"size":1}]},
+        {"sessionId":"missing","parts":[{"partNumber":1,"size":1}]},
+        {"sessionId":ids[5],"parts":[{"partNumber":1,"size":3}]}
+    ]});
+    let (status, result) = post(&app, "/_api/v1/uploads/parts", &credential, request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    for (index, expected) in [(1, 429), (2, 400), (3, 403), (4, 404)] {
+        assert_eq!(result["results"][index]["status"], expected, "{result}");
+    }
+    assert_eq!(
+        result["results"][0]["parts"][0]["headers"]["content-length"],
+        "7"
+    );
+    assert_eq!(
+        result["results"][5]["parts"][0]["headers"]["content-length"],
+        "3"
+    );
+    let (_, replay) = post(&app, "/_api/v1/uploads/parts", &credential, request).await;
+    assert!(replay["results"][0]["parts"].is_array(), "{replay}");
+    assert!(replay["results"][5]["parts"].is_array(), "{replay}");
+    assert_eq!(replay["results"][1]["status"], 429);
+    let (status, _) = post(
+        &app,
+        &format!("/_api/v1/uploads/{}/parts", ids[2]),
+        &credential,
+        json!({"parts":[{"partNumber":1,"size":8}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Abort releases quota through the public API, then fail a bulk SQL write.
+    for id in &ids[..2] {
+        assert_eq!(
+            post(
+                &app,
+                &format!("/_api/v1/uploads/{id}/abort"),
+                &credential,
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    pool_execute(&pool, "CREATE FUNCTION fail_reservation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reservation failure'; END $$;
+        CREATE TRIGGER fail_reservation BEFORE UPDATE OF file_size ON upload_sessions FOR EACH ROW EXECUTE FUNCTION fail_reservation();").await;
+    let request = json!({"uploads":[
+        {"sessionId":ids[2],"parts":[{"partNumber":2,"size":5}]},
+        {"sessionId":ids[3],"parts":[{"partNumber":1,"size":6}]}
+    ]});
+    let (_, failed) = post(&app, "/_api/v1/uploads/parts", &credential, request.clone()).await;
+    assert!(
+        failed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == 500),
+        "{failed}"
+    );
+    let held: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id,file_size FROM upload_sessions WHERE id=ANY($1) ORDER BY id")
+            .bind(vec![ids[2].clone(), ids[3].clone()])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for (id, size) in held {
+        assert_eq!(size, if id == ids[2] { 7 } else { 0 });
+    }
+    pool_execute(
+        &pool,
+        "DROP TRIGGER fail_reservation ON upload_sessions; DROP FUNCTION fail_reservation();",
+    )
+    .await;
+    let (_, retried) = post(&app, "/_api/v1/uploads/parts", &credential, request).await;
+    assert!(
+        retried["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["parts"].is_array()),
+        "{retried}"
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
 async fn direct_grants_preserve_org_isolation_integrity_and_abort(pool: PgPool) {
     pool_execute(&pool, "INSERT INTO orgs(id,slug) VALUES ('org_a','alpha'),('org_b','beta');
         INSERT INTO caches(name,org_id,is_public) VALUES ('vault','org_a',false),('vault','org_b',false);
