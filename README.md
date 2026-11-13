@@ -115,6 +115,14 @@ Build the CLI (or `nix run .` for one-off use):
 nix build       # produces ./result/bin/snowstead
 ```
 
+Build the server with `nix build .#server`. Both packages use Crane to keep
+vendored crate sources and compiled dependencies in separate Nix derivations.
+Source-only changes rebuild the application, not its external crates. Changes
+to dependencies, the toolchain, or build features can rebuild the dependency
+cache. The first build populates it; later builds reuse it while its store paths
+remain available locally or through a configured binary cache. Local development
+still uses Cargo's incremental builds inside `nix develop`.
+
 The CLI is a native Rust binary using the Zig NAR core. On Linux, NAR
 serialization, SHA-256, and zstd compression run in-process; Nix is still used
 for path metadata and closure resolution. On macOS, Nix also serializes the

@@ -5,6 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Keep the native CLI toolchain separate from the existing Worker tooling.
     nixpkgs-cli.url = "github:NixOS/nixpkgs/a7868a727837f3c09cee2ce0ca671c76b1589fed";
+    crane.url = "github:ipetkov/crane";
     nixpkgs-host.url = "github:NixOS/nixpkgs/nixos-26.05";
     deploy-rs = {
       url = "github:serokell/deploy-rs";
@@ -25,6 +26,7 @@
       self,
       nixpkgs,
       nixpkgs-cli,
+      crane,
       nixpkgs-host,
       deploy-rs,
       disko,
@@ -102,56 +104,21 @@
         host:
         let
           pkgs = nixpkgs-cli.legacyPackages.${host.stdenv.hostPlatform.system};
+          craneLib = crane.mkLib pkgs;
         in
         rec {
-          default = pkgs.callPackage ./nix/package.nix { src = self; };
-          server = pkgs.callPackage ./nix/server.nix { src = self; };
+          default = pkgs.callPackage ./nix/package.nix {
+            src = self;
+            inherit craneLib;
+          };
+          server = pkgs.callPackage ./nix/server.nix {
+            src = self;
+            inherit craneLib;
+          };
 
-          server-observability = server.overrideAttrs (old: {
-            pname = "snowstead-server-observability";
-            cargoBuildFlags = old.cargoBuildFlags ++ [
-              "--features"
-              "observability"
-            ];
-            cargoTestFlags = old.cargoTestFlags ++ [
-              "--features"
-              "observability"
-            ];
-          });
-
-          server-hotpath = server.overrideAttrs (old: {
-            pname = "snowstead-server-hotpath";
-            cargoBuildFlags = old.cargoBuildFlags ++ [
-              "--features"
-              "profiling"
-            ];
-            cargoTestFlags = old.cargoTestFlags ++ [
-              "--features"
-              "profiling"
-            ];
-            RUST_MIN_STACK = "16777216";
-          });
-
-          hotpath = default.overrideAttrs (old: {
-            pname = "snowstead-hotpath";
-            cargoBuildFlags = [
-              "--example"
-              "snowstead"
-            ];
-            env = old.env // {
-              RUSTFLAGS = (old.env.RUSTFLAGS or "") + " --cfg snowstead_hotpath";
-            };
-            # This package builds only the profiling example; default runs the CLI tests.
-            doCheck = false;
-            installPhase = ''
-              runHook preInstall
-              install -Dm755 target/${pkgs.stdenv.targetPlatform.rust.cargoShortTarget}/release/examples/snowstead $out/bin/snowstead
-              runHook postInstall
-            '';
-            meta = old.meta // {
-              mainProgram = "snowstead";
-            };
-          });
+          server-observability = server.override { features = [ "observability" ]; };
+          server-hotpath = server.override { features = [ "profiling" ]; };
+          hotpath = default.override { hotpath = true; };
         }
         // nixpkgs.lib.optionalAttrs (host.stdenv.hostPlatform.system == "x86_64-linux") (
           (nixpkgs.lib.mapAttrs' (name: inventory: {
