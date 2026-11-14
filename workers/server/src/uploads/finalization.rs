@@ -423,16 +423,26 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
 /// Release non-job staging admission at the delegation deadline. Revoked
 /// credentials release job staging too; a revoked token cannot resume a job.
 pub(crate) async fn expire(state: &AppState) -> anyhow::Result<u64> {
-    let batches: Vec<(String,String)> = sqlx::query_as(
-        "SELECT b.id,b.org_id FROM upload_finalization_batches b LEFT JOIN api_tokens t ON t.jti=b.token_jti \
-         WHERE EXISTS(SELECT 1 FROM upload_finalizations f JOIN upload_sessions u ON u.id=f.session_id \
-             WHERE f.batch_id=b.id AND u.status='finalizing' AND ( \
+    // This runs every second. Start from the sessions still finalizing and
+    // from the deadline index, never from every retained batch and member.
+    let batches: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,org_id FROM ( \
+             SELECT b.id,b.org_id,b.expires_at FROM upload_sessions u \
+             JOIN upload_finalizations f ON f.session_id=u.id \
+             JOIN upload_finalization_batches b ON b.id=f.batch_id \
+             LEFT JOIN api_tokens t ON t.jti=b.token_jti \
+             WHERE u.status='finalizing' AND ( \
                  (b.expires_at<=NOW() AND u.push_job_id IS NULL) \
                  OR (b.shared_generation IS NULL AND (t.jti IS NULL OR t.revoked_at IS NOT NULL)) \
-                 OR (b.shared_generation IS NOT NULL AND b.shared_generation IS DISTINCT FROM $1))) \
-             OR b.expires_at<NOW()-INTERVAL '24 hours' \
-         ORDER BY b.expires_at,b.id LIMIT 20",
-    ).bind(shared_generation(state)).fetch_all(&state.pool).await?;
+                 OR (b.shared_generation IS NOT NULL AND b.shared_generation IS DISTINCT FROM $1)) \
+             UNION \
+             SELECT b.id,b.org_id,b.expires_at FROM upload_finalization_batches b \
+             WHERE b.expires_at<NOW()-INTERVAL '24 hours') due \
+         ORDER BY expires_at,id LIMIT 20",
+    )
+    .bind(shared_generation(state))
+    .fetch_all(&state.pool)
+    .await?;
     let mut count = 0;
     for (id, org) in batches {
         let mut tx = db::begin(state, &org).await?;
@@ -847,6 +857,39 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(conflict.results[0].status, Some(409));
+        // Resuming a job whose batch already settled must not requeue it.
+        sqlx::query("UPDATE upload_finalizations SET result=$1")
+            .bind(sqlx::types::Json(UploadResult::failed(
+                &old.session.id,
+                400,
+                "failed verification",
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = crate::router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/_api/v1/caches/queued/push-jobs/resume-job/resume")
+                    .header(
+                        protocol::PROTOCOL_VERSION_HEADER,
+                        protocol::PROTOCOL_VERSION,
+                    )
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parked: bool = sqlx::query_scalar(
+            "SELECT work_at='infinity'::timestamptz FROM upload_finalization_batches",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(parked, "settled batches stay out of the runnable range");
         state.finish_background().await;
     }
 }

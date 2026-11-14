@@ -580,13 +580,22 @@ async fn resume(
     // Resume renews queued multipart work too. Failed verification remains
     // terminal; only authorization failures can run under the renewed grant.
     sqlx::query(
-        "WITH renewed AS (UPDATE upload_finalization_batches b SET \
+        "UPDATE upload_finalizations f SET result=NULL FROM upload_finalization_batches b \
+         WHERE b.job_id=$1 AND f.batch_id=b.id AND (f.result->>'status')::integer=401",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    // Only batches with unsettled members become runnable. A settled batch
+    // stays parked, outside the range every idle consumer polls.
+    sqlx::query(
+        "UPDATE upload_finalization_batches b SET \
          expires_at=LEAST(j.authorization_expires_at,j.idle_expires_at,j.hard_expires_at), \
          actor=$2,token_jti=$2,grant_generation=j.grant_generation, \
-         work_id=NULL,lease_expires_at=NULL,work_at=NOW(),failures=0 \
-         FROM push_jobs j WHERE j.id=$1 AND b.job_id=j.id RETURNING b.id) \
-         UPDATE upload_finalizations f SET result=NULL FROM renewed r \
-         WHERE f.batch_id=r.id AND (f.result->>'status')::integer=401",
+         work_id=NULL,lease_expires_at=NULL,failures=0, \
+         work_at=CASE WHEN EXISTS(SELECT 1 FROM upload_finalizations f \
+             WHERE f.batch_id=b.id AND f.result IS NULL) THEN NOW() ELSE 'infinity'::timestamptz END \
+         FROM push_jobs j WHERE j.id=$1 AND b.job_id=j.id",
     )
     .bind(&id)
     .bind(&token.id)
