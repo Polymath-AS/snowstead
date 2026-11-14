@@ -4,7 +4,7 @@ use axum::{
     body::{Body, Bytes},
     http::StatusCode,
 };
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream::FuturesUnordered};
 use http_body_util::StreamBody;
 use object_store::{
     Attribute, Attributes, ClientOptions, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
@@ -29,9 +29,10 @@ use crate::{
     error::ApiError,
 };
 
-// Equal-sized, sequential parts satisfy R2's non-final-part rule. Larger
+// Equal-sized parts satisfy R2's non-final-part rule. Larger
 // objects need larger parts to stay within its 10,000-part limit.
 const PART_SIZE: usize = 8 * 1024 * 1024;
+const UPLOAD_BUFFERS: usize = 3;
 const MAX_OBJECT_SIZE: u64 = 5 * 1024_u64.pow(4);
 // Bound aggregate application-owned part buffers, including large legal objects.
 const MEMORY_UNIT: usize = 1024 * 1024;
@@ -468,7 +469,7 @@ impl Storage {
         let buffer_size = expected_size.min(part_size as u64) as usize;
         // No waiting queue, body polling, buffer allocation, or provider mutation
         // before the upload buffer memory has been reserved.
-        let memory = self
+        let mut memory = self
             .upload_memory
             .clone()
             .try_acquire_many_owned(buffer_size.div_ceil(MEMORY_UNIT) as u32)
@@ -483,7 +484,7 @@ impl Storage {
                 if chunk.len() as u64 > expected_size - buffer.len() as u64 {
                     return Err(UploadError::Size);
                 }
-                crate::profile_block!("storage.upload_hash", hash.update(&chunk));
+                crate::profile_block!("storage.small_upload_hash", hash.update(&chunk));
                 buffer.extend_from_slice(&chunk);
             }
             if buffer.len() as u64 != expected_size {
@@ -510,13 +511,41 @@ impl Storage {
             .map_err(io::Error::other)??;
             return Ok(hex::encode(hash.finalize()));
         }
+        // Reserve every in-flight/filling buffer up front. Under memory pressure
+        // retain the single-buffer path rather than queueing for more memory.
+        let mut buffers = 1;
+        while buffers < UPLOAD_BUFFERS
+            && buffers < expected_size.div_ceil(part_size as u64) as usize
+        {
+            let Ok(extra) = self
+                .upload_memory
+                .clone()
+                .try_acquire_many_owned(buffer_size.div_ceil(MEMORY_UNIT) as u32)
+            else {
+                break;
+            };
+            memory.merge(extra);
+            buffers += 1;
+        }
         let mut pending =
             PendingUpload::new(self.store(private).clone(), path, options, memory).await?;
         let mut buffer = Vec::new();
         let mut size = 0_u64;
         let mut hash = Sha256::new();
         let result = async {
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // Poll destination requests while waiting for verification to
+                // produce bytes, not only when the next part fills up.
+                let chunk = tokio::select! {
+                    result = pending.parts.next(), if !pending.parts.is_empty() => {
+                        result.expect("pending part").map_err(io_error)?;
+                        continue;
+                    }
+                    chunk = stream.next() => match chunk {
+                        Some(chunk) => chunk,
+                        None => break,
+                    },
+                };
                 let chunk = chunk?;
                 size = size
                     .checked_add(chunk.len() as u64)
@@ -535,9 +564,15 @@ impl Storage {
                     buffer.extend_from_slice(&remaining[..take]);
                     remaining = &remaining[take..];
                     if buffer.len() == part_size {
-                        // Release the uploaded part before allocating the next
-                        // buffer: at 5 TiB each part can be 525 MiB.
-                        pending.part(std::mem::take(&mut buffer)).await?;
+                        pending.part(std::mem::take(&mut buffer));
+                        if pending.parts.len() == buffers {
+                            pending
+                                .parts
+                                .next()
+                                .await
+                                .expect("pending part")
+                                .map_err(io_error)?;
+                        }
                     }
                 }
             }
@@ -546,7 +581,10 @@ impl Storage {
             }
             // A single empty final part also handles a zero-length object.
             if !buffer.is_empty() || size == 0 {
-                pending.part(buffer).await?;
+                pending.part(buffer);
+            }
+            while let Some(result) = pending.parts.next().await {
+                result.map_err(io_error)?;
             }
             crate::profile_future!(
                 pending.upload.as_mut().expect("active upload").complete(),
@@ -720,6 +758,7 @@ impl UploadError {
 
 struct PendingUpload {
     upload: Option<Box<dyn MultipartUpload>>,
+    parts: FuturesUnordered<object_store::UploadPart>,
     _memory: Option<OwnedSemaphorePermit>,
 }
 
@@ -742,6 +781,7 @@ impl PendingUpload {
                     .map_err(io_error)
                     .map(|upload| Self {
                         upload: Some(upload),
+                        parts: FuturesUnordered::new(),
                         _memory: Some(memory),
                     });
                 let _ = tx.send(result);
@@ -759,13 +799,16 @@ impl PendingUpload {
             name = "storage.multipart_part"
         )
     )]
-    async fn part(&mut self, bytes: Vec<u8>) -> io::Result<()> {
-        self.upload
+    fn part(&mut self, bytes: Vec<u8>) {
+        let part = self
+            .upload
             .as_mut()
             .expect("active upload")
-            .put_part(bytes.into())
-            .await
-            .map_err(io_error)
+            .put_part(bytes.into());
+        self.parts.push(Box::pin(crate::profile_future!(
+            part,
+            label = "storage.upload_part"
+        )));
     }
 
     #[cfg_attr(
@@ -777,6 +820,7 @@ impl PendingUpload {
         )
     )]
     async fn abort(&mut self) {
+        self.parts.clear();
         if let Some(upload) = &mut self.upload
             && matches!(
                 tokio::time::timeout(Duration::from_secs(30), upload.abort()).await,
@@ -790,6 +834,7 @@ impl PendingUpload {
 
 impl Drop for PendingUpload {
     fn drop(&mut self) {
+        self.parts.clear();
         if let Some(mut upload) = self.upload.take() {
             let memory = self._memory.take();
             // One bounded cleanup task per admitted upload; shutdown/crash or
@@ -995,6 +1040,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct Observations {
         parts: Mutex<Vec<usize>>,
+        part_gates: Mutex<Vec<Arc<Semaphore>>>,
+        finished_parts: AtomicUsize,
         starts: AtomicUsize,
         abort_gate: Mutex<Option<Arc<Semaphore>>>,
         put_gate: Mutex<Option<Arc<Semaphore>>>,
@@ -1117,7 +1164,24 @@ mod tests {
             if self.observations.fail_part.load(Ordering::SeqCst) {
                 return Box::pin(async { Err(injected_error()) });
             }
-            self.inner.put_part(bytes)
+            let index = self.observations.parts.lock().unwrap().len() - 1;
+            let gate = self
+                .observations
+                .part_gates
+                .lock()
+                .unwrap()
+                .get(index)
+                .cloned();
+            let part = self.inner.put_part(bytes);
+            let observations = self.observations.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+                part.await?;
+                observations.finished_parts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
 
         async fn complete(&mut self) -> object_store::Result<PutResult> {
@@ -1486,6 +1550,63 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read(&storage, false, "object").await, b"old");
+    }
+
+    #[tokio::test]
+    async fn overlapping_parts_preserve_order_and_respect_memory_budget() {
+        for buffers in 1..=UPLOAD_BUFFERS {
+            let store = Arc::new(ObservedStore::default());
+            let observations = store.observations.clone();
+            let gates: Vec<_> = (0..5).map(|_| Arc::new(Semaphore::new(0))).collect();
+            *observations.part_gates.lock().unwrap() = gates.clone();
+            let mut storage = Storage::from_stores(store, Arc::new(InMemory::new()));
+            storage.configure_limits(&ResourceLimits {
+                upload_buffer_mib: buffers * 8,
+                ..Default::default()
+            });
+            storage.put(false, "object", b"old").await.unwrap();
+            let bytes: Vec<_> = (0..PART_SIZE * 4 + 17)
+                .map(|i| (i / PART_SIZE) as u8)
+                .collect();
+            let expected_hash = hex::encode(Sha256::digest(&bytes));
+            let owned = storage.clone();
+            let body = bytes.clone();
+            let upload = tokio::spawn(async move {
+                owned
+                    .write_body(false, "object", Body::from(body), bytes.len() as u64)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while observations.parts.lock().unwrap().len() != buffers {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(storage.upload_memory.available_permits(), 0);
+            assert_eq!(read(&storage, false, "object").await, b"old");
+            if buffers > 1 {
+                // The later part can finish while the first is blocked. The
+                // completed object's byte order must still follow the source.
+                gates[1].add_permits(1);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while observations.finished_parts.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            for gate in gates {
+                gate.add_permits(1);
+            }
+            assert_eq!(upload.await.unwrap().unwrap(), expected_hash);
+            let expected: Vec<_> = (0..PART_SIZE * 4 + 17)
+                .map(|i| (i / PART_SIZE) as u8)
+                .collect();
+            assert_eq!(read(&storage, false, "object").await, expected);
+            assert_eq!(storage.upload_memory.available_permits(), buffers * 8);
+        }
     }
 
     #[tokio::test]
