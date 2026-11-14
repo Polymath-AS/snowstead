@@ -9,14 +9,11 @@ license-file = "../../LICENSE"
 default = []
 # Compile-time only: normal builds do not link hotpath or activate snitch.
 profiling = ["dep:hotpath"]
-# Production telemetry is opt-in and independent of the native profiler.
+# Vendor-neutral instrumentation for embedding applications.
 observability = [
     "dep:log",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry-appender-tracing",
-    "dep:posthog-rs",
     "dep:tracing-opentelemetry",
 ]
 
@@ -38,11 +35,8 @@ hotpath = { workspace = true, optional = true, features = ["hotpath"] }
 httpdate.workspace = true
 log = { version = "0.4", optional = true }
 object_store = { workspace = true, features = ["aws"] }
-opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
-opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics", "logs"], optional = true }
-opentelemetry-appender-tracing = { version = "0.33.1", optional = true }
-posthog-rs = { version = "0.31.0", default-features = false, features = ["error-tracking"], optional = true }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"], optional = true }
 reqwest = { workspace = true, features = ["rustls", "json", "query"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -64,7 +58,5 @@ pkg-config.workspace = true
 
 [dev-dependencies]
 hegeltest.workspace = true
-opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs"] }
-prost = "0.14"
 tower = { workspace = true, features = ["util"] }
 zstd = { workspace = true, features = ["pkg-config"] }

@@ -35,20 +35,12 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn run() -> anyhow::Result<()> {
-    #[cfg(feature = "observability")]
-    let telemetry = snowstead_server::observability::init().await;
-    #[cfg(not(feature = "observability"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let result = run_server().await;
-    #[cfg(feature = "observability")]
-    if let Some(telemetry) = telemetry {
-        telemetry.shutdown().await;
-    }
-    result
+    run_server().await
 }
 
 async fn run_server() -> anyhow::Result<()> {
