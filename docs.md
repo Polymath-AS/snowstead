@@ -56,9 +56,11 @@ source removal does not change this upgrade requirement.
 Apply the additive `0001_optimistic_publication.sql` migration before deploying
 the new server. It adds bucket pointers, durable object ownership, completion
 receipts, and the exact-key cleanup queue without removing legacy objects.
-Drain old writers and maintenance before cutover. Legacy canonical ownership
-records never expire automatically; reconcile ambiguous provider operations
-before an operator releases their source/destination pins.
+Drain old writers and maintenance before cutover. Upload sessions that wrote
+straight to a NAR's final key, and the `legacy-unresolved` reservations cache
+deletion once recorded for them, predate staged uploads. Maintenance neither
+expires nor protects them, and the server refuses to start while any remain:
+reconcile their provider operations and remove those rows first.
 
 The additive `0014_lifecycle_constraints.sql` migration names the persisted
 state machines documented in `workers/server/src/lifecycle.rs`. Its CHECK
@@ -102,8 +104,11 @@ Before activation:
    `snowstead-server check-upload-cutover` with the runtime environment before
    activation. The command reports the count of active relay sessions containing
    uploaded parts and exits unsuccessfully until those sessions drain or are
-   cancelled. Server startup repeats the guard in case an old writer races the
-   preflight. Do not bypass it by editing upload receipts or provider IDs.
+   cancelled. It also counts upload sessions whose upload key is outside
+   `staging/` and `legacy-unresolved` reservations, and exits unsuccessfully
+   until an operator has resolved them. Server startup repeats the guard in
+   case an old writer races the preflight. Do not bypass it by editing upload
+   receipts or provider IDs.
 
 To verify the release packages locally, from the repository root:
 
@@ -238,7 +243,10 @@ Deletion, retention, and eviction withdraw SQL visibility atomically and queue
 known exact keys for asynchronous cleanup. Storage failure does not roll back
 the committed withdrawal. Maintenance retries idempotent deletion outside SQL
 transactions. Expiry revokes adoption of new attempts, not provider work;
-orphan sweeps find late writes. Legacy canonical ownership never autoexpires.
+orphan sweeps find late writes. Stored NAR bytes are collected once no
+publication points at them and no publication attempt is preparing the same
+content; an upload session alone does not keep them. Collection locks only the
+rows it removes and skips any that a publication is adopting.
 
 ## Rust and C/C++ compiler cache
 

@@ -1711,19 +1711,6 @@ async fn publish_group(
         )
         .await?;
     }
-    // GC takes this table fence before NAR locks. Obtain it before admission
-    // too: eviction can update sessions through invalidation triggers.
-    sqlx::query("LOCK TABLE upload_sessions IN ROW EXCLUSIVE MODE NOWAIT")
-        .execute(&mut *tx)
-        .await?;
-    lock_set(
-        &mut tx,
-        incoming
-            .iter()
-            .map(|p| format!("nar:{}:zstd", p.session.file_hash.as_deref().unwrap()))
-            .collect(),
-    )
-    .await?;
     let input = sqlx::types::Json(&incoming);
     let owned = sqlx::query(
         "DELETE FROM nar_installations n USING jsonb_to_recordset($1) \
@@ -1773,6 +1760,7 @@ async fn publish_group(
     }
     // Deduplicate blobs separately from paths: multiple paths may share bytes,
     // and one batch may need both public and private pointers to those bytes.
+    // The upsert locks each blob row it adopts, which is what excludes blob GC.
     sqlx::query(
         r#"
         WITH incoming AS (

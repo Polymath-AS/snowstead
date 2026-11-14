@@ -38,6 +38,19 @@ pub async fn check_upload_cutover(pool: &PgPool) -> Result<()> {
         active == 0,
         "{active} active relayed upload sessions contain uploaded parts; drain or cancel their pushes before deploying presigned uploads"
     );
+    // Uploads that wrote straight to a blob's final key predate staging. Blob
+    // GC and session expiry no longer fence against them.
+    let unstaged: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM upload_sessions WHERE r2_upload_key IS NOT NULL \
+         AND NOT starts_with(r2_upload_key, 'staging/')) \
+         + (SELECT count(*) FROM nar_installations WHERE phase = 'legacy-unresolved')",
+    )
+    .fetch_one(pool)
+    .await?;
+    ensure!(
+        unstaged == 0,
+        "{unstaged} upload sessions or reservations predate staged uploads; resolve them before deploying"
+    );
     Ok(())
 }
 
