@@ -116,7 +116,6 @@
             inherit craneLib;
           };
 
-          server-observability = server.override { features = [ "observability" ]; };
           server-hotpath = server.override { features = [ "profiling" ]; };
           hotpath = default.override { hotpath = true; };
         }
