@@ -403,9 +403,7 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
         header::AUTHORIZATION,
         format!("Bearer {key}").parse().unwrap(),
     );
-    let key_principal = auth::authenticate(&key_headers, &state, None)
-        .await
-        .unwrap();
+    let key_principal = auth::authenticate(&key_headers, &state).await.unwrap();
     assert_eq!(key_principal.actor(), "key:0123456789abcdef");
     assert!(authz::authorize(&key_principal, Action::OrgRead, &Resource::Org("org_alpha")).is_ok());
     assert!(authz::authorize(&key_principal, Action::OrgRead, &Resource::Org("org_beta")).is_err());

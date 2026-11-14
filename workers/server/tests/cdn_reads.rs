@@ -381,20 +381,12 @@ async fn private_stays_authenticated_and_streamed(pool: PgPool) {
 }
 
 async fn signing_post(app: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
-    let (path, credential) = web::dashboard(
-        "POST",
-        path,
-        "operator-secret",
-        None,
-        body.to_string().as_bytes(),
-    );
+    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path.as_str())
-                .header("authorization", format!("Bearer {credential}"))
+            credential
+                .apply(Request::builder().method("POST").uri(path.as_str()))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -411,7 +403,6 @@ async fn private_sql_representation_validators_and_key_activation(pool: PgPool) 
     let initial = fixture_with_storage(pool.clone(), CDN, storage.clone()).await;
     let mut cfg = config(CDN);
     cfg.admin_secret = "operator-secret".into();
-    cfg.web_assertion_public_keys = web::public_key();
     cfg.signing_master_key = STANDARD.encode([42; 32]);
     cfg.signing_key_name = "fixture".into();
     let state = AppState::new(pool.clone(), cfg, storage.clone(), reqwest::Client::new()).unwrap();
@@ -855,6 +846,8 @@ async fn alias_fixture(pool: PgPool, origin: &str) -> AppState {
     let mut cfg = config(origin);
     cfg.cache_host_suffix = "snowstead.com".into();
     cfg.cache_canonical_hosts = "api.snowstead.com origin.snowstead.com".into();
+    cfg.cache_reserved_names =
+        "www docs admin cache cache-staging auth staging status mail orgs invitations".into();
     cfg.signing_key_name = "alias-test".into();
     cfg.signing_private_key = STANDARD.encode([7; 32]);
     sqlx::query("UPDATE published_paths SET nar_hash='sha256:' || repeat('0',64), signatures_json='[\"upstream:kept\"]'")

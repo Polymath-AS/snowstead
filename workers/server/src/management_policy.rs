@@ -299,7 +299,7 @@ async fn purge_cache(
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&path.cache)?;
-    if state.config.cdn_zone_id.is_empty() {
+    if state.cdn.is_none() {
         return Err(bad("no CDN is configured to purge"));
     }
     let input = body(request).await?;

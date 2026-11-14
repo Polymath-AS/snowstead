@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    bandwidth, cdn,
+    cdn,
     config::Config,
     error::{ApiError, json_response},
     maintenance, management, protocol_policy, storage,
@@ -44,8 +44,7 @@ pub struct AppState {
     pub(crate) manifest_slots: Arc<Semaphore>,
     pub(crate) sql_waiters: Arc<Semaphore>,
     pub(crate) sql_writers: Arc<crate::db::Writers>,
-    /// Keys that sign the web's per-request user assertions.
-    pub(crate) assertion_keys: Arc<[ed25519_dalek::VerifyingKey]>,
+    pub(crate) cdn: Option<Arc<dyn cdn::PurgeTransport>>,
     proxy_ips: Arc<[IpAddr]>,
 }
 
@@ -63,11 +62,6 @@ impl AppState {
         storage.configure_limits(&config.resources);
         cdn::validate_config(&config)?;
         crate::cache_host::validate_config(&config)?;
-        anyhow::ensure!(
-            config.analytics_token.is_empty()
-                || !config.cdn_zone_id.is_empty() && !config.public_cache_origin.is_empty(),
-            "Analytics requires a CDN zone and public cache origin"
-        );
         let proxy_ips = config
             .trusted_proxy_ips
             .split_whitespace()
@@ -78,9 +72,8 @@ impl AppState {
                     "TRUSTED_PROXY_IPS must contain IP addresses separated by whitespace"
                 )
             })?;
-        let assertion_keys = crate::auth::assertion_keys(&config.web_assertion_public_keys)?;
         Ok(Self {
-            assertion_keys: assertion_keys.into(),
+            cdn: None,
             read_pool: pool.clone(),
             sql_waiters: Arc::new(Semaphore::new(pool.options().get_max_connections() as usize)),
             sql_writers: Arc::default(),
@@ -102,6 +95,17 @@ impl AppState {
             protocol_limits: Arc::default(),
             proxy_ips: proxy_ips.into(),
         })
+    }
+
+    /// Attach an invalidation provider before starting requests or workers.
+    /// Core owns the durable queue and drains it before shutdown.
+    pub fn with_cdn(mut self, transport: Arc<dyn cdn::PurgeTransport>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !self.config.public_cache_origin.is_empty(),
+            "CDN purging requires a public cache origin"
+        );
+        self.cdn = Some(transport);
+        Ok(self)
     }
 
     /// Start the durable multipart consumers once. Tower hosts and tests use
@@ -161,7 +165,7 @@ pub async fn serve_router(
             .tasks
             .spawn(crate::push_job_worker::run(worker_state, stopped));
     }
-    if !state.config.cdn_zone_id.is_empty() {
+    if state.cdn.is_some() {
         let retry_state = state.clone();
         let stopped = retry_stop.clone();
         state.tasks.spawn(async move {
@@ -196,7 +200,6 @@ pub async fn serve_router(
                     if maintenance::run(&maintenance_state).await.is_err() {
                         tracing::warn!("Maintenance failed; durable cleanup remains for retry");
                     }
-                    bandwidth::run(&maintenance_state).await;
                 }
             }
         }

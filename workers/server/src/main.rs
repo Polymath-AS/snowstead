@@ -1,5 +1,5 @@
 use snowstead_server::{
-    config::{connect_pool, listen_address},
+    config::{Config, connect_pool, listen_address},
     migrations,
     runtime::application_state,
     serve,
@@ -84,7 +84,7 @@ async fn run_server() -> anyhow::Result<()> {
             anyhow::bail!("Usage: snowstead-server [migrate [--rebaseline] | check-upload-cutover]")
         }
     }
-    let state = application_state(pool).await?;
+    let state = application_state(pool, Config::from_env()).await?;
     let listener = tokio::net::TcpListener::bind(listen_address()?).await?;
     tracing::info!(address = %listener.local_addr()?, "Snowstead listening");
     serve(listener, state, shutdown()).await?;

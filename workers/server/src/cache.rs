@@ -57,7 +57,7 @@ pub(crate) async fn caller(
     headers: &HeaderMap,
     limit: CallerLimit,
 ) -> Result<Principal, ApiError> {
-    let principal = auth::authenticate(headers, state, None).await?;
+    let principal = auth::authenticate(headers, state).await?;
     state.protocol_limits.check(limit, &principal.actor())?;
     Ok(principal)
 }

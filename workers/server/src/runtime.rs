@@ -7,17 +7,11 @@ use crate::{
 };
 use sqlx::PgPool;
 
-/// Build the cache state from the host's primary pool and environment.
+/// Build the cache state from the host's primary pool and configuration.
 /// Migrations remain an explicit operator action, not a startup side effect.
-pub async fn application_state(pool: PgPool) -> anyhow::Result<AppState> {
+pub async fn application_state(pool: PgPool, config: Config) -> anyhow::Result<AppState> {
     migrations::check_upload_cutover(&pool).await?;
-    let config = Config::from_env();
     config.validate_auth()?;
-    if config.allow_legacy_web_admin {
-        tracing::warn!(
-            "ALLOW_LEGACY_WEB_ADMIN=true: org routes accept ADMIN_SECRET with an unverified actor; turn it off once the dashboard signs assertions"
-        );
-    }
     if config.jwt_secret.is_empty() {
         let live: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM api_tokens WHERE secret_hash IS NULL \

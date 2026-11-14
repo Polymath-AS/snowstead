@@ -19,10 +19,7 @@ jobs:
       - name: Check the workspace and protocol integration
         run: nix develop --command pnpm check
       - name: Build the server and exercise application activation
-        run: nix build --no-link -L .#server .#checks.x86_64-linux.host .#checks.x86_64-linux.service .#checks.x86_64-linux.deployment
-      - name: Evaluate the Ubuntu application profile
-        run: |
-          nix eval --raw .#deploy.nodes.staging.profiles.service.path.drvPath
+        run: nix build --no-link -L .#server .#checks.x86_64-linux.host .#checks.x86_64-linux.service
       - name: Check deployment shell
         run: |
           nix shell --inputs-from . nixpkgs#shellcheck nixpkgs#actionlint --command bash -c 'shellcheck infra/*.sh && actionlint .github/workflows/service-*.yml'

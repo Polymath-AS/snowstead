@@ -49,7 +49,6 @@ async fn fixture_with_storage(pool: &PgPool, storage: Storage) -> AppState {
 fn config() -> Config {
     Config {
         admin_secret: "policy-admin".into(),
-        web_assertion_public_keys: web::public_key(),
         jwt_secret: "policy-jwt".into(),
         ..Default::default()
     }
@@ -62,21 +61,22 @@ async fn send(
     value: Value,
 ) -> (StatusCode, Value) {
     let (path, credential) = if credential == "policy-admin" {
-        web::dashboard(method, path, credential, None, value.to_string().as_bytes())
+        web::dashboard(method, path, credential, None)
     } else {
-        (path.to_owned(), credential.to_owned())
+        (
+            path.to_owned(),
+            web::Credential::Bearer(credential.to_owned()),
+        )
     };
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path.as_str())
+            credential
+                .apply(Request::builder().method(method).uri(path.as_str()))
                 .header(
                     snowstead_protocol::PROTOCOL_VERSION_HEADER,
                     snowstead_protocol::PROTOCOL_VERSION,
                 )
-                .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))
                 .unwrap(),

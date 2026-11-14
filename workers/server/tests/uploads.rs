@@ -52,12 +52,11 @@ async fn send(
         )
         .header("host", "backend.local");
     if let Some(token) = credential {
-        let token = if token == OWNER {
-            web::dashboard(method, path, "admin", None, &bytes).1
+        request = if token == OWNER {
+            web::dashboard(method, path, "admin", None).1.apply(request)
         } else {
-            token.to_owned()
+            request.header("authorization", format!("Bearer {token}"))
         };
-        request = request.header("authorization", format!("Bearer {token}"));
     }
     for (name, value) in headers {
         request = request.header(*name, *value);
@@ -634,7 +633,6 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
-        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -725,7 +723,6 @@ async fn manifest_protection_matches_metadata_and_withdrawal_cancels_overlapping
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
-        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -878,7 +875,6 @@ async fn manifest_completion_checks_current_members_and_preserves_history(pool: 
     let mut config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
-        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     config.push_jobs.active_per_org = 1;
@@ -1226,7 +1222,6 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
-        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let storage = common::s3_storage();
@@ -2755,7 +2750,6 @@ async fn manifest_batch_publication_and_withdrawal_preserve_job_fences(pool: PgP
     let config = Config {
         jwt_secret: "test-jwt".into(),
         admin_secret: "operator-secret".into(),
-        web_assertion_public_keys: web::public_key(),
         ..Default::default()
     };
     let app = router(
@@ -4262,7 +4256,6 @@ async fn multipart_survives_restart_and_preserves_immutable_receipts(pool: PgPoo
     let config = Config {
         shared_auth_token: Some("legacy".into()),
         admin_secret: "admin".into(),
-        web_assertion_public_keys: web::public_key(),
         public_url: "https://cache.example.test".into(),
         ..Default::default()
     };
@@ -4911,7 +4904,6 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
         Config {
             shared_auth_token: Some("legacy".into()),
             admin_secret: "admin".into(),
-            web_assertion_public_keys: web::public_key(),
             jwt_secret: "test-jwt".into(),
             ..Default::default()
         },
@@ -5017,7 +5009,6 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
                 Config {
                     shared_auth_token: Some("legacy".into()),
                     admin_secret: "admin".into(),
-                    web_assertion_public_keys: web::public_key(),
                     ..Default::default()
                 },
                 storage.clone(),
@@ -5759,7 +5750,6 @@ async fn ordered_batch_preparation_with_duplicate_paths_and_partial_failures_poo
         let storage = snowstead_server::storage::Storage::new(&config).unwrap();
         config.shared_auth_token = Some("legacy".into());
         config.admin_secret = "admin".into();
-        config.web_assertion_public_keys = web::public_key();
         let state = AppState::new(single.clone(), config, storage, reqwest::Client::new()).unwrap();
         let app = router(state.clone());
         let cache = if inline { "inline" } else { "multipart" };
@@ -6078,7 +6068,6 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
     config.r2_endpoint = format!("http://{}", proxy.local_addr().unwrap());
     config.shared_auth_token = Some("legacy".into());
     config.admin_secret = "admin".into();
-    config.web_assertion_public_keys = web::public_key();
     let proxy_app = Router::new().fallback(any({
         let reached = reached.clone();
         let release = release.clone();

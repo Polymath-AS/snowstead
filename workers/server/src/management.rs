@@ -9,7 +9,7 @@ use std::{
 use axum::{
     Extension, Router,
     body::{Body, to_bytes},
-    extract::{MatchedPath, OriginalUri, Path, Request, State},
+    extract::{MatchedPath, Path, Request, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -18,7 +18,6 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::{
@@ -286,8 +285,7 @@ async fn authorize_and_audit(
     State(state): State<AppState>,
     Path(params): Path<RouteParams>,
     matched: MatchedPath,
-    OriginalUri(uri): OriginalUri,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let admin = matched.as_str().starts_with("/_api/v1/admin");
@@ -303,34 +301,10 @@ async fn authorize_and_audit(
             "/_api/v1/orgs/{org}"
         })
         .ok_or_else(not_found)?;
-    // An assertion signs a hash of the body, so a captured one can't carry
-    // another. Management bodies are at most 1 MiB.
-    let mut body_sha256 = hex::encode(Sha256::digest(b""));
-    if auth::is_assertion(request.headers()) {
-        let (parts, stream) = request.into_parts();
-        let bytes = to_bytes(stream, 1024 * 1024).await.map_err(|_| {
-            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Request body is too large")
-        })?;
-        body_sha256 = hex::encode(Sha256::digest(&bytes));
-        request = Request::from_parts(parts, Body::from(bytes));
-    }
-    let target = auth::Target {
-        method: request.method(),
-        path: uri
-            .path_and_query()
-            .map_or_else(|| uri.path(), |p| p.as_str()),
-        body_sha256: &body_sha256,
-    };
-    let mut principal = match request.extensions().get::<authz::TrustedPrincipal>() {
+    let principal = match request.extensions().get::<authz::TrustedPrincipal>() {
         Some(verified) => verified.0.clone(),
-        None => auth::authenticate(request.headers(), &state, Some(target)).await?,
+        None => auth::authenticate(request.headers(), &state).await?,
     };
-    // Transitional: the old dashboard's operator-secret calls on org routes.
-    if !admin && state.config.allow_legacy_web_admin && matches!(principal, Principal::Operator) {
-        principal = Principal::LegacyWeb {
-            actor: auth::legacy_actor(request.headers()),
-        };
-    }
     let action = if admin {
         Some(Action::Operate)
     } else {
@@ -377,10 +351,7 @@ async fn authorize_and_audit(
     // against them, as is everything an API key or token does.
     let limited = match &principal {
         Principal::Operator => false,
-        Principal::WebUser(_) | Principal::LegacyWeb { actor: Some(_) } => {
-            !matches!(*request.method(), Method::GET | Method::HEAD)
-        }
-        Principal::LegacyWeb { actor: None } => false,
+        Principal::WebUser(_) => !matches!(*request.method(), Method::GET | Method::HEAD),
         _ => true,
     };
     if limited {
@@ -486,10 +457,6 @@ async fn authorize_and_audit(
         } else {
             None
         };
-        // Mark what the transitional path did, so its use is easy to find.
-        if matches!(principal, Principal::LegacyWeb { .. }) {
-            detail["legacyWeb"] = json!(true);
-        }
         let actual_action = if action == "pin.create" && parts.status == StatusCode::OK {
             "pin.update"
         } else {
@@ -1134,7 +1101,7 @@ async fn put_org(
             return Err(bad("the default org's slug can't change"));
         }
         let wanted=wanted.as_str().filter(|s|valid_name(s,SLUG_MAX)).ok_or_else(||bad("slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash"))?;
-        if ["default", "nar", "private", "_api", "healthz"].contains(&wanted) {
+        if crate::cache_host::reserved_name(&state.config, wanted) {
             return Err(bad(format!("{wanted} is reserved")));
         }
         let holder = sqlx::query_scalar!(

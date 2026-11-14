@@ -17,6 +17,23 @@ use sqlx::PgPool;
 use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 
+struct Refused;
+
+impl snowstead_server::cdn::PurgeTransport for Refused {
+    fn send(
+        &self,
+        _: Value,
+    ) -> futures_util::future::BoxFuture<'_, Result<snowstead_server::cdn::PurgeResponse, ()>> {
+        Box::pin(async {
+            Ok(snowstead_server::cdn::PurgeResponse {
+                success: false,
+                retryable: false,
+                retry_after: None,
+            })
+        })
+    }
+}
+
 async fn call(app: &Router, path: &str, method: &str, value: Value) -> (StatusCode, Value) {
     // Nix pushes use the self-hosted shared token; management, the operator.
     let secret = if path.starts_with("/_api/v1/caches/") {
@@ -24,19 +41,16 @@ async fn call(app: &Router, path: &str, method: &str, value: Value) -> (StatusCo
     } else {
         "operator"
     };
-    let (path, credential) =
-        web::dashboard(method, path, secret, None, value.to_string().as_bytes());
+    let (path, credential) = web::dashboard(method, path, secret, None);
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path.as_str())
+            credential
+                .apply(Request::builder().method(method).uri(path.as_str()))
                 .header(
                     snowstead_protocol::PROTOCOL_VERSION_HEADER,
                     snowstead_protocol::PROTOCOL_VERSION,
                 )
-                .header("authorization", format!("Bearer {credential}"))
                 .header("content-type", "application/json")
                 .body(Body::from(value.to_string()))
                 .unwrap(),
@@ -113,7 +127,6 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
-        web_assertion_public_keys: web::public_key(),
         shared_auth_token: Some("shared-token".into()),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
@@ -282,7 +295,6 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
-        web_assertion_public_keys: web::public_key(),
         jwt_secret: "metadata-test-secret".into(),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
@@ -471,25 +483,17 @@ async fn cache_deletion_queues_public_purge_and_manual_purges_validate_and_repor
 ) {
     let config = Config {
         admin_secret: "operator".into(),
-        web_assertion_public_keys: web::public_key(),
         public_cache_origin: "https://cdn.example.test".into(),
         public_url: "https://service.example.test".into(),
-        cdn_zone_id: "test-zone".into(),
-        cdn_purge_token: "test-token".into(),
         ..Default::default()
     };
-    // Confine outbound attempts to a closed loopback endpoint. Failed purges
-    // must remain durable and must not be reported as accepted.
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
-    let http = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(proxy).unwrap())
-        .timeout(std::time::Duration::from_secs(1))
-        .build()
-        .unwrap();
+    // Failed purges must remain durable and must not report acceptance.
+    let http = reqwest::Client::new();
     let storage = common::storage();
-    let state = AppState::new(pool.clone(), config, storage.clone(), http).unwrap();
+    let state = AppState::new(pool.clone(), config, storage.clone(), http)
+        .unwrap()
+        .with_cdn(std::sync::Arc::new(Refused))
+        .unwrap();
     let app = router(state.clone());
     sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_cdn','before');
         INSERT INTO caches(name,org_id,is_public) VALUES ('public','org_cdn',true),('private','org_cdn',false);

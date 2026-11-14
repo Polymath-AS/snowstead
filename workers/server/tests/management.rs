@@ -20,13 +20,7 @@ async fn call(
     input: Value,
     actor: Option<&str>,
 ) -> (StatusCode, HeaderMap, Value) {
-    let (path, credential) = web::dashboard(
-        method,
-        path,
-        "operator",
-        actor,
-        input.to_string().as_bytes(),
-    );
+    let (path, credential) = web::dashboard(method, path, "operator", actor);
     let request = Request::builder()
         .method(method)
         .uri(path)
@@ -34,8 +28,8 @@ async fn call(
             snowstead_protocol::PROTOCOL_VERSION_HEADER,
             snowstead_protocol::PROTOCOL_VERSION,
         )
-        .header("authorization", format!("Bearer {credential}"))
         .header("content-type", "application/json");
+    let request = credential.apply(request);
     let response = app
         .clone()
         .oneshot(request.body(Body::from(input.to_string())).unwrap())
@@ -60,7 +54,6 @@ fn state_with_storage(pool: PgPool, storage: Storage) -> AppState {
         pool,
         Config {
             admin_secret: "operator".into(),
-            web_assertion_public_keys: web::public_key(),
             jwt_secret: "jwt-secret".into(),
             ..Default::default()
         },

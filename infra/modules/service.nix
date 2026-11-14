@@ -1,5 +1,4 @@
 {
-  lib,
   pkgs,
   serverPackage,
   inventory,
@@ -34,28 +33,6 @@ in
     wantedBy = [ "multi-user.target" ];
     restartTriggers = [ bundle ];
   };
-  # Encrypted runtime files are optional during host bootstrap. Provision or
-  # encrypt the files before enabling the application; never embed plaintext.
-  age.identityPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
-  age.secrets =
-    lib.mapAttrs'
-      (
-        name: _:
-        lib.nameValuePair "snowstead-${name}" {
-          file = ../secrets + "/${name}.age";
-          path = "/etc/snowstead/${name}";
-          mode = "0600";
-        }
-      )
-      (
-        lib.filterAttrs (name: _: builtins.pathExists (../secrets + "/${name}.age")) {
-          environment = null;
-          migration = null;
-          origin-certificate = null;
-          origin-key = null;
-          origin-client-ca = null;
-        }
-      );
-  systemd.services.snowstead.after = [ "agenix.service" ];
-  systemd.services.snowstead-proxy.after = [ "agenix.service" ];
+  # Provision /etc/snowstead runtime files with the host's secret manager.
+  # Consumers must add ordering for that manager when it writes at activation.
 }

@@ -3,20 +3,14 @@
 //!
 //! Credentials, by form:
 //! - `ADMIN_SECRET`: the operator, for `/_api/v1/admin` only.
-//! - `snowstead_web.<claims>.<signature>`: a dashboard user, from an Ed25519
-//!   assertion the web signs per request, bound to its method and path.
 //! - `snowstead_key_<id>_<secret>`: an org API key.
 //! - `snowstead_tok_<jti>_<secret>`: an API token. Only a hash of the secret
 //!   is stored; scope comes from `token_permissions` and `token_caches`.
 //! - A JWT-era API token, accepted only while its `jti` is listed and
 //!   unrevoked in `api_tokens`, with scope from the database, not its claims.
 //! - A self-hosted shared `AUTH_TOKEN`, only when explicitly enabled.
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use ed25519_dalek::{Signature, VerifyingKey};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,7 +19,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     AppState,
-    authz::{ApiToken, CacheGrant, Permission, Principal, Role, WebUser},
+    authz::{ApiToken, CacheGrant, Permission, Principal},
     error::ApiError,
 };
 
@@ -33,22 +27,6 @@ pub(crate) const JWT_CLOCK_SKEW_SECONDS: i64 = 60;
 const JWT_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 pub(crate) const TOKEN_PREFIX: &str = "snowstead_tok_";
 const KEY_PREFIX: &str = "snowstead_key_";
-const ASSERTION_PREFIX: &str = "snowstead_web.";
-const ASSERTION_AUDIENCE: &str = "snowstead-cache";
-/// The longest an assertion may claim to live.
-const ASSERTION_LIFETIME_SECONDS: i64 = 60;
-const ASSERTION_SKEW_SECONDS: i64 = 30;
-
-/// The request an assertion must be bound to.
-#[derive(Clone, Copy)]
-pub struct Target<'a> {
-    pub method: &'a Method,
-    /// Path and query exactly as received.
-    pub path: &'a str,
-    /// Hex SHA-256 of the request body; of the empty string when it has none.
-    pub body_sha256: &'a str,
-}
-
 fn auth_error(status: StatusCode, read: bool) -> ApiError {
     let error = ApiError::new(
         status,
@@ -107,130 +85,6 @@ pub(crate) fn issue_token() -> std::io::Result<(String, String, String)> {
     let secret = URL_SAFE_NO_PAD.encode(random_bytes::<32>()?);
     let hash = secret_hash(&secret);
     Ok((id.clone(), format!("{TOKEN_PREFIX}{id}_{secret}"), hash))
-}
-
-/// The local development key: its private half is published in the
-/// dashboard's `.env.example`, so only `pnpm dev` may accept it.
-pub fn local_dev_web_key() -> VerifyingKey {
-    assertion_keys("2aLdazRgIkJp0m0Ik8oS5B0sUJQvwU6jvSaO4wWP/o0=").expect("a valid key")[0]
-}
-
-/// Whether the request presents a web assertion, whose body must be hashed.
-pub fn is_assertion(headers: &HeaderMap) -> bool {
-    bearer(headers).is_ok_and(|credential| credential.starts_with(ASSERTION_PREFIX))
-}
-
-/// The old dashboard's unverified `x-snowstead-actor`, for the transitional
-/// `ALLOW_LEGACY_WEB_ADMIN` path only.
-pub fn legacy_actor(headers: &HeaderMap) -> Option<String> {
-    let actor = headers
-        .get("x-snowstead-actor")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    (!actor.is_empty()
-        && actor.encode_utf16().count() <= 254
-        && !actor.chars().any(|c| c.is_whitespace() || c.is_control()))
-    .then(|| actor.to_owned())
-}
-
-/// Parse `WEB_ASSERTION_PUBLIC_KEYS`.
-pub fn assertion_keys(value: &str) -> anyhow::Result<Vec<VerifyingKey>> {
-    value
-        .split_whitespace()
-        .map(|key| {
-            let bytes: [u8; 32] = STANDARD
-                .decode(key)
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "WEB_ASSERTION_PUBLIC_KEYS must be base64 raw 32-byte Ed25519 public keys"
-                    )
-                })?;
-            let key = VerifyingKey::from_bytes(&bytes).map_err(|_| {
-                anyhow::anyhow!("WEB_ASSERTION_PUBLIC_KEYS contains an invalid Ed25519 key")
-            })?;
-            anyhow::ensure!(
-                !key.is_weak(),
-                "WEB_ASSERTION_PUBLIC_KEYS contains a weak Ed25519 key"
-            );
-            Ok(key)
-        })
-        .collect()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Assertion {
-    aud: String,
-    org: String,
-    sub: String,
-    email: String,
-    role: String,
-    iat: i64,
-    exp: i64,
-    method: String,
-    path: String,
-    body: String,
-}
-
-fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-fn verify_assertion(
-    keys: &[VerifyingKey],
-    credential: &str,
-    target: Target,
-    now: i64,
-) -> Option<WebUser> {
-    if keys.is_empty() || credential.len() > 8192 {
-        return None;
-    }
-    let (signed, signature) = credential.rsplit_once('.')?;
-    let payload = signed.strip_prefix(ASSERTION_PREFIX)?;
-    if payload.contains('.') {
-        return None;
-    }
-    let signature: [u8; 64] = URL_SAFE_NO_PAD.decode(signature).ok()?.try_into().ok()?;
-    let signature = Signature::from_bytes(&signature);
-    if !keys
-        .iter()
-        .any(|key| key.verify_strict(signed.as_bytes(), &signature).is_ok())
-    {
-        return None;
-    }
-    let claims: Assertion = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-    let email = claims.email.trim();
-    let valid = claims.aud == ASSERTION_AUDIENCE
-        && claims.exp > claims.iat
-        && claims.exp - claims.iat <= ASSERTION_LIFETIME_SECONDS
-        && claims.iat <= now + ASSERTION_SKEW_SECONDS
-        && now < claims.exp.saturating_add(ASSERTION_SKEW_SECONDS)
-        && claims.method == target.method.as_str()
-        && claims.path == target.path
-        && claims.body == target.body_sha256
-        && valid_id(&claims.org)
-        && valid_id(&claims.sub)
-        && email == claims.email
-        && email.contains('@')
-        && email.encode_utf16().count() <= 254
-        && !email.chars().any(|c| c.is_whitespace() || c.is_control());
-    if !valid {
-        return None;
-    }
-    Some(WebUser {
-        org: claims.org,
-        user_id: claims.sub,
-        email: claims.email,
-        role: Role::parse(&claims.role)?,
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,30 +353,13 @@ async fn org_key(state: &AppState, rest: &str) -> Result<Principal, ApiError> {
     }
 }
 
-/// Identify the holder of `credential`, or reject it with 401. A web
-/// assertion is accepted only when `target` is the request it was signed for.
+/// Identify the holder of a native credential, or reject it with 401.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn principal(
-    state: &AppState,
-    credential: &str,
-    target: Option<Target<'_>>,
-    read: bool,
-) -> Result<Principal, ApiError> {
+async fn principal(state: &AppState, credential: &str, read: bool) -> Result<Principal, ApiError> {
     let rejected = || auth_error(StatusCode::UNAUTHORIZED, read);
     let config = &state.config;
     if !config.admin_secret.is_empty() && equal_secret(credential, &config.admin_secret) {
         return Ok(Principal::Operator);
-    }
-    if credential.starts_with(ASSERTION_PREFIX) {
-        let target = target.ok_or_else(rejected)?;
-        let user = verify_assertion(
-            &state.assertion_keys,
-            credential,
-            target,
-            chrono::Utc::now().timestamp(),
-        )
-        .ok_or_else(rejected)?;
-        return Ok(Principal::WebUser(user));
     }
     if let Some(rest) = credential.strip_prefix(KEY_PREFIX) {
         return org_key(state, rest).await.map_err(|_| rejected());
@@ -548,16 +385,11 @@ async fn principal(
     Err(rejected())
 }
 
-/// Authenticate a bearer credential. `target` is the request being served,
-/// for web assertions; protocol routes pass None, which rejects them.
+/// Authenticate a native bearer credential.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authenticate(
-    headers: &HeaderMap,
-    state: &AppState,
-    target: Option<Target<'_>>,
-) -> Result<Principal, ApiError> {
+pub async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Principal, ApiError> {
     let credential = bearer(headers)?;
-    principal(state, credential, target, false).await
+    principal(state, credential, false).await
 }
 
 /// A token holder may inspect their own current scope without management access.
@@ -565,7 +397,7 @@ pub(crate) async fn status(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let Principal::ApiToken(token) = authenticate(&headers, &state, None).await? else {
+    let Principal::ApiToken(token) = authenticate(&headers, &state).await? else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "Credential status requires an API token",
@@ -625,7 +457,7 @@ pub async fn authenticate_read(
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| auth_error(StatusCode::UNAUTHORIZED, true))?;
-    principal(state, &credential, None, true).await
+    principal(state, &credential, true).await
 }
 
 /// Authorize a private Nix read of a cache.
@@ -650,7 +482,6 @@ pub async fn authorize_read(
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
-    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{Value, json};
 
     fn payload() -> Value {
@@ -715,115 +546,6 @@ mod tests {
         }
     }
 
-    fn assertion(key: &SigningKey, claims: &Value) -> String {
-        let signed = format!(
-            "{ASSERTION_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap())
-        );
-        let signature = key.sign(signed.as_bytes());
-        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
-    }
-
-    fn claims() -> Value {
-        json!({"aud":"snowstead-cache","org":"org_a","sub":"user_1","email":"dev@example.test","role":"member",
-            "iat":1000,"exp":1030,"method":"POST","path":"/_api/v1/orgs/org_a/tokens?x=1","body":BODY})
-    }
-
-    // Hex SHA-256 of `{"subject":"ci"}`.
-    const BODY: &str = "d58c1d618af77c6b21971af2ee5da4a65f4ee8abd7c11f460384500f3ed9770a";
-
-    #[test]
-    fn assertions_bind_key_lifetime_method_path_and_body() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let other = SigningKey::from_bytes(&[8; 32]);
-        let keys = [key.verifying_key()];
-        let post = Method::POST;
-        let target = Target {
-            method: &post,
-            path: "/_api/v1/orgs/org_a/tokens?x=1",
-            body_sha256: BODY,
-        };
-        let user = verify_assertion(&keys, &assertion(&key, &claims()), target, 1010).unwrap();
-        assert_eq!(
-            (user.org.as_str(), user.user_id.as_str(), user.role),
-            ("org_a", "user_1", Role::Member)
-        );
-        assert!(verify_assertion(&keys, &assertion(&other, &claims()), target, 1010).is_none());
-        assert!(verify_assertion(&[], &assertion(&key, &claims()), target, 1010).is_none());
-        // Skew allows a little clock drift either way, and no more.
-        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 970).is_some());
-        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 969).is_none());
-        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 1059).is_some());
-        assert!(verify_assertion(&keys, &assertion(&key, &claims()), target, 1060).is_none());
-        let get = Method::GET;
-        for wrong in [
-            Target {
-                method: &get,
-                ..target
-            },
-            Target {
-                path: "/_api/v1/orgs/org_a/tokens",
-                ..target
-            },
-            Target {
-                path: "/_api/v1/orgs/org_b/tokens?x=1",
-                ..target
-            },
-            // A captured assertion can't carry another body.
-            Target {
-                body_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                ..target
-            },
-        ] {
-            assert!(verify_assertion(&keys, &assertion(&key, &claims()), wrong, 1010).is_none());
-        }
-        for (field, value) in [
-            ("aud", json!("snowstead")),
-            ("exp", json!(1061)),
-            ("exp", json!(1000)),
-            ("role", json!("operator")),
-            ("org", json!("org/a")),
-            ("email", json!("not an email")),
-            ("email", json!("")),
-            ("sub", json!("")),
-            ("extra", json!(true)),
-        ] {
-            let mut c = claims();
-            c[field] = value;
-            assert!(
-                verify_assertion(&keys, &assertion(&key, &c), target, 1010).is_none(),
-                "{field}"
-            );
-        }
-        // Tampering with the signed payload invalidates the signature.
-        let genuine = assertion(&key, &claims());
-        let mut c = claims();
-        c["role"] = json!("owner");
-        let forged = format!(
-            "{ASSERTION_PREFIX}{}.{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&c).unwrap()),
-            genuine.rsplit_once('.').unwrap().1
-        );
-        assert!(verify_assertion(&keys, &forged, target, 1010).is_none());
-    }
-
-    #[test]
-    fn assertion_keys_must_be_valid_ed25519_keys() {
-        let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
-        let encoded = STANDARD.encode(key.as_bytes());
-        assert_eq!(assertion_keys("").unwrap().len(), 0);
-        assert_eq!(
-            assertion_keys(&format!(" {encoded}\n{encoded} ")).unwrap(),
-            vec![key, key]
-        );
-        assert!(assertion_keys("not-base64!").is_err());
-        assert!(assertion_keys(&STANDARD.encode([1u8; 31])).is_err());
-        // The identity point is a weak key.
-        let mut identity = [0u8; 32];
-        identity[0] = 1;
-        assert!(assertion_keys(&STANDARD.encode(identity)).is_err());
-    }
-
     #[test]
     fn issued_tokens_are_opaque_and_store_only_a_hash() {
         let (id, token, hash) = issue_token().unwrap();
@@ -853,7 +575,7 @@ mod tests {
         let state = AppState::new(pool, config, storage, reqwest::Client::new()).unwrap();
         let mut headers = HeaderMap::new();
         assert!(
-            authenticate(&headers, &state, None)
+            authenticate(&headers, &state)
                 .await
                 .err()
                 .unwrap()
@@ -865,7 +587,7 @@ mod tests {
             HeaderValue::from_static("Bearer legacy-secret"),
         );
         assert!(matches!(
-            authenticate(&headers, &state, None).await,
+            authenticate(&headers, &state).await,
             Ok(Principal::SharedToken)
         ));
         headers.insert(
@@ -877,32 +599,20 @@ mod tests {
             "x-snowstead-actor",
             HeaderValue::from_static("dev@example.test"),
         );
-        let operator = authenticate(&headers, &state, None).await.unwrap();
+        let operator = authenticate(&headers, &state).await.unwrap();
         assert!(matches!(operator, Principal::Operator));
         assert_eq!(operator.actor(), "admin");
-        // Without configured keys, no assertion is accepted.
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!(
-                "Bearer {}",
-                assertion(&SigningKey::from_bytes(&[7; 32]), &claims())
-            ))
-            .unwrap(),
-        );
-        let post = Method::POST;
-        let target = Target {
-            method: &post,
-            path: "/_api/v1/orgs/org_a/tokens?x=1",
-            body_sha256: BODY,
-        };
-        assert_eq!(
-            authenticate(&headers, &state, Some(target))
-                .await
-                .err()
-                .unwrap()
-                .status,
-            StatusCode::UNAUTHORIZED
-        );
+        // Hosted assertions are never core credentials.
+        for credential in [
+            "Bearer snowstead_web.payload.signature",
+            "Bearer snowsvc1.payload.signature",
+        ] {
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_static(credential));
+            assert_eq!(
+                authenticate(&headers, &state).await.err().unwrap().status,
+                StatusCode::UNAUTHORIZED
+            );
+        }
         headers.clear();
         let error = authorize_read(&headers, &state, 1, "private", "default")
             .await

@@ -1,63 +1,55 @@
-//! Dashboard requests: the web signs a short-lived assertion per request with
-//! an Ed25519 key whose public half the service is configured with.
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use ed25519_dalek::{Signer, SigningKey};
+//! In-process embedding identities. No test credential is decoded from HTTP.
+use axum::http::request::Builder;
+use snowstead_server::authz::{Principal, Role, TrustedPrincipal, WebUser};
 
-const SEED: [u8; 32] = [42; 32];
-
-/// For `Config::web_assertion_public_keys`.
-pub fn public_key() -> String {
-    STANDARD.encode(SigningKey::from_bytes(&SEED).verifying_key().as_bytes())
+pub enum Credential {
+    Bearer(String),
+    Trusted(TrustedPrincipal),
 }
 
-/// The bearer credential for `method path` with `body`, as `email` with
-/// `role` in `org`.
-pub fn assertion(
-    method: &str,
-    path: &str,
-    org: &str,
-    role: &str,
-    email: &str,
-    body: &[u8],
-) -> String {
-    use sha2::Digest;
-    let now = chrono::Utc::now().timestamp();
-    let claims = serde_json::json!({"aud":"snowstead-cache","org":org,"sub":"user_test","email":email,
-        "role":role,"iat":now,"exp":now + 30,"method":method,"path":path,
-        "body":hex::encode(sha2::Sha256::digest(body))});
-    let signed = format!(
-        "snowstead_web.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
-    );
-    let signature = SigningKey::from_bytes(&SEED).sign(signed.as_bytes());
-    format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+impl Credential {
+    pub fn apply(self, request: Builder) -> Builder {
+        match self {
+            Self::Bearer(token) => request.header("authorization", format!("Bearer {token}")),
+            Self::Trusted(principal) => request.extension(principal),
+        }
+    }
 }
 
-/// Where and with what credential a test sends `method path`: org routes go
-/// out as the dashboard, signed in as the org's owner (`actor`, by default
-/// dev@example.test); org creation and limits go to the operator's
-/// `/_api/v1/admin/orgs/{org}`; other routes keep `operator`'s secret.
+pub fn person(org: &str, role: Role, email: &str) -> TrustedPrincipal {
+    TrustedPrincipal(Principal::WebUser(WebUser {
+        org: org.into(),
+        user_id: "user_test".into(),
+        email: email.into(),
+        role,
+    }))
+}
+
+/// Org creation/limits use the operator surface; other management requests
+/// enter as a verified organization owner through an in-process extension.
 pub fn dashboard(
     method: &str,
     path: &str,
     operator: &str,
     actor: Option<&str>,
-    body: &[u8],
-) -> (String, String) {
+) -> (String, Credential) {
     let Some(rest) = path.strip_prefix("/_api/v1/orgs/") else {
-        return (path.to_owned(), operator.to_owned());
+        return (path.into(), Credential::Bearer(operator.into()));
     };
     let org = rest.split(['/', '?']).next().unwrap();
     let route = &rest[org.len()..];
     if method == "PUT" && matches!(route, "" | "/") {
-        return (format!("/_api/v1/admin/orgs/{org}"), operator.to_owned());
+        return (
+            format!("/_api/v1/admin/orgs/{org}"),
+            Credential::Bearer(operator.into()),
+        );
     }
-    let email = actor.unwrap_or("dev@example.test");
     (
-        path.to_owned(),
-        assertion(method, path, org, "owner", email, body),
+        path.into(),
+        Credential::Trusted(person(
+            org,
+            Role::Owner,
+            actor.unwrap_or("dev@example.test"),
+        )),
     )
 }

@@ -23,11 +23,13 @@ async fn call(
 ) -> (StatusCode, Value) {
     let (path, token) = match token {
         Some(token) if token == "operator-secret" => {
-            let (path, token) =
-                web::dashboard(method, path, token, None, body.to_string().as_bytes());
+            let (path, token) = web::dashboard(method, path, token, None);
             (path, Some(token))
         }
-        _ => (path.to_owned(), token.map(str::to_owned)),
+        _ => (
+            path.to_owned(),
+            token.map(|v| web::Credential::Bearer(v.into())),
+        ),
     };
     let mut request = Request::builder()
         .method(method)
@@ -37,8 +39,8 @@ async fn call(
             snowstead_protocol::PROTOCOL_VERSION,
         )
         .header("content-type", "application/json");
-    if let Some(token) = &token {
-        request = request.header("authorization", format!("Bearer {token}"));
+    if let Some(token) = token {
+        request = token.apply(request);
     }
     let response = app
         .clone()
@@ -63,7 +65,6 @@ async fn app(pool: &PgPool) -> Router {
             Config {
                 jwt_secret: "contract-secret".into(),
                 admin_secret: "operator-secret".into(),
-                web_assertion_public_keys: web::public_key(),
                 shared_auth_token: Some("legacy-secret".into()),
                 ..Default::default()
             },
@@ -687,27 +688,17 @@ async fn dashboard_users_create_keys_as_themselves_without_logging_secrets(pool:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let path = "/_api/v1/orgs/org_alpha/keys";
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/_api/v1/orgs/org_alpha/keys")
-                .header(
-                    "authorization",
-                    format!(
-                        "Bearer {}",
-                        web::assertion(
-                            "POST",
-                            path,
-                            "org_alpha",
-                            "owner",
-                            "dev@example.test",
-                            json!({"name":"dashboard"}).to_string().as_bytes(),
-                        )
-                    ),
-                )
+                .extension(web::person(
+                    "org_alpha",
+                    snowstead_server::authz::Role::Owner,
+                    "dev@example.test",
+                ))
                 .header("cf-connecting-ip", "198.51.100.99")
                 .extension(axum::extract::ConnectInfo(
                     "192.0.2.23:43210".parse::<std::net::SocketAddr>().unwrap(),
@@ -748,114 +739,60 @@ async fn dashboard_users_create_keys_as_themselves_without_logging_secrets(pool:
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
+async fn embedded_people_are_bound_to_org_and_role(pool: PgPool) {
     let app = app(&pool).await;
-    let as_user = |method: &str, path: &str, org: &str, role: &str, body: &Value| {
-        let body = body.to_string();
-        web::assertion(
-            method,
-            path,
+    let as_user = |org: &str, role: &str| {
+        web::Credential::Trusted(web::person(
             org,
-            role,
+            snowstead_server::authz::Role::parse(role).unwrap(),
             "person@example.test",
-            body.as_bytes(),
-        )
+        ))
     };
     let caches = "/_api/v1/orgs/org_alpha/caches";
     let keys = "/_api/v1/orgs/org_alpha/keys";
     let org = "/_api/v1/orgs/org_alpha";
-    let status = |method: &'static str, path: &'static str, credential: String, body: Value| {
-        let app = app.clone();
-        async move { call(&app, method, path, Some(&credential), body).await.0 }
-    };
+    let status =
+        |method: &'static str, path: &'static str, credential: web::Credential, body: Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    credential
+                        .apply(Request::builder().method(method).uri(path))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
     assert_eq!(
-        status(
-            "GET",
-            caches,
-            as_user("GET", caches, "org_alpha", "member", &Value::Null),
-            Value::Null
-        )
-        .await,
+        status("GET", caches, as_user("org_alpha", "member"), Value::Null).await,
         StatusCode::OK
     );
     // Members can't manage API keys; owners can.
     let named = json!({"name":"deploy"});
     assert_eq!(
-        status(
-            "POST",
-            keys,
-            as_user("POST", keys, "org_alpha", "member", &named),
-            named.clone()
-        )
-        .await,
+        status("POST", keys, as_user("org_alpha", "member"), named.clone()).await,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        status(
-            "POST",
-            keys,
-            as_user("POST", keys, "org_alpha", "owner", &named),
-            named.clone()
-        )
-        .await,
+        status("POST", keys, as_user("org_alpha", "owner"), named.clone()).await,
         StatusCode::CREATED
     );
-    // Another org's user, or an assertion for another request, gets nothing.
+    // Another organization's verified user gets nothing.
     assert_eq!(
-        status(
-            "GET",
-            caches,
-            as_user("GET", caches, "org_beta", "owner", &Value::Null),
-            Value::Null
-        )
-        .await,
+        status("GET", caches, as_user("org_beta", "owner"), Value::Null).await,
         StatusCode::FORBIDDEN,
         "an org_beta user is not authorized on org_alpha"
-    );
-    let beta = "/_api/v1/orgs/org_beta/caches";
-    assert_eq!(
-        status(
-            "GET",
-            caches,
-            as_user("GET", beta, "org_beta", "owner", &Value::Null),
-            Value::Null
-        )
-        .await,
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        status(
-            "POST",
-            keys,
-            as_user("GET", keys, "org_alpha", "owner", &named),
-            named.clone()
-        )
-        .await,
-        StatusCode::UNAUTHORIZED
-    );
-    // A captured assertion can't carry a different body.
-    assert_eq!(
-        status(
-            "POST",
-            keys,
-            as_user("POST", keys, "org_alpha", "owner", &named),
-            json!({"name":"other"})
-        )
-        .await,
-        StatusCode::UNAUTHORIZED
     );
     // Owners change the slug; only the operator sets limits or creates orgs.
     assert_eq!(
         status(
             "PUT",
             org,
-            as_user(
-                "PUT",
-                org,
-                "org_alpha",
-                "member",
-                &json!({"slug":"alpha-2"})
-            ),
+            as_user("org_alpha", "member"),
             json!({"slug":"alpha-2"})
         )
         .await,
@@ -865,7 +802,7 @@ async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
         status(
             "PUT",
             org,
-            as_user("PUT", org, "org_alpha", "owner", &json!({"slug":"alpha-2"})),
+            as_user("org_alpha", "owner"),
             json!({"slug":"alpha-2"})
         )
         .await,
@@ -875,7 +812,7 @@ async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
         status(
             "PUT",
             org,
-            as_user("PUT", org, "org_alpha", "owner", &json!({"storageLimit":1})),
+            as_user("org_alpha", "owner"),
             json!({"storageLimit":1})
         )
         .await,
@@ -886,7 +823,7 @@ async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
         status(
             "PUT",
             fresh,
-            as_user("PUT", fresh, "org_fresh", "owner", &json!({"slug":"fresh"})),
+            as_user("org_fresh", "owner"),
             json!({"slug":"fresh"})
         )
         .await,
@@ -928,7 +865,7 @@ async fn dashboard_assertions_are_bound_to_org_role_and_request(pool: PgPool) {
         status(
             "GET",
             admin_org,
-            key["key"].as_str().unwrap().into(),
+            web::Credential::Bearer(key["key"].as_str().unwrap().into()),
             Value::Null
         )
         .await,
@@ -958,7 +895,7 @@ async fn raw(
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn legacy_dashboard_calls_work_only_while_explicitly_allowed(pool: PgPool) {
+async fn unverified_actor_headers_never_authorize_org_requests(pool: PgPool) {
     let keys = "/_api/v1/orgs/org_alpha/keys";
     let legacy = [
         ("authorization", "Bearer operator-secret"),
@@ -966,56 +903,26 @@ async fn legacy_dashboard_calls_work_only_while_explicitly_allowed(pool: PgPool)
         ("content-type", "application/json"),
     ];
     let body = r#"{"name":"rollout"}"#;
-    // Off by default: the operator secret doesn't reach org routes.
-    let off = app(&pool).await;
+    let app = app(&pool).await;
     assert_eq!(
-        raw(&off, "POST", keys, &legacy, body).await,
+        raw(&app, "POST", keys, &legacy, body).await,
         StatusCode::FORBIDDEN
     );
-    let on = router(
-        AppState::new(
-            pool.clone(),
-            Config {
-                admin_secret: "operator-secret".into(),
-                allow_legacy_web_admin: true,
-                ..Default::default()
-            },
-            common::storage(),
-            reqwest::Client::new(),
-        )
-        .unwrap(),
-    );
-    assert_eq!(
-        raw(&on, "POST", keys, &legacy, body).await,
-        StatusCode::CREATED
-    );
-    // As before, it may set limits on the org route.
     assert_eq!(
         raw(
-            &on,
+            &app,
             "PUT",
             "/_api/v1/orgs/org_alpha",
             &legacy,
             r#"{"storageLimit":7}"#
         )
         .await,
-        StatusCode::OK
-    );
-    let (actor, detail): (String, String) = sqlx::query_as(
-        "SELECT actor, detail FROM audit_logs WHERE action='key.create' ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(actor, "user:dev@example.test");
-    assert_eq!(
-        serde_json::from_str::<Value>(&detail).unwrap()["legacyWeb"],
-        true
+        StatusCode::FORBIDDEN
     );
     // It never reaches protocol routes.
     assert_eq!(
         raw(
-            &on,
+            &app,
             "POST",
             "/_api/v1/get-missing-paths",
             &legacy,
@@ -1030,19 +937,22 @@ async fn legacy_dashboard_calls_work_only_while_explicitly_allowed(pool: PgPool)
 async fn head_requests_are_authorized_as_reads(pool: PgPool) {
     let app = app(&pool).await;
     let caches = "/_api/v1/orgs/org_alpha/caches";
-    let credential = format!(
-        "Bearer {}",
-        web::assertion(
-            "HEAD",
-            caches,
-            "org_alpha",
-            "member",
-            "dev@example.test",
-            b""
-        )
-    );
     assert_eq!(
-        raw(&app, "HEAD", caches, &[("authorization", &credential)], "").await,
+        app.oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(caches)
+                .extension(web::person(
+                    "org_alpha",
+                    snowstead_server::authz::Role::Member,
+                    "dev@example.test"
+                ))
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::OK
     );
 }

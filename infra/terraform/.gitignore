@@ -1,3 +1,4 @@
+# Retain local-state protection after moving hosted Terraform source out.
 .terraform/
 *.tfstate
 *.tfstate.*

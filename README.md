@@ -68,7 +68,7 @@ local state is discarded when the stack stops. Database migrations live in
 
 ## Deploy
 
-Deploy the Rust service and its migrations through [infra/deploy.sh](infra/deploy.sh).
+Deploy the standalone Rust service with the [self-host infrastructure modules](infra/README.md).
 See [docs.md](docs.md#deployment) for gateway configuration and cutover cautions.
 The gateway only forwards to `API_ORIGIN`; it has no storage or backend secrets.
 Hosted public reads retain the existing R2/CDN origin.

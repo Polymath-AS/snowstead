@@ -57,7 +57,6 @@ async fn fixture(pool: &PgPool, origin: &str, storage: Storage) -> AppState {
         pool.clone(),
         Config {
             admin_secret: "operator-secret".into(),
-            web_assertion_public_keys: web::public_key(),
             jwt_secret: "read-test-secret".into(),
             signing_master_key: STANDARD.encode([42; 32]),
             signing_key_name: "reads-test".into(),
@@ -95,20 +94,12 @@ async fn text(response: Response) -> String {
 }
 
 async fn signing_post(app: &Router, path: &str, body: Value) -> Value {
-    let (path, credential) = web::dashboard(
-        "POST",
-        path,
-        "operator-secret",
-        None,
-        body.to_string().as_bytes(),
-    );
+    let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path.as_str())
-                .header("authorization", format!("Bearer {credential}"))
+            credential
+                .apply(Request::builder().method("POST").uri(path.as_str()))
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),

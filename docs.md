@@ -4,7 +4,8 @@
 
 The Rust backend is `workers/server`; SQL migrations live in
 `workers/server/migrations`. It owns Nix, Go, sccache, management, and scheduled
-maintenance. Deploy it and run migrations through [infra/deploy.sh](infra/deploy.sh).
+maintenance. Use the [self-host infrastructure modules](infra/README.md) and
+run migrations explicitly with separate migration credentials.
 It connects directly to Postgres and S3-compatible storage, without Worker
 service bindings, KV, Hyperdrive, or Durable Objects.
 
@@ -41,7 +42,7 @@ traffic. Retain a tested rollback path and legacy state, including KV, until
 all readers and writers have moved. Drain or reconcile outstanding uploads;
 removing old routes does not revoke existing multipart grants. Do not run old
 and new maintenance concurrently or re-enable the legacy bandwidth importer:
-it can overwrite Rust's origin counters. See infra's cutover record before any
+it can overwrite Rust's origin counters. Review your installation's cutover record before any
 further traffic change. Removing the TypeScript source is not authorization to
 delete deployed resources or data, and does not prove exhaustive API parity.
 
@@ -97,7 +98,7 @@ Before activation:
 3. Stop new pushes and let current pushes finish, or cancel them through the
    existing authenticated API. Cancellation is an operator action, not part of
    deployment. Restart cancelled pushes after the upgrade.
-4. Deploy through `infra/deploy.sh`. It runs the candidate's read-only
+4. Run the candidate's read-only
    `snowstead-server check-upload-cutover` with the runtime environment before
    activation. The command reports the count of active relay sessions containing
    uploaded parts and exits unsuccessfully until those sessions drain or are
@@ -491,7 +492,7 @@ Anything it does not allow is denied.
 | Credential | Principal | May |
 | --- | --- | --- |
 | `ADMIN_SECRET` | operator | `/_api/v1/admin/...` only, including org creation and limits |
-| `snowstead_web.<claims>.<signature>` | dashboard user (owner, admin, or member) | its org's management API; only the owner changes the slug, API keys, or signing keys, or moves caches |
+| in-process `TrustedPrincipal` extension | verified person (owner, admin, or member) | its org's management API; only the owner changes the slug, API keys, or signing keys, or moves caches |
 | `snowstead_key_<id>_<secret>` | org API key | its org's management API, except creating keys and changing the slug |
 | `snowstead_tok_<id>_<secret>` | API token | Nix, Go, and sccache in its org, per its permissions and caches; pins with `push` |
 | JWT-era token | API token | the same, only while its `jti` is listed and unrevoked in `api_tokens` |
@@ -502,41 +503,29 @@ caches live in `token_permissions` and `token_caches` and are read on every
 request; a JWT's own claims grant nothing. Migration `0015_central_auth.sql`
 backfills those tables from existing rows.
 
-The dashboard signs each org request with an Ed25519 key. The claims are
-`{aud: "snowstead-cache", org, sub, email, role, iat, exp, method, path, body}`,
-base64url-encoded JSON signed over `snowstead_web.<claims>`. They live at most
-60 seconds and bind the request's method, path (with its query), and body
-(`body` is the hex SHA-256 of the request body, of the empty string when
-there is none). The
-route's org must match, and audit logs name `user:<email>` from the claims.
-`WEB_ASSERTION_PUBLIC_KEYS` holds the base64 raw public keys, separated by
-whitespace for rotation.
+An embedding application can supply a verified person through a
+`TrustedPrincipal` request extension. It must authenticate the person and
+resolve current organization membership before dispatch. HTTP headers and
+hosted web assertions cannot construct this identity. The route's org must
+match, and audit logs name `user:<email>` from the verified identity.
 
 The server refuses to start without an `ADMIN_SECRET` of at least 16
-characters, with a malformed or empty `WEB_ASSERTION_PUBLIC_KEYS`, with
-`ALLOW_SHARED_AUTH_TOKEN=true` but no `AUTH_TOKEN`, or without `JWT_SECRET`
-while unrevoked JWT-era tokens exist. Self-hosters without a dashboard set
-`WEB_ASSERTIONS_DISABLED=true` instead of keys. The local development key,
-whose private half the dashboard's `.env.example` publishes, is refused
-unless `SNOWSTEAD_LOCAL_DEV_WEB_KEY=true`, which only `pnpm dev` sets.
+characters, with `ALLOW_SHARED_AUTH_TOKEN=true` but no `AUTH_TOKEN`, or
+without `JWT_SECRET` while unrevoked JWT-era tokens exist. Standalone
+installations need no hosted assertion keys or dashboard-disable switch.
 
-### Rolling out central authorization
+Host aliases use the generic `CACHE_HOST_SUFFIX` and
+`CACHE_CANONICAL_HOSTS` settings. Embedding applications can reserve
+organization names with `CACHE_RESERVED_NAMES` and exact DNS hosts with
+`CACHE_RESERVED_HOSTS`; both accept whitespace-separated lowercase values.
+Reserved hosts take precedence over canonical hosts. Core protocol names
+remain reserved independently of these settings. Hosted DNS policy belongs
+to the embedding application, not the cache core.
 
-The previous dashboard calls org routes with `ADMIN_SECRET` and an
-unverified `x-snowstead-actor`. `ALLOW_LEGACY_WEB_ADMIN=true` accepts those
-calls again, as a transitional principal allowed exactly what the operator
-was on org routes. The server warns at startup while it is on, and audit
-entries it produces carry `"legacyWeb": true`. Deploy in this order:
+### Migrating JWT-era tokens
 
-1. Apply migration `0015_central_auth.sql`. The previous server keeps
-   working against it.
-2. Deploy the server with `ALLOW_LEGACY_WEB_ADMIN=true` and
-   `WEB_ASSERTION_PUBLIC_KEYS`.
-3. Deploy the dashboard with its `CACHE_ASSERTION_PRIVATE_KEY`.
-4. Remove `ALLOW_LEGACY_WEB_ADMIN` and restart the server.
-
-Validly signed JWTs whose `jti` is not in `api_tokens` stop working at step
-2. That is intended: only listed tokens can be revoked. A JWT-era row whose
+Validly signed JWTs whose `jti` is not in `api_tokens` are refused. Only
+listed tokens can be revoked. A JWT-era row whose
 `perms_json` or `caches_json` was invalid, or empty, gets no permissions or
 caches, so it is refused rather than widened. After migrating, list live
 JWT-era tokens left without either:

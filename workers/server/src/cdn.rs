@@ -5,6 +5,7 @@ use std::{
 };
 
 use axum::http::StatusCode;
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -27,6 +28,18 @@ const SWEEP_PROVIDER_FAILURES: usize = 3;
 static DISPATCH: Semaphore = Semaphore::const_new(4);
 static SWEEP: Mutex<()> = Mutex::const_new(());
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::const_new(None);
+
+/// Provider-neutral result of one invalidation request. Provider credentials,
+/// response parsing, and endpoints belong to the embedding application.
+pub struct PurgeResponse {
+    pub success: bool,
+    pub retryable: bool,
+    pub retry_after: Option<String>,
+}
+
+pub trait PurgeTransport: Send + Sync {
+    fn send(&self, targets: Value) -> BoxFuture<'_, Result<PurgeResponse, ()>>;
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,33 +69,6 @@ pub fn validate_config(config: &Config) -> anyhow::Result<()> {
             );
         }
     }
-    let zone = !config.cdn_zone_id.is_empty();
-    let token = !config.cdn_purge_token.is_empty();
-    anyhow::ensure!(
-        zone == token,
-        "CDN zone and purge token must be configured together"
-    );
-    anyhow::ensure!(
-        !zone || !config.public_cache_origin.is_empty(),
-        "CDN purging requires a public cache origin"
-    );
-    anyhow::ensure!(
-        !zone
-            || config
-                .cdn_zone_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        "Invalid CDN zone ID"
-    );
-    anyhow::ensure!(
-        !token
-            || reqwest::header::HeaderValue::from_str(&format!(
-                "Bearer {}",
-                config.cdn_purge_token
-            ))
-            .is_ok(),
-        "Invalid CDN purge token"
-    );
     Ok(())
 }
 
@@ -119,7 +105,7 @@ fn origin(value: &str) -> anyhow::Result<reqwest::Url> {
 }
 
 fn enabled(state: &AppState) -> bool {
-    !state.config.cdn_zone_id.is_empty() && !state.config.cdn_purge_token.is_empty()
+    state.cdn.is_some()
 }
 
 fn invalid_job() -> ApiError {
@@ -205,13 +191,6 @@ fn files_job(keys: &[String]) -> Result<Job, ApiError> {
     })
 }
 
-fn endpoint(config: &Config) -> String {
-    format!(
-        "https://api.cloudflare.com/client/v4/zones/{}/purge_cache",
-        config.cdn_zone_id
-    )
-}
-
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn schedule_cache(state: &AppState, path: &str) -> Result<(), ApiError> {
     if !enabled(state) {
@@ -230,7 +209,7 @@ async fn schedule(state: &AppState, job: Job) -> Result<(), ApiError> {
         let state = state.clone();
         state.tasks.clone().spawn(async move {
             let _permit = permit;
-            if finish(&state, &key, job, &endpoint(&state.config))
+            if finish(&state, &key, job, state.cdn.as_deref().unwrap())
                 .await
                 .is_err()
             {
@@ -250,7 +229,7 @@ pub async fn purge(
     if !enabled(state) {
         return Ok(());
     }
-    execute(state, &job(path, hashes)?, &endpoint(&state.config))
+    execute(state, &job(path, hashes)?, state.cdn.as_deref().unwrap())
         .await
         .map_err(|_| {
             ApiError::new(
@@ -265,11 +244,11 @@ pub async fn retry(state: &AppState) -> Result<usize, ApiError> {
     if !enabled(state) {
         return Ok(0);
     }
-    retry_at_endpoint(state, &endpoint(&state.config)).await
+    retry_with(state, state.cdn.as_deref().unwrap()).await
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn retry_at_endpoint(state: &AppState, endpoint: &str) -> Result<usize, ApiError> {
+async fn retry_with(state: &AppState, transport: &dyn PurgeTransport) -> Result<usize, ApiError> {
     let Ok(_guard) = SWEEP.try_lock() else {
         return Ok(0);
     };
@@ -316,7 +295,7 @@ async fn retry_at_endpoint(state: &AppState, endpoint: &str) -> Result<usize, Ap
                 break 'sweep;
             }
             budget -= cost;
-            match dispatch(state, &key, valid, endpoint).await {
+            match dispatch(state, &key, valid, transport).await {
                 Ok(()) => completed += 1,
                 Err((error, retryable)) => {
                     failure = Some(error);
@@ -391,8 +370,13 @@ async fn save(state: &AppState, key: &str, job: &Job) -> Result<(), ApiError> {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn finish(state: &AppState, key: &str, job: Job, endpoint: &str) -> Result<(), ApiError> {
-    dispatch(state, key, job, endpoint)
+async fn finish(
+    state: &AppState,
+    key: &str,
+    job: Job,
+    transport: &dyn PurgeTransport,
+) -> Result<(), ApiError> {
+    dispatch(state, key, job, transport)
         .await
         .map_err(|(error, _)| error)
 }
@@ -404,9 +388,9 @@ async fn dispatch(
     state: &AppState,
     key: &str,
     mut job: Job,
-    endpoint: &str,
+    transport: &dyn PurgeTransport,
 ) -> Result<(), (ApiError, bool)> {
-    match execute(state, &job, endpoint).await {
+    match execute(state, &job, transport).await {
         Ok(()) => state
             .storage
             .delete(true, key)
@@ -431,7 +415,11 @@ struct Failure {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn execute(state: &AppState, job: &Job, endpoint: &str) -> Result<(), Failure> {
+async fn execute(
+    state: &AppState,
+    job: &Job,
+    transport: &dyn PurgeTransport,
+) -> Result<(), Failure> {
     let base = origin(&state.config.public_cache_origin).map_err(|_| Failure { retry_at: None })?;
     if job.whole_cache {
         let host = base
@@ -441,8 +429,7 @@ async fn execute(state: &AppState, job: &Job, endpoint: &str) -> Result<(), Fail
             .1
             .trim_end_matches('/');
         request(
-            state,
-            endpoint,
+            transport,
             &json!({"prefixes": [format!("{host}/{}/", job.cache_path)]}),
         )
         .await
@@ -458,7 +445,7 @@ async fn execute(state: &AppState, job: &Job, endpoint: &str) -> Result<(), Fail
                 .iter()
                 .map(|key| format!("{}{key}", base.as_str()))
                 .collect();
-            request(state, endpoint, &json!({"files": files})).await?;
+            request(transport, &json!({"files": files})).await?;
         }
         Ok(())
     }
@@ -473,7 +460,7 @@ async fn execute(state: &AppState, job: &Job, endpoint: &str) -> Result<(), Fail
         name = "cdn.purge_request"
     )
 )]
-async fn request(state: &AppState, endpoint: &str, body: &Value) -> Result<(), Failure> {
+async fn request(transport: &dyn PurgeTransport, body: &Value) -> Result<(), Failure> {
     for attempt in 0..3 {
         {
             let mut last =
@@ -483,44 +470,18 @@ async fn request(state: &AppState, endpoint: &str, body: &Value) -> Result<(), F
             }
             *last = Some(Instant::now());
         }
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut response = crate::profile_future!(
-                state
-                    .http
-                    .post(endpoint)
-                    .bearer_auth(&state.config.cdn_purge_token)
-                    .json(body)
-                    .send(),
-                label = "cdn.purge_http"
-            )
-            .await?;
-            let status = response.status();
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let mut bytes = Vec::new();
-            while let Some(chunk) =
-                crate::profile_future!(response.chunk(), label = "cdn.purge_body_chunk").await?
-            {
-                if bytes.len() + chunk.len() > 64 * 1024 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            let success = serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .is_some_and(|v| v.get("success") == Some(&Value::Bool(true)));
-            Ok::<_, reqwest::Error>((status, success, retry_after))
-        })
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), transport.send(body.clone())).await;
         let fallback = 1000 * (attempt + 1);
         let (retryable, delay) = match result {
-            Ok(Ok((status, true, _))) if status.is_success() => return Ok(()),
-            Ok(Ok((status, _, header))) => (
-                status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
-                header.as_deref().and_then(retry_delay).unwrap_or(fallback),
+            Ok(Ok(response)) if response.success => return Ok(()),
+            Ok(Ok(response)) => (
+                response.retryable,
+                response
+                    .retry_after
+                    .as_deref()
+                    .and_then(retry_delay)
+                    .unwrap_or(fallback),
             ),
             _ => (true, fallback),
         };
@@ -563,6 +524,33 @@ mod tests {
     use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
     use object_store::memory::InMemory;
     use std::{collections::VecDeque, sync::Arc};
+
+    // A loopback-only test transport. Production core has no HTTP provider.
+    impl PurgeTransport for String {
+        fn send(&self, targets: Value) -> BoxFuture<'_, Result<PurgeResponse, ()>> {
+            Box::pin(async move {
+                let response = reqwest::Client::new()
+                    .post(self)
+                    .bearer_auth("secret-test-token")
+                    .json(&targets)
+                    .send()
+                    .await
+                    .map_err(|_| ())?;
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let body: Value = response.json().await.map_err(|_| ())?;
+                Ok(PurgeResponse {
+                    success: status.is_success() && body["success"] == true,
+                    retryable: status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+                    retry_after,
+                })
+            })
+        }
+    }
 
     #[derive(Clone)]
     struct Reply {
@@ -651,8 +639,6 @@ mod tests {
     fn config() -> Config {
         Config {
             public_cache_origin: "https://cdn.example.test".into(),
-            cdn_zone_id: "zone".into(),
-            cdn_purge_token: "secret-test-token".into(),
             ..Config::default()
         }
     }
@@ -665,7 +651,10 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
-        AppState::new(pool, config(), storage, http).unwrap()
+        AppState::new(pool, config(), storage, http)
+            .unwrap()
+            .with_cdn(Arc::new("http://127.0.0.1:1/".to_owned()))
+            .unwrap()
     }
 
     fn storage() -> Storage {
@@ -695,18 +684,12 @@ mod tests {
         assert!(validate_config(&Config::default()).is_ok());
         let mut config = config();
         assert!(validate_config(&config).is_ok());
-        config.cdn_zone_id.clear();
-        assert!(validate_config(&config).is_err());
-        config.cdn_purge_token.clear();
-        assert!(validate_config(&config).is_ok()); // Direct delivery alone.
         config.public_url = "https://CDN.example.test:443/".into();
         assert!(validate_config(&config).is_err());
         config.public_url = "https://api.example.test".into();
         assert!(validate_config(&config).is_ok());
         config.public_cache_origin.clear();
-        config.cdn_zone_id = "zone".into();
-        config.cdn_purge_token = "token".into();
-        assert!(validate_config(&config).is_err());
+        assert!(validate_config(&config).is_ok());
         for value in [
             "https://cache.test",
             "https://cache.test/",
@@ -768,10 +751,6 @@ mod tests {
         let later = SystemTime::now() + Duration::from_secs(3600);
         assert!(retry_delay(&httpdate::fmt_http_date(later)).unwrap() > 3_598_000);
         assert_eq!(retry_delay("nonsense"), None);
-        assert_eq!(
-            endpoint(&config),
-            "https://api.cloudflare.com/client/v4/zones/zone/purge_cache"
-        );
     }
 
     // Pacing and sweep admission are process-wide: these tests take turns.
@@ -855,10 +834,7 @@ mod tests {
         );
         drop(permits);
         server.replies([]).await;
-        assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            3
-        );
+        assert_eq!(retry_with(&state, &server.endpoint).await.unwrap(), 3);
         assert!(server.mock.requests.lock().await.iter().any(
             |(_, b)| b == &json!({"files": ["https://cdn.example.test/cache/nix-cache-info"]})
         ));
@@ -881,19 +857,14 @@ mod tests {
         server
             .replies([Reply::status(StatusCode::TOO_MANY_REQUESTS, Some("3600"))])
             .await;
-        let error = retry_at_endpoint(&state, &server.endpoint)
-            .await
-            .unwrap_err();
+        let error = retry_with(&state, &server.endpoint).await.unwrap_err();
         assert_eq!(error.message, "CDN purge request failed");
         let retained = read_job(&state, key).await;
         assert!(retained.retry_at.unwrap() >= now() + 3_598_000);
         assert_eq!(server.mock.requests.lock().await.len(), 1);
         drop(state);
         let state = self::state(storage); // New process state, same private bucket.
-        assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            0
-        );
+        assert_eq!(retry_with(&state, &server.endpoint).await.unwrap(), 0);
         assert_eq!(server.mock.requests.lock().await.len(), 1); // Not early.
         let mut ready = retained;
         ready.retry_at = Some(1);
@@ -905,10 +876,7 @@ mod tests {
                 Reply::status(StatusCode::OK, None),
             ])
             .await;
-        assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            1
-        );
+        assert_eq!(retry_with(&state, &server.endpoint).await.unwrap(), 1);
         assert_eq!(server.mock.requests.lock().await.len(), 3);
         assert!(state.storage.head(true, key).await.is_err());
 
@@ -920,7 +888,7 @@ mod tests {
         server
             .replies([Reply::status(StatusCode::FORBIDDEN, None)])
             .await;
-        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert!(retry_with(&state, &server.endpoint).await.is_err());
         assert_eq!(server.mock.requests.lock().await.len(), 2);
         assert!(state.storage.head(true, key).await.is_ok());
         assert!(state.storage.head(true, next).await.is_err());
@@ -933,14 +901,11 @@ mod tests {
                 3
             ])
             .await;
-        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert!(retry_with(&state, &server.endpoint).await.is_err());
         assert_eq!(server.mock.requests.lock().await.len(), 3);
         assert!(read_job(&state, key).await.retry_at.unwrap() >= now().saturating_sub(100));
         server.replies([]).await;
-        assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            1
-        );
+        assert_eq!(retry_with(&state, &server.endpoint).await.unwrap(), 1);
 
         // A stalled response and a transport error are retried, without
         // leaking provider details into externally returned errors.
@@ -965,18 +930,11 @@ mod tests {
         let mut ready = read_job(&state, key).await;
         ready.retry_at = None;
         save(&state, key, &ready).await.unwrap();
-        assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
-            1
-        );
+        assert_eq!(retry_with(&state, &server.endpoint).await.unwrap(), 1);
         // The public API keeps the original management error contract. An
         // explicit closed-loopback proxy prevents any production connection.
         let mut manual = state.clone();
-        manual.http = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(&dead).unwrap())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
+        manual.cdn = Some(Arc::new(dead));
         let error = purge(&manual, "cache", Some(&[hash(1)])).await.unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -1010,7 +968,7 @@ mod tests {
             .replies([Reply::status(StatusCode::FORBIDDEN, None)])
             .await;
         // The sweep still reports the failure, but only after the later job ran.
-        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert!(retry_with(&state, &server.endpoint).await.is_err());
         assert_eq!(server.mock.requests.lock().await.len(), 2);
         assert!(state.storage.head(true, later).await.is_err());
         for kept in [malformed, invalid, refused] {
@@ -1027,7 +985,7 @@ mod tests {
         let last = "cdn-purges/0000000000000002-last";
         save(&state, last, &one).await.unwrap();
         server.replies([]).await;
-        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert!(retry_with(&state, &server.endpoint).await.is_err());
         assert_eq!(server.mock.requests.lock().await.len(), 1);
         assert!(state.storage.head(true, last).await.is_err());
         for key in state
@@ -1056,14 +1014,14 @@ mod tests {
                 SWEEP_PROVIDER_FAILURES
             ])
             .await;
-        assert!(retry_at_endpoint(&state, &server.endpoint).await.is_err());
+        assert!(retry_with(&state, &server.endpoint).await.is_err());
         assert_eq!(
             server.mock.requests.lock().await.len(),
             SWEEP_PROVIDER_FAILURES
         );
         server.replies([]).await;
         assert_eq!(
-            retry_at_endpoint(&state, &server.endpoint).await.unwrap(),
+            retry_with(&state, &server.endpoint).await.unwrap(),
             keys.len() - SWEEP_PROVIDER_FAILURES
         );
         for (i, key) in keys.iter().enumerate() {

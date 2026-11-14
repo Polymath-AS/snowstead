@@ -13,18 +13,6 @@ pub struct Config {
     pub shared_auth_token: Option<String>,
     /// The operator credential, valid only on `/_api/v1/admin`.
     pub admin_secret: String,
-    /// Base64 raw Ed25519 public keys, separated by whitespace, that sign the
-    /// web's per-request assertions. Empty accepts no dashboard users.
-    pub web_assertion_public_keys: String,
-    /// Transitional, default off: accept the dashboard's old `ADMIN_SECRET`
-    /// calls on org routes (`ALLOW_LEGACY_WEB_ADMIN=true`) during rollout.
-    pub allow_legacy_web_admin: bool,
-    /// Run without a dashboard and so without assertion keys
-    /// (`WEB_ASSERTIONS_DISABLED=true`), as self-hosters may.
-    pub web_assertions_disabled: bool,
-    /// Accept the local-only dashboard key whose private half is public
-    /// (`SNOWSTEAD_LOCAL_DEV_WEB_KEY=true`); only `pnpm dev` sets it.
-    pub allow_dev_web_key: bool,
     pub upstreams: Vec<String>,
     pub r2_endpoint: String,
     pub r2_access_key_id: String,
@@ -37,14 +25,15 @@ pub struct Config {
     pub require_cache_signing_keys: bool,
     pub public_url: String,
     pub public_cache_origin: String,
-    pub cdn_zone_id: String,
-    pub cdn_purge_token: String,
-    pub analytics_token: String,
     pub trusted_proxy_ips: String,
     /// Bare DNS suffix for direct organization hosts; empty disables aliases.
     pub cache_host_suffix: String,
     /// Exact canonical DNS hosts inside the suffix, separated by whitespace.
     pub cache_canonical_hosts: String,
+    /// Organization names reserved by the embedding host, separated by whitespace.
+    pub cache_reserved_names: String,
+    /// Exact DNS hosts that must not resolve as organization aliases.
+    pub cache_reserved_hosts: String,
     pub resources: ResourceLimits,
     pub push_jobs: PushJobLimits,
 }
@@ -200,14 +189,6 @@ impl Config {
                 .is_ok_and(|v| v == "true")
                 .then(|| std::env::var("AUTH_TOKEN").unwrap_or_default()),
             admin_secret: std::env::var("ADMIN_SECRET").unwrap_or_default(),
-            web_assertion_public_keys: std::env::var("WEB_ASSERTION_PUBLIC_KEYS")
-                .unwrap_or_default(),
-            allow_legacy_web_admin: std::env::var("ALLOW_LEGACY_WEB_ADMIN")
-                .is_ok_and(|v| v == "true"),
-            web_assertions_disabled: std::env::var("WEB_ASSERTIONS_DISABLED")
-                .is_ok_and(|v| v == "true"),
-            allow_dev_web_key: std::env::var("SNOWSTEAD_LOCAL_DEV_WEB_KEY")
-                .is_ok_and(|v| v == "true"),
             upstreams: std::env::var("UPSTREAM_CACHES")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -228,12 +209,11 @@ impl Config {
                 .is_ok_and(|v| v == "true"),
             public_url: std::env::var("PUBLIC_URL").unwrap_or_default(),
             public_cache_origin: std::env::var("PUBLIC_CACHE_ORIGIN").unwrap_or_default(),
-            cdn_zone_id: std::env::var("CDN_ZONE_ID").unwrap_or_default(),
-            cdn_purge_token: std::env::var("CDN_PURGE_TOKEN").unwrap_or_default(),
-            analytics_token: std::env::var("ANALYTICS_TOKEN").unwrap_or_default(),
             trusted_proxy_ips: std::env::var("TRUSTED_PROXY_IPS").unwrap_or_default(),
             cache_host_suffix: std::env::var("CACHE_HOST_SUFFIX").unwrap_or_default(),
             cache_canonical_hosts: std::env::var("CACHE_CANONICAL_HOSTS").unwrap_or_default(),
+            cache_reserved_names: std::env::var("CACHE_RESERVED_NAMES").unwrap_or_default(),
+            cache_reserved_hosts: std::env::var("CACHE_RESERVED_HOSTS").unwrap_or_default(),
             resources: ResourceLimits::from_env(),
             push_jobs: PushJobLimits::from_env(),
         }
@@ -264,15 +244,6 @@ impl Config {
         anyhow::ensure!(
             self.jwt_secret != self.admin_secret,
             "JWT_SECRET must differ from ADMIN_SECRET"
-        );
-        let keys = crate::auth::assertion_keys(&self.web_assertion_public_keys)?;
-        anyhow::ensure!(
-            !keys.is_empty() || self.allow_legacy_web_admin || self.web_assertions_disabled,
-            "WEB_ASSERTION_PUBLIC_KEYS must be set, or WEB_ASSERTIONS_DISABLED=true without a dashboard"
-        );
-        anyhow::ensure!(
-            self.allow_dev_web_key || !keys.contains(&crate::auth::local_dev_web_key()),
-            "WEB_ASSERTION_PUBLIC_KEYS contains the published local development key"
         );
         Ok(())
     }
@@ -312,47 +283,13 @@ mod tests {
 
     #[test]
     fn auth_configuration_fails_closed_at_startup() {
-        use base64::{Engine, engine::general_purpose::STANDARD};
-        let key = STANDARD.encode(
-            ed25519_dalek::SigningKey::from_bytes(&[3; 32])
-                .verifying_key()
-                .as_bytes(),
-        );
-        let dev_key = "2aLdazRgIkJp0m0Ik8oS5B0sUJQvwU6jvSaO4wWP/o0=";
         let valid = Config {
             admin_secret: "operator-secret-1234".into(),
-            web_assertion_public_keys: key,
             ..Default::default()
         };
-        let without_keys = Config {
-            web_assertion_public_keys: String::new(),
-            ..valid.clone()
-        };
-        let with_dev_key = Config {
-            web_assertion_public_keys: format!("{} {dev_key}", valid.web_assertion_public_keys),
-            ..valid.clone()
-        };
-        for ok in [
-            valid.clone(),
-            Config {
-                allow_legacy_web_admin: true,
-                ..without_keys.clone()
-            },
-            Config {
-                web_assertions_disabled: true,
-                ..without_keys.clone()
-            },
-            Config {
-                allow_dev_web_key: true,
-                ..with_dev_key.clone()
-            },
-        ] {
-            assert!(ok.validate_auth().is_ok());
-        }
+        assert!(valid.validate_auth().is_ok());
         for invalid in [
             Config::default(),
-            without_keys,
-            with_dev_key,
             Config {
                 admin_secret: "short".into(),
                 ..Default::default()
@@ -367,10 +304,6 @@ mod tests {
             },
             Config {
                 jwt_secret: valid.admin_secret.clone(),
-                ..valid.clone()
-            },
-            Config {
-                web_assertion_public_keys: "not-a-key".into(),
                 ..valid.clone()
             },
         ] {
