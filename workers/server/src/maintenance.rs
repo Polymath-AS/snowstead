@@ -9,10 +9,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    AppState, auth::JWT_CLOCK_SKEW_SECONDS, lifecycle::UploadStatus,
-    management_policy::MetadataTarget,
-};
+use crate::{AppState, auth::JWT_CLOCK_SKEW_SECONDS, lifecycle::UploadStatus};
 
 const BATCH: i64 = 500;
 const BATCHES: usize = 20;
@@ -989,9 +986,9 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
     )
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(metadata) = metadata else {
+    if metadata.is_none() {
         return Ok(0);
-    };
+    }
     sqlx::query!(
         r#"
         SELECT set_config('snowstead.eviction_reason', 'retention', TRUE)
@@ -1025,15 +1022,6 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
     )
     .fetch_all(&mut *tx)
     .await?;
-    MetadataTarget::new(
-        metadata.is_public,
-        &metadata.slug,
-        metadata.moving_from.as_deref(),
-        &metadata.name,
-    )
-    .withdraw(&mut tx, &hashes)
-    .await
-    .map_err(|_| anyhow::anyhow!("Metadata withdrawal failed"))?;
     tx.commit().await?;
     Ok(hashes.len() as u64)
 }
@@ -1962,7 +1950,9 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
-    async fn retention_withdraws_both_slug_aliases_and_keeps_pinned_shared_nars(pool: PgPool) {
+    async fn retention_withdraws_sql_publication_without_queuing_narinfo_and_keeps_pinned_shared_nars(
+        pool: PgPool,
+    ) {
         let (state, cache) = fixture(pool).await;
         let shared = blob(&state, "shared").await;
         path(&state, cache, shared, "removed").await;
@@ -1990,6 +1980,13 @@ mod tests {
         sqlx::query("INSERT INTO pin_paths(revision_id,cache_id,store_path_hash) VALUES('revision',$1,'pinned')")
             .bind(cache).execute(&state.pool).await.unwrap();
         assert_eq!(retention(&state).await.unwrap(), 1);
+        // Narinfo is rendered from SQL: retention queues no metadata object.
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM object_cleanup WHERE key LIKE '%.narinfo'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, 0);
         assert_eq!(blobs(&state).await.unwrap(), 0);
         cleanup_objects(&state, &mut CleanupCursor::default())
             .await
@@ -2007,7 +2004,7 @@ mod tests {
                     .storage
                     .head(false, &format!("{slug}/cache/removed.narinfo"))
                     .await
-                    .is_err()
+                    .is_ok()
             );
             assert!(
                 state

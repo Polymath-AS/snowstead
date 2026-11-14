@@ -198,8 +198,8 @@ content-addressed NARs. This is cache invalidation, not erasure of public data.
 **Upgrading:** old raw CDN narinfo/cache-info and client copies can remain
 stale, including former one-year TTLs. Switch substituters to the Rust origin.
 SQL withdrawal, slug changes, and signing activation do not erase those copies.
-Backfill repairs missing NAR bucket pointers and queues known legacy metadata
-keys for asynchronous deletion; it does not rewrite mutable metadata or
+A migration queues the legacy metadata objects of every current publication
+for asynchronous deletion, once; it does not rewrite mutable metadata or
 shorten existing edge/client TTLs. Plan explicit legacy CDN invalidation where
 needed. Purges do not clear client caches or revoke public bytes already shared.
 
@@ -321,11 +321,9 @@ The following differences are intentional:
   not interrupted if their entry expires after response streaming starts.
   Direct public narinfo misses use `no-store`, not negative edge caching.
   Only public NAR delivery uses the configured CDN handoff.
-- **Backfill:** `POST /_api/v1/admin/narinfo/backfill` repairs missing NARs
-  from the recorded source using an immutable destination and conditional SQL
-  adoption. It queues known legacy public/private metadata keys for cleanup,
-  rather than writing narinfo. `written` counts adopted NAR repairs, not
-  metadata writes. Follow `next` through all pages and review `skipped`.
+- **Legacy metadata:** narinfo and `nix-cache-info` are rendered from SQL. A
+  migration queues the objects the earlier service stored for them; withdrawing
+  a path, cache, or slug no longer queues per-path metadata cleanup.
 - **Accounting and maintenance:** origin downloads attempt immediate SQL
   bandwidth increments independently of optional telemetry; these count
   selected object bytes, not confirmed client receipt. The public importer
@@ -562,8 +560,8 @@ without an org are its tokens.
   are served at `<host>/<slug>/<name>`, so every org can have a `main`.
   The default org's caches stay at `<host>/<name>`. `PUT /orgs/:org`
   changes SQL routing immediately; Rust serves metadata at the new slug
-  and refuses the old slug. `POST /orgs/:org/move` queues known old
-  metadata keys for cleanup and clears `movingFrom`. It does not move
+  and refuses the old slug. `POST /orgs/:org/move` queues the old slug's
+  `nix-cache-info` keys for cleanup and clears `movingFrom`. It does not move
   NARs or rewrite narinfo. Old raw CDN/client copies can remain stale.
 - **Each org has its own API** under `/_api/v1/orgs/:org`: its storage,
   caches, tokens, API keys, and audit log. The dashboard reaches it for its
@@ -816,7 +814,7 @@ Keep historical public keys trusted while old CDN or client copies exist.
 Cached API narinfo can also retain the prior signature until revalidation.
 Rotation does not purge those copies. This API is not an emergency
 compromise-revocation mechanism; removing old trust needs a separate CDN/client
-invalidation and recovery plan. Backfill repairs NAR pointers, not signatures.
+invalidation and recovery plan.
 Rotation does not rotate `SIGNING_MASTER_KEY`; retain that deployment secret
 to open active and staged keys.
 
