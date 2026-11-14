@@ -594,54 +594,39 @@ async fn withdraw_cache(
     .await?
     .rows_affected();
     if delete {
-        // Freeze session/source discovery before adopting legacy
-        // canonical uploads, matching publication and GC's table fence.
-        sqlx::query!(
-            r#"
-                    LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE NOWAIT
-                    "#
-        )
-        .execute(&mut *tx)
+        // Hand this cache's open multipart uploads to the cleanup queue. An
+        // upload whose staged bytes a publication attempt is copying must
+        // keep its session until that attempt resolves. Session IDs standing
+        // in for an uninitialized upload and completed outcomes are not
+        // multipart uploads that this withdrawal may abort. The org fence
+        // above keeps new attempts from leasing these sources meanwhile.
+        const OPEN: &str = "u.cache_id = $1 AND starts_with(u.r2_upload_key, 'staging/') \
+            AND u.r2_upload_id IS NOT NULL AND u.r2_upload_id <> u.id AND u.status <> 'completed'";
+        let pinned: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM upload_sessions u JOIN nar_installations i \
+             ON i.source_key = u.r2_upload_key OR starts_with(i.source_key, 'staging/' || u.id || '/') \
+             WHERE {OPEN})"
+        )))
+        .bind(id)
+        .fetch_one(&mut *tx)
         .await?;
-        // Transfer ownership of legacy staging MPUs to the cleanup queue.
-        // Pinned MPUs must retain their sessions until their consumer resolves.
-        // Rust receipt markers and completed outcomes are not MPUs
-        // that this withdrawal may abort.
-        let uploads = sqlx::query!(
-            r#"
-                    SELECT
-                        u.r2_upload_key AS "r2_upload_key!",
-                        u.r2_upload_id AS "r2_upload_id!",
-                        EXISTS (
-                            SELECT 1
-                            FROM nar_installations i
-                            WHERE i.source_key = u.r2_upload_key
-                                OR STARTS_WITH(i.source_key, 'staging/' || u.id || '/')
-                        ) AS "pinned!"
-                    FROM upload_sessions u
-                    WHERE u.cache_id = $1
-                        AND STARTS_WITH(u.r2_upload_key, 'staging/')
-                        AND u.r2_upload_id IS NOT NULL
-                        AND u.r2_upload_id <> u.id
-                        AND u.status <> 'completed'
-                    "#,
-            id
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        if uploads.iter().any(|u| u.pinned) {
+        if pinned {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Upload source is in use; retry cache deletion",
             ));
         }
-        for upload in uploads {
-            sqlx::query("INSERT INTO object_cleanup (is_private, key, upload_id) VALUES (TRUE, $1, $2) ON CONFLICT (is_private, key) DO UPDATE SET upload_id = EXCLUDED.upload_id")
-                .bind(&upload.r2_upload_key).bind(&upload.r2_upload_id).execute(&mut *tx).await?;
-        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO object_cleanup (is_private, key, upload_id) \
+             SELECT TRUE, u.r2_upload_key, u.r2_upload_id FROM upload_sessions u WHERE {OPEN} \
+             ON CONFLICT (is_private, key) DO UPDATE SET upload_id = EXCLUDED.upload_id"
+        )))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
-    // Expire every session, but preserve completed outcomes: cleanup
-    // must distinguish reclaimable bytes from uncertain canonical MPUs.
+    // Expire every session, but preserve completed outcomes: a completed
+    // session has no open multipart upload left for cleanup to abort.
     // Unfinished finalization rechecks status under this org fence.
     crate::push_jobs::withdraw(&mut tx, id, None).await?;
     sqlx::query!(
@@ -666,150 +651,29 @@ async fn withdraw_cache(
     for kind in ["go", "sccache"] {
         // Cache deletion detaches compiler entries through the foreign
         // key, keeping their cleanup records for GC. Explicit eviction
-        // withdraws compiler objects before deleting their SQL records.
+        // withdraws compiler objects with their SQL records.
         if delete {
             continue;
         }
-        let mut count = 0;
-        loop {
-            struct Entry {
-                id: String,
-                r2_key: String,
-            }
-            let entries = if kind == "go" {
-                sqlx::query_as!(
-                    Entry,
-                    r#"
-                            SELECT
-                                id,
-                                r2_key
-                            FROM go_entries
-                            WHERE cache_id = $1
-                            ORDER BY id
-                            LIMIT 500
-                            FOR UPDATE NOWAIT
-                            "#,
-                    id
-                )
-                .fetch_all(&mut *tx)
-                .await?
-            } else {
-                sqlx::query_as!(
-                    Entry,
-                    r#"
-                            SELECT
-                                id,
-                                r2_key
-                            FROM sccache_entries
-                            WHERE cache_id = $1
-                            ORDER BY id
-                            LIMIT 500
-                            FOR UPDATE NOWAIT
-                            "#,
-                    id
-                )
-                .fetch_all(&mut *tx)
-                .await?
-            };
-            for entry in &entries {
-                sqlx::query("INSERT INTO object_cleanup (is_private, key) VALUES (TRUE, $1) ON CONFLICT DO NOTHING")
-                    .bind(&entry.r2_key).execute(&mut *tx).await?;
-            }
-            let ids: Vec<_> = entries.iter().map(|e| e.id.clone()).collect();
-            if kind == "go" {
-                sqlx::query!(
-                    r#"
-                            DELETE FROM go_entries
-                            WHERE id = ANY($1)
-                            "#,
-                    &ids
-                )
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query!(
-                    r#"
-                            DELETE FROM sccache_entries
-                            WHERE id = ANY($1)
-                            "#,
-                    &ids
-                )
-                .execute(&mut *tx)
-                .await?;
-            }
-            count += entries.len();
-            if entries.len() < 500 {
-                break;
-            }
-        }
+        let table = if kind == "go" {
+            "go_entries"
+        } else {
+            "sccache_entries"
+        };
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "WITH gone AS (DELETE FROM {table} WHERE cache_id = $1 RETURNING r2_key), \
+             queued AS (INSERT INTO object_cleanup (is_private, key) \
+                SELECT DISTINCT TRUE, r2_key FROM gone ON CONFLICT DO NOTHING) \
+             SELECT count(*) FROM gone"
+        )))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
         removed[kind] = json!(count);
         reset_compiler_generation(&mut tx, id, kind).await?;
     }
     let response = if delete {
         metadata.withdraw_cache_info(&mut tx).await?;
-        // A late legacy canonical MPU completion can outlive its
-        // cache. Preserve the reservation independently of that cache,
-        // and adopt canonical objects so SQL-driven GC can find them.
-        sqlx::query!(
-            r#"
-                    INSERT INTO nar_installations (
-                        key,
-                        operation_id,
-                        source_key,
-                        upload_id,
-                        file_hash,
-                        compression,
-                        is_private,
-                        file_size,
-                        phase
-                    )
-                    SELECT
-                        r2_upload_key,
-                        id,
-                        r2_upload_key,
-                        r2_upload_id,
-                        file_hash,
-                        compression,
-                        NOT STARTS_WITH(r2_upload_key, 'nar/'),
-                        file_size,
-                        'legacy-unresolved'
-                    FROM upload_sessions
-                    WHERE cache_id = $1
-                        AND file_hash IS NOT NULL
-                        AND r2_upload_key IS NOT NULL
-                        AND NOT STARTS_WITH(r2_upload_key, 'staging/')
-                        AND r2_upload_id IS NOT NULL
-                        AND status <> 'completed'
-                    ON CONFLICT DO NOTHING
-                    "#,
-            id
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"
-                    INSERT INTO blob_objects (
-                        file_hash,
-                        file_size,
-                        compression,
-                        r2_key
-                    )
-                    SELECT
-                        file_hash,
-                        file_size,
-                        compression,
-                        r2_upload_key
-                    FROM upload_sessions
-                    WHERE cache_id = $1
-                        AND file_hash IS NOT NULL
-                        AND r2_upload_key IS NOT NULL
-                        AND NOT STARTS_WITH(r2_upload_key, 'staging/')
-                    ON CONFLICT DO NOTHING
-                    "#,
-            id
-        )
-        .execute(&mut *tx)
-        .await?;
         // These foreign keys deliberately do not cascade. A transfer
         // that finishes later must find its session missing, never a
         // newly created cache with the same name. Shared NARs stay.

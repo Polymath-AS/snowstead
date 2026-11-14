@@ -75,7 +75,7 @@ macro_rules! text_states {
 ///     │                   │
 ///     └──────┬────────────┘
 ///            ├─▶ aborted   (client abort, path withdrawal, cache deletion)
-///            └─▶ expired   (maintenance, after `expires_at`)
+///            └─▶ (deleted) (maintenance, after `expires_at`)
 /// ```
 ///
 /// - `streaming`: written by `uploads::create`. Parts may be reserved and
@@ -91,11 +91,13 @@ macro_rules! text_states {
 ///   `invalidate_deleted_publications` trigger and `management_policy` path
 ///   withdrawal (eviction, retention, deletion), and cache deletion. Abort is
 ///   idempotent.
-/// - any state but `completed` → `expired`: `maintenance::expire_session`,
-///   just before the expired row is removed.
+/// - any state → (deleted): `maintenance::expire_session` removes a session
+///   whose lease has lapsed, with its receipts, in one transaction. It used
+///   to pass through `expired` first; that status is no longer written.
 /// - `pending`, `uploading`, and `completing` were written only by the retired
-///   TypeScript service. Rust never writes them. Such rows can remain: an
-///   unfinished canonical multipart upload is never reclaimed automatically.
+///   TypeScript service. Rust never writes them. Maintenance does not reclaim
+///   a session whose upload key is outside `staging/`, and
+///   `migrations::check_upload_cutover` refuses to start while one remains.
 ///
 /// Every transition out of `streaming` or `finalizing` is made under the
 /// `org:<id>` advisory lock, which the publication transaction also holds and
@@ -151,9 +153,10 @@ text_states!(UploadStatus {
 /// - `preparing → revoked`: path withdrawal (`management_policy` and the
 ///   `invalidate_deleted_publications` trigger). A revoked row can never be
 ///   adopted; maintenance retires it.
-/// - `legacy-unresolved`: written by cache deletion for an unfinished legacy
-///   canonical multipart upload. It has no expiry and is never reclaimed
-///   automatically, because the provider may still complete it.
+/// - `legacy-unresolved` is no longer written. Cache deletion used to record
+///   it for an unfinished upload that wrote straight to a blob's final key.
+///   Such a row has no expiry, and `migrations::check_upload_cutover` refuses
+///   to start while one remains.
 /// - `copying` was written only by the retired TypeScript service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InstallationPhase {

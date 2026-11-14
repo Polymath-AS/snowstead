@@ -5058,8 +5058,8 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
         .await
         .unwrap();
 
-    // Fail publication without holding the org fence across a blocked NAR
-    // lock. Both independent pools must be free to prepare their candidates.
+    // Fail publication without holding the org fence across a blocked wait.
+    // Both independent pools must be free to prepare their candidates.
     pool_execute(
         &pool,
         "CREATE FUNCTION defer_publication() RETURNS trigger LANGUAGE plpgsql AS $$

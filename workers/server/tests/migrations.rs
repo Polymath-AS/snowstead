@@ -425,6 +425,77 @@ async fn a_cache_has_at_most_one_active_signing_key() -> Result<()> {
 }
 
 #[tokio::test]
+async fn upload_cutover_refuses_uploads_that_predate_staging() -> Result<()> {
+    isolated(|pool| async move {
+        migrations::run(&pool).await?;
+        migrations::check_upload_cutover(&pool).await?;
+        // Staged and keyless sessions pass, whatever their state or age.
+        pool.execute(
+            "INSERT INTO caches (name) VALUES ('main');
+            INSERT INTO upload_sessions (id, cache_id, store_path_hash, store_path, nar_hash,
+                nar_size, file_size, compression, status, r2_upload_key, expires_at)
+            SELECT k.id, c.id, k.id, '/nix/store/' || k.id, 'sha256:test', 1, 1, 'zstd',
+                'completed', k.key, NOW() - INTERVAL '1 day'
+            FROM caches c, (VALUES ('staged', 'staging/staged/source'), ('keyless', NULL)) k(id, key);
+            INSERT INTO nar_installations (key, operation_id, file_hash, compression, is_private, file_size)
+            VALUES ('nar/objects/attempt/hash/zstd.nar', 'attempt', 'hash', 'zstd', false, 1)",
+        )
+        .await?;
+        migrations::check_upload_cutover(&pool).await?;
+
+        // A session that wrote straight to a final key is refused in any state.
+        pool.execute(
+            "INSERT INTO upload_sessions (id, cache_id, store_path_hash, store_path, nar_hash,
+                nar_size, file_size, compression, status, r2_upload_key, expires_at)
+            SELECT 'unstaged', id, 'unstaged', '/nix/store/unstaged', 'sha256:test', 1, 1, 'zstd',
+                'completed', 'nar/unstaged/zstd.nar', NOW() - INTERVAL '1 day' FROM caches",
+        )
+        .await?;
+        let error = migrations::check_upload_cutover(&pool)
+            .await
+            .expect_err("unstaged session");
+        assert!(
+            error
+                .to_string()
+                .starts_with("1 upload sessions or reservations predate staged uploads"),
+            "{error}"
+        );
+        pool.execute("DELETE FROM upload_sessions WHERE id = 'unstaged'")
+            .await?;
+        migrations::check_upload_cutover(&pool).await?;
+
+        // So is the reservation cache deletion used to leave for one.
+        pool.execute(
+            "INSERT INTO nar_installations (key, operation_id, source_key, upload_id, file_hash,
+                compression, is_private, file_size, phase)
+            VALUES ('nar/old/zstd.nar', 'old', 'nar/old/zstd.nar', 'provider', 'old', 'zstd',
+                false, 1, 'legacy-unresolved')",
+        )
+        .await?;
+        let error = migrations::check_upload_cutover(&pool)
+            .await
+            .expect_err("unresolved reservation");
+        assert!(
+            error
+                .to_string()
+                .starts_with("1 upload sessions or reservations predate staged uploads"),
+            "{error}"
+        );
+        // The check is read-only: the operator resolves the row.
+        let retained: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM nar_installations WHERE operation_id = 'old'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(retained, 1);
+        pool.execute("DELETE FROM nar_installations WHERE operation_id = 'old'")
+            .await?;
+        migrations::check_upload_cutover(&pool).await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn central_auth_backfills_token_scope_from_issued_claims() -> Result<()> {
     isolated(|pool| async move {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

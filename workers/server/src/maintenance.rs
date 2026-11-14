@@ -1,8 +1,9 @@
 //! Bounded, retryable control-plane maintenance over the existing R2 objects.
 //!
 //! SQL withdrawal records exact keys in a durable cleanup queue. Storage I/O
-//! never holds a transaction. Legacy canonical installations do not expire.
-use std::{collections::BTreeSet, time::Duration};
+//! never holds a transaction. Uploads that predate staging are not handled
+//! here: the deploy check refuses to start while any remain.
+use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -14,8 +15,8 @@ use crate::{AppState, auth::JWT_CLOCK_SKEW_SECONDS, lifecycle::UploadStatus};
 const BATCH: i64 = 500;
 const BATCHES: usize = 20;
 const CLEANUP_CONCURRENCY: usize = 8;
-// Each session costs one transaction, with one 500-receipt page. Do not let
-// one huge or broken upload spend the run: the cursor moves past it.
+// Each session costs one transaction, which retires all of its receipts. Do
+// not let one broken upload spend the run: the cursor moves past it.
 const SESSION_PAGE: usize = 20;
 // Row expiry and the session sweep run until drained, since each can gain far
 // more than one batch between runs. Both stay bounded: the deadline is checked
@@ -142,7 +143,7 @@ async fn run_bounded(state: &AppState, session_pages: usize) -> anyhow::Result<C
     record(
         &mut counts.blobs,
         &mut counts.failed_stages,
-        "canonical blobs",
+        "blobs",
         blobs(state).await,
     );
     for (private, prefix) in [(false, "nar/objects/"), (true, "nars/objects/")] {
@@ -630,11 +631,9 @@ async fn orphan_page(
     Ok(count)
 }
 
+#[derive(sqlx::FromRow)]
 struct Session {
     id: String,
-    file_hash: Option<String>,
-    file_size: i64,
-    compression: String,
     status: UploadStatus,
     r2_upload_key: Option<String>,
     r2_upload_id: Option<String>,
@@ -750,26 +749,12 @@ async fn sessions(state: &AppState, pages: usize) -> anyhow::Result<u64> {
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result<bool> {
     let mut tx = begin(&state.pool).await?;
+    // Candidate allocation takes the same two fences before it leases this
+    // session's staged bytes, so the lease check below cannot go stale.
     lock(&mut tx, &format!("org:{org}")).await?;
     lock(&mut tx, &format!("upload:{id}")).await?;
-    sqlx::query!(
-        r#"
-        LOCK TABLE upload_sessions IN SHARE ROW EXCLUSIVE MODE NOWAIT
-        "#
-    )
-    .execute(&mut *tx)
-    .await?;
-    let session = sqlx::query_as!(
-        Session,
-        r#"
-        SELECT
-            u.id,
-            u.file_hash,
-            u.file_size,
-            u.compression,
-            u.status AS "status: UploadStatus",
-            u.r2_upload_key,
-            u.r2_upload_id
+    let session = sqlx::query_as::<_, Session>(
+        "SELECT u.id, u.status, u.r2_upload_key, u.r2_upload_id
         FROM upload_sessions u
         WHERE u.id = $1
             AND u.expires_at <= now()
@@ -779,125 +764,46 @@ async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result
                 WHERE i.source_key = u.r2_upload_key
                     OR starts_with(i.source_key, 'staging/' || u.id || '/')
             )
-        FOR UPDATE OF u NOWAIT
-        "#,
-        id
+        FOR UPDATE OF u NOWAIT",
     )
+    .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(s) = session else { return Ok(false) };
     if let Some(key) = &s.r2_upload_key {
+        // Every upload stages under its own prefix. Anything else predates
+        // staging and is not ours to reclaim: the deploy check refuses it.
         if !key.starts_with("staging/") {
-            // Old canonical MPUs may still complete after an abort. An expired
-            // SQL lease does not prove their bytes are safe to reclaim.
-            if s.r2_upload_id.is_some() && s.status != UploadStatus::Completed {
-                return Ok(false);
-            }
-            if let Some(hash) = &s.file_hash {
-                lock(&mut tx, &format!("nar:{hash}:{}", s.compression)).await?;
-                sqlx::query!(
-                    r#"
-                    INSERT INTO blob_objects (file_hash, file_size, compression, r2_key)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (file_hash, compression) DO NOTHING
-                    "#,
-                    hash,
-                    s.file_size,
-                    &s.compression,
-                    key
-                )
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                // No content identity means we cannot safely adopt or delete.
-                anyhow::bail!("Legacy canonical source has no identity")
-            }
-        } else {
-            // The session ID marks a multipart upload not yet initialized.
-            // All other upload IDs belong to the provider and need aborting.
-            let upload = s
-                .r2_upload_id
-                .as_ref()
-                .filter(|upload| *upload != &s.id && s.status != UploadStatus::Completed);
-            sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) \
-                ON CONFLICT(is_private,key) DO UPDATE SET upload_id=COALESCE(object_cleanup.upload_id,EXCLUDED.upload_id)")
-                .bind(key).bind(upload).execute(&mut *tx).await?;
+            return Ok(false);
         }
+        // The session ID marks a multipart upload not yet initialized.
+        // All other upload IDs belong to the provider and need aborting.
+        let upload = s
+            .r2_upload_id
+            .as_ref()
+            .filter(|upload| *upload != &s.id && s.status != UploadStatus::Completed);
+        sqlx::query("INSERT INTO object_cleanup(is_private,key,upload_id) VALUES(TRUE,$1,$2) \
+            ON CONFLICT(is_private,key) DO UPDATE SET upload_id=COALESCE(object_cleanup.upload_id,EXCLUDED.upload_id)")
+            .bind(key).bind(upload).execute(&mut *tx).await?;
     }
-    sqlx::query!(
-        r#"
-        UPDATE upload_sessions
-        SET status = 'expired'
-        WHERE id = $1
-            AND status <> 'completed'
-        "#,
-        id
+    // The cleanup queue owns these immutable keys after SQL deletion; a crash
+    // cannot lose the remaining physical work. Unreceipted parts and late
+    // writes are discovered by orphan_page after their session is gone.
+    sqlx::query(
+        "WITH gone AS (DELETE FROM upload_parts WHERE session_id = $1 RETURNING storage_key)
+        INSERT INTO object_cleanup(is_private, key)
+        SELECT DISTINCT TRUE, storage_key FROM gone WHERE storage_key IS NOT NULL
+        ON CONFLICT DO NOTHING",
     )
+    .bind(id)
     .execute(&mut *tx)
     .await?;
-    // Bound receipt retirement. The cleanup queue owns these immutable keys
-    // after SQL deletion; a crash cannot lose the remaining physical work.
-    let parts = sqlx::query!(
-        r#"
-        SELECT
-            id,
-            storage_key
-        FROM upload_parts
-        WHERE session_id = $1
-        ORDER BY id
-        LIMIT $2
-        "#,
-        id,
-        BATCH
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    for key in parts.iter().filter_map(|part| part.storage_key.as_ref()) {
-        sqlx::query(
-            "INSERT INTO object_cleanup(is_private,key) VALUES(TRUE,$1) ON CONFLICT DO NOTHING",
-        )
-        .bind(key)
+    sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+        .bind(id)
         .execute(&mut *tx)
         .await?;
-    }
-    let part_ids: Vec<i64> = parts.iter().map(|p| p.id).collect();
-    sqlx::query!(
-        r#"
-        DELETE FROM upload_parts
-        WHERE id = ANY($1)
-        "#,
-        &part_ids
-    )
-    .execute(&mut *tx)
-    .await?;
-    // Unreceipted parts and late writes are discovered by orphan_page after
-    // their session is gone. Listing them does not belong in this transaction.
-    let remaining: bool = sqlx::query_scalar!(
-        r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM upload_parts
-            WHERE session_id = $1
-        ) AS "remaining!"
-        "#,
-        id
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    let removed = !remaining;
-    if removed {
-        sqlx::query!(
-            r#"
-            DELETE FROM upload_sessions
-            WHERE id = $1
-            "#,
-            id
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
     tx.commit().await?;
-    Ok(removed)
+    Ok(true)
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1026,18 +932,6 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
     Ok(hashes.len() as u64)
 }
 
-struct Blob {
-    id: i64,
-    file_hash: String,
-    compression: String,
-    r2_key: String,
-    public_key: Option<String>,
-    private_key: Option<String>,
-}
-
-// Keep expired *canonical* MPUs as reservations too, unlike expiring staged
-// uploads. Their completion may be in flight indefinitely. Publications and
-// source leases are independent references; one cache cannot free another's NAR.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 #[cfg_attr(
     feature = "observability",
@@ -1049,164 +943,67 @@ struct Blob {
 )]
 async fn blobs(state: &AppState) -> anyhow::Result<u64> {
     let mut count = 0;
+    // A batch can come back short when publication holds some candidates, so
+    // only an empty batch ends the sweep.
     for _ in 0..BATCHES {
         let n = blob_batch(state).await?;
         count += n;
-        if n < BATCH as u64 {
+        if n == 0 {
             break;
         }
     }
     Ok(count)
 }
 
+// A blob is collectable once no publication points at it and no publication
+// attempt is preparing the same bytes. Upload sessions hold no claim: each
+// one stages its own bytes and publishes a key of its own.
+const UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM published_paths p WHERE p.blob_object_id = b.id) \
+    AND NOT EXISTS (SELECT 1 FROM nar_installations i \
+        WHERE i.file_hash = b.file_hash AND i.compression = b.compression)";
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
     let mut tx = begin(&state.pool).await?;
-    // Match upload publication and the TS repository's canonical deletion
-    // fence, before taking any per-blob locks. Never acquire org locks here.
-    sqlx::query!(
-        r#"
-        LOCK TABLE upload_sessions IN SHARE MODE NOWAIT
-        "#
-    )
-    .execute(&mut *tx)
-    .await?;
-    let candidates = sqlx::query_as!(
-        Blob,
-        r#"
-        SELECT
-            b.id,
-            b.file_hash,
-            b.compression,
-            b.r2_key,
-            b.public_key,
-            b.private_key
-        FROM blob_objects b
-        WHERE NOT EXISTS(
-            SELECT 1
-            FROM published_paths p
-            WHERE p.blob_object_id = b.id
-        )
-            AND NOT EXISTS(
-                SELECT 1
-                FROM nar_installations i
-                WHERE i.file_hash = b.file_hash
-                    AND i.compression = b.compression
-            )
-            AND NOT EXISTS(
-                SELECT 1
-                FROM upload_sessions u
-                WHERE (
-                    (
-                        u.file_hash = b.file_hash
-                        AND u.compression = b.compression
-                    )
-                    OR u.r2_upload_key = b.r2_key
-                    OR u.r2_upload_key = 'nar/' || b.file_hash || '/' || b.compression || '.nar'
-                    OR u.r2_upload_key = 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar'
-                )
-                    AND (
-                        u.expires_at > now()
-                        OR (
-                            u.status <> 'completed'
-                            AND u.r2_upload_id IS NOT NULL
-                            AND u.r2_upload_key IS NOT NULL
-                            AND NOT starts_with(u.r2_upload_key, 'staging/')
-                        )
-                    )
-            )
-        ORDER BY b.file_hash, b.compression
-        LIMIT $1
-        "#,
-        BATCH
-    )
+    // Publication takes these row locks to adopt a blob, so skipping locked
+    // rows never waits and never collects a blob that is being adopted.
+    let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT b.id FROM blob_objects b WHERE {UNREFERENCED} \
+         ORDER BY b.id LIMIT $1 FOR UPDATE OF b SKIP LOCKED"
+    )))
+    .bind(BATCH)
     .fetch_all(&mut *tx)
     .await?;
-    let mut count = 0;
-    for b in candidates {
-        lock(&mut tx, &format!("nar:{}:{}", b.file_hash, b.compression)).await?;
-        let eligible = sqlx::query_scalar!(
-            r#"
-            SELECT EXISTS(
-                SELECT 1
-                FROM blob_objects b
-                WHERE b.id = $1
-                    AND NOT EXISTS(
-                        SELECT 1
-                        FROM published_paths p
-                        WHERE p.blob_object_id = b.id
-                    )
-                    AND NOT EXISTS(
-                        SELECT 1
-                        FROM nar_installations i
-                        WHERE i.file_hash = b.file_hash
-                            AND i.compression = b.compression
-                    )
-                    AND NOT EXISTS(
-                        SELECT 1
-                        FROM upload_sessions u
-                        WHERE (
-                            (
-                                u.file_hash = b.file_hash
-                                AND u.compression = b.compression
-                            )
-                            OR u.r2_upload_key = b.r2_key
-                            OR u.r2_upload_key = 'nar/' || b.file_hash || '/' || b.compression || '.nar'
-                            OR u.r2_upload_key = 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar'
-                        )
-                            AND (
-                                u.expires_at > now()
-                                OR (
-                                    u.status <> 'completed'
-                                    AND u.r2_upload_id IS NOT NULL
-                                    AND u.r2_upload_key IS NOT NULL
-                                    AND NOT starts_with(u.r2_upload_key, 'staging/')
-                                )
-                            )
-                    )
-            ) AS "eligible!"
-            "#,
-            b.id
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if !eligible {
-            continue;
-        }
-        let mut keys = BTreeSet::from([
-            (
-                true,
-                format!("nars/sha256/{}/{}.nar", b.file_hash, b.compression),
-            ),
-            (false, format!("nar/{}/{}.nar", b.file_hash, b.compression)),
-            (!b.r2_key.starts_with("nar/"), b.r2_key),
-        ]);
-        keys.extend(b.public_key.map(|key| (false, key)));
-        keys.extend(b.private_key.map(|key| (true, key)));
-        // Retire the SQL identity before I/O. New uploads create a new physical
-        // incarnation, never one of these queued keys.
-        for (private, key) in keys {
-            sqlx::query(
-                "INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING",
-            )
-            .bind(private)
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query!(
-            r#"
-            DELETE FROM blob_objects
-            WHERE id = $1
-            "#,
-            b.id
-        )
-        .execute(&mut *tx)
-        .await?;
-        count += 1;
+    if ids.is_empty() {
+        return Ok(0);
     }
+    // A publication that committed after the first snapshot is visible to
+    // this statement, and none can adopt these rows while they are locked.
+    // Retire the SQL identity before I/O. New uploads create a new physical
+    // incarnation, never one of these queued keys.
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "WITH gone AS (
+            DELETE FROM blob_objects b WHERE b.id = ANY($1) AND {UNREFERENCED}
+            RETURNING b.file_hash, b.compression, b.r2_key, b.public_key, b.private_key
+        ), queued AS (
+            INSERT INTO object_cleanup(is_private, key)
+            SELECT DISTINCT k.is_private, k.key FROM gone g CROSS JOIN LATERAL (VALUES
+                (TRUE, 'nars/sha256/' || g.file_hash || '/' || g.compression || '.nar'),
+                (FALSE, 'nar/' || g.file_hash || '/' || g.compression || '.nar'),
+                (NOT starts_with(g.r2_key, 'nar/'), g.r2_key),
+                (FALSE, g.public_key),
+                (TRUE, g.private_key)
+            ) AS k(is_private, key)
+            WHERE k.key IS NOT NULL
+            ON CONFLICT DO NOTHING
+        )
+        SELECT count(*) FROM gone"
+    )))
+    .bind(&ids)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(count)
+    Ok(count as u64)
 }
 
 /// Reclaim at most twenty bounded manifests per sweep. Keep expired identities
@@ -1244,7 +1041,8 @@ async fn expire_manifests(state: &AppState) -> anyhow::Result<u64> {
 }
 
 /// Expiry revokes adoption, not provider execution. Late writes use unique keys
-/// and are rediscovered by orphan_nars. Legacy canonical work has no expiry.
+/// and are rediscovered by orphan_nars. A row without an expiry predates
+/// staged uploads and is left alone; the deploy check refuses those.
 async fn expire_installations(state: &AppState) -> anyhow::Result<u64> {
     let mut tx = begin(&state.pool).await?;
     let result = sqlx::query(
@@ -1677,7 +1475,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
-    async fn session_pages_reclaim_unrelated_work_and_eventually_retry_partial_and_failed_uploads(
+    async fn session_pages_reclaim_unrelated_work_and_eventually_retry_failed_uploads(
         pool: PgPool,
     ) {
         let _run = RUN_TESTS.lock().await;
@@ -1685,8 +1483,9 @@ mod tests {
         // A run stops at its page budget here, as a production run does at its
         // deadline: the cursor rules are the same.
         const PAGES: usize = 20;
-        // Both troublesome records precede more than a full run's budget.
-        for id in ["a-failing", "b-partial"] {
+        // The failing record and one with more receipts than a batch precede
+        // more than a full run's budget.
+        for id in ["a-failing", "b-large"] {
             let key = format!("staging/{id}/source");
             session(&state, cache, id, id, &key, "streaming").await;
             state.storage.put(true, &key, b"data").await.unwrap();
@@ -1702,7 +1501,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO upload_parts(session_id,part_number,etag,size,storage_key)
-             SELECT 'b-partial',n,'etag',4,'staging/b-partial/part-'||n
+             SELECT 'b-large',n,'etag',4,'staging/b-large/part-'||n
              FROM generate_series(1,1001) n",
         )
         .execute(&state.pool)
@@ -1711,7 +1510,7 @@ mod tests {
         for n in 1..=1001 {
             state
                 .storage
-                .put(true, &format!("staging/b-partial/part-{n}"), b"data")
+                .put(true, &format!("staging/b-large/part-{n}"), b"data")
                 .await
                 .unwrap();
         }
@@ -1732,7 +1531,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             healthy, 23,
-            "398 healthy sessions advance despite failure and partial work"
+            "398 healthy sessions advance despite the failure"
         );
         assert!(
             state
@@ -1752,9 +1551,15 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(
-            receipts, 501,
-            "one bounded receipt page, not repeated oldest-session work"
+        assert_eq!(receipts, 0, "a session's receipts retire in one pass");
+        assert!(
+            state
+                .storage
+                .list(true, "staging/b-large", None, 2000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "every receipt key was queued and cleaned"
         );
 
         let counts = run_bounded(&state, PAGES).await.unwrap();
@@ -1768,7 +1573,7 @@ mod tests {
                 .fetch_all(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(remaining, ["a-failing", "b-partial"]);
+        assert_eq!(remaining, ["a-failing"]);
         assert!(
             state
                 .storage
@@ -1778,21 +1583,13 @@ mod tests {
         );
 
         assert_eq!(run_bounded(&state, PAGES).await.unwrap().failed_stages, 1);
-        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_parts")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            receipts, 1,
-            "partial sessions make durable progress on revisit"
-        );
         sqlx::query("DROP TRIGGER reject_session_delete ON upload_sessions")
             .execute(&state.pool)
             .await
             .unwrap();
         let counts = run_bounded(&state, PAGES).await.unwrap();
         assert_eq!(counts.failed_stages, 0);
-        assert_eq!(counts.sessions, 2);
+        assert_eq!(counts.sessions, 1);
         let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_sessions")
             .fetch_one(&state.pool)
             .await
@@ -2154,6 +1951,231 @@ mod tests {
         );
     }
 
+    async fn blob_ids(state: &AppState) -> Vec<i64> {
+        sqlx::query_scalar("SELECT id FROM blob_objects ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn blob_collection_skips_locked_rows_and_keeps_blobs_adopted_meanwhile(pool: PgPool) {
+        let (state, cache) = fixture(pool).await;
+        let idle = blob(&state, "idle").await;
+        let adopted = blob(&state, "adopted").await;
+        blob(&state, "free").await;
+        // Publication locks the blob rows it adopts until it commits.
+        let mut publication = state.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM blob_objects WHERE id=ANY($1) FOR UPDATE")
+            .bind(vec![idle, adopted])
+            .fetch_all(&mut *publication)
+            .await
+            .unwrap();
+        // Collection neither waits for those rows nor fails on them.
+        assert_eq!(blob_batch(&state).await.unwrap(), 1);
+        assert_eq!(blob_ids(&state).await, [idle, adopted]);
+        sqlx::query("INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
+            VALUES($1,'adopted','/nix/store/adopted','sha256:test',4,$2)")
+            .bind(cache).bind(adopted).execute(&mut *publication).await.unwrap();
+        assert_eq!(blob_batch(&state).await.unwrap(), 0);
+        publication.commit().await.unwrap();
+        // Once unlocked, the still unreferenced blob goes and the adopted one stays.
+        assert_eq!(blob_batch(&state).await.unwrap(), 1);
+        assert_eq!(blob_ids(&state).await, [adopted]);
+        let queued: Vec<(bool, String)> =
+            sqlx::query_as("SELECT is_private,key FROM object_cleanup ORDER BY key")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued,
+            [
+                (false, "nar/free/zstd.nar".to_owned()),
+                (false, "nar/idle/zstd.nar".to_owned()),
+                (true, "nars/sha256/free/zstd.nar".to_owned()),
+                (true, "nars/sha256/idle/zstd.nar".to_owned()),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn blob_collection_rechecks_a_selected_blob_that_was_published_before_its_lock(
+        pool: PgPool,
+    ) {
+        use std::time::Duration;
+
+        let (state, cache) = fixture(pool).await;
+        let raced = blob(&state, "raced").await;
+        // Pause the selecting statement after it has taken its snapshot and
+        // before it locks the row: the predicate reads installations through
+        // a view which waits on a barrier, then reports no installation.
+        sqlx::raw_sql(
+            "ALTER TABLE nar_installations RENAME TO held_installations;
+            CREATE TABLE gate_calls(n integer);
+            CREATE FUNCTION gate() RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM set_config('lock_timeout','0',true);
+                PERFORM pg_advisory_xact_lock_shared(78432::bigint);
+                INSERT INTO gate_calls VALUES(1);
+                RETURN false;
+            END $$;
+            CREATE VIEW nar_installations AS SELECT * FROM held_installations WHERE gate();
+            INSERT INTO held_installations(key,operation_id,source_key,file_hash,compression,is_private,file_size)
+            VALUES('gate','gate','staging/gate/source','raced','zstd',false,4);",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let mut barrier = state.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(78432::bigint)")
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let collection = tokio::spawn({
+            let state = state.clone();
+            async move { blob_batch(&state).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT FROM pg_locks
+                WHERE locktype='advisory' AND classid=0 AND objid=78432 AND NOT granted)",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("collection must reach the barrier");
+        // A publication commits in that window. The paused statement's
+        // snapshot cannot see it, so it still selects and locks the blob.
+        sqlx::query("INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
+            VALUES($1,'raced','/nix/store/raced','sha256:test',4,$2)")
+            .bind(cache).bind(raced).execute(&state.pool).await.unwrap();
+        barrier.rollback().await.unwrap();
+        assert_eq!(collection.await.unwrap().unwrap(), 0);
+        // Only a committed collection keeps the gate's records: the blob was
+        // selected, and the deleting statement then saw the publication.
+        let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM gate_calls")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(calls > 0, "the blob must have been selected");
+        assert_eq!(blob_ids(&state).await, [raced]);
+        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM object_cleanup")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn collection_and_expiry_proceed_while_another_session_row_is_being_written(
+        pool: PgPool,
+    ) {
+        let (state, cache) = fixture(pool).await;
+        blob(&state, "shared").await;
+        // A live session for the same content holds no claim on the blob.
+        session(
+            &state,
+            cache,
+            "writing",
+            "shared",
+            "staging/writing/source",
+            "streaming",
+        )
+        .await;
+        sqlx::query("UPDATE upload_sessions SET expires_at=now()+interval '1 day'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        session(
+            &state,
+            cache,
+            "lapsed",
+            "other",
+            "staging/lapsed/source",
+            "streaming",
+        )
+        .await;
+        let mut writer = state.pool.begin().await.unwrap();
+        sqlx::query("UPDATE upload_sessions SET file_size=file_size+1 WHERE id='writing'")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        // Neither stage takes a table lock, so an open row write elsewhere in
+        // the table does not fail them.
+        assert_eq!(blob_batch(&state).await.unwrap(), 1);
+        assert!(blob_ids(&state).await.is_empty());
+        assert!(
+            expire_session(&state, "lapsed", "maintenance")
+                .await
+                .unwrap()
+        );
+        writer.commit().await.unwrap();
+        let remaining: Vec<String> = sqlx::query_scalar("SELECT id FROM upload_sessions")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, ["writing"]);
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn expiry_removes_a_session_with_more_receipts_than_a_batch_in_one_pass(pool: PgPool) {
+        let (state, cache) = fixture(pool).await;
+        session(
+            &state,
+            cache,
+            "large",
+            "large",
+            "staging/large/source",
+            "streaming",
+        )
+        .await;
+        // One receipt was reserved but never stored: it has no key to queue.
+        sqlx::query(
+            "INSERT INTO upload_parts(session_id,part_number,etag,size,storage_key)
+             SELECT 'large',n,'etag',4,CASE WHEN n<=1001 THEN 'staging/large/part-'||n END
+             FROM generate_series(1,1002) n",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        assert!(
+            expire_session(&state, "large", "maintenance")
+                .await
+                .unwrap()
+        );
+        let remaining: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM upload_sessions),(SELECT count(*) FROM upload_parts)",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (0, 0));
+        let queued: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*),count(*) FILTER (WHERE starts_with(key,'staging/large/part-')),
+                count(*) FILTER (WHERE key='staging/large/source')
+             FROM object_cleanup WHERE is_private AND upload_id IS NULL",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, (1002, 1001, 1));
+        // The session is gone: a later sweep finds nothing left to do.
+        assert!(
+            !expire_session(&state, "large", "maintenance")
+                .await
+                .unwrap()
+        );
+    }
+
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
     async fn retired_incarnation_cleanup_survives_republication_and_late_provider_completion(
@@ -2243,7 +2265,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
-    async fn legacy_sessions_adopt_canonical_bytes_but_preserve_mpu_reservations_and_sources(
+    async fn eviction_expires_staged_sessions_but_keeps_leased_sources_and_unstaged_sessions(
         pool: PgPool,
     ) {
         let (state, cache) = fixture(pool).await;
@@ -2257,10 +2279,12 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
+        // An upload written straight to a final key predates staging. Expiry
+        // must not touch it: neither its row nor its bytes are ours to reclaim.
         session(
             &state,
             cache,
-            "completed",
+            "unstaged",
             "abandoned",
             "nar/abandoned/zstd.nar",
             "completed",
@@ -2271,22 +2295,6 @@ mod tests {
             .put(false, "nar/abandoned/zstd.nar", b"data")
             .await
             .unwrap();
-        session(
-            &state,
-            cache,
-            "canonical-mpu",
-            "reserved",
-            "nar/reserved/zstd.nar",
-            "finalizing",
-        )
-        .await;
-        sqlx::query(
-            "UPDATE upload_sessions SET r2_upload_id='provider-id' WHERE id IN ('completed','canonical-mpu')",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap();
-        blob(&state, "reserved").await;
         session(
             &state,
             cache,
@@ -2331,7 +2339,7 @@ mod tests {
             VALUES('nar/source-hash/zstd.nar','operation','staging/pinned','source-hash','zstd',false,4)")
             .execute(&state.pool).await.unwrap();
         // Start with live sessions so eviction, not their original age, must
-        // expire them without erasing proof that the canonical MPU completed.
+        // expire them.
         sqlx::query("UPDATE upload_sessions SET expires_at=now()+interval '1 day'")
             .execute(&state.pool)
             .await
@@ -2354,7 +2362,7 @@ mod tests {
             .await,
             StatusCode::OK
         );
-        assert_eq!(sessions(&state, SESSION_PAGES).await.unwrap(), 2);
+        assert_eq!(sessions(&state, SESSION_PAGES).await.unwrap(), 1);
         orphan_page(&state, "staging/", None).await.unwrap();
         cleanup_objects(&state, &mut CleanupCursor::default())
             .await
@@ -2374,7 +2382,9 @@ mod tests {
                 .is_err()
         );
         assert!(state.storage.head(true, "staging/pinned").await.is_ok());
-        assert_eq!(blobs(&state).await.unwrap(), 1);
+        // The unstaged upload was not adopted as a blob, so nothing can
+        // collect its bytes.
+        assert_eq!(blobs(&state).await.unwrap(), 0);
         cleanup_objects(&state, &mut CleanupCursor::default())
             .await
             .unwrap();
@@ -2383,21 +2393,21 @@ mod tests {
                 .storage
                 .head(false, "nar/abandoned/zstd.nar")
                 .await
-                .is_err()
-        );
-        assert!(
-            state
-                .storage
-                .head(false, "nar/reserved/zstd.nar")
-                .await
                 .is_ok()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blob_objects")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0
         );
         let remaining: Vec<String> =
             sqlx::query_scalar("SELECT id FROM upload_sessions ORDER BY id")
                 .fetch_all(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(remaining, ["canonical-mpu", "pinned"]);
+        assert_eq!(remaining, ["pinned", "unstaged"]);
     }
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]

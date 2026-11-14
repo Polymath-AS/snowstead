@@ -260,7 +260,9 @@ push jobs before upgrading, then restart any cancelled pushes; their old
 multipart sessions cannot resume against the direct-storage server. The deploy
 script runs the candidate's read-only `check-upload-cutover` command before
 activation. Startup repeats the check and refuses active relayed sessions with
-uploaded parts rather than discarding their bytes. Published NARs are unaffected.
+uploaded parts rather than discarding their bytes. It also refuses upload
+sessions and reservations that predate staged uploads. Published NARs are
+unaffected.
 See [the rollout procedure](docs.md#presigned-upload-cutover) for verification
 and rollback limits.
 
@@ -303,13 +305,12 @@ deadline, not a whole-transfer deadline that counts downstream backpressure.
 Integrity verification and publication fences still apply before bytes become
 available; asynchronous finalization does not bypass them.
 
-Legacy canonical installations keep a durable source/destination pin that
-never expires automatically. An operator must reconcile an ambiguous R2
-operation before clearing that pin. Outstanding pre-upgrade canonical multipart
-grants keep their legacy objects protected; removing their API routes does not
-revoke those grants. New immutable publications do not wait for them. Staged
-session bytes are retained for retries and removed by garbage collection
-after expiry.
+Uploads that wrote straight to a NAR's final key predate staged uploads and
+are no longer protected or reclaimed. `check-upload-cutover` and startup refuse
+to proceed while such an upload session or a `legacy-unresolved` reservation
+remains: an operator must reconcile the ambiguous R2 operation and remove the
+row first. Staged session bytes are retained for retries and removed by
+garbage collection after expiry.
 
 Old raw CDN metadata and client caches can outlive SQL changes. Slug changes,
 deletion, and signing rotation do not erase those copies; see the
