@@ -17,8 +17,11 @@ device approval window; it is selected on the approval page, not with a CLI flag
 - `--name <profile>` overrides the organization slug used for the local profile.
 - `--url <web-origin>` selects a different login website. HTTPS is required,
   except for HTTP loopback origins used in local development.
-- `snowstead auth status [--server <profile>]` shows local configuration only;
-  it does not verify the token remotely.
+- `snowstead auth status [--server <profile>]` verifies the API token with the
+  server and shows its organization, permissions, cache scope, and expiry.
+  Use `--json` for structured output. Invalid, expired, or revoked tokens fail
+  with a login-again error; an unreachable server reports that verification
+  was unavailable. The command never prints the token and does not follow redirects.
 - `snowstead logout [--server <profile>]` removes that local profile, preserving
   the others. It does not revoke the remote token. If you remove the default,
   the first remaining profile in alphabetical order becomes the default.

@@ -552,6 +552,13 @@ fn ci_credentials_require_a_pair_and_do_not_write_local_config() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("together"));
         assert!(!String::from_utf8_lossy(&result.stderr).contains(TOKEN));
     }
+    let (url, request) = mock(
+        200,
+        json!({
+            "organization":"alpha", "permissions":["pull","go:read"],
+            "caches":["main","ci-*"], "expiresAt":"2035-01-02T03:04:05+00:00",
+        }),
+    );
     let result = Command::new(env!("CARGO_BIN_EXE_snowstead"))
         .env("HOME", home.path())
         .env("SNOWSTEAD_TOKEN", TOKEN)
@@ -563,9 +570,70 @@ fn ci_credentials_require_a_pair_and_do_not_write_local_config() {
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(stdout.contains("Credential source: SNOWSTEAD_TOKEN / SNOWSTEAD_URL"));
     assert!(stdout.contains(&format!("API address: {url}")));
-    assert!(stdout.contains("Cache scope (unverified claims): unknown"));
+    assert!(stdout.contains("Status: valid (verified by server)"));
+    assert!(stdout.contains("Organization: alpha"));
+    assert!(stdout.contains("Permissions: pull, go:read"));
+    assert!(stdout.contains("Cache scope: main, ci-*"));
+    assert!(stdout.contains("Expiry: 2035-01-02T03:04:05+00:00"));
     assert!(!stdout.contains(TOKEN));
+    assert_eq!(
+        request.join().unwrap().0,
+        "GET /_api/v1/auth/status HTTP/1.1"
+    );
     assert!(!home.path().join(".config/snowstead/config.json").exists());
+}
+
+#[test]
+fn auth_status_verifies_saved_credentials_and_distinguishes_server_failures() {
+    let home = tempfile::tempdir().unwrap();
+    let details = json!({
+        "organization":"alpha", "permissions":["push"],
+        "caches":["*"], "expiresAt":null,
+    });
+    let (url, request) = mock(200, details.clone());
+    login(home.path(), &url);
+    let output = run(home.path(), &["--json", "auth", "status"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        details
+    );
+    request.join().unwrap();
+
+    for (status, expected) in [
+        (401, "invalid, expired, or revoked"),
+        (403, "only supports auth status for API tokens"),
+        (404, "Upgrade the server"),
+        (503, "could not verify credential status (HTTP 503)"),
+        (307, "could not verify credential status (HTTP 307)"),
+        (200, "Invalid credential status response"),
+    ] {
+        let (url, request) = mock(status, json!({"error":TOKEN}));
+        login(home.path(), &url);
+        let output = run(home.path(), &["auth", "status"]);
+        assert_eq!(
+            output.status.code(),
+            Some(if matches!(status, 401 | 403) { 4 } else { 1 })
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains(TOKEN));
+        assert!(!stderr.contains(&url));
+        request.join().unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    login(home.path(), &url);
+    let output = run(home.path(), &["auth", "status"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Could not reach the server"));
 }
 
 #[test]

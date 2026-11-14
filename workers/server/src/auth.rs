@@ -560,6 +560,46 @@ pub async fn authenticate(
     principal(state, credential, target, false).await
 }
 
+/// A token holder may inspect their own current scope without management access.
+pub(crate) async fn status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let Principal::ApiToken(token) = authenticate(&headers, &state, None).await? else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Credential status requires an API token",
+        ));
+    };
+    let organization = sqlx::query_scalar("SELECT slug FROM orgs WHERE id = $1")
+        .bind(&token.org)
+        .fetch_one(&state.pool)
+        .await?;
+    let caches = sqlx::query_scalar(
+        "SELECT COALESCE(c.name, tc.pattern) FROM token_caches tc \
+         LEFT JOIN caches c ON c.id = tc.cache_id AND c.org_id = $2 \
+         WHERE tc.token_jti = $1 ORDER BY tc.id",
+    )
+    .bind(&token.id)
+    .bind(&token.org)
+    .fetch_all(&state.pool)
+    .await?;
+    let status = snowstead_protocol::AuthStatus {
+        organization,
+        permissions: token
+            .permissions
+            .iter()
+            .map(|p| p.as_str().into())
+            .collect(),
+        caches,
+        expires_at: token.expires_at.map(|date| date.to_rfc3339()),
+    };
+    Ok(crate::error::json_response(
+        StatusCode::OK,
+        serde_json::json!(status),
+    ))
+}
+
 /// Authenticate a Nix read: a bearer token, or a Basic password as Nix's
 /// netrc sends it. Failures challenge for Basic credentials.
 #[cfg_attr(feature = "profiling", hotpath::measure)]

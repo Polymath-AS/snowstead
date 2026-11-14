@@ -236,6 +236,10 @@ pub fn router(state: AppState) -> Router {
             snowstead_protocol::routes::PROTOCOL,
             axum::routing::get(crate::wire::info),
         )
+        .route(
+            snowstead_protocol::routes::AUTH_STATUS,
+            axum::routing::get(crate::auth::status),
+        )
         .merge(crate::nix::router(state.clone()))
         .merge(crate::go::router())
         .merge(crate::sccache::router())

@@ -394,6 +394,89 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn auth_status_verifies_the_callers_current_token_scope(pool: PgPool) {
+    let app = app(&pool).await;
+    let (status, made) = call(
+        &app,
+        "POST",
+        "/_api/v1/orgs/org_alpha/tokens",
+        Some("operator-secret"),
+        json!({"subject":"status test","caches":["main","ci-*"],"perms":["pull"],"expiresInDays":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    let token = made["token"].as_str().unwrap();
+    let id = made["jti"].as_str().unwrap();
+    let path = snowstead_protocol::routes::AUTH_STATUS;
+    let (status, details) = call(&app, "GET", path, Some(token), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        details,
+        json!({
+            "organization":"alpha", "permissions":["pull"],
+            "caches":["main","ci-*"], "expiresAt":null,
+        })
+    );
+    assert!(!details.to_string().contains(token));
+
+    // Scope and cache names come from current primary rows, not token claims.
+    sqlx::query("UPDATE caches SET name='renamed' WHERE org_id='org_alpha' AND name='main'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE token_permissions SET permission='go:read' WHERE token_jti=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_tokens SET expires_at='2035-01-02T03:04:05Z' WHERE jti=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, details) = call(&app, "GET", path, Some(token), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        details,
+        json!({
+            "organization":"alpha", "permissions":["go:read"],
+            "caches":["renamed","ci-*"], "expiresAt":"2035-01-02T03:04:05+00:00",
+        })
+    );
+    for credential in [None, Some("bogus"), Some(&format!("{token}wrong"))] {
+        assert_eq!(
+            call(&app, "GET", path, credential, Value::Null).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call(&app, "GET", path, Some("legacy-secret"), Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    sqlx::query("UPDATE api_tokens SET expires_at=NOW()-INTERVAL '2 minutes' WHERE jti=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&app, "GET", path, Some(token), Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    sqlx::query("UPDATE api_tokens SET expires_at=NULL, revoked_at=NOW() WHERE jti=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&app, "GET", path, Some(token), Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn token_batches_preserve_interleaved_order_and_first_error(pool: PgPool) {
     let app = app(&pool).await;
     let path = "/_api/v1/orgs/org_alpha/tokens";

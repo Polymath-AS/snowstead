@@ -534,6 +534,31 @@ impl Client {
         client
     }
 
+    pub async fn auth_status(&self) -> Result<protocol::AuthStatus> {
+        let response = self
+            .api(Method::GET, routes::AUTH_STATUS)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|_| {
+                anyhow!("Could not reach the server. Credential status could not be verified")
+            })?;
+        match response.status().as_u16() {
+            200 => response
+                .json()
+                .await
+                .map_err(|_| anyhow!("Invalid credential status response from the server")),
+            status @ (401 | 403) => Err(anyhow::Error::new(HttpError::new("auth status", status))
+                .context(if status == 401 {
+                    "Credential is invalid, expired, or revoked"
+                } else {
+                    "This server only supports auth status for API tokens"
+                })),
+            404 => bail!("This server does not support auth status. Upgrade the server"),
+            status => bail!("The server could not verify credential status (HTTP {status})"),
+        }
+    }
+
     /// An API request: credentials and this CLI's protocol version. Part
     /// uploads go to granted URLs with only the granted headers instead.
     fn api(&self, method: Method, path: &str) -> reqwest::RequestBuilder {

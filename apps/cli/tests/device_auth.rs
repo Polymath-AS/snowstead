@@ -237,13 +237,9 @@ fn slow_down_backs_off_and_explicit_name_wins() {
 }
 
 #[test]
-fn status_is_local_and_logout_preserves_other_profiles() {
+fn logout_preserves_other_profiles() {
     let home = tempfile::tempdir().unwrap();
-    let before = seed(home.path());
-    let status = run(home.path(), &["auth", "status"]);
-    assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("not been verified"));
-    assert_eq!(std::fs::read(config_path(home.path())).unwrap(), before);
+    seed(home.path());
     assert!(
         run(home.path(), &["logout", "--server", "other"])
             .status
@@ -255,95 +251,6 @@ fn status_is_local_and_logout_preserves_other_profiles() {
     assert_eq!(config["servers"].as_object().unwrap().len(), 1);
     assert!(run(home.path(), &["logout"]).status.success());
     assert!(!run(home.path(), &["auth", "status"]).status.success());
-}
-
-#[test]
-fn status_reports_only_selected_unverified_claims_offline() {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let home = tempfile::tempdir().unwrap();
-    seed(home.path());
-    let path = config_path(home.path());
-    let payload = json!({
-        "perms": ["pull", "push\u{1b}[31m"],
-        "caches": ["id:42", "release-*\n"],
-        "org": "org_example\r\u{009b}",
-        "exp": 1,
-        "sub": "private-subject-never-print",
-        "jti": "private-id-never-print"
-    })
-    .to_string();
-    let signature = URL_SAFE_NO_PAD.encode("private-signature-never-print");
-    let token = format!(
-        "{}.{}.{signature}",
-        URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
-        URL_SAFE_NO_PAD.encode(&payload)
-    );
-    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let name = "scoped\u{1b}\n\u{009b}";
-    config["servers"][name] = json!({"server":"http://127.0.0.1:1/org", "token":token});
-    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let before = std::fs::read(&path).unwrap();
-    let result = run(home.path(), &["auth", "status", "--server", name]);
-    assert!(result.status.success(), "{:?}", result);
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(stdout.contains("Credential source: saved profile 'scoped'"));
-    assert!(stdout.contains("API address: http://127.0.0.1:1/org"));
-    assert!(stdout.contains("Permissions (unverified claims): pull, push[31m"));
-    assert!(stdout.contains("Cache scope (unverified claims): id:42, release-*"));
-    assert!(stdout.contains("Organization (unverified claim): org_example"));
-    assert!(stdout.contains("Expiry (unverified claim): 1 (Unix seconds)"));
-    assert!(stdout.contains("not been verified remotely"));
-    assert!(stdout.contains("JWT signatures and revocation have not been checked"));
-    for text in [stdout, String::from_utf8_lossy(&result.stderr)] {
-        for secret in [
-            &token,
-            &signature,
-            &payload,
-            "private-subject-never-print",
-            "private-id-never-print",
-        ] {
-            assert!(!text.contains(secret));
-        }
-        assert!(text.chars().all(|c| !c.is_control() || c == '\n'));
-    }
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-#[test]
-fn status_keeps_opaque_malformed_and_missing_claims_unknown() {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let home = tempfile::tempdir().unwrap();
-    seed(home.path());
-    let path = config_path(home.path());
-    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256"}"#);
-    for token in [
-        TOKEN.to_owned(),
-        "malformed.%%%payload.signature".into(),
-        format!("{header}.{}.c2ln", URL_SAFE_NO_PAD.encode("not JSON")),
-        format!(
-            "{header}.{}.c2ln",
-            URL_SAFE_NO_PAD.encode(r#"{"perms":"admin"}"#)
-        ),
-        format!("{header}.e30.c2ln"),
-    ] {
-        config["servers"]["existing"]["token"] = json!(token);
-        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let result = run(home.path(), &["auth", "status"]);
-        assert!(result.status.success());
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        for label in [
-            "Permissions (unverified claims)",
-            "Cache scope (unverified claims)",
-            "Organization (unverified claim)",
-            "Expiry (unverified claim)",
-        ] {
-            assert!(stdout.contains(&format!("{label}: unknown")), "{stdout}");
-        }
-        assert!(!stdout.contains("admin"));
-        assert!(!stdout.contains(&token));
-        assert!(!String::from_utf8_lossy(&result.stderr).contains(&token));
-    }
 }
 
 #[test]
@@ -361,13 +268,12 @@ fn status_environment_overrides_selected_profile_and_rejects_partial_pairs() {
             command.env_remove(missing);
         }
         let result = command.output().unwrap();
-        assert_eq!(result.status.success(), missing.is_none());
+        assert!(!result.status.success());
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);
         if missing.is_none() {
-            assert!(stdout.contains("Credential source: SNOWSTEAD_TOKEN / SNOWSTEAD_URL"));
-            assert!(stdout.contains("API address: http://127.0.0.1:1/environment"));
-            assert!(!stdout.contains("saved profile"));
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("Could not reach the server"));
         } else {
             assert!(stderr.contains("together"));
         }

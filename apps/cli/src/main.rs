@@ -82,6 +82,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthCommand {
+    /// Verify the current token and show its organization, scope, and expiry.
     Status,
 }
 
@@ -352,7 +353,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         Command::Logout => return auth::logout(cli.server.as_deref()),
         Command::Auth {
             command: AuthCommand::Status,
-        } => return auth::status(cli.server.as_deref()),
+        } => return auth::status(cli.server.as_deref(), cli.json).await,
         _ => (),
     }
     let json = cli.json;

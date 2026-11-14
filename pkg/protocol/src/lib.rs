@@ -29,6 +29,16 @@ pub const CLI_PRODUCT: &str = "snowstead-cli";
 /// The only NAR compression the upload protocol accepts.
 pub const COMPRESSION_ZSTD: &str = "zstd";
 
+/// Current API token scope, verified against the server's primary database.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatus {
+    pub organization: String,
+    pub permissions: Vec<String>,
+    pub caches: Vec<String>,
+    pub expires_at: Option<String>,
+}
+
 /// Limits both sides enforce. The server rejects requests outside them; the
 /// CLI checks them before sending, so it never builds a request the server
 /// must refuse.
@@ -54,6 +64,7 @@ pub mod routes {
     use super::PushJobAction;
 
     pub const PROTOCOL: &str = "/_api/v1/protocol";
+    pub const AUTH_STATUS: &str = "/_api/v1/auth/status";
     pub const MISSING_PATHS: &str = "/_api/v1/get-missing-paths";
     pub const UPLOAD_STREAMS_ROUTE: &str = "/_api/v1/caches/{cache}/upload-streams/batch";
     pub const UPLOAD_PARTS: &str = "/_api/v1/uploads/parts";
