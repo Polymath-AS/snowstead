@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{AppState, config::Config};
+use crate::{AppState, cache, config::Config};
 
 #[derive(Clone)]
 pub(crate) struct OrganizationHost(pub String);
@@ -37,18 +37,12 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     let suffix = &config.cache_host_suffix;
     anyhow::ensure!(
         suffix.is_empty()
-            || (suffix.len() <= 253
-                && suffix
-                    .split('.')
-                    .all(|label| crate::reads::valid_name(label, 63))),
+            || (suffix.len() <= 253 && suffix.split('.').all(|label| cache::valid_name(label, 63))),
         "CACHE_HOST_SUFFIX must be a bare lowercase DNS name without a leading dot or port"
     );
     anyhow::ensure!(
         config.cache_canonical_hosts.split_whitespace().all(|host| {
-            host.len() <= 253
-                && host
-                    .split('.')
-                    .all(|label| crate::reads::valid_name(label, 63))
+            host.len() <= 253 && host.split('.').all(|label| cache::valid_name(label, 63))
         }),
         "CACHE_CANONICAL_HOSTS must contain bare lowercase DNS names separated by whitespace"
     );
@@ -105,7 +99,7 @@ pub(crate) async fn ingress(
     else {
         return next.run(request).await;
     };
-    let mut response = if RESERVED.contains(&owner) || !crate::reads::valid_name(owner, 39) {
+    let mut response = if RESERVED.contains(&owner) || !cache::valid_name(owner, cache::SLUG_MAX) {
         (
             StatusCode::NOT_FOUND,
             [("cache-control", "no-store")],

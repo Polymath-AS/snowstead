@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use snowstead_protocol::{MissingPaths, limits, routes};
 
 use crate::{
-    AppState, auth,
+    AppState,
     authz::{self, Action, Principal as Identity, Resource},
+    cache,
     error::ApiError,
     protocol_policy::CallerLimit,
     wire::respond,
@@ -48,10 +49,7 @@ pub(crate) async fn write_access(
         false,
     );
     // Authentication precedes parsing, including on malformed requests.
-    let identity = auth::authenticate(request.headers(), &state, None).await?;
-    state
-        .protocol_limits
-        .check(CallerLimit::Push, &identity.actor())?;
+    let identity = cache::caller(&state, request.headers(), CallerLimit::Push).await?;
     let ip = crate::app::client_ip(&state, &request);
     if let Err(denied) =
         authz::authorize(&identity, Action::NixPush, &Resource::Org(identity.org()))

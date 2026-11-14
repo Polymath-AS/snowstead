@@ -12,11 +12,14 @@ use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    AppState, auth,
+    AppState,
     authz::{self, Action, Resource},
+    cache,
     error::ApiError,
-    protocol_policy::CallerLimit,
+    protocol_policy::{Admission, CallerLimit},
 };
+
+pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Product {
@@ -82,8 +85,79 @@ fn lock_error(error: sqlx::Error) -> ApiError {
 }
 const PRIVATE_REFUSED: &str = "this org does not allow private caches: its private caches keep serving their paths, but take no pushes, and no new ones can be made";
 
+/// One authorized request against a compiler cache. Holding it keeps the
+/// request's place in its organization's admission lane.
+pub struct Access {
+    pub target: Target,
+    product: Product,
+    _admission: Option<Admission>,
+}
+
+impl Access {
+    pub async fn download(&self, state: &AppState, head: bool) -> Result<Response, ApiError> {
+        download(state, &self.target, head, self.product).await
+    }
+
+    pub async fn upload(
+        &self,
+        state: &AppState,
+        size: u64,
+        output: Option<&str>,
+        body: Body,
+    ) -> Result<Response, ApiError> {
+        let target = &self.target;
+        upload(
+            state,
+            target,
+            self.product,
+            &target.action,
+            size,
+            output,
+            body,
+        )
+        .await
+    }
+}
+
+/// Protocols accept only literal paths: `Path` decodes captures, so a
+/// percent-encoded name or digest must not reach the lookup.
+pub fn literal(pathname: &str, slug: &str, name: &str) -> bool {
+    !pathname.contains('%')
+        && cache::valid_name(slug, cache::SLUG_MAX)
+        && cache::valid_name(name, cache::NAME_MAX)
+}
+
+/// The shared entry to a compiler cache, after the protocol has parsed its
+/// own grammar: admission, lookup, then authorization.
+pub async fn open(
+    state: &AppState,
+    product: Product,
+    slug: &str,
+    name: &str,
+    action: &str,
+    headers: &HeaderMap,
+    write: bool,
+) -> Result<Access, ApiError> {
+    // Bound both lanes before metadata SQL. Callers hold this through uploads,
+    // but not through a returned download body. Go's client turns its remote
+    // off for the rest of a build on 429, so only sccache queues.
+    let admission = match product {
+        Product::Sccache => Some(state.protocol_limits.admit_sccache(slug, write).await?),
+        Product::Go => None,
+    };
+    let target = target(state, slug, name, product, action)
+        .await?
+        .ok_or_else(cache::not_found)?;
+    authorize(state, headers, &target, name, product, write).await?;
+    Ok(Access {
+        target,
+        product,
+        _admission: admission,
+    })
+}
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn target(
+async fn target(
     state: &AppState,
     slug: &str,
     name: &str,
@@ -153,7 +227,7 @@ pub async fn target(
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn authorize(
+async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
     target: &Target,
@@ -164,25 +238,22 @@ pub async fn authorize(
     if !write && target.public {
         return Ok(());
     }
-    let principal = auth::authenticate(headers, state, None).await?;
+    let limit = if write {
+        CallerLimit::Push
+    } else {
+        CallerLimit::Read
+    };
+    let principal = cache::caller(state, headers, limit).await?;
     authz::authorize(
         &principal,
         product.action(write),
         &Resource::cache(&target.org, target.cache_id, name),
     )?;
-    state.protocol_limits.check(
-        if write {
-            CallerLimit::Push
-        } else {
-            CallerLimit::Read
-        },
-        &principal.actor(),
-    )?;
     Ok(())
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn download(
+async fn download(
     state: &AppState,
     target: &Target,
     head: bool,
@@ -1128,7 +1199,7 @@ async fn finish(
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn upload(
+async fn upload(
     state: &AppState,
     target: &Target,
     product: Product,
@@ -1138,15 +1209,13 @@ pub async fn upload(
     body: Body,
 ) -> Result<Response, ApiError> {
     let mut entry = reserve(state, target, product, action, size, output).await?;
-    let mismatch = || {
-        error(
-            StatusCode::BAD_REQUEST,
-            if product == Product::Go {
-                "Artifact checksum or length mismatch"
-            } else {
-                "Content length mismatch"
-            },
-        )
+    let length = || error(StatusCode::BAD_REQUEST, "Content length mismatch");
+    // A protocol that commits to an output ID has its bytes checked against it.
+    let checked = |digest: &str| match output {
+        Some(output) if output != digest => {
+            Err(error(StatusCode::BAD_REQUEST, "Artifact checksum mismatch"))
+        }
+        _ => Ok(()),
     };
     let stored = entry.stored_at.or(entry.uploaded_at);
     let recovered = if stored.is_none() {
@@ -1162,14 +1231,7 @@ pub async fn upload(
         && (stored.is_some() || recovered.is_some())
         && (entry.output.as_deref() != output || entry.size != size as i64)
     {
-        if consume_hash(body, size)
-            .await
-            .map_err(|_| mismatch())?
-            .as_str()
-            != output.unwrap_or("")
-        {
-            return Err(mismatch());
-        }
+        checked(&consume_hash(body, size).await.map_err(|_| length())?)?;
         return Err(error(
             StatusCode::CONFLICT,
             "Action already has a different output",
@@ -1183,10 +1245,7 @@ pub async fn upload(
         return Err(error(StatusCode::CONFLICT, "Upload in progress; retry"));
     }
     let attempt = if stored.is_some() || recovered.is_some() {
-        let digest = consume_hash(body, size).await.map_err(|_| mismatch())?;
-        if product == Product::Go && Some(digest.as_str()) != output {
-            return Err(mismatch());
-        }
+        checked(&consume_hash(body, size).await.map_err(|_| length())?)?;
         recovered.map(|stored_at| Transfer {
             key: entry.r2_key.clone(),
             stored_at,
@@ -1205,15 +1264,15 @@ pub async fn upload(
             Ok(hash) => hash,
             Err(e) => {
                 return Err(if e.status == StatusCode::BAD_REQUEST {
-                    mismatch()
+                    length()
                 } else {
                     e
                 });
             }
         };
-        if product == Product::Go && Some(digest.as_str()) != output {
+        if let Err(mismatch) = checked(&digest) {
             let _ = state.storage.delete(true, &key).await;
-            return Err(mismatch());
+            return Err(mismatch);
         }
         Some(Transfer {
             key,

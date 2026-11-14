@@ -52,6 +52,7 @@ mod artifacts;
 pub mod auth;
 pub mod authz;
 mod bandwidth;
+mod cache;
 mod cache_host;
 mod capacity;
 mod cdn;

@@ -24,6 +24,7 @@ use sqlx::PgPool;
 use crate::{
     AppState, auth,
     authz::{self, Action, Principal, Resource},
+    cache::{NAME_MAX, SLUG_MAX, valid_name},
     error::{ApiError, json_response},
     signing_management,
 };
@@ -96,18 +97,8 @@ fn valid_org(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
-fn valid_name(name: &str, max: usize) -> bool {
-    !name.is_empty()
-        && name.len() <= max
-        && name.as_bytes()[0].is_ascii_alphanumeric()
-        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 fn cache_name(name: &str) -> Result<(), ApiError> {
-    if !valid_name(name, 64) {
+    if !valid_name(name, NAME_MAX) {
         return Err(bad(
             "CacheName must be 1-64 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen",
         ));
@@ -1142,7 +1133,7 @@ async fn put_org(
         if id == "default" {
             return Err(bad("the default org's slug can't change"));
         }
-        let wanted=wanted.as_str().filter(|s|valid_name(s,39)).ok_or_else(||bad("slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash"))?;
+        let wanted=wanted.as_str().filter(|s|valid_name(s,SLUG_MAX)).ok_or_else(||bad("slug must be 1 to 39 lowercase letters, digits, or dashes, not starting or ending with a dash"))?;
         if ["default", "nar", "private", "_api", "healthz"].contains(&wanted) {
             return Err(bad(format!("{wanted} is reserved")));
         }

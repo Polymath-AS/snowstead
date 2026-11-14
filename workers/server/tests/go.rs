@@ -330,6 +330,29 @@ async fn go_auth_checksum_immutable_replay_and_expiry(pool: PgPool) {
         .0,
         StatusCode::PAYLOAD_TOO_LARGE
     );
+    // Lengths and methods are refused the same way on every compiler cache.
+    for length in [None, Some("+1")] {
+        let mut headers = vec![("x-snowstead-output-id", digest.as_str())];
+        headers.extend(length.map(|length| ("content-length", length)));
+        assert_eq!(
+            send(
+                &app,
+                "PUT",
+                &path("compiler", 'c'),
+                Some(&write),
+                &headers,
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::LENGTH_REQUIRED
+        );
+    }
+    for cache in ["compiler", "absent"] {
+        let (status, headers, _) = send(&app, "DELETE", &path(cache, 'c'), None, &[], &[]).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(headers["allow"], "GET, HEAD, PUT");
+    }
     sqlx::query("DELETE FROM cache_protocols WHERE protocol='go'")
         .execute(&pool)
         .await

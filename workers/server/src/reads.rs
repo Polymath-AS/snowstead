@@ -10,7 +10,12 @@ use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    AppState, auth::authorize_read, error::ApiError, protocol_policy::CallerLimit, signing,
+    AppState,
+    auth::authorize_read,
+    cache::{NAME_MAX, SLUG_MAX, sha256_hex, valid_name},
+    error::ApiError,
+    protocol_policy::CallerLimit,
+    signing,
 };
 
 pub(crate) const INFO: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
@@ -74,22 +79,8 @@ fn storage_error(error: io::Error, private: bool) -> Result<Response, ApiError> 
     }
 }
 
-pub(crate) fn valid_name(name: &str, max: usize) -> bool {
-    !name.is_empty()
-        && name.len() <= max
-        && name.as_bytes()[0].is_ascii_alphanumeric()
-        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 fn valid_blob(hash: &str, compression: &str) -> bool {
-    hash.len() == 64
-        && hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        && matches!(compression, "zstd" | "xz" | "bzip2" | "none")
+    sha256_hex(hash) && matches!(compression, "zstd" | "xz" | "bzip2" | "none")
 }
 
 /// Called only after public cache/product and (for NARs) membership admission.
@@ -237,8 +228,8 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
         }
         (segments[0], segments[1], &segments[2..])
     };
-    if !valid_name(name, 64)
-        || !valid_name(slug, 39)
+    if !valid_name(name, NAME_MAX)
+        || !valid_name(slug, SLUG_MAX)
         || matches!(slug, "nar" | "private" | "_api" | "healthz")
     {
         return Ok(missing(false));
