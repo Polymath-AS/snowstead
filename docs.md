@@ -339,53 +339,25 @@ Cloudflare Cache API/CDN behavior, all storage failure interleavings, and all
 maintenance recovery states have not been exhaustively compared. These
 differences are not a claim that every unlisted behavior has been proven equal.
 
-## Rust server observability (opt-in)
+## Rust server instrumentation (opt-in)
 
-PostHog export is behind the Rust server's `observability` Cargo feature,
-which is off by default. Opt in with either build:
+The `observability` Cargo feature enables vendor-neutral OpenTelemetry and
+tracing instrumentation. The standalone server logs locally; it does not
+configure an exporter or read telemetry-provider credentials.
 
-```bash
-nix build .#server-observability
-# Or, inside nix develop:
-cargo build --release -p snowstead-server --features observability
-```
+Embedding applications enable this feature on their `snowstead-server`
+dependency and install their own tracing subscriber, providers, sampling,
+exporters, and shutdown handling. Call `observability::init_metrics(meter)`
+before constructing database pools. Install `observability::PoolTimingLayer`
+with a filter for the `sqlx::pool::acquire` target to record acquisition waits.
+Trace spans use the `snowstead_observability` target.
 
-The default `server` package and deployment bundles still use the build
-without this feature. To enable export in a deployment, explicitly select
-the observability-enabled server package. Existing Hotpath profiling is
-separate and is not enabled by `observability`.
-
-For an observability-enabled binary, configure export through its runtime
-environment, not Nix build arguments:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `POSTHOG_PROJECT_TOKEN` | unset | PostHog project token; required together with `POSTHOG_HOST` to export |
-| `POSTHOG_HOST` | unset | Regional PostHog ingestion origin |
-| `OBSERVABILITY_SAMPLE_RATE` | `0.4` | Trace sampling rate (40%) |
-| `OTEL_SERVICE_NAME` | `snowstead-api` | Telemetry service name |
-| `SNOWSTEAD_RELEASE` | unset | Optional release ID |
-
-With both PostHog variables missing, logging stays in the local journal only.
-Partial or invalid configuration disables export with a safe warning that
-does not reveal credentials. Set `POSTHOG_HOST` to the regional ingestion
-origin, not a dashboard URL or signal-specific endpoint. SDK error reporting
-uses PostHog; OTLP export appends `/i/v1/traces`, `/i/v1/logs`, and
-`/i/v1/metrics` to that origin. PostHog metrics support is alpha.
-
-Export is asynchronous and bounded; request handling does not wait for
-PostHog ingestion, and telemetry can be dropped under pressure. It is not a
-durable audit log. Exported telemetry excludes secrets, raw SQL, request
-bodies, cookies, query strings, and storage keys. Keep project tokens out of
-source control, command arguments, and diagnostic output.
-
-Spans cover HTTP requests through response streaming, database queries and
-transaction waits, storage reads and mutations, multipart uploads, outbound
-HTTP requests and response reads, and maintenance stages. Operation names
-are static; arguments and provider errors are not exported. This uses the
-existing Axum middleware and `tracing-opentelemetry` bridge rather than a
-second HTTP tracing layer. All additional spans compile out without the
-`observability` feature (existing profiling remains independently opt-in).
+Spans cover HTTP response streaming, database queries and transaction waits,
+storage operations, multipart uploads, outbound requests, and maintenance.
+Operation names are static. Raw SQL, credentials, storage keys, and arbitrary
+error payloads are not added to these spans. Export policy belongs to the
+embedding application. Instrumentation compiles out without the feature;
+Hotpath profiling remains independently opt-in.
 
 ## Setup
 
