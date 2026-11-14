@@ -1,2 +1,2 @@
-// A dev-only target: normal CLI builds do not link the profiler.
+// A dev-only target for the snowstead_local NAR benchmark.
 include!("../src/main.rs");

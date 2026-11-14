@@ -254,6 +254,7 @@ impl Budget {
         Self { attempt: 1 }
     }
     /// Waits out a transient failure. False once the budget is spent.
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     async fn wait(&mut self, after: Option<Duration>) -> bool {
         if self.attempt >= ATTEMPTS {
             return false;
@@ -461,6 +462,7 @@ impl<'a, U: Upload> Publication<'a, U> {
             Some(self.finish(Ok(())))
         }
     }
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     async fn poll_accepted(&mut self) -> bool {
         if self.accepted.is_empty() {
             return false;
@@ -570,6 +572,7 @@ impl Client {
                 protocol::PROTOCOL_VERSION.to_string(),
             )
     }
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub(crate) async fn request(
         &self,
         operation: &str,
@@ -614,7 +617,7 @@ impl Client {
             .json(operation, replay)
             .await
     }
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn missing(&self, cache: &str, hashes: &[String]) -> Result<MissingPaths> {
         let request = MissingPathsRequest {
             cache: cache.to_owned(),
@@ -635,7 +638,7 @@ impl Client {
             }
         }
     }
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn create_sessions(
         &self,
         cache: &str,
@@ -674,7 +677,7 @@ impl Client {
     }
     /// One outcome per upload, in request order. Rows that are still busy
     /// replay together; an error means no row resolved at all.
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn finalize(&self, uploads: &[Receipt]) -> Result<Vec<RowOutcome>> {
         let mut batch = Publication::new(
             "finalize",
@@ -714,6 +717,7 @@ impl Client {
     /// Replays retain the same globally budgeted allocation, including after a
     /// lost publication acknowledgement. HTTP and item failures share a budget.
     /// Outcomes follow the same rules as `finalize`.
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn inline_batch(&self, uploads: &[InlineUpload]) -> Result<Vec<RowOutcome>> {
         if uploads.is_empty() || uploads.len() > limits::INLINE_BATCH_MAX {
             bail!("inline upload: invalid batch size");
@@ -779,7 +783,7 @@ impl Client {
     }
     /// Grants charge exact immutable lengths. Retry only transiently rejected
     /// sessions, preserving every successful grant and its original caller.
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn reserve_parts(
         &self,
         requests: &[PartReservation],
@@ -899,7 +903,7 @@ impl Client {
     }
     /// Send only the headers supplied with this grant. Retries retain the same
     /// immutable allocation, never copying the body or adding API credentials.
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn upload_part(
         &self,
         id: &str,
@@ -995,6 +999,7 @@ impl Client {
         )
         .await
     }
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn upstream_has(&self, upstream: &str, hash: &str) -> bool {
         let Ok(hash) = segment(hash) else {
             return false;

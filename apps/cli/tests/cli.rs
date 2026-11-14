@@ -45,6 +45,46 @@ fn manual_login(home: &std::path::Path, name: &str, url: &str, token: &str) -> O
 }
 
 #[test]
+fn profiling_report_is_opt_in_and_separate_from_command_output() {
+    let home = tempfile::tempdir().unwrap();
+    let report = home.path().join("profile.json");
+    let output = run(
+        home.path(),
+        &["--profiling", report.to_str().unwrap(), "auth", "status"],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    #[cfg(not(feature = "profiling"))]
+    {
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--features profiling"));
+        assert!(!report.exists());
+    }
+    #[cfg(feature = "profiling")]
+    {
+        // A failed command must still flush its profile before exiting.
+        let value: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["type"], "hotpath_report");
+        assert!(
+            value["functions_timing"]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| {
+                    row["name"]
+                        .as_str()
+                        .is_some_and(|name| name.ends_with("::run"))
+                })
+        );
+        std::fs::remove_file(&report).unwrap();
+        let output = run(home.path(), &["auth", "status"]);
+        assert!(!output.status.success());
+        assert!(!report.exists());
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn push_reads_stdin_and_includes_each_paths_closure() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();

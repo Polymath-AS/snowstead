@@ -72,7 +72,7 @@ async fn cancelled() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn push(
     client: &Client,
     cache: &str,
@@ -752,7 +752,7 @@ struct Bridge {
     runtime: tokio::runtime::Handle,
 }
 impl Bridge {
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     async fn new(
         size: usize,
         part_limit: u32,
@@ -788,7 +788,7 @@ impl Bridge {
     }
 }
 impl Write for Bridge {
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let len = bytes.len();
         while !bytes.is_empty() {
@@ -824,7 +824,7 @@ impl Write for Bridge {
         Ok(())
     }
 }
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn upload_parts(
     client: &Client,
     id: &str,

@@ -1374,12 +1374,12 @@ async fn verify(
 ) -> Result<(), ApiError> {
     // Preparation already owns a bounded admission. Wait here rather than
     // rejecting admitted work when all native verifiers are occupied.
-    let permit = state
-        .verification_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| error(503, "Verification unavailable"))?;
+    let permit = crate::profile_future!(
+        state.verification_slots.clone().acquire_owned(),
+        label = "uploads.verification_slot_wait"
+    )
+    .await
+    .map_err(|_| error(503, "Verification unavailable"))?;
     // Open the source only after admission. An R2 response has a running
     // body deadline even while another verifier keeps us queued.
     let mut file = file.await?;
@@ -1413,9 +1413,11 @@ async fn verify(
                     .update(&buffer[..n])
                     .map_err(|_| error(400, "Invalid NAR"))?;
                 if let Some((output, _)) = &output {
-                    output
-                        .blocking_send(axum::body::Bytes::copy_from_slice(&buffer[..n]))
-                        .map_err(|_| error(500, "Destination upload failed"))?;
+                    crate::profile_block!(
+                        "uploads.destination_backpressure",
+                        output.blocking_send(axum::body::Bytes::copy_from_slice(&buffer[..n]))
+                    )
+                    .map_err(|_| error(500, "Destination upload failed"))?;
                 }
             }
             let digest = verifier.finish().map_err(|_| error(400, "Invalid NAR"))?;

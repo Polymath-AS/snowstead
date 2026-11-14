@@ -2,7 +2,7 @@ mod api;
 mod auth;
 mod batch;
 mod config;
-#[cfg(any(snowstead_hotpath, snowstead_local))]
+#[cfg(any(feature = "profiling", snowstead_local))]
 mod local;
 mod nar;
 mod nix;
@@ -30,6 +30,9 @@ struct Cli {
     /// Print the push result as one JSON object on stdout; diagnostics stay on stderr.
     #[arg(long, global = true)]
     json: bool,
+    /// Write a Hotpath JSON report (requires a build with the profiling feature).
+    #[arg(long, alias = "hotpath", global = true, value_name = "REPORT.json")]
+    profiling: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -37,7 +40,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Benchmark local NAR preparation without credentials or network requests.
-    #[cfg(any(snowstead_hotpath, snowstead_local))]
+    #[cfg(any(feature = "profiling", snowstead_local))]
     Local(local::Options),
     /// Sign in using a browser, including from an SSH session.
     Login(auth::Login),
@@ -234,12 +237,26 @@ impl std::fmt::Display for PartialPush {
 impl std::error::Error for PartialPush {}
 
 fn main() {
-    #[cfg(snowstead_hotpath)]
-    let profile = hotpath::HotpathGuardBuilder::new("snowstead").build();
-    let result = async_main();
+    let cli = Cli::parse();
+    #[cfg(not(feature = "profiling"))]
+    if cli.profiling.is_some() {
+        eprintln!(
+            "Error: --profiling requires a build with --features profiling (or nix run .#hotpath)"
+        );
+        std::process::exit(2);
+    }
+    #[cfg(feature = "profiling")]
+    let profile = cli.profiling.as_ref().map(|path| {
+        hotpath::HotpathGuardBuilder::new("snowstead")
+            .format(hotpath::Format::Json)
+            .output_path(path)
+            .limit(0)
+            .build()
+    });
+    let result = async_main(cli);
     // Drop the Tokio runtime first: Hotpath flushes each worker's final
     // measurement batch when that thread exits, before writing the report.
-    #[cfg(snowstead_hotpath)]
+    #[cfg(feature = "profiling")]
     drop(profile);
     if let Err(error) = result {
         // Never format an anyhow chain: transport errors can contain signed URLs.
@@ -291,8 +308,7 @@ fn push_roots(paths: Vec<String>, allow_drv: bool) -> Result<Vec<String>> {
 }
 
 #[tokio::main]
-async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+async fn async_main(cli: Cli) -> Result<()> {
     if cli.verbose {
         tracing_subscriber::fmt()
             .with_env_filter("off,snowstead=debug")
@@ -303,7 +319,7 @@ async fn async_main() -> Result<()> {
     run(cli).await
 }
 
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn run(mut cli: Cli) -> Result<()> {
     // Validate command combinations before loading credentials or making requests.
     if let Command::Push {
@@ -347,7 +363,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         }
     }
     match &cli.command {
-        #[cfg(any(snowstead_hotpath, snowstead_local))]
+        #[cfg(any(feature = "profiling", snowstead_local))]
         Command::Local(options) => return local::run(options).await,
         Command::Login(options) => return auth::login(options).await,
         Command::Logout => return auth::logout(cli.server.as_deref()),
@@ -361,7 +377,7 @@ async fn run(mut cli: Cli) -> Result<()> {
     let client = api::Client::new(&server)?;
     tracing::debug!(target: "snowstead", "Starting authenticated command");
     match cli.command {
-        #[cfg(any(snowstead_hotpath, snowstead_local))]
+        #[cfg(any(feature = "profiling", snowstead_local))]
         Command::Local(_) => unreachable!(),
         Command::Login(_) | Command::Auth { .. } | Command::Logout => unreachable!(),
         Command::Push {

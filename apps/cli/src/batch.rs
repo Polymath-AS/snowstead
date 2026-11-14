@@ -97,7 +97,7 @@ impl<T: Send + 'static, R: Send + 'static> Batcher<T, R> {
         });
         Self { sender }
     }
-    #[cfg_attr(snowstead_hotpath, hotpath::measure)]
+    #[cfg_attr(feature = "profiling", hotpath::measure)]
     pub async fn request(&self, value: T) -> anyhow::Result<R> {
         let (tx, rx) = oneshot::channel();
         self.sender

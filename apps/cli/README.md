@@ -41,6 +41,23 @@ This saves the token without claiming remote validation. Positional login tokens
 are no longer accepted. Verbose tracing remains opt-in with `--verbose`, goes to
 stderr, and does not log authentication requests or credentials.
 
+## Profiling
+
+Normal builds do not link Hotpath. Build with `cargo build --release -p
+snowstead-cli --features profiling`, then pass `--profiling report.json` (or
+`--hotpath report.json`) to write a timing report without mixing it with stdout.
+The `hotpath` Nix output builds the same instrumented CLI:
+
+```sh
+nix run .#hotpath -- --profiling report.json push my-cache /nix/store/…
+```
+
+In the web-service checkout, `make cache-profiling` builds and pushes the same
+outputs as `make cache`, with verbose request timings and a Hotpath report at
+`.amp/in/artifacts/cache-profile.json`. Set `PROFILE_REPORT` to choose another
+path. Build time is outside the CLI report. Concurrent function durations
+overlap; they must not be added together as elapsed time or treated as CPU time.
+
 ## Push progress
 
 In an interactive terminal, `snowstead push` shows an overall path-progress bar

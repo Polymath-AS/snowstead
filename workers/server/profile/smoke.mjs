@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -36,7 +36,7 @@ try {
   const url = new URL(process.env.SNOWSTEAD_TEST_DATABASE_URL);
   url.pathname = `/${name}`;
   const env = {
-    ...process.env, DATABASE_URL: url.toString(), DATABASE_MAX_CONNECTIONS: "1",
+    ...process.env, DATABASE_URL: url.toString(), DATABASE_MAX_CONNECTIONS: "8",
     ADMIN_SECRET: operator, JWT_SECRET: randomBytes(32).toString("hex"), AUTH_TOKEN: "",
     SIGNING_PRIVATE_KEY: randomBytes(32).toString("base64"), SIGNING_KEY_NAME: "profile-fixture",
     SIGNING_MASTER_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false", UPSTREAM_CACHES: "",
@@ -71,7 +71,7 @@ try {
   });
   assert.equal(issued.status, 201);
   const { token } = await issued.json();
-  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json", "snowstead-protocol-version": "2" };
   const contents = Buffer.concat([Buffer.from("profile-content-sentinel"), randomBytes(96 * 1024)]);
   const words = [Buffer.from("nix-archive-1"), Buffer.from("("), Buffer.from("type"), Buffer.from("regular"), Buffer.from("contents"), contents, Buffer.from(")")];
   const raw = Buffer.concat(words.flatMap(word => {
@@ -86,28 +86,22 @@ try {
   const fileHash = createHash("sha256").update(compressed).digest("hex");
   await db.query("BEGIN");
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended('org:default',0))");
-  const pending = request("/_api/v1/caches/profile-private-sentinel/upload-streams/batch", {
+  const createInline = () => request("/_api/v1/caches/profile-private-sentinel/upload-streams/batch", {
     method: "POST", headers, body: JSON.stringify({ paths: [{
       storePath: `/nix/store/${hash}-profile-fixture`, storePathHash: hash,
       narHash: `sha256-${createHash("sha256").update(raw).digest("base64")}`,
       narSize: raw.length, compression: "zstd", references: [], inline: true,
     }] }),
   });
-  // Confirm a real DB lock wait before releasing it. With a pool of one, the
-  // simultaneous health query also waits for the request's pool connection.
-  let waiting = false;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const result = await db.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event='advisory') AS waiting");
-    if (result.rows[0].waiting) { waiting = true; break; }
-    await sleep(10);
-  }
-  assert.ok(waiting, "request reached advisory lock wait");
-  const health = request("/healthz");
-  await sleep(75);
+  // Org fences now fail fast rather than retaining a connection while waiting.
+  // Exercise contention without relying on the old blocking-lock behavior.
+  const contended = await createInline();
+  assert.equal(contended.status, 503);
+  assert.equal((await contended.json()).error, "Concurrent write; retry");
+  assert.equal((await request("/healthz")).status, 200);
   await db.query("COMMIT");
-  const response = await pending;
+  const response = await createInline();
   assert.equal(response.status, 201);
-  assert.equal((await health).status, 200);
   const { sessions: [{ sessionId }] } = await response.json();
   const uploaded = await request(`/_api/v1/uploads/${sessionId}/inline?fileHash=${fileHash}`, {
     method: "POST", headers: { ...headers, "content-length": String(compressed.length) },
@@ -127,6 +121,49 @@ try {
   const download = await request(new URL(/^URL: (.+)$/m.exec(narinfo)[1], `${origin}/profile-private-sentinel/`).pathname, { headers });
   assert.equal(download.status, 200);
   assert.deepEqual(Buffer.from(await download.arrayBuffer()), compressed);
+
+  // Exercise durable multipart finalization too. An optional local fixture lets
+  // the same disposable stack profile a large real NAR without live credentials.
+  // Fixture JSON: { compressedPath, narHash, narSize }.
+  const fixture = process.env.SNOWSTEAD_PROFILE_FIXTURE
+    ? JSON.parse(await readFile(process.env.SNOWSTEAD_PROFILE_FIXTURE, "utf8"))
+    : { narHash: `sha256-${createHash("sha256").update(raw).digest("base64")}`, narSize: raw.length };
+  const multipart = fixture.compressedPath ? await readFile(fixture.compressedPath) : compressed;
+  const multipartHash = createHash("sha256").update(multipart).digest("hex");
+  const post = async (path, body) => {
+    const response = await request(path, { method: "POST", headers, body: JSON.stringify(body) });
+    const result = await response.json();
+    assert.ok(response.ok, JSON.stringify(result));
+    return result;
+  };
+  const multipartCreated = await post("/_api/v1/caches/profile-private-sentinel/upload-streams/batch", { paths: [{
+    storePath: `/nix/store/${"a".repeat(32)}-multipart-profile`, storePathHash: "a".repeat(32),
+    narHash: fixture.narHash, narSize: fixture.narSize, compression: "zstd", references: [], inline: false,
+  }] });
+  const multipartId = multipartCreated.sessions[0].sessionId;
+  const parts = [];
+  for (let offset = 0; offset < multipart.length; offset += 8 * 1024 * 1024) {
+    const bytes = multipart.subarray(offset, offset + 8 * 1024 * 1024);
+    const partNumber = parts.length + 1;
+    const { parts: [grant] } = await post(`/_api/v1/uploads/${multipartId}/parts`, { parts: [{ partNumber, size: bytes.length }] });
+    assert.equal(new URL(grant.url).origin, env.R2_ENDPOINT);
+    const response = await fetch(grant.url, { method: "PUT", headers: grant.headers, body: bytes });
+    assert.equal(response.status, 200, await response.text());
+    parts.push({ partNumber, etag: response.headers.get("etag").replace(/^"|"$/g, "") });
+  }
+  const started = performance.now();
+  await post("/_api/v1/uploads/finalize", { uploads: [{ sessionId: multipartId,
+    narHash: fixture.narHash, narSize: fixture.narSize, fileHash: multipartHash, fileSize: multipart.length, parts }] });
+  const deadline = performance.now() + 180_000;
+  for (;;) {
+    const { results: [result] } = await post("/_api/v1/uploads/status", { sessions: [multipartId] });
+    if (result.published) break;
+    assert.equal(result.status, 202, JSON.stringify(result));
+    assert.ok(performance.now() < deadline, "multipart finalization timed out");
+    await sleep(25);
+  }
+  console.log(JSON.stringify({ multipartBytes: multipart.length, narBytes: fixture.narSize,
+    finalizationMs: performance.now() - started }));
   server.kill("SIGTERM");
   assert.equal((await closed)[0], 0, stderr);
   server = undefined;
@@ -136,18 +173,21 @@ try {
     console.log("profiling off: same locked upload, native verification, signed metadata, and streamed download; no profiler report");
   } else {
     const reportText = await readFile(output, "utf8");
+    if (process.env.SNOWSTEAD_PROFILE_OUTPUT) await copyFile(output, process.env.SNOWSTEAD_PROFILE_OUTPUT);
     const report = JSON.parse(reportText);
     const functions = report.functions_timing.data;
-    for (const label of ["uploads.advisory_lock_wait", "storage.upload_body", "storage.object_body", "reads.nar_body", "snowstead_server::uploads::verify", "snowstead_server::signing::render_with_key"]) {
+    for (const label of ["uploads.advisory_lock_wait", "storage.upload_body", "storage.object_body", "reads.nar_body", "uploads.verification_slot_wait", "uploads.destination_backpressure", "snowstead_server::uploads::verify", "snowstead_server::uploads::finalization::turn", "snowstead_server::signing::render_with_key"]) {
       assert.ok(functions.some(row => row.name === label && row.calls > 0), `missing timing: ${label}`);
     }
-    for (const label of ["uploads.advisory_lock_wait", "app.health_sql", "storage.upload_body"]) {
+    // Inline bodies are buffered before storage now; their induced delay belongs
+    // to the handler, not to the destination storage stream.
+    for (const label of ["snowstead_server::uploads::inline"]) {
       const row = functions.find(row => row.name === label);
       const [value, unit] = row.total.split(" ");
       const milliseconds = Number(value) * ({ ns: 0.000001, "µs": 0.001, ms: 1, s: 1000 }[unit]);
       assert.ok(milliseconds >= 50, `${label} must include the induced wait, got ${row.total}`);
     }
-    assert.ok(report.futures.data.some(row => row.label === "uploads.advisory_lock_wait" && row.total_polls > row.call_count));
+    assert.ok(report.futures.data.some(row => row.label === "uploads.advisory_lock_wait" && row.call_count > 0));
     assert.ok(report.streams.data.some(row => row.label === "reads.nar_body" && row.items_yielded > 0));
     for (const label of ["native.verify.update", "archive.verify.decompress", "archive.verify.nar_hash", "Memory allocated per call"]) {
       assert.ok(stderr.includes(label), `missing native measurement: ${label}`);

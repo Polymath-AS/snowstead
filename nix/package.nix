@@ -54,7 +54,7 @@ craneLib.buildPackage (
 
     # Crane caches vendored crates and compiled dependencies separately from src.
     cargoExtraArgs =
-      "--locked --package snowstead-cli" + lib.optionalString hotpath " --example snowstead";
+      "--locked --package snowstead-cli" + lib.optionalString hotpath " --features profiling";
     doCheck = !hotpath;
     nativeBuildInputs = [
       zig_0_17
@@ -73,11 +73,5 @@ craneLib.buildPackage (
       wrapProgram $out/bin/snowstead --prefix PATH : ${lib.makeBinPath [ nix ]}
     '';
     meta.mainProgram = "snowstead";
-  }
-  // lib.optionalAttrs hotpath {
-    RUSTFLAGS = "--cfg snowstead_hotpath";
-    installPhaseCommand = ''
-      install -Dm755 target/release/examples/snowstead $out/bin/snowstead
-    '';
   }
 )

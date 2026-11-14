@@ -87,7 +87,7 @@ struct Output<'a, W> {
     writer: &'a mut W,
     error: Option<io::Error>,
 }
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 unsafe extern "C" fn write<W: Write>(ctx: *mut c_void, b: *const u8, len: usize) -> i32 {
     // The synchronous native call borrows this output for its whole lifetime.
     let output = unsafe { &mut *ctx.cast::<Output<'_, W>>() };
@@ -112,7 +112,7 @@ impl Drop for Compressor {
         unsafe { (self.api.free)(self.ctx) }
     }
 }
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub fn dump<W: Write>(
     path: &Path,
     size: u64,
@@ -157,7 +157,7 @@ pub fn dump<W: Write>(
     dump_nix(path, size, level, threads, output.writer)
 }
 
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub fn dump_nix<W: Write>(
     path: &Path,
     size: u64,

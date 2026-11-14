@@ -24,7 +24,7 @@ struct Entry {
     deriver: Option<String>,
 }
 
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn query(args: &[&str], paths: &[String]) -> Result<Vec<u8>> {
     let output = Command::new("nix")
         .args(["--extra-experimental-features", "nix-command flakes"])
@@ -59,7 +59,7 @@ fn ensure_local(paths: &[String]) -> Result<()> {
 }
 
 /// The runtime closure of every root: the roots and everything they reference.
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn closure(roots: &[String]) -> Result<Vec<String>> {
     ensure_local(roots)?;
     let mut paths = BTreeSet::new();
@@ -101,7 +101,7 @@ pub fn resolve(path: &str) -> Result<String> {
     Ok(resolved.to_owned())
 }
 
-#[cfg_attr(snowstead_hotpath, hotpath::measure)]
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn path_infos(paths: &[String]) -> Result<HashMap<String, PathInfo>> {
     let mut result = HashMap::new();
     for chunk in paths.chunks(500) {

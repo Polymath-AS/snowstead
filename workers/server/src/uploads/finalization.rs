@@ -237,6 +237,7 @@ pub(crate) async fn run(state: AppState, stopped: CancellationToken) {
     }
 }
 
+#[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
     let org: Option<String> = sqlx::query_scalar(
         "SELECT b.org_id FROM upload_finalization_batches b WHERE b.org_id>$1 AND b.work_at<=NOW() \
