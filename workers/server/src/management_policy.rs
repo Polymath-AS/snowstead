@@ -1,5 +1,5 @@
 //! Management policy uses the same org -> cache -> entry fence as publication.
-//! SQL withdraws metadata atomically; known legacy objects are queued for GC.
+//! SQL withdraws metadata atomically; narinfo is rendered from it and owns no object.
 //! Shared NARs belong to GC, never to cache/path withdrawal.
 use crate::db::Transaction;
 use crate::{
@@ -129,26 +129,6 @@ impl MetadataTarget {
             }
         }
         Self { paths }
-    }
-
-    pub(crate) async fn withdraw(
-        &self,
-        tx: &mut impl std::ops::DerefMut<Target = sqlx::PgConnection>,
-        hashes: &[String],
-    ) -> Result<(), ApiError> {
-        for path in &self.paths {
-            for hash in hashes {
-                // Both placements can survive an earlier visibility change.
-                for (private, key) in [
-                    (false, format!("{path}/{hash}.narinfo")),
-                    (true, format!("narinfo/{path}/{hash}.narinfo")),
-                ] {
-                    sqlx::query("INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-                        .bind(private).bind(key).execute(&mut **tx).await?;
-                }
-            }
-        }
-        Ok(())
     }
 
     async fn withdraw_cache_info(&self, tx: &mut Transaction) -> Result<(), ApiError> {
@@ -556,13 +536,8 @@ async fn remove_paths(
     let org = context_org(&context);
     valid_cache(&path.cache)?;
     let input = body(request).await?;
-    let FencedCache {
-        mut tx,
-        id,
-        metadata,
-        ..
-    } = load_cache(&state, org, &path.cache, false).await?;
-    let response = delete_paths(&metadata, &mut tx, id, input).await?;
+    let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, false).await?;
+    let response = delete_paths(&mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
 }
@@ -680,30 +655,13 @@ async fn withdraw_cache(
     )
     .execute(&mut *tx)
     .await?;
-    let mut nix = 0;
-    loop {
-        let hashes = sqlx::query_scalar!(
-            r#"
-                    DELETE FROM published_paths
-                    WHERE id IN (
-                        SELECT id
-                        FROM published_paths
-                        WHERE cache_id = $1
-                        ORDER BY id
-                        LIMIT 500
-                    )
-                    RETURNING store_path_hash
-                    "#,
-            id
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        metadata.withdraw(&mut tx, &hashes).await?;
-        nix += hashes.len();
-        if hashes.len() < 500 {
-            break;
-        }
-    }
+    // Narinfo is rendered from SQL, so a publication owns no metadata object
+    // and the whole cache goes in one statement.
+    let nix = sqlx::query("DELETE FROM published_paths WHERE cache_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     let mut removed = json!({"nix":nix});
     for kind in ["go", "sccache"] {
         // Cache deletion detaches compiler entries through the foreign
@@ -1250,7 +1208,6 @@ async fn list_paths(
 }
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn delete_paths(
-    metadata: &MetadataTarget,
     tx: &mut Transaction,
     cache: i32,
     value: Value,
@@ -1376,7 +1333,6 @@ async fn delete_paths(
     .bind(InstallationPhase::Revoked)
     .execute(&mut **tx)
     .await?;
-    metadata.withdraw(tx, &withdrawn).await?;
     let gone = if before.is_some() {
         deleted.clone()
     } else {

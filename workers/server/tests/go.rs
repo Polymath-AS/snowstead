@@ -616,12 +616,15 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         .unwrap();
     assert_eq!(pins, 0);
     let cleanup: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE is_private AND key = 'narinfo/alpha/compiler/' || repeat('0',32) || '.narinfo')",
+        "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE key LIKE '%.narinfo')",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(cleanup, "SQL eviction must enqueue legacy metadata cleanup");
+    assert!(
+        !cleanup,
+        "narinfo is rendered from SQL; eviction queues no metadata object"
+    );
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]

@@ -356,51 +356,6 @@ pub async fn admit(
         .map(|v| v.id.parse().expect("database bigint"))
         .collect();
     if !ids.is_empty() {
-        let metadata = sqlx::query!(
-            r#"
-            SELECT
-                o.slug,
-                o.moving_from,
-                c.name,
-                p.store_path_hash,
-                c.is_public
-            FROM published_paths p
-            JOIN caches c ON c.id = p.cache_id
-            JOIN orgs o ON o.id = c.org_id
-            WHERE p.id = ANY($1)
-            "#,
-            &ids,
-        )
-        .fetch_all(&mut **tx)
-        .await?;
-        for row in metadata {
-            let (slug, moving_from, name, hash, public) = (
-                row.slug,
-                row.moving_from,
-                row.name,
-                row.store_path_hash,
-                row.is_public,
-            );
-            for slug in std::iter::once(slug).chain(moving_from) {
-                let path = if slug == "default" {
-                    name.clone()
-                } else {
-                    format!("{slug}/{name}")
-                };
-                let key = if public {
-                    format!("{path}/{hash}.narinfo")
-                } else {
-                    format!("narinfo/{path}/{hash}.narinfo")
-                };
-                sqlx::query(
-                    "INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                )
-                .bind(!public)
-                .bind(key)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
         sqlx::query!(
             r#"
             DELETE FROM published_paths

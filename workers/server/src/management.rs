@@ -223,7 +223,6 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         .route("/caches", get(list_caches).post(create_cache))
         .route("/caches/{cache}", get(get_cache))
         .route("/auth/sync", post(sync_auth))
-        .route("/narinfo/backfill", post(backfill))
         .merge(crate::management_auth::admin_router())
         .merge(crate::management_policy::admin_router());
     Router::new()
@@ -515,7 +514,6 @@ fn audit_action(method: &Method, endpoint: &str, admin: bool) -> Option<&'static
         ("POST", "/caches/{cache}/pins") => Some("pin.create"),
         ("DELETE", "/caches/{cache}/pins/{pin}") => Some("pin.delete"),
         ("POST", "/auth/sync") => Some("auth.sync"),
-        ("POST", "/narinfo/backfill") => Some("narinfo.backfill"),
         _ => None,
     }
 }
@@ -1540,254 +1538,6 @@ async fn sync_auth(State(state): State<AppState>) -> Result<Response, ApiError> 
     ))
 }
 
-struct Published {
-    id: i64,
-    org_id: String,
-    name: String,
-    slug: String,
-    store_path_hash: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct BackfillSnapshot {
-    cache_id: i32,
-    blob_id: i64,
-    is_public: bool,
-    r2_key: String,
-    public_key: Option<String>,
-    private_key: Option<String>,
-    file_hash: String,
-    compression: String,
-    file_size: i64,
-}
-
-async fn backfill_snapshot(
-    tx: &mut crate::db::Transaction,
-    row: &Published,
-) -> Result<BackfillSnapshot, ApiError> {
-    sqlx::query_as::<_, BackfillSnapshot>(
-        "SELECT c.id AS cache_id, b.id AS blob_id, c.is_public, b.r2_key, b.public_key,
-            b.private_key, b.file_hash, b.compression, b.file_size
-         FROM published_paths p JOIN caches c ON c.id=p.cache_id
-         JOIN orgs o ON o.id=c.org_id JOIN blob_objects b ON b.id=p.blob_object_id
-         WHERE p.id=$1 AND c.org_id=$2 AND p.store_path_hash=$3
-         FOR UPDATE OF c,o,b,p NOWAIT",
-    )
-    .bind(row.id)
-    .bind(&row.org_id)
-    .bind(&row.store_path_hash)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(not_found)
-}
-
-// An uncertain finish commit may already have adopted the key. Only the
-// matching, still-unadopted reservation can transfer ownership to cleanup.
-async fn retire_backfill(state: &AppState, key: &str, operation: &str) -> Result<(), ApiError> {
-    sqlx::query("WITH retired AS (
-        DELETE FROM nar_installations i WHERE i.key=$1 AND i.operation_id=$2
-            AND NOT EXISTS (SELECT 1 FROM blob_objects b WHERE b.public_key=i.key OR b.private_key=i.key)
-        RETURNING is_private,key
-    ) INSERT INTO object_cleanup(is_private,key) SELECT is_private,key FROM retired ON CONFLICT DO NOTHING")
-        .bind(key).bind(operation).execute(&state.pool).await?;
-    Ok(())
-}
-
-async fn repair_backfill(state: &AppState, row: &Published) -> Result<bool, ApiError> {
-    let operation = uuid::Uuid::now_v7().to_string();
-    let mut tx = crate::db::begin(state, &row.org_id).await?;
-    crate::db::advisory_lock(&mut tx, &format!("org:{}", row.org_id)).await?;
-    let snapshot = backfill_snapshot(&mut tx, row).await?;
-    let nar_fence = format!("nar:{}:{}", snapshot.file_hash, snapshot.compression);
-    crate::db::advisory_lock(&mut tx, &nar_fence).await?;
-    let private = !snapshot.is_public;
-    let destination = format!(
-        "{}/objects/{operation}/{}/{}.nar",
-        if private { "nars" } else { "nar" },
-        snapshot.file_hash,
-        snapshot.compression
-    );
-    let pointer = if private {
-        &snapshot.private_key
-    } else {
-        &snapshot.public_key
-    };
-    let target = pointer.clone().unwrap_or_else(|| {
-        format!(
-            "{}/{}/{}.nar",
-            if private { "nars/sha256" } else { "nar" },
-            snapshot.file_hash,
-            snapshot.compression
-        )
-    });
-    let source = if private {
-        &snapshot.public_key
-    } else {
-        &snapshot.private_key
-    }
-    .as_deref()
-    .unwrap_or(&snapshot.r2_key)
-    .to_owned();
-    sqlx::query(
-        "INSERT INTO nar_installations (
-        key,operation_id,source_key,file_hash,compression,is_private,file_size,
-        cache_id,expires_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+INTERVAL '1 hour')",
-    )
-    .bind(&destination)
-    .bind(&operation)
-    .bind(&source)
-    .bind(&snapshot.file_hash)
-    .bind(&snapshot.compression)
-    .bind(private)
-    .bind(snapshot.file_size)
-    .bind(snapshot.cache_id)
-    .execute(&mut *tx)
-    .await?;
-    if let Err(error) = tx.commit().await {
-        let _ = retire_backfill(state, &destination, &operation).await;
-        return Err(error.into());
-    }
-    let result = async {
-        // No SQL transaction is held during provider calls. The reservation
-        // owns the unique destination and pins its recorded source for GC.
-        let copied = match state.storage.head(private, &target).await {
-            // Immutable records never use the legacy canonical fallback at
-            // read time. They need an adopted bucket pointer even if it exists.
-            Ok(_) => pointer.is_none() && snapshot.r2_key.contains("/objects/"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => return Err(internal()),
-        };
-        if copied {
-            state.storage.copy(!source.starts_with("nar/"), &source, private, &destination)
-                .await.map_err(|_| internal())?;
-        }
-        let mut tx = crate::db::begin(state, &row.org_id).await?;
-        crate::db::advisory_lock(&mut tx, &format!("org:{}", row.org_id)).await?;
-        crate::db::advisory_lock(&mut tx, &nar_fence).await?;
-        let fresh = backfill_snapshot(&mut tx, row).await?;
-        if fresh.cache_id != snapshot.cache_id || fresh.blob_id != snapshot.blob_id
-            || fresh.is_public != snapshot.is_public
-            || fresh.r2_key != snapshot.r2_key {
-            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Publication changed; retry"));
-        }
-        let owned: Option<String> = sqlx::query_scalar("SELECT operation_id FROM nar_installations
-            WHERE key=$1 AND operation_id=$2 AND expires_at>NOW() AND phase<>'revoked'
-            FOR UPDATE NOWAIT")
-            .bind(&destination).bind(&operation)
-            .fetch_optional(&mut *tx).await?;
-        if owned.is_none() {
-            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Repair expired; retry"));
-        }
-        let adopted = if copied {
-            let query = if private {
-                "UPDATE blob_objects SET private_key=$1 WHERE id=$2 AND private_key IS NOT DISTINCT FROM $3"
-            } else {
-                "UPDATE blob_objects SET public_key=$1 WHERE id=$2 AND public_key IS NOT DISTINCT FROM $3"
-            };
-            sqlx::query(query).bind(&destination).bind(snapshot.blob_id).bind(pointer)
-                .execute(&mut *tx).await?.rows_affected() == 1
-        } else { false };
-        if !adopted {
-            sqlx::query("INSERT INTO object_cleanup(is_private,key) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                .bind(private).bind(&destination).execute(&mut *tx).await?;
-        }
-        sqlx::query("DELETE FROM nar_installations WHERE key=$1 AND operation_id=$2")
-            .bind(&destination).bind(&operation).execute(&mut *tx).await?;
-        retire_narinfo(&mut tx, row, &path(&row.slug, &row.name)).await?;
-        tx.commit().await?;
-        Ok(adopted)
-    }.await;
-    if result.is_err() {
-        // Failure here is still safe: durable expiry retains cleanup ownership.
-        let _ = retire_backfill(state, &destination, &operation).await;
-    }
-    result
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn retire_narinfo(
-    tx: &mut crate::db::Transaction,
-    row: &Published,
-    target: &str,
-) -> Result<(), ApiError> {
-    // Narinfo is rendered from SQL at read time; retire known legacy keys.
-    for (private, key) in [
-        (false, format!("{target}/{}.narinfo", row.store_path_hash)),
-        (
-            true,
-            format!("narinfo/{target}/{}.narinfo", row.store_path_hash),
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO object_cleanup (is_private, key) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(private)
-        .bind(key)
-        .execute(&mut **tx)
-        .await?;
-    }
-    set_cache_info(tx, target).await?;
-    Ok(())
-}
-
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn backfill(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
-    let state = &state;
-    let input = body(request).await?;
-    let after = input
-        .get("after")
-        .map(|v| {
-            integer(v)
-                .filter(|n| *n >= 0)
-                .ok_or_else(|| bad("after must be a non-negative integer"))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let limit = input
-        .get("limit")
-        .map(|v| {
-            integer(v)
-                .filter(|n| (1..=1000).contains(n))
-                .ok_or_else(|| bad("limit must be between 1 and 1000"))
-        })
-        .transpose()?
-        .unwrap_or(500);
-    let rows = sqlx::query_as!(
-        Published,
-        r#"
-        SELECT
-            p.id,
-            c.org_id,
-            c.name,
-            o.slug,
-            p.store_path_hash
-        FROM published_paths p
-        JOIN caches c ON c.id = p.cache_id
-        JOIN orgs o ON o.id = c.org_id
-        WHERE p.id > $1
-        ORDER BY p.id
-        LIMIT $2
-        "#,
-        after,
-        limit
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let mut skipped = Vec::new();
-    let mut written = 0;
-    for row in &rows {
-        let target = path(&row.slug, &row.name);
-        match repair_backfill(state, row).await {
-            Ok(repaired) => written += usize::from(repaired),
-            Err(_) => skipped.push(format!("{target}/{}", row.store_path_hash)),
-        }
-    }
-    Ok(ok(
-        json!({"written":written,"processed":rows.len()-skipped.len(),"skipped":skipped,"next":if rows.len()==limit as usize{rows.last().map(|r|r.id)}else{None}}),
-    ))
-}
-
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn move_slug(
     State(state): State<AppState>,
@@ -1837,8 +1587,8 @@ async fn move_slug(
     let Some(from) = moving else {
         return Ok(ok(json!({"done":true})));
     };
-    // Reads already resolve the new slug from SQL. Retire only known old keys;
-    // orphan object discovery is not part of a policy transaction.
+    // Reads already resolve the new slug from SQL, and narinfo is rendered
+    // from it. Only the old slug's cache-info objects remain to retire.
     let names = sqlx::query_scalar!(
         r#"
             SELECT name
@@ -1850,14 +1600,6 @@ async fn move_slug(
     .fetch_all(&mut *tx)
     .await?;
     for name in names {
-        let hashes = sqlx::query_scalar!(
-                "SELECT p.store_path_hash FROM published_paths p JOIN caches c ON c.id = p.cache_id WHERE c.org_id = $1 AND c.name = $2",
-                id,
-                name
-            ).fetch_all(&mut *tx).await?;
-        crate::management_policy::MetadataTarget::new(true, &from, None, &name)
-            .withdraw(&mut tx, &hashes)
-            .await?;
         set_cache_info(&mut tx, &path(&from, &name)).await?;
     }
     sqlx::query!(

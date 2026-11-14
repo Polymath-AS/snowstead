@@ -679,119 +679,7 @@ async fn cache_summaries_keep_monthly_products_and_paths_separate(pool: PgPool) 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn metadata_backfill_repairs_recorded_nar_placement(pool: PgPool) {
-    let storage = if std::env::var_os("SNOWSTEAD_TEST_R2_ENDPOINT").is_some() {
-        Storage::new(&Config::from_env()).unwrap()
-    } else {
-        common::storage()
-    };
-    let app = router(state_with_storage(pool.clone(), storage.clone()));
-    sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_repair','repair');
-        INSERT INTO caches (name,org_id,is_public) VALUES ('public','org_repair',true),('secret','org_repair',false);
-        INSERT INTO cache_protocols (cache_id,protocol) SELECT id,'nix' FROM caches;")
-        .execute(&pool).await.unwrap();
-    for private in [false, true] {
-        let name = if private { "secret" } else { "public" };
-        let hash = if private { "d" } else { "c" }.repeat(64);
-        let source = if private {
-            format!("nar/{hash}/none.nar")
-        } else {
-            format!("nars/sha256/{hash}/none.nar")
-        };
-        let target = if private {
-            format!("nars/sha256/{hash}/none.nar")
-        } else {
-            format!("nar/{hash}/none.nar")
-        };
-        sqlx::query("INSERT INTO blob_objects (file_hash,file_size,compression,r2_key) VALUES ($1,5,'none',$2)")
-            .bind(&hash).bind(&source).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO published_paths (cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
-            SELECT c.id,repeat('0',32),'/nix/store/00000000000000000000000000000000-example','sha256:'||repeat('0',64),5,b.id
-            FROM caches c CROSS JOIN blob_objects b WHERE c.name=$1 AND b.file_hash=$2")
-            .bind(name).bind(&hash).execute(&pool).await.unwrap();
-        storage.put(!private, &source, b"bytes").await.unwrap();
-        assert!(storage.head(private, &target).await.is_err());
-    }
-    let backfill = || {
-        call(
-            &app,
-            "POST",
-            "/_api/v1/admin/narinfo/backfill",
-            json!({}),
-            None,
-        )
-    };
-    let (status, _, result) = backfill().await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        result,
-        json!({"written":2,"processed":2,"skipped":[],"next":null})
-    );
-    for private in [false, true] {
-        let (name, hash, prefix) = if private {
-            ("secret", "d".repeat(64), "nars/sha256")
-        } else {
-            ("public", "c".repeat(64), "nar")
-        };
-        let pointer: String = sqlx::query_scalar(if private {
-            "SELECT private_key FROM blob_objects WHERE file_hash=$1"
-        } else {
-            "SELECT public_key FROM blob_objects WHERE file_hash=$1"
-        })
-        .bind(&hash)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(pointer.starts_with(if private {
-            "nars/objects/"
-        } else {
-            "nar/objects/"
-        }));
-        assert!(
-            storage
-                .head(private, &format!("{prefix}/{hash}/none.nar"))
-                .await
-                .is_err()
-        );
-        let object = storage.open(private, &pointer).await.unwrap();
-        let mut bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut { object.reader }, &mut bytes)
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"bytes");
-        let info_key = format!(
-            "{}repair/{name}/{}.narinfo",
-            if private { "narinfo/" } else { "" },
-            "0".repeat(32)
-        );
-        assert!(storage.head(private, &info_key).await.is_err());
-        assert!(storage.head(!private, &info_key).await.is_err());
-        // Once placed, a missing recorded source must not prevent reuse.
-        let source = format!(
-            "{}/{hash}/none.nar",
-            if private { "nar" } else { "nars/sha256" }
-        );
-        storage.delete(!private, &source).await.unwrap();
-    }
-    assert_eq!(
-        backfill().await.2,
-        json!({"written":0,"processed":2,"skipped":[],"next":null})
-    );
-    let public_key: String =
-        sqlx::query_scalar("SELECT public_key FROM blob_objects WHERE file_hash=$1")
-            .bind("c".repeat(64))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    storage.delete(false, &public_key).await.unwrap();
-    assert_eq!(
-        backfill().await.2,
-        json!({"written":0,"processed":1,"skipped":[format!("repair/public/{}", "0".repeat(32))],"next":null})
-    );
-}
-
-#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
+async fn slug_move_retires_old_cache_info_and_concurrent_slug_claims_conflict(pool: PgPool) {
     let one = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect_with(pool.connect_options().as_ref().clone())
@@ -808,23 +696,6 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
     let private = format!("nars/sha256/{}/none.nar", "a".repeat(64));
     storage.put(false, &blob, b"bytes").await.unwrap();
     storage.put(true, &private, b"bytes").await.unwrap();
-    let (status, _, written) = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        call(
-            &app,
-            "POST",
-            "/_api/v1/admin/narinfo/backfill",
-            json!({}),
-            None,
-        ),
-    )
-    .await
-    .unwrap();
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        written,
-        json!({"written":0,"processed":2,"skipped":[],"next":null})
-    );
     let hash = "0".repeat(32);
     assert!(
         storage
@@ -927,14 +798,26 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
             .await
             .is_ok()
     );
-    assert!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM object_cleanup WHERE NOT is_private AND key=$1)"
+    // Narinfo is rendered from SQL: the move retires only the old slug's
+    // cache-info objects, never per-path narinfo keys.
+    let queued: Vec<String> = sqlx::query_scalar(
+        "SELECT key FROM object_cleanup WHERE NOT is_private AND key LIKE 'alpha/%' ORDER BY key",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued,
+        ["alpha/public/nix-cache-info", "alpha/secret/nix-cache-info"]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM object_cleanup WHERE key LIKE '%.narinfo'"
         )
-        .bind(format!("alpha/public/{hash}.narinfo"))
         .fetch_one(&pool)
         .await
-        .unwrap()
+        .unwrap(),
+        0
     );
     assert_eq!(storage.head(true, &fresh).await.unwrap().size, 14);
     assert!(storage.head(false, &blob).await.is_ok());
@@ -1028,18 +911,6 @@ async fn metadata_backfill_slug_move_and_concurrent_slug_claims(pool: PgPool) {
         (a.0, b.0),
         (StatusCode::OK, StatusCode::CONFLICT) | (StatusCode::CONFLICT, StatusCode::OK)
     ));
-    storage.delete(false, &blob).await.unwrap();
-    let (_, _, skipped) = call(
-        &app,
-        "POST",
-        "/_api/v1/admin/narinfo/backfill",
-        json!({}),
-        None,
-    )
-    .await;
-    assert_eq!(skipped["written"], 0);
-    assert_eq!(skipped["processed"], 1);
-    assert_eq!(skipped["skipped"], json!([format!("bravo/public/{hash}")]));
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]

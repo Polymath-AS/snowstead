@@ -502,3 +502,69 @@ async fn central_auth_backfills_token_scope_from_issued_claims() -> Result<()> {
     })
     .await
 }
+
+#[tokio::test]
+async fn legacy_narinfo_retirement_queues_every_placement_once() -> Result<()> {
+    isolated(|pool| async move {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        let (before, after): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|path| path.file_name().unwrap().to_str().unwrap() < "0019");
+        for path in before {
+            pool.execute(sqlx::AssertSqlSafe(std::fs::read_to_string(path)?))
+                .await?;
+        }
+        // A default-slug cache, whose keys carry no slug, and an org mid-move,
+        // whose keys may sit under either slug. One key is already queued.
+        pool.execute(
+            "INSERT INTO orgs (id, slug, moving_from) VALUES ('org_moved', 'new-slug', 'old-slug');
+            INSERT INTO caches (name, org_id, is_public)
+            VALUES ('main', 'default', true), ('vault', 'org_moved', false), ('empty', 'org_moved', true);
+            INSERT INTO blob_objects (file_hash, file_size, compression, r2_key)
+            VALUES (repeat('a', 64), 5, 'none', 'nar/test');
+            INSERT INTO published_paths (cache_id, store_path_hash, store_path, nar_hash, nar_size, blob_object_id)
+            SELECT c.id, repeat(v.digit, 32), '/nix/store/' || repeat(v.digit, 32) || '-fixture', 'sha256:test', 5, b.id
+            FROM (VALUES ('main', '1'), ('main', '2'), ('vault', '3')) v(cache, digit)
+            JOIN caches c ON c.name = v.cache CROSS JOIN blob_objects b;
+            INSERT INTO object_cleanup (is_private, key)
+            VALUES (false, 'main/' || repeat('1', 32) || '.narinfo'), (true, 'nars/unrelated');",
+        )
+        .await?;
+        for path in after {
+            pool.execute(sqlx::AssertSqlSafe(std::fs::read_to_string(path)?))
+                .await?;
+        }
+        let queued: Vec<(bool, String)> =
+            sqlx::query_as("SELECT is_private, key FROM object_cleanup ORDER BY is_private, key")
+                .fetch_all(&pool)
+                .await?;
+        let mut expected = vec![(true, "nars/unrelated".to_owned())];
+        for (path, digit) in [
+            ("main", "1"),
+            ("main", "2"),
+            ("new-slug/vault", "3"),
+            ("old-slug/vault", "3"),
+        ] {
+            let hash = digit.repeat(32);
+            expected.push((false, format!("{path}/{hash}.narinfo")));
+            expected.push((true, format!("narinfo/{path}/{hash}.narinfo")));
+        }
+        for path in [
+            "main",
+            "new-slug/vault",
+            "old-slug/vault",
+            "new-slug/empty",
+            "old-slug/empty",
+        ] {
+            expected.push((false, format!("{path}/nix-cache-info")));
+        }
+        expected.sort();
+        assert_eq!(queued, expected);
+        Ok(())
+    })
+    .await
+}

@@ -139,8 +139,7 @@ text_states!(UploadStatus {
 /// attempt ends.
 ///
 /// - `preparing`: the column default, inserted by `uploads::allocate_candidate`
-///   (and by `management`'s narinfo backfill) before the copy. Only a
-///   `preparing`, unexpired row can be adopted.
+///   before the copy. Only a `preparing`, unexpired row can be adopted.
 /// - `preparing`: also holds an execution lease (`lease_expires_at`) while one
 ///   worker copies and verifies; another may take over once the lease lapses.
 /// - `preparing → ready`: the verified candidate is in place and waits for

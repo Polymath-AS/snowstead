@@ -122,8 +122,17 @@ async fn assert_cleanup(pool: &PgPool, private: bool, key: &str) {
     );
 }
 
+async fn assert_no_narinfo_cleanup(pool: &PgPool) {
+    let queued: Vec<String> =
+        sqlx::query_scalar("SELECT key FROM object_cleanup WHERE key LIKE '%.narinfo'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(queued.is_empty(), "narinfo keys queued: {queued:?}");
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup(pool: PgPool) {
+async fn publication_and_capacity_eviction_use_sql_membership_and_queue_no_narinfo(pool: PgPool) {
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
@@ -236,8 +245,9 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["paths"].as_array().unwrap().len(), 1);
     assert_eq!(listed["paths"][0]["storePathHash"], hash);
-    assert_cleanup(&pool, false, &format!("main/{old_hash}.narinfo")).await;
-    // The legacy object survives until GC, but cannot restore SQL membership.
+    // Eviction owns no narinfo object: the legacy one is neither queued nor
+    // deleted, and cannot restore SQL membership.
+    assert_no_narinfo_cleanup(&pool).await;
     assert!(
         storage
             .head(false, &format!("main/{old_hash}.narinfo"))
@@ -291,7 +301,7 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_legacy_cleanup
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgPool) {
+async fn move_and_withdrawal_use_sql_and_queue_no_narinfo(pool: PgPool) {
     let storage = common::storage();
     let config = Config {
         admin_secret: "operator".into(),
@@ -316,17 +326,17 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
         INSERT INTO caches(name,org_id,is_public) VALUES ('public','org_metadata',true),('private','org_metadata',false);
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;
         INSERT INTO blob_objects(file_hash,file_size,compression,r2_key) VALUES(repeat('a',64),5,'none','nar/objects/seed');
+        UPDATE blob_objects SET public_key='nar/objects/seed',private_key='nars/objects/seed';
         INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id)
         SELECT c.id,repeat('0',32),'/nix/store/00000000000000000000000000000000-fixture','sha256:'||repeat('0',64),5,b.id FROM caches c CROSS JOIN blob_objects b;")
         .execute(&pool).await.unwrap();
-    storage
-        .put(false, "nar/objects/seed", b"bytes")
-        .await
-        .unwrap();
+    let (public_key, private_key) = ("nar/objects/seed", "nars/objects/seed");
+    storage.put(false, public_key, b"bytes").await.unwrap();
+    storage.put(true, private_key, b"bytes").await.unwrap();
     let hash = "0".repeat(32);
     let file_hash = "a".repeat(64);
     // Leave stale metadata in both placements. Reads must use SQL, and policy
-    // transactions must queue cleanup instead of rewriting/deleting objects.
+    // transactions must neither rewrite, delete, nor queue those objects.
     for name in ["public", "private"] {
         storage
             .put(false, &format!("before/{name}/{hash}.narinfo"), b"stale")
@@ -341,31 +351,12 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
             .await
             .unwrap();
     }
-    let (status, result) = call(&app, "/_api/v1/admin/narinfo/backfill", "POST", json!({})).await;
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["written"], 2);
-    assert_eq!(result["processed"], 2);
-    assert_eq!(result["skipped"], json!([]));
-    let (public_key, private_key): (String, String) =
-        sqlx::query_as("SELECT public_key,private_key FROM blob_objects WHERE file_hash=$1")
-            .bind(&file_hash)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(public_key.starts_with("nar/objects/"));
-    assert!(private_key.starts_with("nars/objects/"));
-    assert!(storage.head(false, &public_key).await.is_ok());
-    assert!(storage.head(true, &private_key).await.is_ok());
-    assert!(storage.head(false, &private_key).await.is_err());
     for (name, private) in [("public", false), ("private", true)] {
         let path = format!("before/{name}");
         let (status, body) = read(&app, &format!("/{path}/{hash}.narinfo"), private).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("-fixture"));
         assert!(body.contains(&format!("URL: nar/{file_hash}/none.nar")));
-        assert_cleanup(&pool, false, &format!("{path}/{hash}.narinfo")).await;
-        assert_cleanup(&pool, true, &format!("narinfo/{path}/{hash}.narinfo")).await;
-        assert_cleanup(&pool, false, &format!("{path}/nix-cache-info")).await;
     }
     for suffix in [
         format!("{hash}.narinfo"),
@@ -403,6 +394,8 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result, json!({"done":true}));
     for (name, private) in [("public", false), ("private", true)] {
+        // The move retires the old slug's cache-info, not per-path narinfo.
+        assert_cleanup(&pool, false, &format!("before/{name}/nix-cache-info")).await;
         assert_eq!(
             read(&app, &format!("/before/{name}/{hash}.narinfo"), private)
                 .await
@@ -455,15 +448,7 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
         .await;
         assert_eq!(status, StatusCode::OK, "{listed}");
         assert_eq!(listed["paths"], json!([]));
-        for slug in ["before", "after"] {
-            assert_cleanup(&pool, false, &format!("{slug}/{name}/{hash}.narinfo")).await;
-            assert_cleanup(
-                &pool,
-                true,
-                &format!("narinfo/{slug}/{name}/{hash}.narinfo"),
-            )
-            .await;
-        }
+        assert_no_narinfo_cleanup(&pool).await;
         assert!(
             storage
                 .head(false, &format!("before/{name}/{hash}.narinfo"))
@@ -471,8 +456,8 @@ async fn backfill_move_and_withdrawal_use_sql_and_queue_legacy_cleanup(pool: PgP
                 .is_ok()
         );
     }
-    assert!(storage.head(false, &public_key).await.is_ok());
-    assert!(storage.head(true, &private_key).await.is_ok());
+    assert!(storage.head(false, public_key).await.is_ok());
+    assert!(storage.head(true, private_key).await.is_ok());
     state.finish_background().await;
     assert!(jobs(&storage).await.is_empty());
 }
