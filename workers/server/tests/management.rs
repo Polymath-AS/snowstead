@@ -1118,3 +1118,41 @@ async fn org_limit_versions_fence_delayed_writes_and_registration(pool: PgPool) 
         9007199254740993
     );
 }
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn org_limit_version_never_moves_backwards_at_write_time(pool: PgPool) {
+    let app = router(state(pool.clone()));
+    let base = "/_api/v1/orgs/org_raced";
+    let policy = |version: &str, limit: i64, slug: &str| {
+        json!({
+            "slug":slug, "storageLimit":limit, "privateCaches":true,
+            "customSigningKeys":true, "limitsVersion":version
+        })
+    };
+    let current = call(&app, "PUT", base, policy("3", 30, "raced"), None).await;
+    assert_eq!(current.0, StatusCode::OK);
+    // Stands in for a newer registration that commits after this request
+    // compared versions: it runs inside the request's own transaction, when a
+    // rename queues the public cache's old nix-cache-info for cleanup.
+    sqlx::raw_sql(
+        "INSERT INTO caches(name,is_public,org_id) VALUES('main',true,'org_raced'); \
+         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches WHERE org_id='org_raced'; \
+         CREATE FUNCTION newer_registration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         UPDATE orgs SET limits_version=10 WHERE id='org_raced'; RETURN NULL; END $$; \
+         CREATE TRIGGER newer_registration AFTER INSERT ON object_cleanup \
+         FOR EACH STATEMENT EXECUTE FUNCTION newer_registration();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale = call(&app, "PUT", base, policy("5", 50, "renamed"), None).await;
+    assert_eq!(stale.0, StatusCode::OK);
+    assert_eq!(stale.2, current.2);
+    // The stale policy, its rename, and its version all rolled back together.
+    let stored: (String, Option<i64>, i64) =
+        sqlx::query_as("SELECT slug,storage_limit,limits_version FROM orgs WHERE id='org_raced'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, ("raced".into(), Some(30), 3));
+}

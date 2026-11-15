@@ -6787,3 +6787,155 @@ async fn direct_grants_preserve_org_isolation_integrity_and_abort(pool: PgPool) 
         0
     );
 }
+
+/// A sealed, authorized job with one member and a second job still building,
+/// both in the public `manifest` cache.
+async fn manifest_jobs(pool: &PgPool) -> (Router, String, Value, String, String) {
+    pool_execute(
+        pool,
+        "INSERT INTO caches(name,is_public) VALUES('manifest',true); \
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
+        INSERT INTO api_tokens(jti,subject,org_id,perms_json,created_by) VALUES('default-*','cli','default','[\"push\"]','fixture') ON CONFLICT DO NOTHING;",
+    )
+    .await;
+    let config = Config {
+        jwt_secret: "test-jwt".into(),
+        admin_secret: "operator-secret".into(),
+        ..Default::default()
+    };
+    let app = router(
+        AppState::new(
+            pool.clone(),
+            config,
+            common::storage(),
+            reqwest::Client::new(),
+        )
+        .unwrap(),
+    );
+    let auth = token(pool, "default", "*").await;
+    let base = "/_api/v1/caches/manifest/push-jobs";
+    let input = path_input(&"0".repeat(32), &nar(b"fenced member"), false);
+    let mut jobs = Vec::new();
+    for key in ["sealed", "building"] {
+        let (status, created) = post(
+            &app,
+            base,
+            &auth,
+            json!({"idempotencyKey":key,"mode":"selected","roots":[input["storePath"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let job = format!("{base}/{}", created["job"]["id"].as_str().unwrap());
+        assert_eq!(
+            put_manifest(&app, &job, 0, &auth, json!([input])).await,
+            StatusCode::OK
+        );
+        jobs.push(job);
+    }
+    for action in ["seal", "resume"] {
+        let (status, body) = post(&app, &format!("{}/{action}", jobs[0]), &auth, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let building = jobs.pop().unwrap();
+    (app, auth, input, jobs.pop().unwrap(), building)
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_writers_lock_the_job_row_they_decide_on(pool: PgPool) {
+    let (app, auth, _, sealed, building) = manifest_jobs(&pool).await;
+    // None of these writers' own statements conflict with a key-share lock.
+    // Only the exclusive row lock each takes when it loads the job waits.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT FROM push_jobs FOR SHARE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let other = path_input(&"1".repeat(32), &nar(b"another member"), false);
+    assert_eq!(
+        put_manifest(&app, &building, 1, &auth, json!([other])).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for writer in [
+        format!("{building}/seal"),
+        format!("{sealed}/resume"),
+        format!("{sealed}/complete"),
+        format!("{sealed}/cancel"),
+        format!("{building}/cancel"),
+    ] {
+        let (status, body) = post(&app, &writer, &auth, json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{writer}: {body}");
+    }
+    // Progress reads take no row lock, and no writer changed anything.
+    for (job, state) in [(&sealed, "sealed"), (&building, "building")] {
+        let (status, _, body) = send(&app, "GET", job, Some(&auth), &[], vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["job"]["state"], state, "{page}");
+        assert_eq!(page["job"]["revision"], 1, "{page}");
+    }
+    holder.rollback().await.unwrap();
+    let (status, cancelled) = post(&app, &format!("{sealed}/cancel"), &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["job"]["state"], "cancelled");
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_allocation_holds_its_members_until_sessions_are_linked(pool: PgPool) {
+    let (app, auth, input, sealed, _) = manifest_jobs(&pool).await;
+    let allocate = "/_api/v1/caches/manifest/upload-streams/batch";
+    let id = sealed.rsplit('/').next().unwrap();
+    let request = json!({"jobId":id,"paths":[input]});
+    // Linking a session does not conflict with a key-share lock on its member.
+    // Only the exclusive lock taken before reading the member waits for it.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT FROM push_job_members FOR KEY SHARE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let (status, body) = post(&app, allocate, &auth, request.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    holder.rollback().await.unwrap();
+    let (status, first) = post(&app, allocate, &auth, request.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, replay) = post(&app, allocate, &auth, request).await;
+    assert_eq!(status, StatusCode::CREATED, "{replay}");
+    assert_eq!(
+        first["sessions"][0]["sessionId"],
+        replay["sessions"][0]["sessionId"]
+    );
+    // The refused allocation left no session behind for a worker to miss.
+    let linked: bool = sqlx::query_scalar(
+        "SELECT count(*)=1 AND bool_and(EXISTS(SELECT 1 FROM push_job_members m \
+         WHERE m.session_id=u.id)) FROM upload_sessions u",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(linked);
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn manifest_resume_holds_its_batches_before_resetting_results(pool: PgPool) {
+    let (app, auth, _, sealed, _) = manifest_jobs(&pool).await;
+    sqlx::query(
+        "INSERT INTO upload_finalization_batches(id,org_id,actor,prepare_only,expires_at,job_id) \
+        VALUES('queued','default','default-*',true,NOW()+INTERVAL '1 hour',$1)",
+    )
+    .bind(sealed.rsplit('/').next().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Resume's own batch update does not conflict with a key-share lock. Only
+    // the exclusive lock it takes before resetting any result waits for it.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT FROM upload_finalization_batches FOR KEY SHARE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let resume = format!("{sealed}/resume");
+    let (status, body) = post(&app, &resume, &auth, json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    holder.rollback().await.unwrap();
+    let (status, body) = post(&app, &resume, &auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
