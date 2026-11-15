@@ -44,6 +44,8 @@ pub struct AppState {
     pub(crate) manifest_slots: Arc<Semaphore>,
     pub(crate) sql_waiters: Arc<Semaphore>,
     pub(crate) sql_writers: Arc<crate::db::Writers>,
+    /// Organizations whose retained usage may have grown since eviction.
+    pub(crate) evictions: Arc<crate::capacity::Wakes>,
     pub(crate) cdn: Option<Arc<dyn cdn::PurgeTransport>>,
     proxy_ips: Arc<[IpAddr]>,
 }
@@ -77,6 +79,7 @@ impl AppState {
             read_pool: pool.clone(),
             sql_waiters: Arc::new(Semaphore::new(pool.options().get_max_connections() as usize)),
             sql_writers: Arc::default(),
+            evictions: Arc::default(),
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),
@@ -158,6 +161,11 @@ pub async fn serve_router(
         .tasks
         .spawn(maintenance::drain(state.clone(), retry_stop.clone()));
     state.start_upload_finalizers();
+    state.tasks.spawn(crate::capacity::run(
+        state.clone(),
+        retry_stop.clone(),
+        Duration::from_secs(30),
+    ));
     for _ in 0..state.config.push_jobs.publication_workers {
         let worker_state = state.clone();
         let stopped = retry_stop.clone();

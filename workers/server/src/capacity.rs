@@ -1,30 +1,124 @@
-//! Retained capacity is logical, across all three products. Callers hold the
-//! org transaction lock through admission and publication. Physical orphan
-//! reclamation is separate; SQL publication controls public narinfo visibility.
-use std::collections::HashSet;
+//! Retained capacity is logical, across all three products, and eventually
+//! consistent. Publication never checks or evicts: it commits and wakes the
+//! evictor, which brings an organization back under its limit in its own
+//! bounded transactions. A brief overshoot is expected. New uploads are refused
+//! once usage reaches 110% of the limit, or reaches the limit while protected
+//! paths alone already fill it. Physical orphan reclamation is separate.
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Mutex,
+    time::Duration,
+};
 
-use crate::db::Transaction;
 use axum::http::StatusCode;
+use sqlx::PgConnection;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-use crate::error::ApiError;
+use crate::{
+    AppState,
+    db::{self, Transaction},
+    error::ApiError,
+};
 
-struct Victim {
-    kind: String,
-    id: String,
-    size: i64,
+/// Organizations waiting for the evictor. Requests coalesce per organization
+/// and never block: without a running worker they only occupy this set.
+#[derive(Default)]
+pub(crate) struct Wakes {
+    pending: Mutex<BTreeSet<String>>,
+    notify: Notify,
 }
 
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-pub async fn admit(
-    tx: &mut Transaction,
-    org: &str,
-    limit: i64,
-    incoming_bytes: i64,
-    protect: &[(i32, String)],
-) -> Result<(), ApiError> {
-    let caches: Vec<_> = protect.iter().map(|p| p.0).collect();
-    let hashes: Vec<_> = protect.iter().map(|p| p.1.clone()).collect();
-    let used = sqlx::query_scalar!(
+impl Wakes {
+    /// Call after a commit which may have raised retained usage.
+    pub(crate) fn request(&self, org: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        if !pending.contains(org) {
+            pending.insert(org.to_owned());
+        }
+        drop(pending);
+        // A stored permit wakes a worker that is busy or has not started yet.
+        self.notify.notify_one();
+    }
+
+    fn take(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+}
+
+/// Evict woken organizations promptly, and every `period` those a wake missed:
+/// a limit lowered by management, another instance's publication, or a pass
+/// that failed. Shutdown interrupts between passes, never inside a transaction.
+pub async fn run(state: AppState, stopped: CancellationToken, period: Duration) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = stopped.cancelled() => break,
+            _ = state.evictions.notify.notified() => {}
+            _ = interval.tick() => {
+                match over_limit(&state.pool, None).await {
+                    Ok(orgs) => state.evictions.pending.lock().unwrap().extend(orgs),
+                    Err(_) => tracing::warn!("Capacity scan failed; retried on the next tick"),
+                }
+            }
+        }
+        for org in state.evictions.take() {
+            if stopped.is_cancelled() {
+                break;
+            }
+            if evict_until(&state, &org, &stopped).await.is_err() {
+                tracing::warn!("Capacity eviction failed; retried on the next wake or tick");
+            }
+        }
+    }
+}
+
+/// Organizations whose retained usage exceeds their limit, or only `org`.
+/// Unfenced and therefore a hint: each eviction pass recomputes under the
+/// organization fence.
+async fn over_limit(pool: &sqlx::PgPool, org: Option<&str>) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT o.id
+        FROM orgs o
+        WHERE o.storage_limit IS NOT NULL
+            AND ($1::text IS NULL OR o.id = $1)
+            AND o.storage_limit < (
+                SELECT COALESCE(SUM(n), 0)
+                FROM (
+                    SELECT c.size AS n
+                    FROM caches c
+                    WHERE c.org_id = o.id
+                    UNION ALL
+                    SELECT e.size
+                    FROM go_entries e
+                    JOIN caches c ON c.id = e.cache_id
+                    WHERE c.org_id = o.id
+                        AND e.generation = c.go_generation
+                        AND e.uploaded_at IS NOT NULL
+                        AND e.expires_at > NOW()
+                    UNION ALL
+                    SELECT e.size
+                    FROM sccache_entries e
+                    JOIN caches c ON c.id = e.cache_id
+                    WHERE c.org_id = o.id
+                        AND e.generation = c.sccache_generation
+                        AND e.uploaded_at IS NOT NULL
+                        AND e.expires_at > NOW()
+                ) usage
+            )
+        ORDER BY o.id
+        "#,
+        org,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Committed retained bytes: published Nix paths plus live compiler entries.
+async fn usage(tx: &mut PgConnection, org: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar!(
         r#"
         SELECT COALESCE(SUM(n), 0)::bigint AS "used!"
         FROM (
@@ -51,68 +145,141 @@ pub async fn admit(
         "#,
         org,
     )
-    .fetch_one(&mut **tx)
-    .await?;
-    let total = used.saturating_add(incoming_bytes);
-    if total <= limit {
+    .fetch_one(tx)
+    .await
+}
+
+/// Refuse a new upload for an organization that is too far over its limit to
+/// wait for eviction, or over it with nothing left to evict. The read is not
+/// exact: concurrent publications may still overshoot, and the evictor
+/// recovers. `over` is the caller's message for the 110% refusal.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+pub(crate) async fn admit_upload(
+    tx: &mut Transaction,
+    org: &str,
+    limit: i64,
+    over: &'static str,
+) -> Result<(), ApiError> {
+    let used = usage(tx, org).await?;
+    if used < limit {
         return Ok(());
     }
+    // used >= limit * 1.1, exactly and without overflow.
+    if i128::from(used) * 10 >= i128::from(limit) * 11 {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, over));
+    }
+    // Only an organization already at its limit pays for this. Driven from the
+    // pin and job tables, not one `nix_path_pinned` call per published path.
     let protected = sqlx::query_scalar!(
         r#"
-        SELECT COALESCE(SUM(n), 0)::bigint AS "protected!"
+        SELECT COALESCE(SUM(b.file_size), 0)::bigint AS "protected!"
         FROM (
-            SELECT b.file_size AS n
-            FROM published_paths e
-            JOIN caches c ON c.id = e.cache_id
-            JOIN blob_objects b ON b.id = e.blob_object_id
+            SELECT
+                m.cache_id,
+                m.store_path_hash
+            FROM pin_paths m
+            JOIN pin_revisions r ON r.id = m.revision_id
+            JOIN pins p ON p.id = r.pin_id
+            JOIN caches c ON c.id = m.cache_id
             WHERE c.org_id = $1
-                AND EXISTS (
-                    SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = e.store_path_hash
+                AND (
+                    r.revision = p.current_revision
+                    OR p.keep_kind = 'forever'
+                    OR (p.keep_kind = 'revisions' AND r.revision > p.current_revision - p.keep_value)
+                    OR (p.keep_kind = 'days' AND r.superseded_at > NOW() - p.keep_value * INTERVAL '1 day')
                 )
-            UNION ALL
-            SELECT e.size
-            FROM go_entries e
-            JOIN caches c ON c.id = e.cache_id
-            WHERE c.org_id = $1
-                AND e.generation = c.go_generation
-                AND e.uploaded_at IS NOT NULL
-                AND e.expires_at > NOW()
-                AND EXISTS (
-                    SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = 'go:' || e.id
-                )
-            UNION ALL
-            SELECT e.size
-            FROM sccache_entries e
-            JOIN caches c ON c.id = e.cache_id
-            WHERE c.org_id = $1
-                AND e.generation = c.sccache_generation
-                AND e.uploaded_at IS NOT NULL
-                AND e.expires_at > NOW()
-                AND EXISTS (
-                    SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = 'sccache:' || e.id
-                )
-        ) protected
+            UNION
+            SELECT
+                j.cache_id,
+                j.store_path_hash
+            FROM nix_job_protected_paths($1, NOW()) j
+        ) kept
+        JOIN published_paths e ON e.cache_id = kept.cache_id
+            AND e.store_path_hash = kept.store_path_hash
+        JOIN blob_objects b ON b.id = e.blob_object_id
         "#,
         org,
-        &caches,
-        &hashes,
     )
     .fetch_one(&mut **tx)
     .await?;
-    if protected.saturating_add(incoming_bytes) > limit {
+    if protected >= limit {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "Incoming objects exceed retained capacity",
+            "Insufficient evictable capacity; delete retained paths first",
         ));
+    }
+    Ok(())
+}
+
+struct Victim {
+    kind: String,
+    id: String,
+    size: i64,
+}
+
+struct Pass {
+    removed: usize,
+    freed: i64,
+    over: bool,
+}
+
+/// Bring `org` back to its limit, least recently used first, and return the
+/// bytes freed. Each pass is its own transaction under the organization fence
+/// and removes at most 256 entries; passes repeat while the organization is
+/// still over and the last one removed something. Ending over the limit is not
+/// an error: whatever remains is pinned, job-protected, being uploaded, or
+/// locked by another writer, and the next wake or tick tries again.
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+pub async fn evict(state: &AppState, org: &str) -> anyhow::Result<u64> {
+    evict_until(state, org, &CancellationToken::new()).await
+}
+
+async fn evict_until(
+    state: &AppState,
+    org: &str,
+    stopped: &CancellationToken,
+) -> anyhow::Result<u64> {
+    // Most wakes find nothing to do. Decide that without the fence.
+    if over_limit(&state.pool, Some(org)).await?.is_empty() {
+        return Ok(0);
+    }
+    let mut freed = 0u64;
+    loop {
+        let pass = pass(state, org).await?;
+        freed = freed.saturating_add(pass.freed.max(0) as u64);
+        if pass.removed == 0 || !pass.over || stopped.is_cancelled() {
+            return Ok(freed);
+        }
+    }
+}
+
+async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
+    let idle = |over| Pass {
+        removed: 0,
+        freed: 0,
+        over,
+    };
+    let mut tx = db::begin(state, org).await?;
+    db::advisory_lock(&mut tx, &format!("org:{org}")).await?;
+    let limit = sqlx::query_scalar!(
+        r#"
+        SELECT storage_limit
+        FROM orgs
+        WHERE id = $1
+        "#,
+        org,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let Some(limit) = limit else {
+        tx.rollback().await?;
+        return Ok(idle(false));
+    };
+    let used = usage(&mut tx, org).await?;
+    if used <= limit {
+        tx.rollback().await?;
+        return Ok(idle(false));
     }
     // A bounded LRU candidate list, then three batched row-lock statements.
     // SKIP LOCKED excludes work being moved by another product's transfer.
@@ -152,12 +319,6 @@ pub async fn admit(
                 )
                 AND NOT EXISTS (
                     SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = e.store_path_hash
-                )
-                AND NOT EXISTS (
-                    SELECT 1
                     FROM active a
                     WHERE a.cache_id = e.cache_id
                         AND a.store_path_hash = e.store_path_hash
@@ -180,12 +341,6 @@ pub async fn admit(
                 AND e.generation = c.go_generation
                 AND e.uploaded_at IS NOT NULL
                 AND e.expires_at > NOW()
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = 'go:' || e.id
-                )
             UNION ALL
             SELECT
                 'sccache',
@@ -198,21 +353,13 @@ pub async fn admit(
                 AND e.generation = c.sccache_generation
                 AND e.uploaded_at IS NOT NULL
                 AND e.expires_at > NOW()
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM UNNEST($2::int[], $3::text[]) p(cache, hash)
-                    WHERE p.cache = e.cache_id
-                        AND p.hash = 'sccache:' || e.id
-                )
         ) victims
         ORDER BY used, kind, id
         LIMIT 256
         "#,
         org,
-        &caches,
-        &hashes,
     )
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut *tx)
     .await?;
     let mut available = HashSet::new();
     let nix: Vec<i64> = candidates
@@ -256,7 +403,7 @@ pub async fn admit(
             &nix,
             org,
         )
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut *tx)
         .await?;
         for id in locked {
             available.insert(("nix".to_owned(), id.to_string()));
@@ -288,7 +435,7 @@ pub async fn admit(
                 &ids,
                 org,
             )
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?
         } else {
             sqlx::query_scalar!(
@@ -307,48 +454,36 @@ pub async fn admit(
                 &ids,
                 org,
             )
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?
         };
         for id in locked {
             available.insert((kind.to_owned(), id));
         }
     }
+    // Stop at the limit: LRU order, skipping whatever another writer holds.
     let mut victims = Vec::new();
-    let mut freed = 0i64;
-    let busy = candidates
-        .iter()
-        .any(|v| !available.contains(&(v.kind.clone(), v.id.clone())));
+    let mut remaining = used;
     for v in candidates {
+        if remaining <= limit {
+            break;
+        }
         if !available.contains(&(v.kind.clone(), v.id.clone())) {
             continue;
         }
-        freed = freed.saturating_add(v.size);
+        remaining = remaining.saturating_sub(v.size);
         victims.push(v);
-        if total.saturating_sub(freed) <= limit {
-            break;
-        }
     }
-    if total.saturating_sub(freed) > limit {
-        return Err(ApiError::new(
-            if busy {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::PAYLOAD_TOO_LARGE
-            },
-            if busy {
-                "Capacity victims are busy; retry"
-            } else {
-                "Insufficient evictable capacity within the 256-object budget; delete retained paths first"
-            },
-        ));
+    if victims.is_empty() {
+        tx.rollback().await?;
+        return Ok(idle(true));
     }
     sqlx::query!(
         r#"
         SELECT SET_CONFIG('snowstead.eviction_reason', 'capacity', TRUE)
         "#
     )
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     let ids: Vec<i64> = victims
         .iter()
@@ -363,7 +498,7 @@ pub async fn admit(
             "#,
             &ids,
         )
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     }
     for kind in ["go", "sccache"] {
@@ -384,7 +519,7 @@ pub async fn admit(
                 "#,
                 &ids,
             )
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         } else {
             sqlx::query!(
@@ -395,9 +530,14 @@ pub async fn admit(
                 "#,
                 &ids,
             )
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
     }
-    Ok(())
+    tx.commit().await?;
+    Ok(Pass {
+        removed: victims.len(),
+        freed: used.saturating_sub(remaining),
+        over: remaining > limit,
+    })
 }

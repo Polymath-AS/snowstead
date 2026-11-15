@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(b.file_size), 0)::bigint AS \"protected!\"\n        FROM (\n            SELECT\n                m.cache_id,\n                m.store_path_hash\n            FROM pin_paths m\n            JOIN pin_revisions r ON r.id = m.revision_id\n            JOIN pins p ON p.id = r.pin_id\n            JOIN caches c ON c.id = m.cache_id\n            WHERE c.org_id = $1\n                AND (\n                    r.revision = p.current_revision\n                    OR p.keep_kind = 'forever'\n                    OR (p.keep_kind = 'revisions' AND r.revision > p.current_revision - p.keep_value)\n                    OR (p.keep_kind = 'days' AND r.superseded_at > NOW() - p.keep_value * INTERVAL '1 day')\n                )\n            UNION\n            SELECT\n                j.cache_id,\n                j.store_path_hash\n            FROM nix_job_protected_paths($1, NOW()) j\n        ) kept\n        JOIN published_paths e ON e.cache_id = kept.cache_id\n            AND e.store_path_hash = kept.store_path_hash\n        JOIN blob_objects b ON b.id = e.blob_object_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "protected!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "406f9bdd0b58f76257215aca724993411ed7b1fe6226423ef5c5e47f24a0c9ff"
+}

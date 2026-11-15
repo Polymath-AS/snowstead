@@ -11,7 +11,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use object_store::{ObjectStoreExt, memory::InMemory};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use snowstead_server::{AppState, config::Config, router, storage::Storage};
+use snowstead_server::{AppState, capacity::evict, config::Config, router, storage::Storage};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -506,9 +506,9 @@ async fn failed_duplicate_cannot_expire_an_inflight_compiler_upload(pool: PgPool
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(pool: PgPool) {
+async fn compiler_capacity_is_shared_with_nix_and_eviction_keeps_protected_paths(pool: PgPool) {
     let state = fixture(&pool).await;
-    let app = router(state);
+    let app = router(state.clone());
     let credential = token(
         &pool,
         "org_a",
@@ -530,10 +530,21 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         INSERT INTO pin_paths(revision_id,cache_id,store_path_hash) SELECT 'rev',id,repeat('0',32) FROM caches WHERE org_id='org_a' AND name='compiler';
         UPDATE go_entries SET uploaded_at='2000-01-01',last_accessed_at=NULL;
         UPDATE orgs SET storage_limit=35 WHERE id='org_a';").execute(&pool).await.unwrap();
+    // Publication does not evict: both entries stay until the evictor runs,
+    // which then removes the least recently used entry across products.
     assert_eq!(
         put(&app, &cc, &credential, &[2; 20]).await,
         StatusCode::CREATED
     );
+    let live: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM go_entries WHERE cache_id IS NOT NULL)
+            +(SELECT count(*) FROM sccache_entries WHERE cache_id IS NOT NULL)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 2);
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 18);
     assert_eq!(
         send(&app, "GET", &go, Some(&credential), &[], &[]).await.0,
         StatusCode::NOT_FOUND
@@ -546,69 +557,106 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
         put(&app, &go, &credential, &[3; 26]).await,
         StatusCode::CREATED
     );
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 20);
     assert_eq!(
         send(&app, "GET", &cc, Some(&credential), &[], &[]).await.0,
         StatusCode::NOT_FOUND
     );
+    // 40 retained bytes against a limit of 30 is past 110%: new artifacts of
+    // either product are refused, while a replay starts no upload and passes.
     sqlx::query("UPDATE orgs SET storage_limit=30 WHERE id='org_a'")
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        put(&app, &go, &credential, &[3; 26]).await,
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
-    assert_eq!(
-        send(&app, "GET", &go, Some(&credential), &[], &[]).await.2,
-        vec![3; 26]
-    );
-    let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(pins, 1);
-    sqlx::raw_sql("DELETE FROM pin_paths; UPDATE orgs SET storage_limit=40 WHERE id='org_a'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    // The shared admission path must also honor temporary Nix job protection
-    // for both compiler products. No maintenance run releases this lease.
-    sqlx::raw_sql("INSERT INTO api_tokens(jti,subject,perms_json,created_by,org_id) VALUES('job-token','test','[\"push\"]','test','org_a');
-        INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,state,manifest_bytes,authorization_jti,authorization_expires_at)
-        SELECT 'job',id,'job-token','job','selected','[]','sealed',1,'job-token',now()+interval '30 minutes' FROM caches WHERE org_id='org_a' AND name='compiler';
-        INSERT INTO push_job_members(job_id,store_path_hash,metadata)
-        SELECT 'job',store_path_hash,jsonb_build_object('storePath',store_path,'narHash',nar_hash,'narSize',nar_size,'references',references_json::jsonb,'deriver',deriver)
-        FROM published_paths;").execute(&pool).await.unwrap();
-    for (url, bytes) in [(&path("compiler", 'f'), vec![4; 32]), (&cc, vec![5; 32])] {
+    for (url, bytes) in [(&path("compiler", 'd'), vec![6; 2]), (&cc, vec![6; 2])] {
         assert_eq!(
             put(&app, url, &credential, &bytes).await,
             StatusCode::PAYLOAD_TOO_LARGE
         );
     }
     assert_eq!(
+        put(&app, &go, &credential, &[3; 26]).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
         send(&app, "GET", &go, Some(&credential), &[], &[]).await.2,
         vec![3; 26]
     );
+    // The evictor removes the replayed entry, never the pinned path, and has
+    // nothing further to do once the organization is under its limit.
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 26);
+    assert_eq!(
+        send(&app, "GET", &go, Some(&credential), &[], &[]).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 0);
+    let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pins, 1);
+    // Temporary Nix job protection counts for both compiler products at
+    // upload start and for the evictor. No maintenance run releases this lease.
+    sqlx::raw_sql("DELETE FROM pin_paths; UPDATE orgs SET storage_limit=15 WHERE id='org_a';
+        INSERT INTO api_tokens(jti,subject,perms_json,created_by,org_id) VALUES('job-token','test','[\"push\"]','test','org_a');
+        INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,state,manifest_bytes,authorization_jti,authorization_expires_at)
+        SELECT 'job',id,'job-token','job','selected','[]','sealed',1,'job-token',now()+interval '30 minutes' FROM caches WHERE org_id='org_a' AND name='compiler';
+        INSERT INTO push_job_members(job_id,store_path_hash,metadata)
+        SELECT 'job',store_path_hash,jsonb_build_object('storePath',store_path,'narHash',nar_hash,'narSize',nar_size,'references',references_json::jsonb,'deriver',deriver)
+        FROM published_paths;").execute(&pool).await.unwrap();
+    let small = path("compiler", 'f');
+    assert_eq!(
+        put(&app, &small, &credential, &[4; 1]).await,
+        StatusCode::CREATED
+    );
+    // 15 retained bytes meet a limit of 14 without reaching 110% of it, but
+    // the protected path alone fills that limit: nothing evictable would help.
+    sqlx::query("UPDATE orgs SET storage_limit=14 WHERE id='org_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (url, bytes) in [(&path("compiler", 'd'), vec![6; 2]), (&cc, vec![6; 2])] {
+        assert_eq!(
+            put(&app, url, &credential, &bytes).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 1);
+    assert_eq!(
+        send(&app, "GET", &small, Some(&credential), &[], &[])
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 0);
+    let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pins, 1);
+    // Once the job's authorization lapses the path is evictable again: the
+    // organization is at its limit, so uploads start and eviction takes it.
     sqlx::query("UPDATE push_jobs SET authorization_expires_at=now()-interval '1 second'")
         .execute(&pool)
         .await
         .unwrap();
     assert_eq!(
-        put(&app, &path("compiler", 'f'), &credential, &[4; 32]).await,
-        StatusCode::NO_CONTENT
+        put(&app, &path("compiler", 'd'), &credential, &[6; 2]).await,
+        StatusCode::CREATED
     );
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 14);
     assert_eq!(
         send(
             &app,
             "GET",
-            &path("compiler", 'f'),
+            &path("compiler", 'd'),
             Some(&credential),
             &[],
             &[]
         )
         .await
         .2,
-        vec![4; 32]
+        vec![6; 2]
     );
     let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
         .fetch_one(&pool)
@@ -628,8 +676,83 @@ async fn compiler_capacity_is_shared_with_nix_and_cannot_evict_its_own_replay(po
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn new_artifacts_are_refused_from_110_percent_of_the_limit_until_eviction(pool: PgPool) {
+    let state = fixture(&pool).await;
+    let app = router(state.clone());
+    let credential = token(
+        &pool,
+        "org_a",
+        "compiler",
+        &["go:write", "go:read", "sccache:write", "sccache:read"],
+    )
+    .await;
+    let cc = |digit: char| {
+        format!(
+            "/_api/v1/sccache/alpha/compiler/{digit}/{digit}/{digit}/{}",
+            digit.to_string().repeat(64)
+        )
+    };
+    sqlx::query("UPDATE orgs SET storage_limit=100 WHERE id='org_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let oldest = path("compiler", '1');
+    assert_eq!(
+        put(&app, &oldest, &credential, &[1; 60]).await,
+        StatusCode::CREATED
+    );
+    sqlx::query("UPDATE go_entries SET uploaded_at='2000-01-01',last_accessed_at=NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Publication never refuses: 60 + 48 bytes pass the limit of 100.
+    assert_eq!(
+        put(&app, &path("compiler", '2'), &credential, &[2; 48]).await,
+        StatusCode::CREATED
+    );
+    // At 108 and 109 bytes, under 110%, each product still starts an upload.
+    assert_eq!(
+        put(&app, &path("compiler", '3'), &credential, &[3; 1]).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put(&app, &cc('4'), &credential, &[4; 1]).await,
+        StatusCode::CREATED
+    );
+    // At exactly 110 bytes neither does, and nothing was reserved for them.
+    for url in [path("compiler", '5'), cc('6')] {
+        assert_eq!(
+            put(&app, &url, &credential, &[5; 1]).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+    let reserved: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM go_entries)+(SELECT count(*) FROM sccache_entries)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reserved, 4);
+    // The evictor frees the oldest entry only, and uploads start again.
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 60);
+    assert_eq!(
+        send(&app, "GET", &oldest, Some(&credential), &[], &[])
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for url in [path("compiler", '5'), cc('6')] {
+        assert_eq!(
+            put(&app, &url, &credential, &[5; 1]).await,
+            StatusCode::CREATED
+        );
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn compiler_capacity_ignores_pending_nix_attempts(pool: PgPool) {
-    let app = router(fixture(&pool).await);
+    let state = fixture(&pool).await;
+    let app = router(state.clone());
     let credential = token(&pool, "org_a", "compiler", &["go:write", "go:read"]).await;
     let first = path("compiler", '1');
     let second = path("compiler", '2');
@@ -667,12 +790,13 @@ async fn compiler_capacity_ignores_pending_nix_attempts(pool: PgPool) {
             .2,
         vec![1; 6]
     );
-    // The real retained total is 31 bytes. LRU eviction must remove both
-    // existing entries to fit the new publication, without deleting attempts.
+    // The real retained total is 31 bytes. Publication exceeds the limit; the
+    // evictor then removes both older entries, without deleting attempts.
     assert_eq!(
         put(&app, &third, &credential, &[3; 15]).await,
         StatusCode::CREATED
     );
+    assert_eq!(evict(&state, "org_a").await.unwrap(), 16);
     for url in [&first, &second] {
         assert_eq!(
             send(&app, "GET", url, Some(&credential), &[], &[]).await.0,
@@ -811,4 +935,72 @@ async fn competing_writers_and_recovery_never_replace_or_delete_adopted_bytes(po
             winner
         );
     }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn a_committed_upload_wakes_the_eviction_worker(pool: PgPool) {
+    use std::time::Duration;
+
+    let state = fixture(&pool).await;
+    let app = router(state.clone());
+    let credential = token(&pool, "org_a", "compiler", &["go:write", "go:read"]).await;
+    sqlx::query("UPDATE orgs SET storage_limit=20 WHERE id='org_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The timer fires once at startup, finds nothing, and then not again
+    // within this test: only a wake can cause what follows.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(snowstead_server::capacity::run(
+        state.clone(),
+        stop.clone(),
+        Duration::from_secs(3600),
+    ));
+    let older = path("compiler", '1');
+    let newer = path("compiler", '2');
+    assert_eq!(
+        put(&app, &older, &credential, &[1; 15]).await,
+        StatusCode::CREATED
+    );
+    sqlx::query("UPDATE go_entries SET uploaded_at='2000-01-01',last_accessed_at=NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The second upload is admitted under the limit and commits over it.
+    assert_eq!(
+        put(&app, &newer, &credential, &[2; 15]).await,
+        StatusCode::CREATED
+    );
+    // Observe through SQL: a read would count as a use and reorder the two.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM go_entries WHERE cache_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+            != 1
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the commit must wake the worker without waiting for its timer");
+    assert_eq!(
+        send(&app, "GET", &older, Some(&credential), &[], &[])
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&app, "GET", &newer, Some(&credential), &[], &[])
+            .await
+            .2,
+        vec![2; 15]
+    );
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("cancellation must stop the worker")
+        .unwrap();
 }
