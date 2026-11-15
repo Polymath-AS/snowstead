@@ -145,25 +145,38 @@ struct Job {
     protection_expires_at: Option<i64>,
     valid: bool,
 }
+/// Writers pass `lock` so the state they decide on cannot change before they
+/// write. The job row is the first row lock a job writer takes.
 async fn load(
     executor: impl sqlx::PgExecutor<'_>,
     cache: i32,
     actor: &str,
     id: &str,
+    lock: bool,
 ) -> Result<Job, ApiError> {
-    let job: Job = sqlx::query_as("SELECT id,mode,roots,state,revision,manifest_digest,manifest_bytes,input_members, \
+    // Both forms are static, so each keeps its own prepared statement.
+    macro_rules! select {
+        ($lock:literal) => {
+            concat!("SELECT id,mode,roots,state,revision,manifest_digest,manifest_bytes,input_members, \
         grant_generation,FLOOR(EXTRACT(EPOCH FROM authorization_expires_at))::bigint AS authorization_expires_at, \
         FLOOR(EXTRACT(EPOCH FROM completed_at))::bigint AS completed_at, \
         FLOOR(EXTRACT(EPOCH FROM protection_expires_at))::bigint AS protection_expires_at, \
         FLOOR(EXTRACT(EPOCH FROM LEAST(idle_expires_at,hard_expires_at)))::bigint AS expires_at, \
         FLOOR(EXTRACT(EPOCH FROM hard_expires_at))::bigint AS hard_expires_at, \
-        state='completed' OR (idle_expires_at>NOW() AND hard_expires_at>NOW()) AS valid FROM push_jobs WHERE cache_id=$1 AND creator=$2 AND id=$3")
-        .bind(cache)
-        .bind(actor)
-        .bind(id)
-        .fetch_optional(executor)
-        .await?
-        .ok_or_else(|| error(404, "Job not found"))?;
+        state='completed' OR (idle_expires_at>NOW() AND hard_expires_at>NOW()) AS valid FROM push_jobs WHERE cache_id=$1 AND creator=$2 AND id=$3", $lock)
+        };
+    }
+    let job: Job = sqlx::query_as(if lock {
+        select!(" FOR NO KEY UPDATE")
+    } else {
+        select!("")
+    })
+    .bind(cache)
+    .bind(actor)
+    .bind(id)
+    .fetch_optional(executor)
+    .await?
+    .ok_or_else(|| error(404, "Job not found"))?;
     if !job.valid {
         return Err(error(410, "Push job expired; create a new job"));
     }
@@ -322,7 +335,7 @@ async fn create(
     sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes) VALUES($1,$2,$3,$4,$5,$6,$7)")
         .bind(&id).bind(cache_id).bind(&actor).bind(input.idempotency_key).bind(input.mode.as_str()).bind(roots).bind(size as i32)
         .execute(&mut *tx).await?;
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::CREATED, job, &state))
 }
@@ -354,7 +367,7 @@ async fn chunk(
     let members = Json(input.members);
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
     let actor = identity.actor();
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, true).await?;
     if job.state == "cancelled" {
         return Err(error(409, "Push job is cancelled"));
     }
@@ -397,7 +410,7 @@ async fn chunk(
             idle_expires_at=LEAST(hard_expires_at,NOW()+INTERVAL '30 minutes') WHERE id=$1")
             .bind(&id).bind(bytes as i32).bind(members.0.len() as i32).execute(&mut *tx).await?;
     }
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }
@@ -409,7 +422,7 @@ async fn seal(
 ) -> Result<Response, ApiError> {
     let cache_id = cache(&state.pool, &identity, &name, true).await?;
     let actor = identity.actor();
-    let before = load(&state.pool, cache_id, &actor, &id).await?;
+    let before = load(&state.pool, cache_id, &actor, &id, false).await?;
     if before.state == "cancelled" {
         return Err(error(409, "Push job is cancelled"));
     }
@@ -506,7 +519,7 @@ async fn seal(
         serde_json::to_vec(&(&before.mode, &before.roots.0, &members)).unwrap(),
     ));
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
-    let current = load(&mut *tx, cache_id, &actor, &id).await?;
+    let current = load(&mut *tx, cache_id, &actor, &id, true).await?;
     if current.state == "cancelled" {
         return Err(error(409, "Push job is cancelled"));
     }
@@ -521,7 +534,7 @@ async fn seal(
         .bind(&id).bind(Json(members.iter().map(|member| json!({"metadata":member,"publication_order":publication_order[member.store_path_hash.as_str()]})).collect::<Vec<_>>())).execute(&mut *tx).await?;
     sqlx::query("UPDATE push_jobs SET state='sealed',manifest_digest=$2,idle_expires_at=LEAST(hard_expires_at,NOW()+INTERVAL '30 minutes') WHERE id=$1")
         .bind(&id).bind(digest).execute(&mut *tx).await?;
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }
@@ -535,7 +548,7 @@ async fn resume(
         return Err(error(409, "Background authorization requires an API token"));
     };
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
-    let job = load(&mut *tx, cache_id, &token.id, &id).await?;
+    let job = load(&mut *tx, cache_id, &token.id, &id, true).await?;
     if job.state == "completed" {
         tx.commit().await?;
         return progress(
@@ -579,6 +592,12 @@ async fn resume(
     }
     // Resume renews queued multipart work too. Failed verification remains
     // terminal; only authorization failures can run under the renewed grant.
+    // Batch rows come first, as in a consumer's settlement, so a settlement
+    // either commits its results before this reset or finds its claim gone.
+    sqlx::query("SELECT FROM upload_finalization_batches WHERE job_id=$1 ORDER BY id FOR UPDATE")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE upload_finalizations f SET result=NULL FROM upload_finalization_batches b \
          WHERE b.job_id=$1 AND f.batch_id=b.id AND (f.result->>'status')::integer=401",
@@ -601,13 +620,14 @@ async fn resume(
     .bind(&token.id)
     .execute(&mut *tx)
     .await?;
-    let job = load(&mut *tx, cache_id, &token.id, &id).await?;
+    let job = load(&mut *tx, cache_id, &token.id, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }
 
 /// The caller normalizes metadata before taking the org fence and policy rows.
 /// Reuse durable sessions instead of issuing transfers on allocation retries.
+/// The named members stay locked until the caller's transaction ends.
 pub(crate) async fn upload_members(
     tx: &mut Transaction,
     identity: &Identity,
@@ -619,7 +639,7 @@ pub(crate) async fn upload_members(
         return Err(error(409, "Job uploads require the owning API token"));
     }
     let actor = identity.actor();
-    let job = load(&mut **tx, cache, &actor, id).await?;
+    let job = load(&mut **tx, cache, &actor, id, false).await?;
     let authorized: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti \
          WHERE j.id=$1 AND j.state='sealed' AND j.authorization_expires_at>NOW() AND t.revoked_at IS NULL)",
@@ -643,6 +663,19 @@ pub(crate) async fn upload_members(
         prepared: bool,
     }
     let hashes: Vec<_> = paths.iter().map(|p| &p.store_path_hash).collect();
+    // The caller links a new session to every member read without one. Hold
+    // the members until that link commits, so a second allocation waits and
+    // then reuses the session instead of orphaning it. This is its own
+    // statement: a lock wait inside the join below would recheck only the
+    // member, and still report the session the first allocation linked as absent.
+    sqlx::query(
+        "SELECT FROM push_job_members WHERE job_id=$1 AND store_path_hash=ANY($2) \
+         ORDER BY store_path_hash FOR UPDATE",
+    )
+    .bind(id)
+    .bind(&hashes)
+    .execute(&mut **tx)
+    .await?;
     let members: Vec<Member> = sqlx::query_as(
         "SELECT m.store_path_hash,m.metadata,u.id,u.part_size,u.r2_upload_id IS NULL AS inline, \
          u.status,u.publication_result, \
@@ -762,7 +795,7 @@ async fn complete(
 ) -> Result<Response, ApiError> {
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
     let actor = identity.actor();
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, true).await?;
     if job.state == "completed" {
         tx.commit().await?;
         return Ok(response(StatusCode::OK, job, &state));
@@ -798,14 +831,19 @@ async fn complete(
             &format!("Push job member {hash}: absent or conflicting metadata"),
         ));
     }
-    sqlx::query(
+    let completed: i64 = sqlx::query_scalar(
         "WITH completed AS (UPDATE push_jobs SET state='completed',completed_at=NOW(), \
          protection_expires_at=LEAST(NOW()+INTERVAL '5 minutes',idle_expires_at,hard_expires_at,authorization_expires_at), \
-         grant_generation=grant_generation+1,work_id=NULL,work_expires_at=NULL WHERE id=$1 RETURNING id) \
-         UPDATE upload_sessions SET status='aborted',expires_at=LEAST(expires_at,NOW()) \
-         WHERE push_job_id IN (SELECT id FROM completed) AND status IN ('streaming','finalizing')",
-    ).bind(&id).execute(&mut *tx).await?;
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+         grant_generation=grant_generation+1,work_id=NULL,work_expires_at=NULL \
+         WHERE id=$1 AND state='sealed' RETURNING id), \
+         aborted AS (UPDATE upload_sessions SET status='aborted',expires_at=LEAST(expires_at,NOW()) \
+         WHERE push_job_id IN (SELECT id FROM completed) AND status IN ('streaming','finalizing')) \
+         SELECT count(*) FROM completed",
+    ).bind(&id).fetch_one(&mut *tx).await?;
+    if completed != 1 {
+        return Err(error(409, "Push job changed; retry"));
+    }
+    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }
@@ -818,19 +856,24 @@ async fn cancel(
     // A tier downgrade or disabled protocol must not prevent cancellation.
     let (mut tx, cache_id) = writer(&state, &identity, &name, false).await?;
     let actor = identity.actor();
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, true).await?;
     if !matches!(job.state.as_str(), "cancelled" | "completed") {
-        sqlx::query(
+        let cancelled: i64 = sqlx::query_scalar(
             "WITH cancelled AS (UPDATE push_jobs SET state='cancelled',grant_generation=grant_generation+1, \
-            authorization_jti=NULL,authorization_expires_at=NULL WHERE id=$1 RETURNING id) \
-            UPDATE upload_sessions SET status='aborted' WHERE push_job_id IN (SELECT id FROM cancelled) \
-            AND status IN ('streaming','finalizing')",
+            authorization_jti=NULL,authorization_expires_at=NULL \
+            WHERE id=$1 AND state IN ('building','sealed') RETURNING id), \
+            aborted AS (UPDATE upload_sessions SET status='aborted' \
+            WHERE push_job_id IN (SELECT id FROM cancelled) AND status IN ('streaming','finalizing')) \
+            SELECT count(*) FROM cancelled",
         )
         .bind(&id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        if cancelled != 1 {
+            return Err(error(409, "Push job changed; retry"));
+        }
     }
-    let job = load(&mut *tx, cache_id, &actor, &id).await?;
+    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
     tx.commit().await?;
     Ok(response(StatusCode::OK, job, &state))
 }

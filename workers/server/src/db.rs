@@ -228,6 +228,22 @@ pub(crate) async fn advisory_lock(
     Ok(())
 }
 
+/// Stands in for a writer that commits between a handler's read and its
+/// write, which the org fence makes impossible to stage for real: `body` runs
+/// inside the handler's own transaction, right after it writes `table`.
+#[cfg(test)]
+pub(crate) async fn interleave(pool: &sqlx::PgPool, event: &str, table: &str, body: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION interleaved() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF pg_trigger_depth()=1 THEN {body}; END IF; RETURN NULL; END $$; \
+         CREATE TRIGGER interleaved AFTER {event} ON {table} \
+         FOR EACH STATEMENT EXECUTE FUNCTION interleaved();"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

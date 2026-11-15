@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE api_tokens\n            SET last_used_at = NOW()\n            WHERE jti = (\n                SELECT jti\n                FROM api_tokens\n                WHERE jti = $1\n                    AND (last_used_at IS NULL OR last_used_at <= NOW() - INTERVAL '5 minutes')\n                FOR NO KEY UPDATE SKIP LOCKED\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3bbec1ec04d4f72dfa34d42fd011271c8a4634b828aa53b4273596536d5ede4d"
+}

@@ -1053,15 +1053,24 @@ async fn put_org(
         label = "management.put_org_lock_wait"
     )
     .await?;
-    // Compare and write under the same org lock. Stale registrations cannot
-    // change slugs either; equal versions are safe transport retries.
-    let stored_version: Option<i64> =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT limits_version FROM orgs WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
-    if let Some(stored) = stored_version {
+    // Compare the version on the locked row, so the comparison and the write
+    // see the same row. Stale registrations cannot change slugs either; equal
+    // versions are safe transport retries.
+    let current = sqlx::query!(
+        r#"
+        SELECT
+            slug,
+            moving_from,
+            limits_version
+        FROM orgs
+        WHERE id = $1
+        FOR UPDATE NOWAIT
+        "#,
+        id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(stored) = current.as_ref().and_then(|o| o.limits_version) {
         if version.is_some_and(|incoming| incoming <= stored) {
             tx.commit().await?;
             return org_response(state, id, None, false).await;
@@ -1074,19 +1083,6 @@ async fn put_org(
             return Err(bad("limitsVersion is required for this organization"));
         }
     }
-    let current = sqlx::query!(
-        r#"
-        SELECT
-            slug,
-            moving_from
-        FROM orgs
-        WHERE id = $1
-        FOR UPDATE NOWAIT
-        "#,
-        id
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
     // Creating an org sets its limits.
     if current.is_none() {
         limits(&context.principal)?;
@@ -1198,11 +1194,21 @@ async fn put_org(
     .execute(&mut *tx)
     .await?;
     if let Some(version) = version {
-        sqlx::query("UPDATE orgs SET limits_version = $2 WHERE id = $1")
-            .bind(id)
-            .bind(version)
-            .execute(&mut *tx)
-            .await?;
+        // A new org has no row to lock above, so two registrations can both
+        // reach this write. The older one loses here, along with its policy.
+        let advanced = sqlx::query(
+            "UPDATE orgs SET limits_version = $2 WHERE id = $1 \
+             AND (limits_version IS NULL OR limits_version < $2)",
+        )
+        .bind(id)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if advanced != 1 {
+            tx.rollback().await?;
+            return org_response(state, id, None, false).await;
+        }
     }
     tx.commit().await?;
     // Report the row this request just wrote, not the one read before it.

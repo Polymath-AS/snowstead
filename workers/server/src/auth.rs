@@ -286,13 +286,20 @@ async fn token(
 async fn record_use(state: &AppState, id: &str) {
     // Await bounded pool work; never spawn an unbounded task per request.
     // Telemetry is best-effort and the predicate limits actual writes.
+    // A finalization or publication holds this row shared until it commits;
+    // skip the stamp rather than park a connection behind it.
     if crate::profile_future!(
         sqlx::query!(
             r#"
             UPDATE api_tokens
             SET last_used_at = NOW()
-            WHERE jti = $1
-                AND (last_used_at IS NULL OR last_used_at <= NOW() - INTERVAL '5 minutes')
+            WHERE jti = (
+                SELECT jti
+                FROM api_tokens
+                WHERE jti = $1
+                    AND (last_used_at IS NULL OR last_used_at <= NOW() - INTERVAL '5 minutes')
+                FOR NO KEY UPDATE SKIP LOCKED
+            )
             "#,
             id,
         )

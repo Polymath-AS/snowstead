@@ -343,9 +343,11 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
     };
     let mut tx = db::begin_queued(state, &org).await?;
     lock(&mut tx, &format!("org:{org}")).await?;
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE id=$1 AND work_id=$2 AND lease_expires_at>NOW())")
-        .bind(&work.id).bind(&claim).fetch_one(&mut *tx).await?;
-    if !owned {
+    // Hold the batch row while settling. A job resume resets results and the
+    // claim under the same row lock, so it runs wholly before or after this.
+    let owned: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM upload_finalization_batches WHERE id=$1 AND work_id=$2 AND lease_expires_at>NOW() FOR UPDATE")
+        .bind(&work.id).bind(&claim).fetch_optional(&mut *tx).await?;
+    if owned.is_none() {
         tracing::info!(batch_id=%work.id,work_id=%claim,count=ids.len(),elapsed_ms=started.elapsed().as_millis() as u64,
             status="replaced",error_category="lease","Multipart finalization turn finished");
         return Ok(true);
@@ -375,8 +377,11 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
             retry = true;
             continue;
         }
-        sqlx::query("UPDATE upload_finalizations SET result=$2 WHERE session_id=$1 AND batch_id=$3 AND result IS NULL")
-            .bind(id).bind(sqlx::types::Json(&result)).bind(&work.id).execute(&mut *tx).await?;
+        // Each write still requires the claim, so a result computed under a
+        // replaced grant is never written back over a reset.
+        sqlx::query("UPDATE upload_finalizations f SET result=$2 FROM upload_finalization_batches b \
+            WHERE f.session_id=$1 AND f.batch_id=$3 AND f.result IS NULL AND b.id=f.batch_id AND b.work_id=$4")
+            .bind(id).bind(sqlx::types::Json(&result)).bind(&work.id).bind(&claim).execute(&mut *tx).await?;
     }
     let failures = if retry { (work.failures + 1).min(6) } else { 0 };
     let delay = if retry {
@@ -891,6 +896,359 @@ mod tests {
         .await
         .unwrap();
         assert!(parked, "settled batches stay out of the runnable range");
+        state.finish_background().await;
+    }
+
+    /// A registered token allowed to push to every cache of the default org.
+    async fn api_token(pool: &sqlx::PgPool) -> Identity {
+        let (id, _, hash) = crate::auth::issue_token().unwrap();
+        sqlx::query("INSERT INTO api_tokens(jti,subject,created_by,org_id,secret_hash) VALUES($1,'fixture','fixture','default',$2)")
+            .bind(&id).bind(hash).execute(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO token_permissions(token_jti,permission,position) VALUES($1,'push',0)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO token_caches(token_jti,pattern) VALUES($1,'*')")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .unwrap();
+        Identity::ApiToken(ApiToken {
+            id,
+            org: "default".into(),
+            permissions: vec![Permission::Push],
+            caches: vec![CacheGrant::Pattern("*".into())],
+            expires_at: None,
+        })
+    }
+
+    /// Seal the fixture session and give it a verified candidate, as a
+    /// finished preparation leaves it. Publication then needs no storage I/O.
+    async fn prepared(state: &AppState, receipt: &Receipt) -> Prepared {
+        let identity = Identity::SharedToken;
+        let session = load(&state.pool, &receipt.session_id, &identity)
+            .await
+            .unwrap();
+        assert!(
+            seal(state, &identity, &session, receipt, None, None)
+                .await
+                .is_ok()
+        );
+        sqlx::query("INSERT INTO nar_installations(key,operation_id,file_hash,compression,is_private,file_size,cache_id,session_id,expires_at,phase) \
+            SELECT 'nar/objects/'||id,'operation-'||id,file_hash,'zstd',false,file_size,cache_id,id,expires_at,'ready' FROM upload_sessions WHERE id=$1")
+            .bind(&receipt.session_id).execute(&state.pool).await.unwrap();
+        let session = load(&state.pool, &receipt.session_id, &identity)
+            .await
+            .unwrap();
+        let Ok(ready) = seal(state, &identity, &session, receipt, None, None).await else {
+            panic!("a sealed session replays its receipt");
+        };
+        assert!(matches!(ready.source, PreparedSource::Ready));
+        ready
+    }
+
+    async fn session_status(pool: &sqlx::PgPool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn sealing_loses_to_an_abort_since_its_reload(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        // Sealing records part receipts just before it changes the status.
+        db::interleave(
+            &pool,
+            "UPDATE",
+            "upload_parts",
+            "UPDATE upload_sessions SET status='aborted'",
+        )
+        .await;
+        let session = load(&pool, &receipt.session_id, &Identity::SharedToken)
+            .await
+            .unwrap();
+        let refused = seal(
+            &state,
+            &Identity::SharedToken,
+            &session,
+            &receipt,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("an aborted session must not be sealed");
+        assert_eq!(refused.status, StatusCode::CONFLICT);
+        state.finish_background().await;
+        // The refusal rolled back with the stand-in abort; nothing was sealed.
+        let unsealed: bool = sqlx::query_scalar(
+            "SELECT status='streaming' AND file_hash IS NULL FROM upload_sessions WHERE id=$1",
+        )
+        .bind(&receipt.session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(unsealed);
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn publication_loses_to_an_abort_since_its_reload(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        let ready = prepared(&state, &receipt).await;
+        // Publication inserts the path just before it completes the session.
+        db::interleave(
+            &pool,
+            "INSERT",
+            "published_paths",
+            "UPDATE upload_sessions SET status='aborted'",
+        )
+        .await;
+        let refused = publish(&state, &Identity::SharedToken, &ready, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        // The whole publication rolled back, leaving the candidate reusable.
+        let (paths, candidates): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM published_paths),(SELECT count(*) FROM nar_installations)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((paths, candidates), (0, 1));
+        assert_eq!(
+            session_status(&pool, &receipt.session_id).await,
+            "finalizing"
+        );
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn publication_adopts_only_a_candidate_in_the_session_bucket(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        let identity = Identity::SharedToken;
+        let session = load(&pool, &receipt.session_id, &identity).await.unwrap();
+        let Ok(sealed) = seal(&state, &identity, &session, &receipt, None, None).await else {
+            panic!("the fixture session seals");
+        };
+        // The cache is public. This candidate was verified into the private
+        // bucket, as one discovered before a visibility change would be.
+        sqlx::query("INSERT INTO nar_installations(key,operation_id,file_hash,compression,is_private,file_size,cache_id,session_id,expires_at,phase) \
+            SELECT 'nars/objects/private','private-operation',file_hash,'zstd',true,file_size,cache_id,id,expires_at,'ready' FROM upload_sessions WHERE id=$1")
+            .bind(&receipt.session_id).execute(&pool).await.unwrap();
+        let stale = Prepared {
+            session: sealed.session,
+            source: PreparedSource::Ready,
+            key: "nars/objects/private".into(),
+            operation: "private-operation".into(),
+            finalization_claim: None,
+        };
+        let refused = publish(&state, &identity, &stale, &[]).await.unwrap_err();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        let (paths, blobs, candidates): (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM published_paths),(SELECT count(*) FROM blob_objects), \
+             (SELECT count(*) FROM nar_installations)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((paths, blobs, candidates), (0, 0, 1));
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn finalization_authority_orders_against_token_revocation(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        let identity = api_token(&pool).await;
+        let session = load(&pool, &receipt.session_id, &identity).await.unwrap();
+        let revoke = "UPDATE api_tokens SET revoked_at=NOW(),revoked_by='fixture'";
+        // A revocation in flight: the decision must wait for it, not read past it.
+        let mut revocation = pool.begin().await.unwrap();
+        sqlx::query(revoke).execute(&mut *revocation).await.unwrap();
+        let (mut tx, current) = locked(&state, &session, &identity).await.unwrap();
+        let waited = finalization_authority(&state, &mut tx, &identity, &current, false)
+            .await
+            .unwrap_err();
+        assert_eq!(waited.status, StatusCode::SERVICE_UNAVAILABLE);
+        tx.rollback().await.unwrap();
+        revocation.rollback().await.unwrap();
+        // An authorized transaction in flight: revocation must wait for it.
+        let (mut tx, current) = locked(&state, &session, &identity).await.unwrap();
+        finalization_authority(&state, &mut tx, &identity, &current, false)
+            .await
+            .unwrap();
+        let mut revocation = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout='100ms'")
+            .execute(&mut *revocation)
+            .await
+            .unwrap();
+        let blocked = sqlx::query(revoke)
+            .execute(&mut *revocation)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blocked.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        revocation.rollback().await.unwrap();
+        // Only the token row is locked, not its permission and cache rows.
+        let mut grants = pool.begin().await.unwrap();
+        sqlx::raw_sql(
+            "SET LOCAL lock_timeout='100ms'; UPDATE token_permissions SET position=position; \
+             UPDATE token_caches SET pattern=pattern",
+        )
+        .execute(&mut *grants)
+        .await
+        .unwrap();
+        grants.rollback().await.unwrap();
+        tx.rollback().await.unwrap();
+        sqlx::query(revoke).execute(&pool).await.unwrap();
+        let (mut tx, current) = locked(&state, &session, &identity).await.unwrap();
+        let revoked = finalization_authority(&state, &mut tx, &identity, &current, false)
+            .await
+            .unwrap_err();
+        assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
+        tx.rollback().await.unwrap();
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn an_append_orders_against_admission_closing(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        let identity = Identity::SharedToken;
+        sqlx::query("INSERT INTO upload_finalization_batches(id,org_id,actor,shared_generation,prepare_only,expires_at) \
+            VALUES('closing','default',$1,$2,false,NOW()+INTERVAL '1 hour')")
+            .bind(identity.actor()).bind(shared_generation(&state)).execute(&pool).await.unwrap();
+        let session = load(&pool, &receipt.session_id, &identity).await.unwrap();
+        // A consumer is closing admission but has not committed. Appending
+        // now would add a member its claim has already stopped looking for.
+        let mut closing = pool.begin().await.unwrap();
+        sqlx::query("UPDATE upload_finalization_batches SET admitted=true")
+            .execute(&mut *closing)
+            .await
+            .unwrap();
+        let admission = Some(("closing", 0, false));
+        let waited = seal(&state, &identity, &session, &receipt, None, admission)
+            .await
+            .err()
+            .expect("an append must wait for a close in flight");
+        assert_eq!(waited.status, StatusCode::SERVICE_UNAVAILABLE);
+        closing.commit().await.unwrap();
+        let closed = seal(&state, &identity, &session, &receipt, None, admission)
+            .await
+            .err()
+            .expect("admission is closed");
+        assert_eq!(closed.message, "Finalization admission closed; retry");
+        state.finish_background().await;
+        let members: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_finalizations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(members, 0);
+        assert_eq!(
+            session_status(&pool, &receipt.session_id).await,
+            "streaming"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn a_consumer_retries_its_claim_while_an_append_holds_admission_open(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        enqueue_finalizations(
+            &state,
+            &Identity::SharedToken,
+            vec![receipt.clone()],
+            Finalization::default(),
+        )
+        .await
+        .unwrap();
+        // An abandoned admission that recovery may claim, with an append to
+        // it still in flight on another connection.
+        sqlx::query("UPDATE upload_finalization_batches SET admitted=false,created_at=NOW()-INTERVAL '61 seconds'")
+            .execute(&pool).await.unwrap();
+        let mut append = pool.begin().await.unwrap();
+        sqlx::query("SELECT TRUE FROM upload_finalization_batches WHERE NOT admitted FOR SHARE")
+            .execute(&mut *append)
+            .await
+            .unwrap();
+        let busy = turn(&state, &mut String::new()).await.unwrap_err();
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        let unclaimed: bool = sqlx::query_scalar(
+            "SELECT NOT admitted AND work_id IS NULL FROM upload_finalization_batches",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(unclaimed);
+        append.rollback().await.unwrap();
+        // The next tick claims it.
+        assert!(turn(&state, &mut String::new()).await.unwrap());
+        let admitted: bool = sqlx::query_scalar("SELECT admitted FROM upload_finalization_batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(admitted);
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn settlement_writes_no_result_after_losing_its_claim(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        sqlx::query("INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,r2_upload_key,r2_upload_id,expires_at,part_size) \
+            SELECT 'second-session',cache_id,repeat('1',32),'/nix/store/'||repeat('1',32)||'-second',nar_hash,nar_size,file_size,compression,'streaming','staging/second-session/source','second-provider',expires_at,part_size FROM upload_sessions WHERE id='queued-session'")
+            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO upload_parts(session_id,part_number,size) VALUES('second-session',1,1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = Receipt {
+            session_id: "second-session".into(),
+            ..receipt.clone()
+        };
+        enqueue_finalizations(
+            &state,
+            &Identity::SharedToken,
+            vec![receipt, second],
+            Finalization::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO nar_installations(key,operation_id,file_hash,compression,is_private,file_size,cache_id,session_id,expires_at,phase) \
+            SELECT 'nar/objects/'||id,'operation-'||id,file_hash,'zstd',false,file_size,cache_id,id,expires_at,'ready' FROM upload_sessions")
+            .execute(&pool).await.unwrap();
+        // A job resume takes the claim away after the first result is written.
+        db::interleave(
+            &pool,
+            "UPDATE",
+            "upload_finalizations",
+            "UPDATE upload_finalization_batches SET work_id=NULL,lease_expires_at=NULL",
+        )
+        .await;
+        assert!(turn(&state, &mut String::new()).await.unwrap());
+        // Both members have a terminal result to write; only the one settled
+        // while the claim was still held may be recorded.
+        let (completed, unsettled, unclaimed): (i64, i64, bool) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM upload_sessions WHERE status='completed'), \
+             (SELECT count(*) FROM upload_finalizations WHERE result IS NULL), \
+             (SELECT work_id IS NULL FROM upload_finalization_batches)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((completed, unsettled, unclaimed), (2, 1, true));
         state.finish_background().await;
     }
 }

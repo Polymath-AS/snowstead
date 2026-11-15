@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            slug,\n            moving_from\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE NOWAIT\n        ",
+  "query": "\n        SELECT\n            slug,\n            moving_from,\n            limits_version\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE NOWAIT\n        ",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,17 @@
             "name": "moving_from"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "limits_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "limits_version"
+          }
+        }
       }
     ],
     "parameters": {
@@ -33,8 +44,9 @@
     },
     "nullable": [
       false,
+      true,
       true
     ]
   },
-  "hash": "8267784190d97f8ab3f09f3e90b640f831ee41d4516d59ea150698abc3d3b311"
+  "hash": "3ee26fda57a6eb0fb6a38e20811e6ff30f1ebebc7dbfa56aee76427f0c4ffb85"
 }

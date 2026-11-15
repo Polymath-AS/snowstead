@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE upload_sessions\n            SET status = 'finalizing', file_hash = $2\n            WHERE id = $1\n                AND status = 'streaming'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3449b50e681d1add480c7f752a554a6a05f2a8702e2daa20f240f31bd9d5f981"
+}

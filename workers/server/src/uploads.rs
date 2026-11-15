@@ -1114,8 +1114,10 @@ fn shared_generation(state: &AppState) -> Option<String> {
     })
 }
 
-/// Call under the org fence, which also orders token revocation. Never store
-/// the bearer credential, and never trust middleware's old token snapshot.
+/// Call inside the caller's write transaction. The share lock on the token row
+/// orders revocation against it: a revocation in flight is waited for and then
+/// seen, and a later one waits for this transaction. Never store the bearer
+/// credential, and never trust middleware's old token snapshot.
 async fn finalization_authority(
     state: &AppState,
     tx: &mut Transaction,
@@ -1140,7 +1142,7 @@ async fn finalization_authority(
                  ARRAY(SELECT cache_id FROM token_caches WHERE token_jti=t.jti AND cache_id IS NOT NULL) AS caches, \
                  ARRAY(SELECT pattern FROM token_caches WHERE token_jti=t.jti AND pattern IS NOT NULL) AS patterns \
                  FROM api_tokens t WHERE t.jti=$1 AND t.revoked_at IS NULL \
-                 AND (t.expires_at IS NULL OR t.expires_at>NOW())",
+                 AND (t.expires_at IS NULL OR t.expires_at>NOW()) FOR SHARE OF t",
             ).bind(&token.id).fetch_optional(&mut **tx).await?
                 .ok_or_else(|| error(401, "Token revoked or expired"))?;
             let current = Identity::ApiToken(ApiToken {
@@ -1215,15 +1217,17 @@ async fn seal(
             return Err(error(409, "Finalization intent cannot change"));
         }
         if existing.is_none() {
-            // The same org fence orders this append against recovery closing
-            // an abandoned admission. Never strand a late member in settled work.
-            let open: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM upload_finalization_batches WHERE id=$1 AND NOT admitted)",
+            // Never strand a late member in settled work. The share lock holds
+            // admission open until this append commits: a consumer's claim
+            // fails its NOWAIT and retries, and a close that got there first
+            // is waited for and then seen.
+            let open: Option<bool> = sqlx::query_scalar(
+                "SELECT TRUE FROM upload_finalization_batches WHERE id=$1 AND NOT admitted FOR SHARE",
             )
             .bind(batch)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-            if !open {
+            if open.is_none() {
                 return Err(error(503, "Finalization admission closed; retry"));
             }
         }
@@ -1322,17 +1326,24 @@ async fn seal(
         ));
     }
     if s.status == UploadStatus::Streaming {
-        sqlx::query!(
+        // Deletion, cancellation, and expiry abort sessions in bulk. Sealing
+        // must lose to them on its own, not resurrect an aborted session.
+        let sealed = sqlx::query!(
             r#"
             UPDATE upload_sessions
             SET status = 'finalizing', file_hash = $2
             WHERE id = $1
+                AND status = 'streaming'
             "#,
             &s.id,
             &receipt.file_hash,
         )
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if sealed != 1 {
+            return Err(error(409, "Conflict"));
+        }
         s.file_hash = Some(receipt.file_hash.clone());
         s.status = UploadStatus::Finalizing;
     }
@@ -1712,11 +1723,13 @@ async fn publish_group(
         .await?;
     }
     let input = sqlx::types::Json(&incoming);
+    // Adopt a candidate only from the bucket the session's visibility names.
+    // Discovery chose the key earlier, under a policy that may have changed.
     let owned = sqlx::query(
         "DELETE FROM nar_installations n USING jsonb_to_recordset($1) \
-         AS i(key text, operation_id text, id text) \
+         AS i(key text, operation_id text, id text, is_public boolean) \
          WHERE n.key=i.key AND n.operation_id=i.operation_id AND n.session_id=i.id \
-         AND n.phase='ready' AND n.expires_at>NOW()",
+         AND n.phase='ready' AND n.expires_at>NOW() AND n.is_private=NOT i.is_public",
     )
     .bind(input)
     .execute(&mut *tx)
@@ -1800,15 +1813,18 @@ async fn publish_group(
     ).bind(input).execute(&mut *tx).await?;
     // Completed replays need the immutable receipts, not their staging bytes.
     // Retire those exact keys with publication, never after a failed commit.
-    sqlx::query(
+    // An abort or cancellation since the reload above must win: only sessions
+    // still finalizing complete, and a partial group publishes nothing.
+    let completed: i64 = sqlx::query_scalar(
         "WITH completed AS (UPDATE upload_sessions u SET status='completed',publication_result=i.result \
          FROM jsonb_to_recordset($1) AS i(session_id text,result jsonb) WHERE u.id=i.session_id \
-         RETURNING u.id,u.push_job_id), \
+         AND u.status='finalizing' RETURNING u.id,u.push_job_id), \
          staging_cleanup AS (INSERT INTO object_cleanup(is_private,key) \
          SELECT TRUE,p.storage_key FROM upload_parts p JOIN completed u ON u.id=p.session_id \
-         WHERE starts_with(p.storage_key,'staging/'||u.id||'/') ON CONFLICT DO NOTHING) \
-         UPDATE push_job_members m SET blocked_generation=NULL,publication_error=NULL FROM completed u \
-         WHERE m.job_id=u.push_job_id AND m.session_id=u.id AND m.blocked_generation IS NOT NULL",
+         WHERE starts_with(p.storage_key,'staging/'||u.id||'/') ON CONFLICT DO NOTHING), \
+         unblocked AS (UPDATE push_job_members m SET blocked_generation=NULL,publication_error=NULL FROM completed u \
+         WHERE m.job_id=u.push_job_id AND m.session_id=u.id AND m.blocked_generation IS NOT NULL) \
+         SELECT count(*) FROM completed",
     )
     .bind(json!(
         incoming
@@ -1816,8 +1832,14 @@ async fn publish_group(
             .map(|i| json!({"session_id":i.session.id,"result":results[i.ordinal]}))
             .collect::<Vec<_>>()
     ))
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    if completed != incoming.len() as i64 {
+        return Err(error(
+            503,
+            "Publication attempt expired or cancelled; retry",
+        ));
+    }
     if let Some(claim) = claim {
         crate::push_job_worker::complete(&mut tx, claim).await?;
     }
