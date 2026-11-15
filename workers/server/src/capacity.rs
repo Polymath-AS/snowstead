@@ -1,16 +1,17 @@
 //! Retained capacity is logical, across all three products, and eventually
 //! consistent. Publication never checks or evicts: it commits and wakes the
 //! evictor, which brings an organization back under its limit in its own
-//! bounded transactions. A brief overshoot is expected. New uploads are refused
-//! once usage reaches 110% of the limit, or reaches the limit while protected
-//! paths alone already fill it. Physical orphan reclamation is separate.
+//! bounded transactions. A brief overshoot is expected. From 110% of the limit
+//! a new upload is asked to retry while eviction catches up; it is refused
+//! outright once usage reaches the limit while protected paths alone fill it.
+//! Physical orphan reclamation is separate.
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Mutex,
     time::Duration,
 };
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use sqlx::PgConnection;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -149,24 +150,20 @@ async fn usage(tx: &mut PgConnection, org: &str) -> Result<i64, sqlx::Error> {
     .await
 }
 
-/// Refuse a new upload for an organization that is too far over its limit to
-/// wait for eviction, or over it with nothing left to evict. The read is not
-/// exact: concurrent publications may still overshoot, and the evictor
-/// recovers. `over` is the caller's message for the 110% refusal.
+/// Hold back a new upload for an organization that is over its limit. With
+/// nothing left to evict the refusal is final. Otherwise, from 110% of the
+/// limit, the caller is asked to retry while the evictor catches up. The read
+/// is not exact: concurrent publications may still overshoot.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 pub(crate) async fn admit_upload(
+    state: &AppState,
     tx: &mut Transaction,
     org: &str,
     limit: i64,
-    over: &'static str,
 ) -> Result<(), ApiError> {
     let used = usage(tx, org).await?;
     if used < limit {
         return Ok(());
-    }
-    // used >= limit * 1.1, exactly and without overflow.
-    if i128::from(used) * 10 >= i128::from(limit) * 11 {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, over));
     }
     // Only an organization already at its limit pays for this. Driven from the
     // pin and job tables, not one `nix_path_pinned` call per published path.
@@ -207,6 +204,15 @@ pub(crate) async fn admit_upload(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Insufficient evictable capacity; delete retained paths first",
         ));
+    }
+    // used >= limit * 1.1, exactly and without overflow.
+    if i128::from(used) * 10 >= i128::from(limit) * 11 {
+        state.evictions.request(org);
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Storage is over its limit while older data is evicted; retry",
+        )
+        .header(header::RETRY_AFTER, HeaderValue::from_static("1")));
     }
     Ok(())
 }

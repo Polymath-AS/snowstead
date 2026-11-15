@@ -164,7 +164,7 @@ pub async fn serve_router(
     state.tasks.spawn(crate::capacity::run(
         state.clone(),
         retry_stop.clone(),
-        Duration::from_secs(30),
+        Duration::from_secs(10 * 60),
     ));
     for _ in 0..state.config.push_jobs.publication_workers {
         let worker_state = state.clone();

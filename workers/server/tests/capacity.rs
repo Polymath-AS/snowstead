@@ -255,7 +255,7 @@ async fn evictor_spares_protected_paths_and_returns_when_only_they_remain(pool: 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn upload_start_accepts_at_109_percent_and_refuses_from_110(pool: PgPool) {
+async fn upload_start_accepts_at_109_percent_and_asks_to_retry_from_110(pool: PgPool) {
     let state = fixture(&pool).await;
     let app = router(state.clone());
     limit(&pool, Some(100)).await;
@@ -264,10 +264,10 @@ async fn upload_start_accepts_at_109_percent_and_refuses_from_110(pool: PgPool) 
     assert_eq!(status, StatusCode::CREATED, "{created}");
     retain(&pool, '2', 1, 2).await;
     let (status, refused) = start(&app, 'b').await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refused}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
     assert_eq!(
         refused,
-        json!({"error":"Incoming objects exceed retained capacity"})
+        json!({"error":"Storage is over its limit while older data is evicted; retry"})
     );
     assert_eq!(sessions(&pool).await, 1);
     // A limit whose tenth is not a whole number: 15 * 1.1 = 16.5, so 16 bytes
@@ -282,15 +282,16 @@ async fn upload_start_accepts_at_109_percent_and_refuses_from_110(pool: PgPool) 
     retain(&pool, '3', 16, 1).await;
     assert_eq!(start(&app, 'c').await.0, StatusCode::CREATED);
     retain(&pool, '4', 1, 2).await;
-    assert_eq!(start(&app, 'd').await.0, StatusCode::PAYLOAD_TOO_LARGE);
-    // A limit of zero retains nothing, so nothing may start. No limit, no rule.
+    assert_eq!(start(&app, 'd').await.0, StatusCode::SERVICE_UNAVAILABLE);
+    // A limit of zero retains nothing and leaves nothing to evict, so the
+    // refusal is final. No limit, no rule.
     limit(&pool, Some(0)).await;
     assert_eq!(start(&app, 'g').await.0, StatusCode::PAYLOAD_TOO_LARGE);
     limit(&pool, None).await;
     assert_eq!(start(&app, 'f').await.0, StatusCode::CREATED);
     // After eviction the same organization starts uploads again.
     limit(&pool, Some(15)).await;
-    assert_eq!(start(&app, 'd').await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(start(&app, 'd').await.0, StatusCode::SERVICE_UNAVAILABLE);
     sqlx::query("DELETE FROM upload_sessions")
         .execute(&pool)
         .await

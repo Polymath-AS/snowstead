@@ -737,13 +737,7 @@ async fn reserve(
     }
     // A new or growing reservation is a new upload. Replays returned above.
     if let Some(limit) = limit {
-        crate::capacity::admit_upload(
-            &mut tx,
-            &target.org,
-            limit,
-            "Artifact exceeds retained capacity",
-        )
-        .await?;
+        crate::capacity::admit_upload(state, &mut tx, &target.org, limit).await?;
     }
     let staging = match product {
         Product::Go => {

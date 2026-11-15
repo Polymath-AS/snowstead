@@ -1895,7 +1895,7 @@ async fn manifest_worker_publishes_over_quota_and_eviction_spares_job_members(po
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refused}");
     assert_eq!(
         refused["error"],
-        "Incoming objects exceed retained capacity"
+        "Insufficient evictable capacity; delete retained paths first"
     );
     // Once the job's protection lapses, the evictor brings the org back.
     sqlx::query("UPDATE push_jobs SET authorization_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1")

@@ -599,13 +599,7 @@ async fn create(
     if !rows.is_empty() {
         // Replaying sessions a job already owns starts no new upload.
         if let Some(limit) = capacity {
-            crate::capacity::admit_upload(
-                &mut tx,
-                identity.org(),
-                limit,
-                "Incoming objects exceed retained capacity",
-            )
-            .await?;
+            crate::capacity::admit_upload(state, &mut tx, identity.org(), limit).await?;
         }
         sqlx::query!(
             r#"

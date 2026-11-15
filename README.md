@@ -271,8 +271,8 @@ retained-byte reservation or a borrowed SQL connection. One short transaction
 then adopts the pointer and records completion, without checking the storage
 limit. A background evictor afterwards removes eligible least-recently-used
 entries across the org's products until it is back under its limit, so usage
-can briefly exceed it. New uploads are refused with 413 once usage reaches
-110% of the limit. Completed retries return their
+can briefly exceed it. From 110% of the limit new uploads get 503 and retry
+while eviction catches up. Completed retries return their
 recorded result and cannot restore a deleted path. SQL decisions fail fast on
 contention; they are not literally lock-free. Cleanup of retired exact keys is
 asynchronous. Direct CDN downloads do not update access times; pushes and
