@@ -235,7 +235,7 @@ marked `503` with `Retry-After: 1` before opening its circuit breaker.
 Capacity remains logical and shared across Nix, Go, and sccache, and counts
 committed retained entries separately from staging budgets. The storage limit
 is eventually consistent. Publication commits without checking it and wakes a
-background evictor, which also scans every 30 seconds for organizations over
+background evictor, which also scans every ten minutes for organizations over
 their limit. The evictor removes least-recently-used entries in its own
 bounded transactions, at most 256 entries each, until the organization is at
 or under its limit. LRU ordering still uses the later of publication and
@@ -245,12 +245,13 @@ until a protection ends. An organization can therefore exceed its limit
 briefly, and the most recent publication is evicted like any other entry when
 nothing older is evictable. Direct CDN downloads do not update access.
 
-New uploads are refused with 413 when they start, at Nix session creation and
-at a Go or sccache reservation, once usage is at or above 110% of the limit,
-or at or above the limit while pinned and job-protected paths alone fill it.
+New uploads are held back when they start, at Nix session creation and at a Go
+or sccache reservation. Once usage is at or above 110% of the limit they get
+503 with `Retry-After`, which also wakes the evictor; the CLI retries it. At or
+above the limit while pinned and job-protected paths alone fill it they are
+refused with 413, which the CLI does not retry: delete retained paths.
 Sessions and reservations that already exist continue, and a batch larger than
-the whole limit is still refused with 413 before any member publishes. The CLI
-does not retry a 413: retry the push after eviction, or delete retained paths.
+the whole limit is still refused with 413 before any member publishes.
 
 Deletion, retention, and eviction withdraw SQL visibility atomically and queue
 known exact keys for asynchronous cleanup. Storage failure does not roll back
@@ -600,9 +601,9 @@ without an org are its tokens.
   the token's org, so `snowstead push main` pushes to that org's `main`.
 - **Storage limits.** Limits are eventually consistent. Publication does not
   check them: a background evictor removes eligible LRU entries across products
-  afterwards, so usage can briefly exceed the limit. New uploads are refused
-  with 413 at 110% of the limit, or at the limit when only pinned or
-  job-protected paths remain; delete retained paths explicitly in that case.
+  afterwards, so usage can briefly exceed the limit. New uploads get a
+  retryable 503 from 110% of the limit, and 413 at the limit when only pinned
+  or job-protected paths remain; delete retained paths explicitly in that case.
   Staging has its own budget.
 - **Admission.** Rust does not retain the Worker's per-minute request caps.
   Storage limits, staging safeguards, and bounded runtime resources still apply.

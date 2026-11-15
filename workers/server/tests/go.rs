@@ -563,7 +563,7 @@ async fn compiler_capacity_is_shared_with_nix_and_eviction_keeps_protected_paths
         StatusCode::NOT_FOUND
     );
     // 40 retained bytes against a limit of 30 is past 110%: new artifacts of
-    // either product are refused, while a replay starts no upload and passes.
+    // either product are asked to retry, while a replay starts no upload and passes.
     sqlx::query("UPDATE orgs SET storage_limit=30 WHERE id='org_a'")
         .execute(&pool)
         .await
@@ -571,7 +571,7 @@ async fn compiler_capacity_is_shared_with_nix_and_eviction_keeps_protected_paths
     for (url, bytes) in [(&path("compiler", 'd'), vec![6; 2]), (&cc, vec![6; 2])] {
         assert_eq!(
             put(&app, url, &credential, &bytes).await,
-            StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
     assert_eq!(
@@ -676,7 +676,7 @@ async fn compiler_capacity_is_shared_with_nix_and_eviction_keeps_protected_paths
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn new_artifacts_are_refused_from_110_percent_of_the_limit_until_eviction(pool: PgPool) {
+async fn new_artifacts_retry_from_110_percent_of_the_limit_until_eviction(pool: PgPool) {
     let state = fixture(&pool).await;
     let app = router(state.clone());
     let credential = token(
@@ -719,11 +719,11 @@ async fn new_artifacts_are_refused_from_110_percent_of_the_limit_until_eviction(
         put(&app, &cc('4'), &credential, &[4; 1]).await,
         StatusCode::CREATED
     );
-    // At exactly 110 bytes neither does, and nothing was reserved for them.
+    // At exactly 110 bytes neither does until eviction, and nothing was reserved for them.
     for url in [path("compiler", '5'), cc('6')] {
         assert_eq!(
             put(&app, &url, &credential, &[5; 1]).await,
-            StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
     let reserved: i64 = sqlx::query_scalar(
