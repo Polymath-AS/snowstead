@@ -847,7 +847,7 @@ mod tests {
             FROM upload_finalization_batches b JOIN upload_finalizations f ON f.batch_id=b.id JOIN push_jobs j ON j.id=b.job_id")
             .fetch_one(&pool).await.unwrap();
         assert!(renewed);
-        let failed = publish(&state, &identity, &old, &[]).await.unwrap_err();
+        let failed = publish(&state, &identity, &old).await.unwrap_err();
         assert_eq!(failed.status, StatusCode::CONFLICT);
         let replay = enqueue_finalizations(
             &state,
@@ -1010,7 +1010,7 @@ mod tests {
             "UPDATE upload_sessions SET status='aborted'",
         )
         .await;
-        let refused = publish(&state, &Identity::SharedToken, &ready, &[])
+        let refused = publish(&state, &Identity::SharedToken, &ready)
             .await
             .unwrap_err();
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1050,7 +1050,7 @@ mod tests {
             operation: "private-operation".into(),
             finalization_claim: None,
         };
-        let refused = publish(&state, &identity, &stale, &[]).await.unwrap_err();
+        let refused = publish(&state, &identity, &stale).await.unwrap_err();
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
         let (paths, blobs, candidates): (i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM published_paths),(SELECT count(*) FROM blob_objects), \

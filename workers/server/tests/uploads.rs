@@ -1673,7 +1673,7 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
-async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPool) {
+async fn manifest_worker_publishes_over_quota_and_eviction_spares_job_members(pool: PgPool) {
     pool_execute(&pool,"INSERT INTO orgs(id,slug) VALUES('org_z','zeta'); \
         INSERT INTO caches(name,is_public,org_id) VALUES('manifest',true,'default'),('manifest',true,'org_z'); \
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches; \
@@ -1684,15 +1684,14 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         ..Default::default()
     };
     let storage = common::storage();
-    let app = router(
-        AppState::new(
-            pool.clone(),
-            config.clone(),
-            storage.clone(),
-            reqwest::Client::new(),
-        )
-        .unwrap(),
-    );
+    let state = AppState::new(
+        pool.clone(),
+        config.clone(),
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let app = router(state.clone());
     // Incompressible enough to exceed the entire default org's retained quota.
     let mut random = 7u32;
     let large: Vec<u8> = (0..4096)
@@ -1774,8 +1773,8 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         }
         jobs.push((org, id, members));
     }
-    // A downgrade after preparation tests publication admission, not the
-    // earlier per-object transfer size check.
+    // A downgrade after preparation: publication does not check quota, so the
+    // worker still publishes every prepared member, in both organizations.
     sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
         .bind(limit as i64)
         .execute(&pool)
@@ -1800,15 +1799,7 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
     let job = format!("{base}/{id}");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
-            let progress: Value = serde_json::from_slice(&out).unwrap();
-            let blocked = progress["members"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|m| m["publicationError"] == "capacity_blocked")
-                .count();
-            let other = send(
+            let mut visible = send(
                 &app,
                 "GET",
                 &format!("/zeta/manifest/{}.narinfo", "2".repeat(32)),
@@ -1817,91 +1808,7 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
                 vec![],
             )
             .await
-            .0;
-            if blocked == 2 && other == StatusCode::OK {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("an oversized member must not stop smaller members or another org");
-    for (i, expected) in [
-        (0, StatusCode::NOT_FOUND),
-        (1, StatusCode::OK),
-        (2, StatusCode::NOT_FOUND),
-    ] {
-        assert_eq!(
-            send(
-                &app,
-                "GET",
-                &format!("/default/manifest/{}.narinfo", i.to_string().repeat(32)),
-                None,
-                &[],
-                vec![]
-            )
-            .await
-            .0,
-            expected
-        );
-    }
-    // A direct client retry must also clear its blocked status, without a new
-    // authorization generation. The oversized member stays prepared for resume.
-    pool_execute(
-        &pool,
-        "UPDATE orgs SET storage_limit=NULL WHERE id='default'",
-    )
-    .await;
-    let (status, pending) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
-    assert_eq!(status, StatusCode::CREATED, "{pending}");
-    let session = pending["sessions"][2]["sessionId"].as_str().unwrap();
-    let hash = hex::encode(Sha256::digest(&bytes[2]));
-    let (status, _, out) = send(
-        &app,
-        "POST",
-        &format!("/_api/v1/uploads/{session}/inline?fileHash={hash}"),
-        Some(&auth),
-        &[("content-length", &bytes[2].len().to_string())],
-        bytes[2].clone(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&out).unwrap()["published"],
-        true
-    );
-    let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
-    let progress: Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(
-        progress["members"][0]["publicationError"],
-        "capacity_blocked"
-    );
-    assert!(progress["members"][2].get("publicationError").is_none());
-    let (status, _, summary) = send(
-        &app,
-        "GET",
-        &format!("{job}?summary=true"),
-        Some(&auth),
-        &[],
-        vec![],
-    )
-    .await;
-    let summary: Value = serde_json::from_slice(&summary).unwrap();
-    assert_eq!(status, StatusCode::OK, "{summary}");
-    assert_eq!(summary["available"], false);
-    assert_eq!(summary["blocked"], true);
-    assert_eq!(summary["members"], json!([]));
-    // Resume now publishes the retained oversized candidate without another
-    // client upload or finalize request for that object.
-    assert_eq!(
-        post(&app, &format!("{job}/resume"), &auth, json!({}))
-            .await
-            .0,
-        StatusCode::OK
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let mut visible = true;
+            .0 == StatusCode::OK;
             for index in 0..4 {
                 visible &= send(
                     &app,
@@ -1921,16 +1828,28 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         }
     })
     .await
-    .expect("resume must publish retained candidates without another upload");
-    let (status, replay) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
-    assert_eq!(status, StatusCode::CREATED, "{replay}");
-    assert!(
-        replay["sessions"]
-            .as_array()
+    .expect("a storage limit must not stop the worker publishing prepared members");
+    // The serving process runs the evictor too. Stop it, so that what follows
+    // is this test's own deterministic eviction.
+    stop.send(()).unwrap();
+    serving.await.unwrap().unwrap();
+    let used = || async {
+        sqlx::query_scalar::<_, i64>("SELECT sum(size)::bigint FROM caches WHERE org_id='default'")
+            .fetch_one(&pool)
+            .await
             .unwrap()
-            .iter()
-            .all(|s| s["status"] == "completed")
+    };
+    let total: i64 = bytes.iter().map(|b| b.len() as i64).sum();
+    // The org is over its limit, and stays there: a sealed job protects its
+    // published members, so the evictor finds nothing and reports no error.
+    assert_eq!(used().await, total);
+    assert_eq!(
+        snowstead_server::capacity::evict(&state, "default")
+            .await
+            .unwrap(),
+        0
     );
+    assert_eq!(used().await, total);
     let (_, _, out) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
     let progress: Value = serde_json::from_slice(&out).unwrap();
     assert!(
@@ -1938,7 +1857,8 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
             .as_array()
             .unwrap()
             .iter()
-            .all(|m| m.get("publicationError").is_none())
+            .all(|m| m.get("publicationError").is_none()),
+        "{progress}"
     );
     for data in &bytes {
         let hash = hex::encode(Sha256::digest(data));
@@ -1954,8 +1874,42 @@ async fn manifest_worker_splits_capacity_and_resumes_blocked_members(pool: PgPoo
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&download, data);
     }
-    stop.send(()).unwrap();
-    serving.await.unwrap().unwrap();
+    // Replaying the job's sessions starts no upload and is still answered.
+    // A new upload is refused: the org is far past 110% of its limit.
+    let (status, replay) = post(&app, allocate, &auth, json!({"jobId":id,"paths":members})).await;
+    assert_eq!(status, StatusCode::CREATED, "{replay}");
+    assert!(
+        replay["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["status"] == "completed")
+    );
+    let (status, refused) = post(
+        &app,
+        allocate,
+        &auth,
+        json!({"paths":[path_input(&"9".repeat(32), &raw[1], true)]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "Incoming objects exceed retained capacity"
+    );
+    // Once the job's protection lapses, the evictor brings the org back.
+    sqlx::query("UPDATE push_jobs SET authorization_expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let freed = snowstead_server::capacity::evict(&state, "default")
+        .await
+        .unwrap() as i64;
+    assert!(freed > 0);
+    assert_eq!(used().await, total - freed);
+    assert!(used().await <= limit as i64);
+    state.finish_background().await;
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
@@ -2406,6 +2360,9 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
                 .unwrap()
                 .unwrap();
             if scenario == 8 {
+                // Quota is not publication policy. A limit lowered after the
+                // claim neither blocks the member nor fails the turn: the
+                // parent publishes, and the evictor owns the overshoot.
                 let (status, _, bytes) = send(&app, "GET", &job, Some(&auth), &[], vec![]).await;
                 assert_eq!(status, StatusCode::OK);
                 let progress: Value = serde_json::from_slice(&bytes).unwrap();
@@ -2414,21 +2371,36 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
                         .as_array()
                         .unwrap()
                         .iter()
-                        .any(|m| m["storePathHash"] == parent_hash
-                            && m["publicationError"] == "capacity_blocked")
+                        .all(|m| m.get("publicationError").is_none()),
+                    "{progress}"
                 );
-            } else {
-                let failures: i32 =
-                    sqlx::query_scalar("SELECT work_failures FROM push_jobs WHERE id=$1")
-                        .bind(id)
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
-                assert!(
-                    failures > 0,
-                    "scenario {scenario} must exercise a rejected publication turn"
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM published_paths WHERE store_path_hash=$1",
+                    )
+                    .bind(&parent_hash)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                    1
                 );
+                pool_execute(
+                    &pool,
+                    "UPDATE orgs SET storage_limit=NULL WHERE id='default'",
+                )
+                .await;
+                continue;
             }
+            let failures: i32 =
+                sqlx::query_scalar("SELECT work_failures FROM push_jobs WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                failures > 0,
+                "scenario {scenario} must exercise a rejected publication turn"
+            );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT count(*) FROM published_paths WHERE store_path_hash=$1",
@@ -4116,6 +4088,25 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
         upload_inline(&app, "main", path_input(&new_hash, &raw_new, true), &new).await["published"],
         true
     );
+    // Publication passes the limit without evicting. The evictor then removes
+    // exactly the unpinned least recently used path, and has no more to do.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(
+        snowstead_server::capacity::evict(&state, "default")
+            .await
+            .unwrap(),
+        evict.len() as u64
+    );
+    assert_eq!(
+        snowstead_server::capacity::evict(&state, "default")
+            .await
+            .unwrap(),
+        0
+    );
     let kept: Vec<String> =
         sqlx::query_scalar("SELECT store_path_hash FROM published_paths ORDER BY store_path_hash")
             .fetch_all(&pool)
@@ -4173,15 +4164,32 @@ async fn capacity_pins_and_corrupt_uploads_fail_without_exposure(pool: PgPool) {
             .unwrap();
     assert_eq!(reason, "capacity");
     sqlx::query("INSERT INTO pin_paths(revision_id,cache_id,store_path_hash) SELECT 'rev',id,$1 FROM caches").bind(&new_hash).execute(&pool).await.unwrap();
-    let denied = upload_inline(
+    // The organization is exactly at its limit and every retained byte is
+    // pinned: an upload cannot start, because eviction could never make room.
+    let (status, denied) = post(
         &app,
-        "main",
-        path_input(&"5".repeat(32), &raw_new, true),
-        &new,
+        "/_api/v1/caches/main/upload-streams/batch",
+        "legacy",
+        json!({"paths":[path_input(&"5".repeat(32), &raw_new, true)]}),
     )
     .await;
-    assert_eq!(denied["published"], false);
-    assert_eq!(denied["status"], 413);
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{denied}");
+    assert_eq!(
+        denied["error"],
+        "Insufficient evictable capacity; delete retained paths first"
+    );
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_sessions WHERE status='streaming'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 0);
+    // With one evictable path left, the same organization may start uploads.
+    sqlx::query("DELETE FROM pin_paths WHERE store_path_hash=$1")
+        .bind(&new_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
     let mut corrupt = path_input(&"6".repeat(32), &raw_new, true);
     corrupt["narHash"] = json!(format!("sha256:{}", "0".repeat(64)));
     let denied = upload_inline(&app, "main", corrupt, &new).await;
@@ -4985,7 +4993,9 @@ async fn batch_shared_bytes_preserve_public_and_private_delivery_after_queued_cl
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 #[ignore = "requires scripts/with-r2.sh disposable S3 endpoint"]
-async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollback(pool: PgPool) {
+async fn independent_publishers_reuse_candidates_after_rollback_and_publish_over_quota(
+    pool: PgPool,
+) {
     use std::time::Duration;
 
     pool_execute(
@@ -5124,7 +5134,7 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
     )
     .await;
 
-    // Pause A after capacity admission, while it still owns the org fence.
+    // Pause A inside its publication, while it still owns the org fence.
     // Disable only this test trigger's lock timeout, so the barrier does not
     // depend on the host completing an assertion within the production timeout.
     pool_execute(
@@ -5196,8 +5206,9 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["results"][0]["published"], true, "{result}");
 
-    // B needs to evict A. A later SQL error must roll back that eviction and
-    // preserve B's ready candidate, not merely return a failed item result.
+    // B would take the org past its limit, which publication no longer checks.
+    // A SQL error must roll B back whole and preserve its ready candidate, not
+    // merely return a failed item result, and must leave A published.
     pool_execute(
         &pool,
         "DROP TRIGGER pause_publication ON published_paths;
@@ -5243,8 +5254,9 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
             .unwrap(),
         1
     );
-    // Pinning A makes B inadmissible. Raising the limit to the exact combined
-    // size then admits B, still without its deleted staging bytes.
+    // Pinning A leaves nothing evictable. Publication does not recheck quota:
+    // B still publishes, without its deleted staging bytes, and the org stays
+    // over its limit until the evictor runs.
     let (status, result) = post(&apps[0], "/_api/v1/orgs/default/caches/main/pins", OWNER,
         json!({"name":"release","storePath":format!("/nix/store/{}-fixture", "a".repeat(32)),"keep":"forever"})).await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
@@ -5257,23 +5269,9 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["results"][0]["status"], 413, "{result}");
-    sqlx::query("UPDATE orgs SET storage_limit=$1 WHERE id='default'")
-        .bind(total)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let (status, result) = post(
-        &apps[1],
-        "/_api/v1/uploads/finalize",
-        "legacy",
-        json!({"uploads":[receipts[1]]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["results"][0]["published"], true, "{result}");
     for (index, receipt) in receipts.iter().enumerate() {
-        // Replay through the other instance must not charge or prepare again.
+        // Replay through the other instance must not publish or prepare again.
         let (status, result) = post(
             &apps[1 - index],
             "/_api/v1/uploads/finalize",
@@ -5329,6 +5327,28 @@ async fn independent_publishers_recheck_quota_and_reuse_candidates_after_rollbac
             .unwrap(),
         0
     );
+    // The evictor brings the org back to its limit. A is pinned, so the only
+    // evictable path is B, although it is the most recently published.
+    let evictor = AppState::new(
+        pool.clone(),
+        Config::default(),
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        snowstead_server::capacity::evict(&evictor, "default")
+            .await
+            .unwrap(),
+        files[1].len() as u64
+    );
+    let retained: (i64, i64) =
+        sqlx::query_as("SELECT sum(path_count)::bigint,sum(size)::bigint FROM caches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, (1, files[0].len() as i64));
+    evictor.finish_background().await;
     for independent in pools {
         independent.close().await;
     }

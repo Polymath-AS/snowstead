@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT storage_limit\n        FROM orgs\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "storage_limit",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "storage_limit"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "bb9ec6e7a779862dc2d84ee086f124695d2d1060ad352f53614adb8588c8bec0"
+}

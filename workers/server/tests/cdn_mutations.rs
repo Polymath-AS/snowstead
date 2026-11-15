@@ -153,8 +153,7 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_queue_no_narin
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'nix' FROM caches;
         INSERT INTO blob_objects(file_hash,file_size,compression,r2_key) VALUES(repeat('a',64),500,'none','nar/old');
         INSERT INTO published_paths(cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,last_pushed_at)
-        SELECT c.id,repeat('1',32),'/nix/store/11111111111111111111111111111111-old','sha256:'||repeat('0',64),500,b.id,'2000-01-01' FROM caches c CROSS JOIN blob_objects b;
-        UPDATE orgs SET storage_limit=300 WHERE id='default';")
+        SELECT c.id,repeat('1',32),'/nix/store/11111111111111111111111111111111-old','sha256:'||repeat('0',64),500,b.id,'2000-01-01' FROM caches c CROSS JOIN blob_objects b;")
         .execute(&pool).await.unwrap();
     let old_hash = "1".repeat(32);
     storage
@@ -193,6 +192,12 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_queue_no_narin
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let id = created["sessions"][0]["sessionId"].as_str().unwrap();
+    // The limit drops below the retained 500 bytes once the upload has started:
+    // upload start refuses an organization this far over its limit.
+    sqlx::query("UPDATE orgs SET storage_limit=300 WHERE id='default'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -215,6 +220,19 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_queue_no_narin
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     assert_eq!(result["published"], true, "{result}");
+    // Publication does not evict. The evictor withdraws the old path afterwards.
+    assert_eq!(
+        read(&app, &format!("/main/{old_hash}.narinfo"), false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        snowstead_server::capacity::evict(&state, "default")
+            .await
+            .unwrap(),
+        500
+    );
     let (status, metadata) = read(&app, &format!("/main/{hash}.narinfo"), false).await;
     assert_eq!(status, StatusCode::OK, "{metadata}");
     assert!(metadata.contains(&format!("StorePath: /nix/store/{hash}-new")));

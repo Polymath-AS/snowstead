@@ -21,7 +21,6 @@ pub(crate) struct Claim {
     pub org: String,
     pub identity: Identity,
     pub members: i32,
-    pub member: Option<String>,
     failures: i32,
 }
 
@@ -86,11 +85,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
             }
         }
     }
-    match published {
-        // Splitting a group or skipping one blocked member also advances work.
-        Err(error) if error.status == StatusCode::PAYLOAD_TOO_LARGE => Ok(true),
-        result => result.map(|count| count > 0),
-    }
+    published.map(|count| count > 0)
 }
 
 async fn discover(state: &AppState, after: &str) -> Result<Option<String>, ApiError> {
@@ -175,7 +170,6 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
             expires_at: None,
         }),
         members: grant.work_members,
-        member: None,
         failures: grant.work_failures,
     }))
 }
@@ -230,20 +224,10 @@ async fn release(
     sqlx::query("SET LOCAL statement_timeout='1s'")
         .execute(&mut *tx)
         .await?;
-    let capacity = result
-        .as_ref()
-        .is_err_and(|e| e.status == StatusCode::PAYLOAD_TOO_LARGE);
-    let members = if capacity && claim.members > 1 {
-        claim.members / 2
-    } else if capacity {
-        16
-    } else {
-        claim.members
-    };
     let blocked = result
         .as_ref()
-        .is_err_and(|e| matches!(e.status.as_u16(), 400 | 401 | 403 | 404 | 507));
-    let waiting = !capacity && !matches!(result, Ok(n) if *n > 0);
+        .is_err_and(|e| matches!(e.status.as_u16(), 400 | 401 | 403 | 404));
+    let waiting = !matches!(result, Ok(n) if *n > 0);
     let failures = if waiting {
         (claim.failures + 1).min(6)
     } else {
@@ -257,11 +241,9 @@ async fn release(
         0
     };
     sqlx::query(
-        "WITH released AS (UPDATE push_jobs SET work_id=NULL,work_expires_at=NULL,work_blocked=$4, \
+        "UPDATE push_jobs SET work_id=NULL,work_expires_at=NULL,work_blocked=$4, \
         work_failures=$5,work_at=clock_timestamp()+$6*INTERVAL '1 millisecond',work_members=$7 \
-        WHERE id=$1 AND work_id=$2 AND grant_generation=$3 RETURNING id,grant_generation) \
-        UPDATE push_job_members m SET blocked_generation=r.grant_generation,publication_error='capacity_blocked' \
-        FROM released r WHERE m.job_id=r.id AND m.session_id=$8 AND $9",
+        WHERE id=$1 AND work_id=$2 AND grant_generation=$3",
     )
     .bind(&claim.job)
     .bind(&claim.id)
@@ -269,9 +251,7 @@ async fn release(
     .bind(blocked)
     .bind(failures)
     .bind(delay as f64)
-    .bind(members)
-    .bind(&claim.member)
-    .bind(capacity && claim.members == 1)
+    .bind(claim.members)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -354,7 +334,6 @@ mod tests {
                 expires_at: None,
             }),
             members: 16,
-            member: None,
             failures: 0,
         };
         (state, claim)

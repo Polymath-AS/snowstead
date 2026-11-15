@@ -53,7 +53,7 @@ pub mod auth;
 pub mod authz;
 mod cache;
 mod cache_host;
-mod capacity;
+pub mod capacity;
 pub mod cdn;
 pub mod config;
 mod db;

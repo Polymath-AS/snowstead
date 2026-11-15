@@ -213,9 +213,9 @@ needed. Purges do not clear client caches or revoke public bytes already shared.
 Nix publication first records ownership of a unique destination key and
 protects its source. Storage copying runs outside SQL transactions and does
 not reserve retained capacity. A short SQL transaction then checks ownership,
-expiry, current policy, and signing configuration, admits retained capacity,
-and atomically adopts the bucket pointer, publishes the path, and saves the
-completion receipt. Replaying that receipt does not republish withdrawn paths.
+expiry, current policy, and signing configuration, and atomically adopts the
+bucket pointer, publishes the path, and saves the completion receipt. It does
+not check or enforce the storage limit. Replaying that receipt does not republish withdrawn paths.
 A stale attempt cannot adopt its object or overwrite published bytes.
 
 These are SQL-only, fail-fast decisions, not literal lock freedom.
@@ -232,12 +232,25 @@ The CLI retries explicit session-creation 503 responses up to four attempts,
 but does not replay a lost creation response. The Go helper retries uploads
 marked `503` with `Retry-After: 1` before opening its circuit breaker.
 
-Capacity remains logical and shared across Nix, Go, and sccache. Admission
-counts committed retained entries, separately from staging budgets.
-LRU ordering still uses the later of publication and access, with existing
-pin and active-upload protections. Direct CDN downloads do not update access.
-Quota eviction and publication commit together after storage preparation.
-Failed preparation or a rolled-back publication does not evict existing content.
+Capacity remains logical and shared across Nix, Go, and sccache, and counts
+committed retained entries separately from staging budgets. The storage limit
+is eventually consistent. Publication commits without checking it and wakes a
+background evictor, which also scans every 30 seconds for organizations over
+their limit. The evictor removes least-recently-used entries in its own
+bounded transactions, at most 256 entries each, until the organization is at
+or under its limit. LRU ordering still uses the later of publication and
+access, with existing pin, push-job, and active-upload protections; an
+organization whose remaining entries are all protected stays over its limit
+until a protection ends. An organization can therefore exceed its limit
+briefly, and the most recent publication is evicted like any other entry when
+nothing older is evictable. Direct CDN downloads do not update access.
+
+New uploads are refused with 413 when they start, at Nix session creation and
+at a Go or sccache reservation, once usage is at or above 110% of the limit,
+or at or above the limit while pinned and job-protected paths alone fill it.
+Sessions and reservations that already exist continue, and a batch larger than
+the whole limit is still refused with 413 before any member publishes. The CLI
+does not retry a 413: retry the push after eviction, or delete retained paths.
 
 Deletion, retention, and eviction withdraw SQL visibility atomically and queue
 known exact keys for asynchronous cleanup. Storage failure does not roll back
@@ -585,12 +598,12 @@ without an org are its tokens.
   anything: `ci-*` reaches every cache starting with `ci-`, including
   ones made later, and `*` reaches them all. A push names its cache within
   the token's org, so `snowstead push main` pushes to that org's `main`.
-- **Storage limits.** Verified Nix candidates do not reserve retained capacity.
-  A short SQL transaction admits current usage, evicts eligible LRU entries
-  across products, publishes pointers, and records completion together. Failed
-  preparation or publication does not evict existing content. Staging has its
-  own budget; retained admission can fail after uploads finish. A publication
-  needing more than 256 evictions must first delete retained paths explicitly.
+- **Storage limits.** Limits are eventually consistent. Publication does not
+  check them: a background evictor removes eligible LRU entries across products
+  afterwards, so usage can briefly exceed the limit. New uploads are refused
+  with 413 at 110% of the limit, or at the limit when only pinned or
+  job-protected paths remain; delete retained paths explicitly in that case.
+  Staging has its own budget.
 - **Admission.** Rust does not retain the Worker's per-minute request caps.
   Storage limits, staging safeguards, and bounded runtime resources still apply.
 - **Bandwidth.** `GET /orgs/:org` reports `servedThisMonth` for the current UTC
@@ -690,7 +703,7 @@ For Nix, `key` is the full store path; for Go/sccache it is the action key.
 publication and access, then product and entry ID. It excludes pinned closures,
 active Nix uploads/installations, and expired/obsolete action entries. It is
 an advisory preview, not a reservation: row locks, accesses, and uploads can
-change what admission actually removes. Each response uses a consistent DB
+change what the evictor actually removes. Each response uses a consistent DB
 snapshot; subsequent pages are live views, not a frozen multi-request snapshot.
 `bytesToFree` is `max(used - storageLimit, 0)`, or zero for unlimited storage;
 it excludes pending transfers and hypothetical future uploads. Candidates are

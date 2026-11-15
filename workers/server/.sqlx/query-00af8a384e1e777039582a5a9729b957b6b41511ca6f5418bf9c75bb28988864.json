@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT o.id\n        FROM orgs o\n        WHERE o.storage_limit IS NOT NULL\n            AND ($1::text IS NULL OR o.id = $1)\n            AND o.storage_limit < (\n                SELECT COALESCE(SUM(n), 0)\n                FROM (\n                    SELECT c.size AS n\n                    FROM caches c\n                    WHERE c.org_id = o.id\n                    UNION ALL\n                    SELECT e.size\n                    FROM go_entries e\n                    JOIN caches c ON c.id = e.cache_id\n                    WHERE c.org_id = o.id\n                        AND e.generation = c.go_generation\n                        AND e.uploaded_at IS NOT NULL\n                        AND e.expires_at > NOW()\n                    UNION ALL\n                    SELECT e.size\n                    FROM sccache_entries e\n                    JOIN caches c ON c.id = e.cache_id\n                    WHERE c.org_id = o.id\n                        AND e.generation = c.sccache_generation\n                        AND e.uploaded_at IS NOT NULL\n                        AND e.expires_at > NOW()\n                ) usage\n            )\n        ORDER BY o.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "00af8a384e1e777039582a5a9729b957b6b41511ca6f5418bf9c75bb28988864"
+}

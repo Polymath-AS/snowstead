@@ -735,6 +735,16 @@ async fn reserve(
     if limit.is_some_and(|n| size > n as u64) {
         return Err(too_large());
     }
+    // A new or growing reservation is a new upload. Replays returned above.
+    if let Some(limit) = limit {
+        crate::capacity::admit_upload(
+            &mut tx,
+            &target.org,
+            limit,
+            "Artifact exceeds retained capacity",
+        )
+        .await?;
+    }
     let staging = match product {
         Product::Go => {
             sqlx::query_as!(
@@ -1034,7 +1044,6 @@ async fn finish(
     attempt: Option<Transfer>,
 ) -> Result<Response, ApiError> {
     let id = &expected.id;
-    let kind = product.name();
     let mut tx = crate::profile_future!(
         crate::db::begin(state, &target.org),
         label = "artifacts.adopt_pool_begin"
@@ -1126,29 +1135,8 @@ async fn finish(
     )
     .await?;
     org_lock(&mut tx, &target.org).await?;
-    let limit = policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
+    policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
-    if let Some(limit) = limit {
-        crate::capacity::admit(
-            &mut tx,
-            &target.org,
-            limit,
-            if entry.uploaded_at.is_none() {
-                entry.size
-            } else {
-                0
-            },
-            &[(target.cache_id, format!("{kind}:{id}"))],
-        )
-        .await
-        .map_err(|e| {
-            if e.status == StatusCode::SERVICE_UNAVAILABLE {
-                e.header(header::RETRY_AFTER, HeaderValue::from_static("1"))
-            } else {
-                e
-            }
-        })?;
-    }
     if entry.uploaded_at.is_none() {
         let stored = entry
             .stored_at
@@ -1187,6 +1175,8 @@ async fn finish(
         };
     }
     tx.commit().await?;
+    // Publication never checks quota. Eviction follows the commit.
+    state.evictions.request(&target.org);
     Ok((
         if won && attempt.as_ref().is_some_and(|t| t.created) {
             StatusCode::CREATED

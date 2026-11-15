@@ -597,6 +597,16 @@ async fn create(
         .collect();
     let sizes: Vec<_> = rows.iter().map(|(_, _, _, size)| *size as i32).collect();
     if !rows.is_empty() {
+        // Replaying sessions a job already owns starts no new upload.
+        if let Some(limit) = capacity {
+            crate::capacity::admit_upload(
+                &mut tx,
+                identity.org(),
+                limit,
+                "Incoming objects exceed retained capacity",
+            )
+            .await?;
+        }
         sqlx::query!(
             r#"
         INSERT INTO upload_sessions (
@@ -1480,8 +1490,8 @@ fn nar(s: &Session) -> Result<signing::Narinfo, ApiError> {
     })
 }
 
-/// Own an immutable destination before I/O. This does not admit retained bytes
-/// or evict anything: both decisions belong to the publication transaction.
+/// Own an immutable destination before I/O. This neither admits retained bytes
+/// nor evicts anything: upload start refuses, and the evictor follows publication.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn allocate_candidate(
     state: &AppState,
@@ -1552,9 +1562,8 @@ async fn publish(
     state: &AppState,
     identity: &Identity,
     ready: &Prepared,
-    protect: &[(i32, String)],
 ) -> Result<UploadResult, ApiError> {
-    Ok(publish_group(state, identity, &[ready], protect, None)
+    Ok(publish_group(state, identity, &[ready], None)
         .await?
         .remove(0))
 }
@@ -1580,7 +1589,6 @@ async fn publish_group(
     state: &AppState,
     identity: &Identity,
     ready: &[&Prepared],
-    protect: &[(i32, String)],
     claim: Option<&crate::push_job_worker::Claim>,
 ) -> Result<Vec<UploadResult>, ApiError> {
     let org = &ready[0].session.org_id;
@@ -1615,11 +1623,12 @@ async fn publish_group(
     .bind(&cache_ids)
     .fetch_all(&mut *tx)
     .await?;
-    let limit: Option<i64> =
-        sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1 FOR SHARE NOWAIT")
-            .bind(org)
-            .fetch_one(&mut *tx)
-            .await?;
+    // The limit is not read here: quota is the evictor's. The row lock still
+    // holds the private-cache policy the reloaded sessions are checked against.
+    sqlx::query("SELECT 1 FROM orgs WHERE id=$1 FOR SHARE NOWAIT")
+        .bind(org)
+        .fetch_one(&mut *tx)
+        .await?;
     let ids: Vec<_> = ready.iter().map(|p| p.session.id.clone()).collect();
     let sessions: HashMap<_, _> = load_sessions(&mut *tx, &ids, identity)
         .await?
@@ -1750,26 +1759,11 @@ async fn publish_group(
     .fetch_all(&mut *tx)
     .await?;
     let mut seen: HashSet<_> = existing.into_iter().collect();
-    let mut bytes = 0i64;
     for item in &incoming {
         let s = item.session;
-        let path = (s.cache_id, s.store_path_hash.clone());
-        if seen.insert(path) {
-            bytes = bytes.saturating_add(s.file_size);
-        } else {
+        if !seen.insert((s.cache_id, s.store_path_hash.clone())) {
             results[item.ordinal].already_existed = true;
         }
-    }
-    if let Some(limit) = limit {
-        let mut protected = protect.to_vec();
-        // Keep earlier successes from the same durable batch through retries.
-        let batch_paths: Vec<(i32, String)> = sqlx::query_as(
-            "SELECT u.cache_id,u.store_path_hash FROM upload_finalizations f \
-             JOIN upload_sessions u ON u.id=f.session_id JOIN caches c ON c.id=u.cache_id \
-             WHERE c.org_id=$2 AND f.batch_id IN (SELECT batch_id FROM upload_finalizations WHERE session_id=ANY($1))",
-        ).bind(&ids).bind(org).fetch_all(&mut *tx).await?;
-        protected.extend(batch_paths);
-        crate::capacity::admit(&mut tx, org, limit, bytes, &protected).await?;
     }
     // Deduplicate blobs separately from paths: multiple paths may share bytes,
     // and one batch may need both public and private pointers to those bytes.
@@ -1848,6 +1842,8 @@ async fn publish_group(
     match result {
         Ok(results) => {
             tx.commit().await?;
+            // Publication never checks quota. Eviction follows the commit.
+            state.evictions.request(org);
             Ok(results)
         }
         Err(error) => {
@@ -2035,12 +2031,10 @@ pub(crate) async fn publish_job(
     }
     let count = ready.len();
     claim.members = count as i32;
-    claim.member = (count == 1).then(|| ready[0].session.id.clone());
     publish_group(
         state,
         &claim.identity,
         &ready.iter().collect::<Vec<_>>(),
-        &[],
         Some(claim),
     )
     .await?;
@@ -2327,7 +2321,6 @@ async fn publish_prepared(
     state: &AppState,
     identity: &Identity,
     ready: Prepared,
-    protect: Vec<(i32, String)>,
 ) -> Result<UploadResult, ApiError> {
     if ready.session.status == UploadStatus::Completed {
         return Ok(completed_result(&ready.session));
@@ -2341,7 +2334,7 @@ async fn publish_prepared(
         .spawn(crate::profile_future!(
             async move {
                 let ready = finish_preparation(&owned, &identity, ready).await?;
-                publish(&owned, &identity, &ready, &protect).await
+                publish(&owned, &identity, &ready).await
             },
             label = "uploads.publication"
         ))
@@ -2509,7 +2502,7 @@ async fn publish_batch(
     for (index, p) in ready {
         if p.session.status == UploadStatus::Completed {
             let id = p.session.id.clone();
-            results[index] = result_value(&id, publish_prepared(state, identity, p, vec![]).await);
+            results[index] = result_value(&id, publish_prepared(state, identity, p).await);
         } else {
             pending.push((index, p));
         }
@@ -2536,10 +2529,6 @@ async fn publish_batch(
             }
         }
     }
-    let protect: Vec<_> = ready
-        .iter()
-        .map(|(_, p)| (p.session.cache_id, p.session.store_path_hash.clone()))
-        .collect();
     let owned = state.clone();
     let identity = identity.clone();
     // Own inline allocation through publication too, including later groups
@@ -2578,7 +2567,7 @@ async fn publish_batch(
                     .collect();
                 for chunk in group.chunks(16) {
                     let members: Vec<_> = chunk.iter().map(|(_, p)| p).collect();
-                    match publish_group(&owned, &identity, &members, &protect, None).await {
+                    match publish_group(&owned, &identity, &members, None).await {
                         Ok(outcomes) => {
                             for ((index, _), result) in chunk.iter().zip(outcomes) {
                                 results[*index] = Some(result);
@@ -2591,7 +2580,7 @@ async fn publish_batch(
                             for (index, p) in chunk {
                                 results[*index] = result_value(
                                     &p.session.id,
-                                    publish(&owned, &identity, p, &protect).await,
+                                    publish(&owned, &identity, p).await,
                                 );
                             }
                         }
@@ -2840,11 +2829,7 @@ async fn inline(
                 .await
                 .map_err(|_| error(500, "Preparation failed"))?;
         }
-        let protect = vec![(
-            ready.session.cache_id,
-            ready.session.store_path_hash.clone(),
-        )];
-        publish_prepared(state, identity, ready, protect).await
+        publish_prepared(state, identity, ready).await
     }
     .await;
     Ok(respond(StatusCode::OK, &result_value(id, result)))
