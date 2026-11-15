@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT moving_from\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE NOWAIT\n        ",
+  "query": "\n        SELECT storage_limit\n        FROM orgs\n        WHERE id = $1\n        FOR SHARE\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "moving_from",
-        "type_info": "Text",
+        "name": "storage_limit",
+        "type_info": "Int8",
         "origin": {
           "Table": {
             "table": "orgs",
-            "name": "moving_from"
+            "name": "storage_limit"
           }
         }
       }
@@ -24,5 +24,5 @@
       true
     ]
   },
-  "hash": "03d78cf0f435bf1c3f40b04bb0f613242d630e3e5c385af7485d5f77c140cad4"
+  "hash": "97409c0232ec739fb8190b2a9e0ce100364dc35ef426a1e2a1c33bfe9a509fdb"
 }

@@ -216,12 +216,16 @@ async fn revoke_token(
         512,
         "reason exceeds maximum length",
     )?;
-    let token_org: String = sqlx::query_scalar(
-        "SELECT COALESCE(org_id,'default') FROM api_tokens WHERE jti=$1 AND ($2::text IS NULL OR org_id=$2)",
-    ).bind(&jti).bind(org).fetch_optional(&state.pool).await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Token not found or already revoked"))?;
-    let mut tx = crate::db::begin(&state, &token_org).await?;
-    crate::db::advisory_lock(&mut tx, &format!("org:{token_org}")).await?;
+    let mut tx = crate::db::begin(&state).await?;
+    // The jobs this token authorizes come first, in ID order, as every job
+    // writer and publisher locks a job before its token. Whoever acts on the
+    // token's authority shares its row until they commit: the update below
+    // waits for them, and anything that starts later reads it revoked. So
+    // once this returns, nothing more commits on this token's authority.
+    sqlx::query("SELECT FROM push_jobs WHERE authorization_jti=$1 ORDER BY id FOR NO KEY UPDATE")
+        .bind(&jti)
+        .execute(&mut *tx)
+        .await?;
     let changed = sqlx::query!(
         r#"
                 UPDATE api_tokens
@@ -481,7 +485,8 @@ async fn create_token(
         ),
     };
     let org = scope.or(requested_org).unwrap_or("default");
-    let mut tx = state.pool.begin().await?;
+    // The key share locks below wait for a cache deletion; bound that wait.
+    let mut tx = crate::db::begin(&state).await?;
     let literals: Vec<_> = caches
         .iter()
         .filter(|entry| !entry.contains('*'))

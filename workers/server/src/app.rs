@@ -42,8 +42,6 @@ pub struct AppState {
     pub(crate) verification_slots: Arc<Semaphore>,
     pub(crate) preparation_slots: Arc<Semaphore>,
     pub(crate) manifest_slots: Arc<Semaphore>,
-    pub(crate) sql_waiters: Arc<Semaphore>,
-    pub(crate) sql_writers: Arc<crate::db::Writers>,
     /// Organizations whose retained usage may have grown since eviction.
     pub(crate) evictions: Arc<crate::capacity::Wakes>,
     pub(crate) cdn: Option<Arc<dyn cdn::PurgeTransport>>,
@@ -77,8 +75,6 @@ impl AppState {
         Ok(Self {
             cdn: None,
             read_pool: pool.clone(),
-            sql_waiters: Arc::new(Semaphore::new(pool.options().get_max_connections() as usize)),
-            sql_writers: Arc::default(),
             evictions: Arc::default(),
             pool,
             storage,

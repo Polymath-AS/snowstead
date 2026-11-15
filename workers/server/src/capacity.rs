@@ -76,8 +76,8 @@ pub async fn run(state: AppState, stopped: CancellationToken, period: Duration) 
 }
 
 /// Organizations whose retained usage exceeds their limit, or only `org`.
-/// Unfenced and therefore a hint: each eviction pass recomputes under the
-/// organization fence.
+/// Unlocked and therefore a hint: each eviction pass recomputes under its
+/// lease.
 async fn over_limit(pool: &sqlx::PgPool, org: Option<&str>) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar!(
         r#"
@@ -230,11 +230,17 @@ struct Pass {
 }
 
 /// Bring `org` back to its limit, least recently used first, and return the
-/// bytes freed. Each pass is its own transaction under the organization fence
-/// and removes at most 256 entries; passes repeat while the organization is
-/// still over and the last one removed something. Ending over the limit is not
-/// an error: whatever remains is pinned, job-protected, being uploaded, or
-/// locked by another writer, and the next wake or tick tries again.
+/// bytes freed. Each pass is its own transaction and removes at most 256
+/// entries; passes repeat while the organization is still over and the last
+/// one removed something. Ending over the limit is not an error: whatever
+/// remains is pinned, job-protected, being uploaded, or locked by another
+/// writer, and the next wake or tick tries again.
+///
+/// One evictor works on an organization at a time. A pass holds the
+/// `evict:<org>` advisory lock for its transaction, and a caller that finds
+/// it held returns without evicting: two passes that read the same usage
+/// would otherwise each remove the whole overage. Nothing else takes this
+/// lock. It is a worker lease, not a write fence.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 pub async fn evict(state: &AppState, org: &str) -> anyhow::Result<u64> {
     evict_until(state, org, &CancellationToken::new()).await
@@ -245,7 +251,7 @@ async fn evict_until(
     org: &str,
     stopped: &CancellationToken,
 ) -> anyhow::Result<u64> {
-    // Most wakes find nothing to do. Decide that without the fence.
+    // Most wakes find nothing to do. Decide that without a transaction.
     if over_limit(&state.pool, Some(org)).await?.is_empty() {
         return Ok(0);
     }
@@ -265,13 +271,22 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         freed: 0,
         over,
     };
-    let mut tx = db::begin(state, org).await?;
-    db::advisory_lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = db::begin(state).await?;
+    if !db::try_advisory_lock(&mut tx, &format!("evict:{org}")).await? {
+        // Another evictor, here or on another instance, is working on it.
+        tx.rollback().await?;
+        return Ok(idle(false));
+    }
+    // Share the organization's policy row like every other dependent of it:
+    // a limit change in flight is waited for and then read, and a later one
+    // waits for this pass. A raised limit that has been acknowledged is never
+    // evicted against.
     let limit = sqlx::query_scalar!(
         r#"
         SELECT storage_limit
         FROM orgs
         WHERE id = $1
+        FOR SHARE
         "#,
         org,
     )
@@ -282,13 +297,15 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         tx.rollback().await?;
         return Ok(idle(false));
     };
-    let used = usage(&mut tx, org).await?;
-    if used <= limit {
+    // A hint, to skip the candidate scan. The usage this pass acts on is read
+    // again below, once nothing else can remove a path.
+    if usage(&mut tx, org).await? <= limit {
         tx.rollback().await?;
         return Ok(idle(false));
     }
-    // A bounded LRU candidate list, then three batched row-lock statements.
-    // SKIP LOCKED excludes work being moved by another product's transfer.
+    // A bounded LRU candidate list, then the caches' rows, then three batched
+    // row-lock statements. SKIP LOCKED excludes work being moved by another
+    // product's transfer.
     let candidates = sqlx::query_as!(
         Victim,
         r#"
@@ -367,6 +384,31 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
     )
     .fetch_all(&mut *tx)
     .await?;
+    if candidates.is_empty() {
+        tx.rollback().await?;
+        return Ok(idle(true));
+    }
+    // Every cache of the organization, in ID order, before any victim. This
+    // is the totals lock every writer of a cache's paths takes first, so from
+    // here no publication, pin, retention pass, deletion, or withdrawal in
+    // the organization commits until this pass does. The usage read next is
+    // therefore what this pass may act on: an overage someone else already
+    // removed is not removed again. The predicates below are read after, and
+    // hold against, the same writers: a pin holds its cache FOR UPDATE until
+    // it commits, and a job authorization takes its cache's totals. For
+    // compiler entries this orders the pass against a generation reset. It
+    // does not conflict with the key share locks uploads and publications
+    // hold on policy, and is held only for the statements below, not for
+    // the candidate scan above.
+    sqlx::query("SELECT FROM caches WHERE org_id=$1 ORDER BY id FOR NO KEY UPDATE")
+        .bind(org)
+        .execute(&mut *tx)
+        .await?;
+    let used = usage(&mut tx, org).await?;
+    if used <= limit {
+        tx.rollback().await?;
+        return Ok(idle(false));
+    }
     let mut available = HashSet::new();
     let nix: Vec<i64> = candidates
         .iter()
@@ -497,10 +539,33 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         .map(|v| v.id.parse().expect("database bigint"))
         .collect();
     if !ids.is_empty() {
+        // Deleting a path aborts its unfinished sessions, in a trigger. Take
+        // those rows here, in ID order, as every other bulk abort does. None
+        // of them is active: a path with an upload in flight is no victim.
+        sqlx::query(
+            "SELECT FROM upload_sessions u WHERE u.status<>'completed' AND EXISTS ( \
+             SELECT 1 FROM published_paths e WHERE e.id=ANY($1) AND e.cache_id=u.cache_id \
+             AND e.store_path_hash=u.store_path_hash) ORDER BY u.id FOR NO KEY UPDATE OF u",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        // An upload that started since the victims were chosen keeps its
+        // path: the trigger would abort that session with it.
         sqlx::query!(
             r#"
-            DELETE FROM published_paths
-            WHERE id = ANY($1)
+            DELETE FROM published_paths e
+            WHERE e.id = ANY($1)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM upload_sessions u
+                    WHERE u.cache_id = e.cache_id
+                        AND u.store_path_hash = e.store_path_hash
+                        AND (
+                            u.status = 'finalizing'
+                            OR (u.status IN ('pending', 'uploading', 'streaming') AND u.expires_at > NOW())
+                        )
+                )
             "#,
             &ids,
         )

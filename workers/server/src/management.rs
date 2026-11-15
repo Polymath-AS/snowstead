@@ -1033,13 +1033,14 @@ async fn put_org(
         ));
     }
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, id),
+        crate::db::begin(state),
         label = "management.put_org_pool_begin"
     )
     .await?;
     // Slug uniqueness spans slug and moving_from, not just either index.
-    // Serialize claims before taking the org lock; protocol writers never
-    // acquire this namespace lock, so they cannot form a lock cycle.
+    // Serialize claims before taking the org row; protocol writers never
+    // acquire this namespace lock, so they cannot form a lock cycle. Creating
+    // an org always names a slug, so two creations never run at once.
     if raw.get("slug").is_some() {
         crate::profile_future!(
             crate::db::advisory_lock(&mut tx, "org-slugs"),
@@ -1047,15 +1048,11 @@ async fn put_org(
         )
         .await?;
     }
-    let org_key = format!("org:{id}");
-    crate::profile_future!(
-        crate::db::advisory_lock(&mut tx, &org_key),
-        label = "management.put_org_lock_wait"
-    )
-    .await?;
     // Compare the version on the locked row, so the comparison and the write
     // see the same row. Stale registrations cannot change slugs either; equal
-    // versions are safe transport retries.
+    // versions are safe transport retries. Every reader that depends on this
+    // row's policy shares it, so the lock also waits for uploads, publications,
+    // and cache changes decided under the old policy.
     let current = sqlx::query!(
         r#"
         SELECT
@@ -1064,7 +1061,7 @@ async fn put_org(
             limits_version
         FROM orgs
         WHERE id = $1
-        FOR UPDATE NOWAIT
+        FOR UPDATE
         "#,
         id
     )
@@ -1270,14 +1267,8 @@ async fn create_cache(
         None
     };
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, id),
+        crate::db::begin(state),
         label = "management.create_cache_pool_begin"
-    )
-    .await?;
-    let org_key = format!("org:{id}");
-    crate::profile_future!(
-        crate::db::advisory_lock(&mut tx, &org_key),
-        label = "management.create_cache_org_lock_wait"
     )
     .await?;
     let policy = sqlx::query!(
@@ -1307,7 +1298,7 @@ async fn create_cache(
         FROM caches
         WHERE org_id = $1
             AND name = $2
-        FOR UPDATE NOWAIT
+        FOR UPDATE
         "#,
         id,
         name
@@ -1418,14 +1409,27 @@ async fn create_cache(
                 is_public
             )
             VALUES ($1, $2, $3)
+            ON CONFLICT (org_id, name) DO NOTHING
             RETURNING id
             "#,
             name,
             id,
             private != Some(true)
         )
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?
+        // Another request created this name after the read above. Its row
+        // was not there to lock, so let the caller retry against it.
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Cache is being created; retry",
+            )
+            .header(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            )
+        })?
     };
     if created && let Some(key) = signing_management::new_cache_key(&state.config, cache).await? {
         sqlx::query!(
@@ -1569,14 +1573,8 @@ async fn move_slug(
         })
         .transpose()?;
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, id),
+        crate::db::begin(state),
         label = "management.move_slug_pool_begin"
-    )
-    .await?;
-    let org_key = format!("org:{id}");
-    crate::profile_future!(
-        crate::db::advisory_lock(&mut tx, &org_key),
-        label = "management.move_slug_org_lock_wait"
     )
     .await?;
     let moving: Option<String> = sqlx::query_scalar!(
@@ -1584,7 +1582,7 @@ async fn move_slug(
         SELECT moving_from
         FROM orgs
         WHERE id = $1
-        FOR UPDATE NOWAIT
+        FOR UPDATE
         "#,
         id
     )

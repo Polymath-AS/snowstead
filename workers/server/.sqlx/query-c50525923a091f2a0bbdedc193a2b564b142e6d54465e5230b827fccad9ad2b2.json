@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            c.id,\n            c.is_public,\n            o.private_caches,\n            o.storage_limit\n        FROM caches c\n        JOIN orgs o ON o.id = c.org_id\n        WHERE c.org_id = $1\n            AND c.name = $2\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols p\n                WHERE p.cache_id = c.id\n                    AND p.protocol = 'nix'\n            )\n        FOR SHARE OF c, o NOWAIT\n        ",
+  "query": "\n        SELECT\n            c.id,\n            c.is_public,\n            o.slug,\n            o.moving_from\n        FROM caches c\n        JOIN orgs o ON o.id = c.org_id\n        WHERE c.org_id = $1\n            AND c.name = $2\n        FOR UPDATE OF c\n        ",
   "describe": {
     "columns": [
       {
@@ -27,23 +27,23 @@
       },
       {
         "ordinal": 2,
-        "name": "private_caches",
-        "type_info": "Bool",
+        "name": "slug",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "orgs",
-            "name": "private_caches"
+            "name": "slug"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "storage_limit",
-        "type_info": "Int8",
+        "name": "moving_from",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "orgs",
-            "name": "storage_limit"
+            "name": "moving_from"
           }
         }
       }
@@ -61,5 +61,5 @@
       true
     ]
   },
-  "hash": "cd75ca767274abcae06143e22f302ec5949105b2d1e1011b484644691c940ac0"
+  "hash": "c50525923a091f2a0bbdedc193a2b564b142e6d54465e5230b827fccad9ad2b2"
 }

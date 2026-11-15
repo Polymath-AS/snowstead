@@ -273,8 +273,9 @@ limit. A background evictor afterwards removes eligible least-recently-used
 entries across the org's products until it is back under its limit, so usage
 can briefly exceed it. From 110% of the limit new uploads get 503 and retry
 while eviction catches up. Completed retries return their
-recorded result and cannot restore a deleted path. SQL decisions fail fast on
-contention; they are not literally lock-free. Cleanup of retired exact keys is
+recorded result and cannot restore a deleted path. Writers in one organization
+run concurrently. A SQL decision that meets a conflicting writer waits briefly
+or fails fast with a retryable 503; it is not literally lock-free. Cleanup of retired exact keys is
 asynchronous. Direct CDN downloads do not update access times; pushes and
 service reads update use.
 Each session uploads private staging bytes, even when the hash is already

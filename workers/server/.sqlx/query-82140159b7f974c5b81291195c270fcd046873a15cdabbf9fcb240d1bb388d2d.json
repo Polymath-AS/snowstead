@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            slug,\n            moving_from,\n            limits_version\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE NOWAIT\n        ",
+  "query": "\n        SELECT\n            slug,\n            moving_from,\n            limits_version\n        FROM orgs\n        WHERE id = $1\n        FOR UPDATE\n        ",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       true
     ]
   },
-  "hash": "3ee26fda57a6eb0fb6a38e20811e6ff30f1ebebc7dbfa56aee76427f0c4ffb85"
+  "hash": "82140159b7f974c5b81291195c270fcd046873a15cdabbf9fcb240d1bb388d2d"
 }

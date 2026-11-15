@@ -1051,13 +1051,13 @@ async fn absent_named_deletion_and_empty_eviction_cancel_only_affected_sessions(
 async fn policy_contention_fails_fast_without_withdrawing_rows(pool: PgPool) {
     let app = router(fixture(&pool).await);
     publish(&pool, 'a', "root", json!([])).await;
-    for advisory in [false, true] {
+    // Another policy change holds the cache row exclusively. An upload or a
+    // publication in flight holds it FOR KEY SHARE until it commits.
+    for query in [
+        "SELECT id FROM caches WHERE org_id='policy_a' FOR UPDATE",
+        "SELECT id FROM caches WHERE org_id='policy_a' FOR KEY SHARE",
+    ] {
         let mut holder = pool.begin().await.unwrap();
-        let query = if advisory {
-            "SELECT pg_advisory_xact_lock(hashtextextended('org:policy_a',0))"
-        } else {
-            "SELECT id FROM caches WHERE org_id='policy_a' FOR UPDATE"
-        };
         sqlx::query(query).execute(&mut *holder).await.unwrap();
         let (status, result) = tokio::time::timeout(
             std::time::Duration::from_secs(1),

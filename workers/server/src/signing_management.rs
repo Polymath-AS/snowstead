@@ -197,6 +197,10 @@ struct History {
     created_at: DateTime<Utc>,
 }
 
+/// Signing keys are cache policy. Publication holds the cache row FOR KEY
+/// SHARE while it signs, so a key change takes the row exclusively: it waits
+/// for publications in flight, up to the lock timeout, and later ones sign
+/// with the new key.
 async fn current_for_update(
     conn: &mut sqlx::PgConnection,
     cache_id: i32,
@@ -292,7 +296,12 @@ async fn list_keys(
     Path(CachePath { cache }): Path<CachePath>,
 ) -> Result<Response, ApiError> {
     let cache_id = cache_id(&state, &context, &cache).await?;
-    let mut tx = state.pool.begin().await?;
+    // One snapshot of the cache's key and its history, on the primary. A
+    // listing takes no row lock, so it never waits for a key change.
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
     let current = sqlx::query_as!(
         Current,
         r#"
@@ -301,12 +310,12 @@ async fn list_keys(
                 signing_public_key
             FROM caches
             WHERE id = $1
-            FOR SHARE
             "#,
         cache_id
     )
-    .fetch_one(&mut *tx)
-    .await?;
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no cache"))?;
     let rows = history(&mut tx, cache_id).await?;
     let shared = current.signing_public_key.is_none();
     let public = match current.signing_public_key {
@@ -412,7 +421,7 @@ async fn create_key(
             .await?
             .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "managed signing unavailable"))?
     };
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state).await?;
     let current = current_for_update(&mut tx, cache_id).await?;
     let mut made = false;
     if current.signing_key_name.as_deref() != Some(&key.signing_key_name)
@@ -467,7 +476,7 @@ async fn activate_key(
     let cache_id = cache_id(&state, &context, &cache).await?;
     let (body, _secret, custom) =
         mutation_body(&state, request, context.org.as_deref().unwrap()).await?;
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state).await?;
     let current = current_for_update(&mut tx, cache_id).await?;
     let rows = history(&mut tx, cache_id).await?;
     let target = rows
