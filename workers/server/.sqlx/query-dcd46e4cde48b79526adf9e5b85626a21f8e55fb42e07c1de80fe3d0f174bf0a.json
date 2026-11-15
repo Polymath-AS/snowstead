@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE upload_sessions\n        SET status = 'aborted'\n        WHERE id = $1\n            AND status <> 'completed'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dcd46e4cde48b79526adf9e5b85626a21f8e55fb42e07c1de80fe3d0f174bf0a"
+}

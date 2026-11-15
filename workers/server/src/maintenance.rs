@@ -224,6 +224,16 @@ async fn begin(pool: &PgPool) -> anyhow::Result<Transaction<'static, Postgres>> 
     Ok(tx)
 }
 
+/// For sweeps that order themselves against request writers on a row lock:
+/// the same wait budget those writers have, instead of giving up at once.
+async fn begin_patient(pool: &PgPool) -> anyhow::Result<Transaction<'static, Postgres>> {
+    let mut tx = begin(pool).await?;
+    sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn lock(tx: &mut Transaction<'_, Postgres>, key: &str) -> anyhow::Result<()> {
     crate::profile_future!(
@@ -389,15 +399,16 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
     } in candidates
     {
         let result: anyhow::Result<bool> = async {
-            let mut tx = begin(&state.pool).await?;
-            if let Some(org) = org {
-                lock(&mut tx, &format!("org:{org}")).await?;
+            let mut tx = begin_patient(&state.pool).await?;
+            if org.is_some() {
+                // Hold the generation the predicate below compares against.
+                // A reset takes this row FOR UPDATE.
                 sqlx::query!(
                     r#"
                     SELECT id
                     FROM caches
                     WHERE id = $1
-                    FOR SHARE
+                    FOR KEY SHARE
                     "#,
                     cache
                 )
@@ -697,7 +708,7 @@ async fn sessions(state: &AppState, pages: usize) -> anyhow::Result<u64> {
         let next = candidates.last().map(|row| row.id.clone());
         let exhausted = candidates.len() < SESSION_PAGE;
         for candidate in candidates {
-            match expire_session(state, &candidate.id, &candidate.org_id).await {
+            match expire_session(state, &candidate.id).await {
                 Ok(true) => count += 1,
                 Ok(false) => (),
                 Err(_) => failed = true,
@@ -747,11 +758,10 @@ async fn sessions(state: &AppState, pages: usize) -> anyhow::Result<u64> {
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn expire_session(state: &AppState, id: &str, org: &str) -> anyhow::Result<bool> {
-    let mut tx = begin(&state.pool).await?;
-    // Candidate allocation takes the same two fences before it leases this
+async fn expire_session(state: &AppState, id: &str) -> anyhow::Result<bool> {
+    let mut tx = begin_patient(&state.pool).await?;
+    // Candidate allocation takes the same upload lock before it leases this
     // session's staged bytes, so the lease check below cannot go stale.
-    lock(&mut tx, &format!("org:{org}")).await?;
     lock(&mut tx, &format!("upload:{id}")).await?;
     let session = sqlx::query_as::<_, Session>(
         "SELECT u.id, u.status, u.r2_upload_key, u.r2_upload_id
@@ -871,8 +881,11 @@ async fn retention(state: &AppState) -> anyhow::Result<u64> {
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Result<u64> {
-    let mut tx = begin(&state.pool).await?;
-    lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = begin_patient(&state.pool).await?;
+    // The cache row, for its path totals: this pass reads its retention
+    // policy and deletes its paths. Publication, eviction, pins, and
+    // withdrawal in this cache each run wholly before or after it. Uploads
+    // in flight hold the row FOR KEY SHARE, which this does not wait for.
     let metadata = sqlx::query!(
         r#"
         SELECT
@@ -885,7 +898,7 @@ async fn retention_batch(state: &AppState, cache: i32, org: &str) -> anyhow::Res
         WHERE c.id = $1
             AND c.org_id = $2
             AND c.retention_days IS NOT NULL
-        FOR UPDATE OF c NOWAIT
+        FOR NO KEY UPDATE OF c
         "#,
         cache,
         org
@@ -1008,7 +1021,7 @@ async fn blob_batch(state: &AppState) -> anyhow::Result<u64> {
 
 /// Reclaim at most twenty bounded manifests per sweep. Keep expired identities
 /// until 24 hours after their hard deadline so delayed retries cannot reopen
-/// a builder. All mutations use the same org fence as manifest writes.
+/// a builder. Each job's row is locked first, as manifest writes lock it.
 async fn expire_manifests(state: &AppState) -> anyhow::Result<u64> {
     let jobs: Vec<(String, String)> = sqlx::query_as(
         "SELECT j.id,c.org_id FROM push_jobs j JOIN caches c ON c.id=j.cache_id \
@@ -1016,9 +1029,8 @@ async fn expire_manifests(state: &AppState) -> anyhow::Result<u64> {
             OR j.hard_expires_at<=NOW()-INTERVAL '24 hours' ORDER BY j.idle_expires_at,j.id LIMIT 20",
     ).fetch_all(&state.pool).await?;
     let mut count = 0;
-    for (id, org) in jobs {
-        let mut tx = crate::db::begin(state, &org).await?;
-        crate::db::advisory_lock(&mut tx, &format!("org:{org}")).await?;
+    for (id, _) in jobs {
+        let mut tx = crate::db::begin(state).await?;
         let cleared: i64 = sqlx::query_scalar(
             "WITH expired AS (UPDATE push_jobs SET manifest_bytes=0 WHERE id=$1 AND manifest_bytes>0 \
                 AND (idle_expires_at<=NOW() OR hard_expires_at<=NOW()) RETURNING id), \
@@ -2112,11 +2124,7 @@ mod tests {
         // the table does not fail them.
         assert_eq!(blob_batch(&state).await.unwrap(), 1);
         assert!(blob_ids(&state).await.is_empty());
-        assert!(
-            expire_session(&state, "lapsed", "maintenance")
-                .await
-                .unwrap()
-        );
+        assert!(expire_session(&state, "lapsed").await.unwrap());
         writer.commit().await.unwrap();
         let remaining: Vec<String> = sqlx::query_scalar("SELECT id FROM upload_sessions")
             .fetch_all(&state.pool)
@@ -2147,11 +2155,7 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        assert!(
-            expire_session(&state, "large", "maintenance")
-                .await
-                .unwrap()
-        );
+        assert!(expire_session(&state, "large").await.unwrap());
         let remaining: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM upload_sessions),(SELECT count(*) FROM upload_parts)",
         )
@@ -2169,11 +2173,7 @@ mod tests {
         .unwrap();
         assert_eq!(queued, (1002, 1001, 1));
         // The session is gone: a later sweep finds nothing left to do.
-        assert!(
-            !expire_session(&state, "large", "maintenance")
-                .await
-                .unwrap()
-        );
+        assert!(!expire_session(&state, "large").await.unwrap());
     }
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
@@ -2462,7 +2462,7 @@ mod tests {
             if already_aborted {
                 provider.abort_multipart(&path, &upload).await.unwrap();
             }
-            assert!(expire_session(&state, &id, "default").await.unwrap());
+            assert!(expire_session(&state, &id).await.unwrap());
             let retained: Option<String> =
                 sqlx::query_scalar("SELECT upload_id FROM object_cleanup WHERE key=$1")
                     .bind(&key)

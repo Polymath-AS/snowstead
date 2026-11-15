@@ -1,6 +1,6 @@
 //! Opt-in SQL-only publication of verified job candidates. Discovery owns no
 //! locks. A durable job lease fences competing processes; publication rechecks
-//! it under the existing org fence. No worker here transfers or verifies bytes.
+//! it under the job's row lock. No worker here transfers or verifies bytes.
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -49,7 +49,7 @@ pub(crate) async fn run(state: AppState, stopped: CancellationToken) {
 }
 
 async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
-    // At most one discovery read at a time, closed before org admission.
+    // At most one discovery read at a time, closed before the claim.
     // Wrap only after exhausting larger org IDs, rather than sorting every org.
     let mut org = discover(state, after).await?;
     if org.is_none() && !after.is_empty() {
@@ -68,7 +68,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
     // Only empty/failed turns need a separate backoff transaction.
     if !matches!(&published, Ok(count) if *count > 0) {
         // A busy release must not abandon an otherwise healthy job for the
-        // entire execution lease. Each retry drops its SQL/gate ownership
+        // entire execution lease. Each retry drops its transaction
         // before waiting, and still checks the same work ID and generation.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -113,8 +113,7 @@ async fn discover(state: &AppState, after: &str) -> Result<Option<String>, ApiEr
 }
 
 async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
-    let mut tx = db::begin(state, org).await?;
-    db::advisory_lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = db::begin(state).await?;
     sqlx::query("SET LOCAL statement_timeout='1s'")
         .execute(&mut *tx)
         .await?;
@@ -127,6 +126,8 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
         work_failures: i32,
         work_members: i32,
     }
+    // A job another writer holds is skipped, not waited for: a competing
+    // worker, a client publishing its sessions, or a cancellation.
     let grant: Option<Grant> = sqlx::query_as(
         "SELECT j.id,j.grant_generation,j.authorization_jti,j.cache_id,j.work_failures,j.work_members \
          FROM push_jobs j JOIN caches c ON c.id=j.cache_id JOIN api_tokens t ON t.jti=j.authorization_jti \
@@ -140,7 +141,7 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
              AND m.blocked_generation IS DISTINCT FROM j.grant_generation \
              AND u.push_job_id=j.id AND u.status='finalizing' AND u.expires_at>NOW() \
              AND n.phase='ready' AND n.expires_at>NOW()) \
-         ORDER BY j.work_at,j.id LIMIT 1 FOR UPDATE OF j NOWAIT",
+         ORDER BY j.work_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED",
     ).bind(org).fetch_optional(&mut *tx).await?;
     let Some(grant) = grant else {
         return Ok(None);
@@ -219,8 +220,7 @@ async fn release(
     claim: &Claim,
     result: &Result<usize, ApiError>,
 ) -> Result<(), ApiError> {
-    let mut tx = db::begin(state, &claim.org).await?;
-    db::advisory_lock(&mut tx, &format!("org:{}", claim.org)).await?;
+    let mut tx = db::begin(state).await?;
     sqlx::query("SET LOCAL statement_timeout='1s'")
         .execute(&mut *tx)
         .await?;

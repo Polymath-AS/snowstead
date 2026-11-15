@@ -251,8 +251,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
         return Ok(false);
     };
     *after = org.clone();
-    let mut tx = db::begin(state, &org).await?;
-    lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = db::begin(state).await?;
     let work: Option<Work> = sqlx::query_as(
         "SELECT b.id,b.org_id,b.actor,b.token_jti,b.shared_generation,b.prepare_only,b.failures, \
          EXTRACT(EPOCH FROM b.expires_at-NOW())::double precision AS remaining \
@@ -341,8 +340,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
             result = &mut renew => { result?; return Ok(true); }
         }
     };
-    let mut tx = db::begin_queued(state, &org).await?;
-    lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = db::begin(state).await?;
     // Hold the batch row while settling. A job resume resets results and the
     // claim under the same row lock, so it runs wholly before or after this.
     let owned: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM upload_finalization_batches WHERE id=$1 AND work_id=$2 AND lease_expires_at>NOW() FOR UPDATE")
@@ -409,7 +407,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
     }.await;
     if let Err(error) = &result {
         // A live process must not strand its batch until the crash lease
-        // expires merely because SQL admission or an org fence was busy.
+        // expires merely because the pool or a row lock was busy.
         // Matching the claim prevents this cleanup from disturbing a successor.
         let released = sqlx::query(
             "UPDATE upload_finalization_batches SET work_id=NULL,lease_expires_at=NULL, \
@@ -450,9 +448,18 @@ pub(crate) async fn expire(state: &AppState) -> anyhow::Result<u64> {
     .fetch_all(&state.pool)
     .await?;
     let mut count = 0;
-    for (id, org) in batches {
-        let mut tx = db::begin(state, &org).await?;
-        lock(&mut tx, &format!("org:{org}")).await?;
+    for (id, _) in batches {
+        let mut tx = db::begin(state).await?;
+        // Sessions in ID order, as publication and the other bulk aborts lock
+        // them. The update below rechecks every condition on the rows it finds.
+        sqlx::query(
+            "SELECT FROM upload_sessions u WHERE u.status='finalizing' AND u.id IN \
+             (SELECT session_id FROM upload_finalizations WHERE batch_id=$1) \
+             ORDER BY u.id FOR NO KEY UPDATE",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
         count+=sqlx::query(
             "WITH expired AS (UPDATE upload_sessions u SET status='aborted',expires_at=LEAST(u.expires_at,NOW()) \
              FROM upload_finalizations f,upload_finalization_batches b LEFT JOIN api_tokens t ON t.jti=b.token_jti \
@@ -602,8 +609,8 @@ mod tests {
         .unwrap();
         assert_eq!(rejected.results[0].status, Some(409));
 
-        // A recovery consumer closes admission under the same org fence as
-        // appends. A late request must retry into a new batch, not disappear.
+        // A recovery consumer closes admission under the batch's row lock,
+        // which appends share. A late request must retry into a new batch, not disappear.
         sqlx::query("INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,r2_upload_key,r2_upload_id,expires_at,part_size) \
             SELECT 'late-session',cache_id,repeat('1',32),'/nix/store/'||repeat('1',32)||'-late',nar_hash,nar_size,file_size,compression,'streaming','staging/late/source','late-provider',expires_at,part_size FROM upload_sessions WHERE id='queued-session'")
             .execute(&pool).await.unwrap();

@@ -83,17 +83,32 @@ async fn body<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| error(400, "Invalid manifest JSON"))
 }
 
+/// A writer passes `lock` to hold the cache row until it commits, as upload
+/// creation does: a cache deletion in flight answers 503 here instead of
+/// failing the job's foreign key, and a later one waits for this writer.
 async fn cache(
     executor: impl sqlx::PgExecutor<'_>,
     identity: &Identity,
     name: &str,
     push: bool,
+    lock: bool,
 ) -> Result<i32, ApiError> {
-    let (id, public, allowed, nix): (i32, bool, bool, bool) = sqlx::query_as(
-        "SELECT c.id,c.is_public,o.private_caches,EXISTS (SELECT 1 FROM cache_protocols p \
+    // Both forms are static, so each keeps its own prepared statement.
+    macro_rules! select {
+        ($lock:literal) => {
+            concat!(
+                "SELECT c.id,c.is_public,o.private_caches,EXISTS (SELECT 1 FROM cache_protocols p \
          WHERE p.cache_id=c.id AND p.protocol='nix') FROM caches c JOIN orgs o ON o.id=c.org_id \
          WHERE c.org_id=$1 AND c.name=$2",
-    )
+                $lock
+            )
+        };
+    }
+    let (id, public, allowed, nix): (i32, bool, bool, bool) = sqlx::query_as(if lock {
+        select!(" FOR KEY SHARE OF c NOWAIT")
+    } else {
+        select!("")
+    })
     .bind(identity.org())
     .bind(name)
     .fetch_optional(executor)
@@ -120,9 +135,8 @@ async fn writer(
     name: &str,
     push: bool,
 ) -> Result<(Transaction, i32), ApiError> {
-    let mut tx = db::begin(state, identity.org()).await?;
-    db::advisory_lock(&mut tx, &format!("org:{}", identity.org())).await?;
-    let id = cache(&mut *tx, identity, name, push).await?;
+    let mut tx = db::begin(state).await?;
+    let id = cache(&mut *tx, identity, name, push, true).await?;
     Ok((tx, id))
 }
 
@@ -229,8 +243,9 @@ fn response(status: StatusCode, job: Job, state: &AppState) -> Response {
     }
 }
 
-// Call under writer()'s org fence. Reserve metadata before accepting it, not
-// at completion: successful publication must never lose its promised grace.
+// Reserve metadata before accepting it, not at completion: successful
+// publication must never lose its promised grace. The budgets are soft:
+// concurrent requests each read the totals before either adds to them.
 async fn reserve_manifest(
     tx: &mut Transaction,
     org: &str,
@@ -297,47 +312,61 @@ async fn create(
     }
     let (mut tx, cache_id) = writer(&state, &identity, &name, true).await?;
     let actor = identity.actor();
-    let existing: Option<Job> = sqlx::query_as("SELECT id,mode,roots,state,revision,manifest_digest,manifest_bytes,input_members, \
-        grant_generation,FLOOR(EXTRACT(EPOCH FROM authorization_expires_at))::bigint AS authorization_expires_at, \
-        FLOOR(EXTRACT(EPOCH FROM completed_at))::bigint AS completed_at, \
-        FLOOR(EXTRACT(EPOCH FROM protection_expires_at))::bigint AS protection_expires_at, \
-        FLOOR(EXTRACT(EPOCH FROM LEAST(idle_expires_at,hard_expires_at)))::bigint AS expires_at, \
-        FLOOR(EXTRACT(EPOCH FROM hard_expires_at))::bigint AS hard_expires_at, \
-        state='completed' OR (idle_expires_at>NOW() AND hard_expires_at>NOW()) AS valid FROM push_jobs WHERE cache_id=$1 AND creator=$2 AND idempotency_key=$3")
-    .bind(cache_id)
-    .bind(&actor)
-    .bind(&input.idempotency_key)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(job) = existing {
-        if job.mode != input.mode.as_str() || job.roots.0 != roots.0 {
-            return Err(error(
-                409,
-                "Idempotency key has different manifest identity",
-            ));
+    // Two requests with one idempotency key can both find no job. The unique
+    // index decides: the loser waits for the winner's commit, inserts
+    // nothing, and reads again to answer as the winner's replay.
+    for replay in [false, true] {
+        let existing: Option<Job> = sqlx::query_as("SELECT id,mode,roots,state,revision,manifest_digest,manifest_bytes,input_members, \
+            grant_generation,FLOOR(EXTRACT(EPOCH FROM authorization_expires_at))::bigint AS authorization_expires_at, \
+            FLOOR(EXTRACT(EPOCH FROM completed_at))::bigint AS completed_at, \
+            FLOOR(EXTRACT(EPOCH FROM protection_expires_at))::bigint AS protection_expires_at, \
+            FLOOR(EXTRACT(EPOCH FROM LEAST(idle_expires_at,hard_expires_at)))::bigint AS expires_at, \
+            FLOOR(EXTRACT(EPOCH FROM hard_expires_at))::bigint AS hard_expires_at, \
+            state='completed' OR (idle_expires_at>NOW() AND hard_expires_at>NOW()) AS valid FROM push_jobs WHERE cache_id=$1 AND creator=$2 AND idempotency_key=$3")
+        .bind(cache_id)
+        .bind(&actor)
+        .bind(&input.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(job) = existing {
+            if job.mode != input.mode.as_str() || job.roots.0 != roots.0 {
+                return Err(error(
+                    409,
+                    "Idempotency key has different manifest identity",
+                ));
+            }
+            if !job.valid {
+                return Err(error(410, "Push job expired; create a new job"));
+            }
+            tx.commit().await?;
+            return Ok(response(StatusCode::OK, job, &state));
         }
-        if !job.valid {
-            return Err(error(410, "Push job expired; create a new job"));
+        if replay {
+            break;
         }
-        tx.commit().await?;
-        return Ok(response(StatusCode::OK, job, &state));
+        reserve_manifest(
+            &mut tx,
+            identity.org(),
+            &state.config.push_jobs,
+            true,
+            1,
+            size,
+        )
+        .await?;
+        let id = uuid::Uuid::now_v7().to_string();
+        let inserted = sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes) VALUES($1,$2,$3,$4,$5,$6,$7) \
+            ON CONFLICT (cache_id,creator,idempotency_key) DO NOTHING")
+            .bind(&id).bind(cache_id).bind(&actor).bind(&input.idempotency_key).bind(input.mode.as_str()).bind(&roots).bind(size as i32)
+            .execute(&mut *tx).await?.rows_affected();
+        if inserted == 1 {
+            let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
+            tx.commit().await?;
+            return Ok(response(StatusCode::CREATED, job, &state));
+        }
     }
-    reserve_manifest(
-        &mut tx,
-        identity.org(),
-        &state.config.push_jobs,
-        true,
-        1,
-        size,
-    )
-    .await?;
-    let id = uuid::Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO push_jobs(id,cache_id,creator,idempotency_key,mode,roots,manifest_bytes) VALUES($1,$2,$3,$4,$5,$6,$7)")
-        .bind(&id).bind(cache_id).bind(&actor).bind(input.idempotency_key).bind(input.mode.as_str()).bind(roots).bind(size as i32)
-        .execute(&mut *tx).await?;
-    let job = load(&mut *tx, cache_id, &actor, &id, false).await?;
-    tx.commit().await?;
-    Ok(response(StatusCode::CREATED, job, &state))
+    // The winner was removed again before the second read.
+    Err(error(503, "Push job changed; retry")
+        .header(header::RETRY_AFTER, HeaderValue::from_static("1")))
 }
 
 async fn chunk(
@@ -420,7 +449,7 @@ async fn seal(
     Extension(identity): Extension<Identity>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let cache_id = cache(&state.pool, &identity, &name, true).await?;
+    let cache_id = cache(&state.pool, &identity, &name, true, false).await?;
     let actor = identity.actor();
     let before = load(&state.pool, cache_id, &actor, &id, false).await?;
     if before.state == "cancelled" {
@@ -578,6 +607,15 @@ async fn resume(
         Some(false) => return Err(error(401, "Token revoked")),
         _ => {}
     }
+    // Authorization starts the job's protection of its published members.
+    // Take the cache's totals first, as whoever deletes its paths does: an
+    // eviction or retention pass in flight finishes before this returns, and
+    // a later one reads the protection. A member that is published when this
+    // returns stays published while the authorization lasts.
+    sqlx::query("SELECT FROM caches WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(cache_id)
+        .execute(&mut *tx)
+        .await?;
     // Record only the delegated action and cache. The worker acts as this
     // token, limited to pushing to this cache, while the token stays live.
     let delegated = json!({"jti": token.id, "cacheId": cache_id, "perms": ["push"]});
@@ -625,7 +663,7 @@ async fn resume(
     Ok(response(StatusCode::OK, job, &state))
 }
 
-/// The caller normalizes metadata before taking the org fence and policy rows.
+/// The caller normalizes metadata before taking the policy rows.
 /// Reuse durable sessions instead of issuing transfers on allocation retries.
 /// The named members stay locked until the caller's transaction ends.
 pub(crate) async fn upload_members(
@@ -639,12 +677,21 @@ pub(crate) async fn upload_members(
         return Err(error(409, "Job uploads require the owning API token"));
     }
     let actor = identity.actor();
+    // Share the job before reading it. Cancellation, completion, resume, and
+    // withdrawal take the row exclusively: each either waits for these
+    // sessions and then aborts them, or has committed and is read here.
+    sqlx::query("SELECT FROM push_jobs WHERE id=$1 FOR SHARE")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
     let job = load(&mut **tx, cache, &actor, id, false).await?;
-    let authorized: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti \
-         WHERE j.id=$1 AND j.state='sealed' AND j.authorization_expires_at>NOW() AND t.revoked_at IS NULL)",
-    ).bind(&job.id).fetch_one(&mut **tx).await?;
-    if !authorized {
+    // Then the token, as publication does: a revocation in flight is waited
+    // for and then seen, and a later one waits for these sessions.
+    let authorized: Option<bool> = sqlx::query_scalar(
+        "SELECT t.revoked_at IS NULL FROM push_jobs j JOIN api_tokens t ON t.jti=j.authorization_jti \
+         WHERE j.id=$1 AND j.state='sealed' AND j.authorization_expires_at>NOW() FOR SHARE OF t",
+    ).bind(&job.id).fetch_optional(&mut **tx).await?;
+    if authorized != Some(true) {
         return Err(error(
             409,
             "Push job authorization is inactive; resume the job",
@@ -737,8 +784,8 @@ pub(crate) async fn upload_members(
     Ok(reused)
 }
 
-/// Recheck logical identity and in-manifest prerequisites under the publication
-/// org fence. Transfer/preparation order is independent of dependency order.
+/// Recheck logical identity and in-manifest prerequisites while publication
+/// holds the cache's totals lock, which every path deletion needs. Transfer/preparation order is independent of dependency order.
 pub(crate) async fn publication(tx: &mut Transaction, ids: &[String]) -> Result<(), ApiError> {
     let blocked: Option<(String, String)> = sqlx::query_as(
         r#"
@@ -786,8 +833,9 @@ pub(crate) async fn publication(tx: &mut Transaction, ids: &[String]) -> Result<
     Ok(())
 }
 
-/// Check the bounded manifest once, not after every publication group. The org
-/// fence orders this receipt with publication, withdrawal, and revocation.
+/// Check the bounded manifest once, not after every publication group. The job
+/// row orders this receipt with publication, cancellation, withdrawal, and
+/// revocation, which all lock it first.
 async fn complete(
     State(state): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -831,6 +879,7 @@ async fn complete(
             &format!("Push job member {hash}: absent or conflicting metadata"),
         ));
     }
+    lock_sessions(&mut tx, std::slice::from_ref(&id)).await?;
     let completed: i64 = sqlx::query_scalar(
         "WITH completed AS (UPDATE push_jobs SET state='completed',completed_at=NOW(), \
          protection_expires_at=LEAST(NOW()+INTERVAL '5 minutes',idle_expires_at,hard_expires_at,authorization_expires_at), \
@@ -858,6 +907,7 @@ async fn cancel(
     let actor = identity.actor();
     let job = load(&mut *tx, cache_id, &actor, &id, true).await?;
     if !matches!(job.state.as_str(), "cancelled" | "completed") {
+        lock_sessions(&mut tx, std::slice::from_ref(&id)).await?;
         let cancelled: i64 = sqlx::query_scalar(
             "WITH cancelled AS (UPDATE push_jobs SET state='cancelled',grant_generation=grant_generation+1, \
             authorization_jti=NULL,authorization_expires_at=NULL \
@@ -885,13 +935,53 @@ struct Page {
     summary: bool,
 }
 
-// Callers hold the org fence. Include absent named members: a deletion must
+/// A bulk abort locks its jobs' open sessions in ID order before it updates
+/// them, as publication locks the sessions it completes.
+async fn lock_sessions(tx: &mut Transaction, jobs: &[String]) -> Result<(), ApiError> {
+    sqlx::query(
+        "SELECT FROM upload_sessions WHERE push_job_id=ANY($1) \
+         AND status IN ('streaming','finalizing') ORDER BY id FOR NO KEY UPDATE",
+    )
+    .bind(jobs)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+// Callers hold the cache row FOR UPDATE. Include absent named members: a deletion must
 // invalidate their existing authorization, not merely remove visible rows.
 pub(crate) async fn withdraw(
     tx: &mut Transaction,
     cache: i32,
     hashes: Option<&[String]>,
 ) -> Result<(), ApiError> {
+    // Jobs in ID order, then sessions in ID order, as every other writer of
+    // several jobs or sessions locks them, and before the caller deletes any
+    // path. A whole-cache withdrawal takes every job and session of the
+    // cache, since it goes on to expire or delete them all. A path deletion
+    // takes the jobs it cancels, their open sessions, and every session of
+    // the named paths: those are the rows the deletion's trigger and the
+    // caller's own abort then update. The statement below rechecks.
+    let jobs: Vec<String> = sqlx::query_scalar(
+        "SELECT j.id FROM push_jobs j WHERE j.cache_id=$1 AND ($2::text[] IS NULL OR ( \
+         j.state IN ('building','sealed') AND EXISTS (SELECT 1 FROM push_job_members m \
+         WHERE m.job_id=j.id AND m.store_path_hash=ANY($2)))) ORDER BY j.id FOR NO KEY UPDATE",
+    )
+    .bind(cache)
+    .bind(hashes)
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT FROM upload_sessions u WHERE CASE WHEN $2::text[] IS NULL THEN u.cache_id=$1 \
+         ELSE (u.push_job_id=ANY($3) AND u.status IN ('streaming','finalizing')) \
+             OR (u.cache_id=$1 AND u.store_path_hash=ANY($2)) END \
+         ORDER BY u.id FOR NO KEY UPDATE",
+    )
+    .bind(cache)
+    .bind(hashes)
+    .bind(&jobs)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("WITH cancelled AS (UPDATE push_jobs j SET state='cancelled',grant_generation=grant_generation+1, \
         authorization_jti=NULL,authorization_expires_at=NULL WHERE cache_id=$1 AND state IN ('building','sealed') \
         AND ($2::text[] IS NULL OR EXISTS (SELECT 1 FROM push_job_members m \
@@ -908,7 +998,7 @@ async fn progress(
     Path((name, id)): Path<(String, String)>,
     Query(page): Query<Page>,
 ) -> Result<Response, ApiError> {
-    let cache_id = cache(&state.pool, &identity, &name, true).await?;
+    let cache_id = cache(&state.pool, &identity, &name, true, false).await?;
     let after = page.after.unwrap_or_default();
     if after.len() > 32 {
         return Err(error(400, "Invalid page cursor"));
@@ -924,7 +1014,7 @@ async fn progress(
         blocked: Option<bool>,
     }
     // One statement snapshot prevents mixing a building revision with members
-    // from a concurrent seal. No read transaction or org fence is necessary.
+    // from a concurrent seal. No read transaction or row lock is necessary.
     // Summary requests check exact current membership but skip the member
     // page, session hydration, and candidate lookups with a zero row limit.
     let Progress { job, chunks, mut members, available, blocked }: Progress = sqlx::query_as(

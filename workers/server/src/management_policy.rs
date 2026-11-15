@@ -1,4 +1,5 @@
-//! Management policy uses the same org -> cache -> entry fence as publication.
+//! Every mutation here holds its cache row FOR UPDATE, which orders it against
+//! uploads, publications, eviction, and retention in that cache.
 //! SQL withdraws metadata atomically; narinfo is rendered from it and owns no object.
 //! Shared NARs belong to GC, never to cache/path withdrawal.
 use crate::db::Transaction;
@@ -99,17 +100,6 @@ fn page_limit(params: &[(String, String)], default: i64) -> Result<i64, ApiError
     }
     Ok(n as i64)
 }
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn fence(tx: &mut Transaction, org: &str) -> Result<(), ApiError> {
-    let key = format!("org:{org}");
-    crate::profile_future!(
-        crate::db::advisory_lock(tx, &key),
-        label = "management_policy.org_lock_wait"
-    )
-    .await?;
-    Ok(())
-}
-
 pub(crate) struct MetadataTarget {
     paths: Vec<String>,
 }
@@ -208,13 +198,16 @@ async fn load_cache(
         });
     }
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, org),
+        crate::db::begin(state),
         label = "management_policy.pool_begin"
     )
     .await?;
-    // Mutations retain the primary publication fence. Reporting uses a
-    // repeatable-read replica snapshot instead of blocking writers.
-    fence(&mut tx, org).await?;
+    // Every mutation holds its cache's row exclusively until it commits.
+    // Uploads, publications, and compiler transfers hold the same row FOR KEY
+    // SHARE, and eviction and retention take it for the path totals, so each
+    // of them runs wholly before or after this transaction. It waits for them
+    // up to the lock timeout. Reporting uses a repeatable-read replica
+    // snapshot instead of blocking writers.
     let cache = sqlx::query!(
         r#"
         SELECT
@@ -226,7 +219,7 @@ async fn load_cache(
         JOIN orgs o ON o.id = c.org_id
         WHERE c.org_id = $1
             AND c.name = $2
-        FOR UPDATE OF c NOWAIT
+        FOR UPDATE OF c
         "#,
         org,
         name
@@ -593,13 +586,30 @@ async fn withdraw_cache(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    // Expire every session, but preserve completed outcomes: a completed
+    // session has no open multipart upload left for cleanup to abort.
+    // Unfinished finalization rechecks status under its session's row lock.
+    crate::push_jobs::withdraw(&mut tx, id, None).await?;
+    sqlx::query!(
+        r#"
+                UPDATE upload_sessions
+                SET status = CASE WHEN status = 'completed' THEN status ELSE 'aborted' END,
+                    expires_at = NOW()
+                WHERE cache_id = $1
+                "#,
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
     if delete {
         // Hand this cache's open multipart uploads to the cleanup queue. An
         // upload whose staged bytes a publication attempt is copying must
         // keep its session until that attempt resolves. Session IDs standing
         // in for an uninitialized upload and completed outcomes are not
-        // multipart uploads that this withdrawal may abort. The org fence
-        // above keeps new attempts from leasing these sources meanwhile.
+        // multipart uploads that this withdrawal may abort. This runs after
+        // the statement above has locked every session of the cache: an
+        // upload adopted just before it is read here, and none can be adopted
+        // or leased afterwards. The set queued is exactly the set deleted.
         const OPEN: &str = "u.cache_id = $1 AND starts_with(u.r2_upload_key, 'staging/') \
             AND u.r2_upload_id IS NOT NULL AND u.r2_upload_id <> u.id AND u.status <> 'completed'";
         let pinned: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -625,21 +635,6 @@ async fn withdraw_cache(
         .execute(&mut *tx)
         .await?;
     }
-    // Expire every session, but preserve completed outcomes: a completed
-    // session has no open multipart upload left for cleanup to abort.
-    // Unfinished finalization rechecks status under this org fence.
-    crate::push_jobs::withdraw(&mut tx, id, None).await?;
-    sqlx::query!(
-        r#"
-                UPDATE upload_sessions
-                SET status = CASE WHEN status = 'completed' THEN status ELSE 'aborted' END,
-                    expires_at = NOW()
-                WHERE cache_id = $1
-                "#,
-        id
-    )
-    .execute(&mut *tx)
-    .await?;
     // Narinfo is rendered from SQL, so a publication owns no metadata object
     // and the whole cache goes in one statement.
     let nix = sqlx::query("DELETE FROM published_paths WHERE cache_id = $1")
@@ -1133,24 +1128,52 @@ async fn delete_paths(
     )
     .fetch_all(&mut **tx)
     .await?;
-    let deleted: Vec<String> = if let Some(before) = before {
+    // Choose what goes before deleting anything. The cache row is held
+    // exclusively, so neither the paths nor their pins change meanwhile.
+    let mut aged = Vec::new();
+    let mut withdrawn: Vec<String> = named
+        .iter()
+        .filter(|hash| !protected.contains(hash))
+        .cloned()
+        .collect();
+    if let Some(before) = before {
+        for path in sqlx::query!(
+            r#"
+            SELECT
+                id,
+                store_path_hash
+            FROM published_paths
+            WHERE cache_id = $1
+                AND created_at < $2
+                AND NOT nix_path_pinned(cache_id, store_path_hash, NOW())
+            ORDER BY created_at, id
+            LIMIT 500
+            "#,
+            cache,
+            before
+        )
+        .fetch_all(&mut **tx)
+        .await?
+        {
+            aged.push(path.id);
+            withdrawn.push(path.store_path_hash);
+        }
+    }
+    // Fence only the withdrawn paths, including absent named paths. Unrelated
+    // uploads remain valid; completed outcomes may replay but never republish.
+    // Jobs first, then sessions, then the paths, as cache withdrawal and
+    // every job writer order them: the deletion's trigger aborts sessions.
+    crate::push_jobs::withdraw(tx, cache, Some(&withdrawn)).await?;
+    let deleted: Vec<String> = if before.is_some() {
         sqlx::query_scalar!(
             r#"
             DELETE FROM published_paths
             WHERE cache_id = $1
-                AND id IN (
-                    SELECT id
-                    FROM published_paths
-                    WHERE cache_id = $1
-                        AND created_at < $2
-                        AND NOT nix_path_pinned(cache_id, store_path_hash, NOW())
-                    ORDER BY created_at, id
-                    LIMIT 500
-                )
+                AND id = ANY($2)
             RETURNING store_path_hash
             "#,
             cache,
-            before
+            &aged
         )
         .fetch_all(&mut **tx)
         .await?
@@ -1169,15 +1192,6 @@ async fn delete_paths(
         .fetch_all(&mut **tx)
         .await?
     };
-    let mut withdrawn = deleted.clone();
-    for hash in &named {
-        if !protected.contains(hash) && !withdrawn.contains(hash) {
-            withdrawn.push(hash.clone());
-        }
-    }
-    // Fence only the withdrawn paths, including absent named paths. Unrelated
-    // uploads remain valid; completed outcomes may replay but never republish.
-    crate::push_jobs::withdraw(tx, cache, Some(&withdrawn)).await?;
     sqlx::query(
         "UPDATE upload_sessions SET status=$3 WHERE cache_id=$1 \
         AND store_path_hash=ANY($2) AND status<>$4",

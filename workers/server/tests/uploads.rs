@@ -671,8 +671,10 @@ async fn manifest_token_revocation_fences_authorization(pool: PgPool) {
         StatusCode::OK
     );
     let revoke = "/_api/v1/orgs/default/tokens/default-*/revoke";
+    // Whoever acts on the token's authority shares its row until they commit.
+    // Revocation waits for them, here past its lock timeout.
     let mut fence = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default',0))")
+    sqlx::query("SELECT FROM api_tokens WHERE jti='default-*' FOR SHARE")
         .execute(&mut *fence)
         .await
         .unwrap();
@@ -2197,13 +2199,11 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
                             released.await.unwrap();
                         }
                     }
-                    // After claim acknowledgement, two failed boolean lock
-                    // results identify publication and its first release.
+                    // After claim acknowledgement, two lock timeouts identify
+                    // publication and its first release.
                     if barrier.is_none()
-                        && header[0] == b'D'
-                        && body.len() == 7
-                        && body[..6] == [0, 1, 0, 0, 0, 1]
-                        && matches!(body[6], 0 | b'f')
+                        && header[0] == b'E'
+                        && body.windows(5).any(|code| code == b"55P03")
                     {
                         refusals += 1;
                         if refusals == 2 {
@@ -2509,8 +2509,13 @@ async fn manifest_stale_worker_cannot_publish_or_release_a_replacement(pool: PgP
                     .unwrap();
             assert_eq!(outcome["alreadyExisted"], true, "{outcome}");
         } else if scenario == 2 {
+            // Another writer holds the job row, as a client publishing the
+            // job's sessions itself does until it commits. The worker's
+            // publication and then its release both wait past their lock
+            // timeout.
             let mut blocker = pool.begin().await.unwrap();
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default',0))")
+            sqlx::query("SELECT FROM push_jobs WHERE id=$1 FOR SHARE")
+                .bind(id)
                 .execute(&mut *blocker)
                 .await
                 .unwrap();
@@ -6288,7 +6293,8 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         .unwrap(),
         0
     );
-    // A transient org conflict must retain the verified immutable candidate.
+    // A transient conflict must retain the verified immutable candidate: a
+    // policy change in flight holds the cache row publication needs.
     // A fresh server retries publication without reading or writing any bytes.
     paused.store(false, Ordering::SeqCst);
     let pending = tokio::spawn({
@@ -6301,7 +6307,7 @@ async fn paused_immutable_copy_releases_pool_without_reserving_quota_or_publishi
         .await
         .unwrap();
     let mut competing = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:default', 0))")
+    sqlx::query("SELECT FROM caches WHERE name='main' FOR UPDATE")
         .execute(&mut *competing)
         .await
         .unwrap();

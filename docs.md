@@ -218,19 +218,33 @@ bucket pointer, publishes the path, and saves the completion receipt. It does
 not check or enforce the storage limit. Replaying that receipt does not republish withdrawn paths.
 A stale attempt cannot adopt its object or overwrite published bytes.
 
-These are SQL-only, fail-fast decisions, not literal lock freedom.
-They use bounded connection acquisition, `pg_try_advisory_xact_lock`, explicit
-`NOWAIT` locks, and a 100 ms `lock_timeout` after acquiring the org fence.
-Same-process writers wait on a per-org gate before borrowing a connection,
-with the pool's acquisition deadline and a bounded queue of at most one waiter
-per configured pool connection. Queue slots do not borrow connections.
-Transaction startup finishes even if its caller disconnects: cancelling SQLx
-0.9 during `BEGIN` can otherwise return an untracked transaction to the pool.
-The gate ends with each transaction and never spans storage I/O. PostgreSQL
-still serializes writers across server instances; rejected writers must retry.
-The CLI retries explicit session-creation 503 responses up to four attempts,
-but does not replay a lost creation response. The Go helper retries uploads
-marked `503` with `Retry-After: 1` before opening its circuit breaker.
+These are short SQL-only decisions, not literal lock freedom. No lock spans
+an organization: writers in one organization run concurrently, and each locks
+only the rows its decision depends on. An upload, publication, or compiler
+transfer holds its cache's row `FOR KEY SHARE` and its organization's row
+`FOR SHARE`, so a policy change, a cache deletion, a pin, or a path deletion,
+which take the cache row `FOR UPDATE`, runs wholly before or after it. Whoever
+inserts or deletes a cache's published paths first takes that cache's row for
+its totals, so publications into one cache commit one after another and
+publications into different caches do not wait for each other. Requests for
+one upload session exclude each other with `pg_try_advisory_xact_lock`, and
+job writers lock their push job's row.
+
+Every write transaction has a 100 ms `lock_timeout`. A writer that cannot get
+a lock in that time, or at once for a `NOWAIT` lock or a held session lock, is
+answered 503 with `Retry-After: 1` and must retry. The connection pool is the
+only other backpressure: a writer waits for a connection up to the pool's
+acquisition deadline, then gets the same 503. Transaction startup finishes
+even if its caller disconnects: cancelling SQLx 0.9 during `BEGIN` can
+otherwise return an untracked transaction to the pool. No transaction spans
+storage I/O. The CLI retries explicit session-creation 503 responses up to
+four attempts, but does not replay a lost creation response. The Go helper
+retries uploads marked `503` with `Retry-After: 1` before opening its circuit
+breaker.
+
+Organization-wide limits are soft. Active upload sessions, staged bytes,
+compiler staging, and push job budgets are read without a lock, so a few
+concurrent requests can each pass a limit that only one of them fits under.
 
 Capacity remains logical and shared across Nix, Go, and sccache, and counts
 committed retained entries separately from staging budgets. The storage limit
@@ -238,7 +252,11 @@ is eventually consistent. Publication commits without checking it and wakes a
 background evictor, which also scans every ten minutes for organizations over
 their limit. The evictor removes least-recently-used entries in its own
 bounded transactions, at most 256 entries each, until the organization is at
-or under its limit. LRU ordering still uses the later of publication and
+or under its limit. One evictor works on an organization at a time, across
+server instances: a second one finds the first at work and leaves it to it.
+A pass reads the limit and the usage it acts on under locks, so a limit that
+was raised, or an overage that someone else already deleted, is not evicted
+against once that change has been acknowledged. LRU ordering still uses the later of publication and
 access, with existing pin, push-job, and active-upload protections; an
 organization whose remaining entries are all protected stays over its limit
 until a protection ends. An organization can therefore exceed its limit
@@ -755,9 +773,11 @@ already be published in this cache (409 otherwise); upstream-only dependencies
 are not fetched or silently assumed protected. More than 10000 distinct paths
 returns 413. Creation cost and stored membership scale with closure size;
 history storage scales with revisions and their closures. Candidate scans use
-indexed membership checks, not recursive traversal. Pin mutations serialize
-with publication and deletion through short, fail-fast SQL decisions,
-not locks held across storage I/O. Pinned roots and dependencies cannot be
+indexed membership checks, not recursive traversal. A pin mutation holds its
+cache's row until it commits, which orders it against publication, deletion,
+retention, and eviction in that cache: a path is either evicted before the pin
+is created, and the pin is refused, or protected by it. These are short SQL
+decisions, not locks held across storage I/O. Pinned roots and dependencies cannot be
 removed by capacity, retention, or the existing individual-path deletion
 endpoint. Whole-cache eviction and cache deletion explicitly override pins.
 

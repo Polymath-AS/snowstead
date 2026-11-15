@@ -407,8 +407,9 @@ async fn blocked_policy_update_does_not_block_another_org_slug_claim(pool: PgPoo
         .await
         .unwrap();
     let app = router(state(pool.clone()));
+    // An upload or publication in org A shares its policy row until it commits.
     let mut blocker = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('org:org_alpha',0))")
+    sqlx::query("SELECT FROM orgs WHERE id='org_alpha' FOR SHARE")
         .execute(&mut *blocker)
         .await
         .unwrap();

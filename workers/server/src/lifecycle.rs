@@ -99,9 +99,12 @@ macro_rules! text_states {
 ///   a session whose upload key is outside `staging/`, and
 ///   `migrations::check_upload_cutover` refuses to start while one remains.
 ///
-/// Every transition out of `streaming` or `finalizing` is made under the
-/// `org:<id>` advisory lock, which the publication transaction also holds and
-/// under which it re-reads the status. Publication and abort cannot both win.
+/// Every transition out of `streaming` or `finalizing` is conditional on the
+/// status it leaves, on the session row. A request for one session (seal,
+/// abort, publication) holds that session's `upload:<id>` advisory lock; a
+/// bulk abort (path or cache deletion, job cancellation or completion,
+/// expiry) takes only the row. Publication completes a session only while it
+/// is still `finalizing`, so publication and abort cannot both win.
 ///
 /// Two "active" predicates exist on purpose; they are not the same question:
 /// - Quota (`uploads::create`, `uploads::reserve_tx`): `expires_at > NOW() AND

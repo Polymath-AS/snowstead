@@ -379,23 +379,38 @@ async fn locked(
     identity: &Identity,
 ) -> Result<(Transaction, Session), ApiError> {
     let tx = crate::profile_future!(
-        crate::db::begin(state, &s.org_id),
+        crate::db::begin(state),
         label = "uploads.session_pool_begin"
     )
     .await?;
     lock_session(tx, s, identity).await
 }
 
+/// One writer per session. The advisory lock orders requests for the session
+/// against each other and against publication, without waiting. The row lock
+/// orders them against writers that take no advisory lock: bulk aborts wait
+/// for this transaction, and a cache deletion cannot remove the session from
+/// under the parts, receipt, or candidate this transaction adds.
 async fn lock_session(
     mut tx: Transaction,
     s: &Session,
     identity: &Identity,
 ) -> Result<(Transaction, Session), ApiError> {
-    lock(&mut tx, &format!("org:{}", s.org_id)).await?;
     lock(&mut tx, &format!("upload:{}", s.id)).await?;
-    // Re-read and reauthorize after the fences, using the same query as preflight.
+    lock_rows(&mut tx, std::slice::from_ref(&s.id)).await?;
+    // Re-read and reauthorize after the locks, using the same query as preflight.
     let current = load(&mut *tx, &s.id, identity).await?;
     Ok((tx, current))
+}
+
+/// Lock session rows in ID order, so two multi-session writers cannot wait on
+/// each other. Status changes and deletion wait for the holder.
+async fn lock_rows(tx: &mut Transaction, ids: &[String]) -> Result<(), ApiError> {
+    sqlx::query("SELECT FROM upload_sessions WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE")
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 pub(crate) use protocol::PathInput;
@@ -470,12 +485,12 @@ async fn create(
             member.normalize()?;
         }
     }
-    let mut tx = crate::profile_future!(
-        crate::db::begin(state, identity.org()),
-        label = "uploads.create_pool_begin"
-    )
-    .await?;
-    lock(&mut tx, &format!("org:{}", identity.org())).await?;
+    let mut tx =
+        crate::profile_future!(crate::db::begin(state), label = "uploads.create_pool_begin")
+            .await?;
+    // Hold the policy this decision reads until the sessions commit. A key
+    // share lock on the cache excludes a policy change or deletion, which
+    // take the row FOR UPDATE, but not a publication's update of its totals.
     struct CachePolicy {
         id: i32,
         is_public: bool,
@@ -505,7 +520,8 @@ async fn create(
                 WHERE p.cache_id = c.id
                     AND p.protocol = 'nix'
             )
-        FOR SHARE OF c, o NOWAIT
+        FOR KEY SHARE OF c NOWAIT
+        FOR SHARE OF o NOWAIT
         "#,
         identity.org(),
         cache,
@@ -527,6 +543,7 @@ async fn create(
     } else {
         HashMap::new()
     };
+    // A soft limit: concurrent requests each count before either inserts.
     let active = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) AS "count!"
@@ -730,8 +747,10 @@ async fn reserve_tx(
     reserve_group(tx, &[(s, requested)]).await?.remove(0)
 }
 
-/// The org fence protects the staging total and every accepted size update.
-/// Validation failures exclude only their own session; SQL failures abort the group.
+/// The callers' session locks protect every accepted size update. The staging
+/// total is a soft limit: concurrent reservations each read it before either
+/// adds to it. Validation failures exclude only their own session; SQL
+/// failures abort the group.
 async fn reserve_group(
     tx: &mut Transaction,
     requests: &[(&Session, &[Reservation])],
@@ -906,7 +925,9 @@ async fn reserve_batch(
             }
         }
     }
-    for (org, indices) in groups {
+    // One transaction per organization: each reads that organization's
+    // staging total once.
+    for (_, indices) in groups {
         let requests: Vec<_> = indices
             .iter()
             .map(|i| {
@@ -914,7 +935,7 @@ async fn reserve_batch(
                 (s.id.clone(), parts.as_slice())
             })
             .collect();
-        let outcomes = reserve_org(state, identity, &org, &requests).await;
+        let outcomes = reserve_org(state, identity, &requests).await;
         match outcomes {
             Ok(outcomes) => {
                 for (index, outcome) in indices.into_iter().zip(outcomes) {
@@ -954,11 +975,9 @@ async fn reserve_batch(
 async fn reserve_org(
     state: &AppState,
     identity: &Identity,
-    org: &str,
     requests: &[(String, &[Reservation])],
 ) -> Result<Vec<Result<Session, ApiError>>, ApiError> {
-    let mut tx = crate::db::begin(state, org).await?;
-    lock(&mut tx, &format!("org:{org}")).await?;
+    let mut tx = crate::db::begin(state).await?;
     lock_set(
         &mut tx,
         requests
@@ -968,6 +987,7 @@ async fn reserve_org(
     )
     .await?;
     let ids: Vec<_> = requests.iter().map(|(id, _)| id.clone()).collect();
+    lock_rows(&mut tx, &ids).await?;
     let mut sessions: HashMap<_, _> = load_session_rows(&mut *tx, &ids, identity)
         .await?
         .into_iter()
@@ -1055,8 +1075,18 @@ async fn initialize_multipart(
                 return Err(error(409, "Conflict"));
             }
             if current.r2_upload_id.as_deref() == Some(s.id.as_str()) {
-                sqlx::query("UPDATE upload_sessions SET r2_upload_id=$2,r2_upload_key=$3 WHERE id=$1")
-                    .bind(&s.id).bind(&upload).bind(&key).execute(&mut *tx).await?;
+                // Adopt only into the session this transaction read: still
+                // streaming and still without a provider upload. The row lock
+                // already holds that; the predicate keeps it true by itself.
+                let set = sqlx::query(
+                    "UPDATE upload_sessions SET r2_upload_id=$2,r2_upload_key=$3 \
+                     WHERE id=$1 AND status='streaming' AND r2_upload_id=$1",
+                )
+                .bind(&s.id).bind(&upload).bind(&key).execute(&mut *tx).await?
+                .rows_affected();
+                if set != 1 {
+                    return Err(error(409, "Conflict"));
+                }
                 current.r2_upload_id = Some(upload.clone());
                 current.r2_upload_key = Some(key.clone());
             }
@@ -1176,13 +1206,16 @@ async fn finalization_authority(
         _ => return Err(error(403, "Forbidden")),
     }
     if delegated && session.status != UploadStatus::Completed {
+        // The share lock on the batch holds what this reads until the caller
+        // commits: a consumer's claim, a settlement, and a job resume all take
+        // the batch exclusively, so each runs wholly before or after it.
         let active: Option<bool> = sqlx::query_scalar(
             "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND \
              (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND \
              (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND \
              ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false) \
              FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id \
-             WHERE f.session_id=$1",
+             WHERE f.session_id=$1 FOR SHARE OF b",
         )
         .bind(&session.id)
         .bind(identity.actor())
@@ -1512,7 +1545,8 @@ async fn allocate_candidate(
     Ok(candidate)
 }
 
-/// The caller holds the org and session fences and has validated the seal.
+/// The caller holds the session's advisory and row locks and has validated
+/// the seal, so the session stays finalizing until this candidate commits.
 async fn claim_candidate(tx: &mut Transaction, s: &Session) -> Result<(String, String), ApiError> {
     if !s.is_public && !s.private_caches {
         return Err(error(403, PRIVATE_CACHES_REFUSED));
@@ -1586,11 +1620,25 @@ async fn publish_group(
     claim: Option<&crate::push_job_worker::Claim>,
 ) -> Result<Vec<UploadResult>, ApiError> {
     let org = &ready[0].session.org_id;
-    let mut tx = crate::db::begin(state, org).await?;
+    let mut tx = crate::db::begin(state).await?;
     let result = async {
-    lock(&mut tx, &format!("org:{org}")).await?;
+    // Job rows come first, as for every job writer. A worker holds its job
+    // exclusively from validation to release. A client publishing a job's
+    // sessions itself shares the row: cancellation, completion, resume, and
+    // withdrawal wait for this transaction, or it reads the state they left.
     if let Some(claim) = claim {
         crate::push_job_worker::validate(&mut tx, claim).await?;
+    } else {
+        let jobs: Vec<_> = ready
+            .iter()
+            .filter_map(|p| p.session.push_job_id.clone())
+            .collect();
+        if !jobs.is_empty() {
+            sqlx::query("SELECT FROM push_jobs WHERE id=ANY($1) ORDER BY id FOR SHARE")
+                .bind(&jobs)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     lock_set(
         &mut tx,
@@ -1602,6 +1650,9 @@ async fn publish_group(
     .await?;
     // Cache rows precede the org row, as in the single-item writer. Keys and
     // policy stay locked until all pointers and outcomes commit together.
+    // Key share is enough: whoever changes a cache's keys or visibility, or
+    // deletes it, takes its row FOR UPDATE. A plain share lock would make
+    // two publishers into one cache wait for each other's totals update.
     #[derive(sqlx::FromRow)]
     struct CacheKeys {
         id: i32,
@@ -1612,7 +1663,7 @@ async fn publish_group(
     let cache_ids: Vec<_> = ready.iter().map(|p| p.session.cache_id).collect();
     let keys: Vec<CacheKeys> = sqlx::query_as(
         "SELECT id,signing_key_name,signing_public_key,signing_key_sealed \
-         FROM caches WHERE id=ANY($1) ORDER BY id FOR SHARE NOWAIT",
+         FROM caches WHERE id=ANY($1) ORDER BY id FOR KEY SHARE NOWAIT",
     )
     .bind(&cache_ids)
     .fetch_all(&mut *tx)
@@ -1647,6 +1698,8 @@ async fn publish_group(
             continue;
         }
         finalization_authority(state, &mut tx, identity, current, true).await?;
+        // The authority check above share-locked this session's batch, so
+        // its claim cannot be replaced between this read and the commit.
         if let Some(expected) = &p.finalization_claim {
             let owned: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM upload_finalizations f JOIN upload_finalization_batches b \
@@ -1698,6 +1751,26 @@ async fn publish_group(
         }
         return Ok(results);
     }
+    // From here this transaction reads and writes published paths. Whoever
+    // inserts or deletes a cache's paths first takes its row for the totals
+    // the trigger updates, in ID order: publication, eviction, retention, and
+    // withdrawal then never wait on each other's path rows, and the checks
+    // below hold until commit. This does not conflict with the key share
+    // locks above, so it waits only for another writer of the same cache.
+    sqlx::query("SELECT FROM caches WHERE id=ANY($1) ORDER BY id FOR NO KEY UPDATE")
+        .bind(&cache_ids)
+        .execute(&mut *tx)
+        .await?;
+    // Then the sessions, in ID order. A bulk abort that got there first is
+    // seen by the conditional completion below.
+    lock_rows(
+        &mut tx,
+        &incoming
+            .iter()
+            .map(|p| p.session.id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     if incoming.iter().any(|p| p.session.push_job_id.is_some()) {
         // Prerequisites must match the actual first path winner, not a losing
         // job session with different metadata. Fall back to ordered singletons
@@ -1859,7 +1932,7 @@ struct Prepared {
 
 /// Discover a bounded dependency-closed set of prepared members. This is only a
 /// scheduling hint: publish_group reloads authorization, policy, sessions,
-/// dependencies, and immutable ownership under the existing org fence.
+/// dependencies, and immutable ownership under its own row locks.
 pub(crate) async fn publish_job(
     state: &AppState,
     claim: &mut crate::push_job_worker::Claim,
@@ -2210,7 +2283,7 @@ async fn prepare(
             if matches!(ready.source, PreparedSource::Parts(_)) {
                 // Queued batch members have no execution lease to expire.
                 // Revalidate and own the destination only when work starts.
-                let tx = crate::db::begin_queued(&owned, &ready.session.org_id).await?;
+                let tx = crate::db::begin(&owned).await?;
                 (ready.key, ready.operation) =
                     allocate_candidate(&owned, tx, &identity, &ready.session).await?;
             }
@@ -2346,7 +2419,7 @@ async fn finish_preparation(
     if !ready.key.is_empty() {
         return Ok(ready);
     }
-    let tx = crate::db::begin(state, &ready.session.org_id).await?;
+    let tx = crate::db::begin(state).await?;
     (ready.key, ready.operation) = allocate_candidate(state, tx, identity, &ready.session).await?;
     let PreparedSource::Inline(bytes) = &ready.source else {
         unreachable!("ready candidate has ownership")
@@ -2374,20 +2447,20 @@ async fn finish_preparation(
 
 /// Reject an oversized incoming set before publishing any member. Only verified
 /// sessions count, and duplicate store paths count once, as SQL insertion does.
+/// An unlocked read: this is a sanity bound, not the quota. A limit changed
+/// meanwhile is the evictor's to restore.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn preflight(state: &AppState, org: &str, ready: &[&Prepared]) -> Result<(), ApiError> {
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, org),
+        crate::db::begin(state),
         label = "uploads.preflight_pool_begin"
     )
     .await?;
-    lock(&mut tx, &format!("org:{org}")).await?;
     let limit: Option<i64> = sqlx::query_scalar!(
         r#"
         SELECT storage_limit
         FROM orgs
         WHERE id = $1
-        FOR SHARE NOWAIT
         "#,
         org,
     )
@@ -2454,8 +2527,8 @@ async fn finalize_batch(
     let mut results = vec![None; inputs.len()];
     let mut ready = Vec::with_capacity(inputs.len());
     let mut sealed = Vec::with_capacity(inputs.len());
-    // Serialize SQL decisions within this request, not storage I/O. Otherwise
-    // this batch could reject its own items on the fail-fast org fence.
+    // Seal one at a time: each seal is a short transaction, and a batch
+    // should not occupy several pool connections at once.
     for (index, input) in inputs.into_iter().enumerate() {
         let id = input.session_id.clone();
         let reserved = async {
@@ -2733,7 +2806,7 @@ async fn inline_batch(
     let mut ready = Vec::with_capacity(body.uploads.len());
     let mut sealed = Vec::with_capacity(body.uploads.len());
     offset = 4 + manifest_size;
-    // As with streamed batches, do not race this request's own SQL admissions.
+    // As with streamed batches, seal one at a time.
     for (index, input) in body.uploads.into_iter().enumerate() {
         let bytes = frame.slice(offset..offset + input.file_size as usize);
         offset += input.file_size as usize;
@@ -2845,8 +2918,8 @@ async fn abort(
     let (mut tx, s) = locked(state, &s, identity).await?;
     // A sealed session is abortable too: after a failed verification or
     // publication it could otherwise only wait out its lease. Completed is
-    // terminal. Publication re-reads this status under the same org and upload
-    // fences before it adopts anything, so exactly one of the two commits.
+    // terminal. Publication holds this session's upload lock from before it
+    // re-reads the status until it commits, so exactly one of the two commits.
     // A push job owns its members: cancelling the job is how they stop, so a
     // sealed member is not aborted from under its publication worker.
     let abortable = match s.status {
@@ -2862,6 +2935,7 @@ async fn abort(
         UPDATE upload_sessions
         SET status = 'aborted'
         WHERE id = $1
+            AND status <> 'completed'
         "#,
         id,
     )

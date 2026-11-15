@@ -365,10 +365,12 @@ async fn worker_evicts_on_its_timer_and_survives_a_failed_eviction(pool: PgPool)
     retain(&pool, '1', 40, 1).await;
     retain(&pool, '2', 40, 2).await;
     limit(&pool, Some(40)).await;
-    // Another writer holds the organization fence: eviction fails, retryably.
-    let mut fence = pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(hashtextextended('org:default',0))")
-        .execute(&mut *fence)
+    // A management change holds the cache's row, as a pin or a path deletion
+    // does until it commits. Eviction needs that row for the cache's totals:
+    // it waits out its lock timeout and fails, retryably.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SELECT FROM caches FOR UPDATE")
+        .execute(&mut *writer)
         .await
         .unwrap();
     assert!(capacity::evict(&state, "default").await.is_err());
@@ -378,15 +380,12 @@ async fn worker_evicts_on_its_timer_and_survives_a_failed_eviction(pool: PgPool)
         stop.clone(),
         Duration::from_millis(20),
     ));
-    // Several ticks fail against the fence. The worker neither evicts nor ends.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Several passes time out against that row. The worker neither evicts
+    // nor ends.
+    tokio::time::sleep(Duration::from_millis(350)).await;
     assert!(!worker.is_finished());
     assert_eq!(kept(&pool).await, "12");
-    sqlx::query("SELECT pg_advisory_unlock(hashtextextended('org:default',0))")
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-    drop(fence);
+    writer.rollback().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while kept(&pool).await != "2" {
             tokio::time::sleep(Duration::from_millis(5)).await;

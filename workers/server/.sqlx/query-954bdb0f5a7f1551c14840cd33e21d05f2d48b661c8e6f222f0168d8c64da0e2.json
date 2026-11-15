@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                    SELECT id\n                    FROM caches\n                    WHERE id = $1\n                    FOR SHARE\n                    ",
+  "query": "\n                    SELECT id\n                    FROM caches\n                    WHERE id = $1\n                    FOR KEY SHARE\n                    ",
   "describe": {
     "columns": [
       {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "7cd5336481264ed3019bf999461da233459d072c3e70cfe68140c31b7f1c8d5e"
+  "hash": "954bdb0f5a7f1551c14840cd33e21d05f2d48b661c8e6f222f0168d8c64da0e2"
 }

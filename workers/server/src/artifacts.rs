@@ -483,19 +483,10 @@ pub async fn consume(body: Body, size: u64) -> Result<(), ApiError> {
     consume_hash(body, size).await.map(|_| ())
 }
 
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn org_lock(tx: &mut Transaction, org: &str) -> Result<(), ApiError> {
-    let key = format!("org:{org}");
-    crate::profile_future!(
-        crate::db::advisory_lock(tx, &key),
-        label = "artifacts.org_lock_wait"
-    )
-    .await?;
-    Ok(())
-}
-
-// Every compiler writer takes org -> cache -> entry. The cache row also fences
-// reset/deletion, which cannot be undone by an older in-flight transfer.
+// Every compiler writer takes cache -> entry. A key share lock on the cache
+// row holds its generation and visibility: a reset, a visibility change, and
+// deletion take the row FOR UPDATE, and cannot be undone by an older
+// in-flight transfer. The org row is shared against a policy change.
 struct Policy {
     generation: String,
     public: bool,
@@ -532,7 +523,8 @@ async fn policy(
                                 WHERE p.cache_id = c.id
                                     AND p.protocol = 'go'
                             )
-                        FOR SHARE OF c, o NOWAIT
+                        FOR KEY SHARE OF c NOWAIT
+                        FOR SHARE OF o NOWAIT
                         "#,
                         target.cache_id,
                         &target.org,
@@ -559,7 +551,8 @@ async fn policy(
                                 WHERE p.cache_id = c.id
                                     AND p.protocol = 'sccache'
                             )
-                        FOR SHARE OF c, o NOWAIT
+                        FOR KEY SHARE OF c NOWAIT
+                        FOR SHARE OF o NOWAIT
                         "#,
                         target.cache_id,
                         &target.org,
@@ -608,11 +601,10 @@ async fn reserve(
 ) -> Result<Entry, ApiError> {
     let kind = product.name();
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, &target.org),
+        crate::db::begin(state),
         label = "artifacts.reserve_pool_begin"
     )
     .await?;
-    org_lock(&mut tx, &target.org).await?;
     let mut limit = policy(&mut tx, target, product, StatusCode::CONFLICT).await?;
     let too_large = || {
         error(
@@ -716,8 +708,7 @@ async fn reserve(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")),
             }
-            tx = crate::db::begin(state, &target.org).await?;
-            org_lock(&mut tx, &target.org).await?;
+            tx = crate::db::begin(state).await?;
             limit = policy(&mut tx, target, product, StatusCode::CONFLICT).await?;
             let current = locked_entry(&mut tx, target, product, &entry.id).await?;
             if current.r2_key != entry.r2_key
@@ -1039,11 +1030,10 @@ async fn finish(
 ) -> Result<Response, ApiError> {
     let id = &expected.id;
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, &target.org),
+        crate::db::begin(state),
         label = "artifacts.adopt_pool_begin"
     )
     .await?;
-    org_lock(&mut tx, &target.org).await?;
     policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
     let won = entry.stored_at.is_none() && entry.uploaded_at.is_none();
@@ -1124,11 +1114,10 @@ async fn finish(
         let _ = state.storage.delete(true, &transfer.key).await;
     }
     let mut tx = crate::profile_future!(
-        crate::db::begin(state, &target.org),
+        crate::db::begin(state),
         label = "artifacts.publish_pool_begin"
     )
     .await?;
-    org_lock(&mut tx, &target.org).await?;
     policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
     if entry.uploaded_at.is_none() {
