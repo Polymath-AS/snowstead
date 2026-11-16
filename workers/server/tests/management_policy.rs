@@ -21,6 +21,148 @@ use std::sync::{
 };
 use tower::ServiceExt;
 
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn bazel_targets_follow_tiers_and_reset_isolates_generations(pool: PgPool) {
+    use sha2::Digest;
+    let storage = common::storage();
+    let state = fixture_with_storage(&pool, storage.clone()).await;
+    let app = router(state.clone());
+    let base = "/_api/v1/orgs/policy_a";
+    let (status, _) = send(
+        &app,
+        "PUT",
+        base,
+        "policy-admin",
+        json!({"storageLimit":100}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (name, capacity) in [("bazel-a", 100), ("bazel-b", 80)] {
+        let (status, result) = send(
+            &app,
+            "POST",
+            &format!("{base}/caches"),
+            "policy-admin",
+            json!({"name":name,"protocols":["bazel"],"bazelCapacity":capacity}),
+        )
+        .await;
+        assert!(status.is_success(), "{result}");
+    }
+    let (_, usage) = send(
+        &app,
+        "GET",
+        &format!("{base}/caches/bazel-a/bazel"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(usage["capacity"], 100);
+    assert_eq!(usage["target"], 50);
+    assert!(usage["usageUpdatedAt"].is_null());
+    let generation: String = sqlx::query_scalar("SELECT generation FROM bazel_caches b JOIN caches c ON c.id=b.cache_id WHERE c.name='bazel-a'")
+        .fetch_one(&pool).await.unwrap();
+    let store = snowstead_server::bazel::store::Store::new(storage, &generation, 50);
+    let hash = hex::encode(Sha256::digest(b"contents"));
+    store
+        .write("cas", &hash, 8, Body::from("contents"))
+        .await
+        .unwrap();
+    let (_, usage) = send(
+        &app,
+        "GET",
+        &format!("{base}/caches/bazel-a/bazel"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(usage["entries"], 0);
+    assert!(usage["usageUpdatedAt"].is_null());
+    // Dashboard reads use the last completed background observation, not S3.
+    sqlx::query("INSERT INTO bazel_usage(cache_id,generation,entries,size,physical_size,staging_size,updated_at)
+        SELECT cache_id,generation,1,8,16,4,NOW() - INTERVAL '5 minutes' FROM bazel_caches WHERE generation=$1")
+        .bind(&generation).execute(&pool).await.unwrap();
+    let (_, usage) = send(
+        &app,
+        "GET",
+        &format!("{base}/caches/bazel-a/bazel"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(usage["entries"], 1);
+    assert_eq!(usage["size"], 8);
+    assert_eq!(usage["physicalSize"], 16);
+    assert_eq!(usage["stagingSize"], 4);
+    assert!(usage["usageUpdatedAt"].is_string());
+    let offline = Storage::new(&Config {
+        r2_endpoint: "http://127.0.0.1:1".into(),
+        r2_access_key_id: "test".into(),
+        r2_secret_access_key: "test".into(),
+        r2_bucket_name: "unavailable-private".into(),
+        r2_public_bucket_name: "unavailable-public".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let offline =
+        router(AppState::new(pool.clone(), config(), offline, reqwest::Client::new()).unwrap());
+    for path in [base.to_owned(), format!("{base}/caches/bazel-a/bazel")] {
+        let (status, result) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send(&offline, "GET", &path, "policy-admin", Value::Null),
+        )
+        .await
+        .expect("dashboard reads must not wait for object storage");
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result[if path == base { "used" } else { "size" }], 8);
+    }
+    let (status, usage) = send(&app, "GET", base, "policy-admin", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(usage["used"], 8);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        base,
+        "policy-admin",
+        json!({"storageLimit":30}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, usage) = send(
+        &app,
+        "GET",
+        &format!("{base}/caches/bazel-a/bazel"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(usage["target"], 15);
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{base}/caches/bazel-a/bazel/reset"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A writer admitted before reset can finish only in the retired generation.
+    store
+        .write("cas", &hash, 8, Body::from("contents"))
+        .await
+        .unwrap();
+    let (_, usage) = send(
+        &app,
+        "GET",
+        &format!("{base}/caches/bazel-a/bazel"),
+        "policy-admin",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(usage["entries"], 0);
+    assert_eq!(usage["size"], 0);
+    assert!(usage["usageUpdatedAt"].is_null());
+}
+
 fn jwt(org: &str, cache: &str, perms: &[&str]) -> String {
     let p = json!({"jti":format!("policy-{org}-{cache}-{}", perms.join("+")),"sub":"ci","iss":"snowstead","aud":"snowstead","iat":1,"org":org,"caches":[cache],"perms":perms});
     let input = format!(

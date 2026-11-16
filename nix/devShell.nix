@@ -18,6 +18,7 @@ pkgs.mkShell {
     # The GOCACHEPROG helper and real compiler-client checks.
     pkgs.go
     pkgs.sccache
+    pkgs.bazel_8
     pkgs.stdenv.cc
     # Tests run against a throwaway cluster (scripts/with-postgres.sh).
     pkgs.postgresql

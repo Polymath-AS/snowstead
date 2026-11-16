@@ -246,9 +246,13 @@ fn route_action(method: &Method, endpoint: &str) -> Option<Action> {
         ("GET", "" | "/" | "/overview" | "/caches" | "/caches/{cache}" | "/eviction") => {
             Action::OrgRead
         }
-        ("GET", "/caches/{cache}/pins" | "/caches/{cache}/go" | "/caches/{cache}/sccache") => {
-            Action::OrgRead
-        }
+        (
+            "GET",
+            "/caches/{cache}/pins"
+            | "/caches/{cache}/go"
+            | "/caches/{cache}/sccache"
+            | "/caches/{cache}/bazel",
+        ) => Action::OrgRead,
         ("GET", "/caches/{cache}/paths") => Action::OrgRead,
         ("PUT", "" | "/") => Action::OrgSlugWrite,
         ("POST", "/move") => Action::OrgMove,
@@ -257,6 +261,7 @@ fn route_action(method: &Method, endpoint: &str) -> Option<Action> {
             "/caches"
             | "/caches/{cache}/go/reset"
             | "/caches/{cache}/sccache/reset"
+            | "/caches/{cache}/bazel/reset"
             | "/caches/{cache}/paths/delete"
             | "/caches/{cache}/delete"
             | "/caches/{cache}/evict"
@@ -511,6 +516,7 @@ fn audit_action(method: &Method, endpoint: &str, admin: bool) -> Option<&'static
         ("POST", "/caches/{cache}/evict") => Some("cache.evict"),
         ("POST", "/caches/{cache}/go/reset") => Some("go.reset"),
         ("POST", "/caches/{cache}/sccache/reset") => Some("sccache.reset"),
+        ("POST", "/caches/{cache}/bazel/reset") => Some("bazel.reset"),
         ("POST", "/caches/{cache}/pins") => Some("pin.create"),
         ("DELETE", "/caches/{cache}/pins/{pin}") => Some("pin.delete"),
         ("POST", "/auth/sync") => Some("auth.sync"),
@@ -786,6 +792,12 @@ async fn org_response(
             WHERE c.org_id = $1
                 AND e.generation = c.sccache_generation
                 AND e.expires_at > NOW()
+            UNION ALL
+            SELECT SUM(u.size), 0
+            FROM bazel_usage u
+            JOIN bazel_caches b ON b.cache_id=u.cache_id AND b.generation=u.generation
+            JOIN caches c ON c.id=b.cache_id
+            WHERE c.org_id=$1
         ) usage
         "#,
             id
@@ -1250,13 +1262,13 @@ async fn create_cache(
         let p = p
             .as_array()
             .filter(|a| !a.is_empty())
-            .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+            .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
         let mut result = Vec::new();
         for value in p {
             let protocol = value
                 .as_str()
-                .filter(|s| ["nix", "go", "sccache"].contains(s))
-                .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+                .filter(|s| ["nix", "go", "sccache", "bazel"].contains(s))
+                .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
             if result.iter().any(|p| p == protocol) {
                 return Err(bad("protocols must not contain duplicates"));
             }
@@ -1322,7 +1334,7 @@ async fn create_cache(
     };
     let protocols = requested
         .or_else(|| existing.as_ref().map(|_| old_protocols.clone()))
-        .ok_or_else(|| bad("Choose at least one protocol: nix, go, or sccache"))?;
+        .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
     if old_protocols.iter().any(|p| !protocols.contains(p)) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1469,6 +1481,35 @@ async fn create_cache(
         )
         .execute(&mut *tx)
         .await?;
+    }
+    if protocols.iter().any(|p| p == "bazel")
+        && (!old_protocols.iter().any(|p| p == "bazel") || raw.get("bazelCapacity").is_some())
+    {
+        let limit: Option<i64> = sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let allocation = match raw.get("bazelCapacity") {
+            Some(value) => integer(value)
+                .filter(|size| *size >= 0)
+                .ok_or_else(|| bad("bazelCapacity must be a nonnegative byte count"))?,
+            None => limit.unwrap_or(1024 * 1024 * 1024).min(1024 * 1024 * 1024),
+        };
+        sqlx::query("INSERT INTO bazel_caches(cache_id, generation, capacity) VALUES ($1,$2,$3) ON CONFLICT(cache_id) DO UPDATE SET capacity=EXCLUDED.capacity")
+            .bind(cache)
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(allocation)
+            .execute(&mut *tx)
+            .await?;
+    }
+    if changing {
+        // Visibility changes cannot expose objects from a private generation.
+        // In-flight writers may finish only in the retired generation.
+        sqlx::query("UPDATE bazel_caches SET generation=$2 WHERE cache_id=$1")
+            .bind(cache)
+            .bind(uuid::Uuid::now_v7().to_string())
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query!(
         r#"

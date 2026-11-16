@@ -17,6 +17,7 @@ use axum::{
     response::Response,
 };
 use futures_util::Stream;
+use http_body_util::{BodyStream, StreamBody};
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram, Meter},
@@ -158,7 +159,7 @@ impl RequestObservation {
         }
         let (parts, body) = response.into_parts();
         let stream = ObservedStream {
-            inner: Box::pin(body.into_data_stream()),
+            inner: Box::pin(BodyStream::new(body)),
             operation: Operation {
                 started: self.started,
                 attributes,
@@ -167,7 +168,7 @@ impl RequestObservation {
             },
             span: self.span,
         };
-        Response::from_parts(parts, axum::body::Body::from_stream(stream))
+        Response::from_parts(parts, axum::body::Body::new(StreamBody::new(stream)))
     }
 }
 

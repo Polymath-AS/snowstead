@@ -40,6 +40,7 @@ let
       server {
         listen 443 ssl;
         listen [::]:443 ssl;
+        http2 on;
         server_name ${inventory.hostname} ${inventory.publicHostname}${
           pkgs.lib.optionalString (inventory ? cacheHostSuffix) " *.${inventory.cacheHostSuffix}"
         };
@@ -47,6 +48,15 @@ let
         ssl_certificate_key $CREDENTIALS_DIRECTORY/origin-key;
         ssl_client_certificate $CREDENTIALS_DIRECTORY/origin-client-ca;
         ssl_verify_client on;
+        location ~ ^/(build\.bazel\.remote\.execution\.v2\.(Capabilities|ActionCache|ContentAddressableStorage)|google\.bytestream\.ByteStream)/ {
+          grpc_pass grpc://127.0.0.1:8080;
+          grpc_set_header Host \$host;
+          grpc_set_header X-Forwarded-For \$remote_addr;
+          grpc_set_header X-Forwarded-Proto https;
+          grpc_connect_timeout 5s;
+          grpc_read_timeout 300s;
+          grpc_send_timeout 300s;
+        }
         location / {
           proxy_pass http://snowstead;
           proxy_http_version 1.1;

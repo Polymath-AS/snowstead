@@ -156,6 +156,9 @@ pub async fn serve_router(
     state
         .tasks
         .spawn(maintenance::drain(state.clone(), retry_stop.clone()));
+    state
+        .tasks
+        .spawn(crate::bazel::maintain(state.clone(), retry_stop.clone()));
     state.start_upload_finalizers();
     state.tasks.spawn(crate::capacity::run(
         state.clone(),
@@ -250,6 +253,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::nix::router(state.clone()))
         .merge(crate::go::router())
         .merge(crate::sccache::router())
+        .merge(crate::bazel::router(state.clone()))
         .merge(management::router(state.clone()))
         .route("/_api/v1", any(api_not_found))
         .route("/_api/v1/{*unmatched}", any(api_not_found))

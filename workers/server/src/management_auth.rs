@@ -101,22 +101,13 @@ fn strings(value: &Value, field: &str, max: usize) -> Result<Vec<String>, ApiErr
             })?
         } else {
             let s = item.as_str().unwrap_or("");
-            if ![
-                "pull",
-                "push",
-                "go:read",
-                "go:write",
-                "sccache:read",
-                "sccache:write",
-            ]
-            .contains(&s)
-            {
+            if crate::authz::Permission::parse(s).is_none() {
                 let input = item
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| item.to_string());
                 return Err(bad(format!(
-                    "perms[{index}]: invalid permission: {input}, expected \"pull\", \"push\", \"go:read\", \"go:write\", \"sccache:read\", or \"sccache:write\""
+                    "perms[{index}]: invalid permission: {input}, expected \"pull\", \"push\", \"go:read\", \"go:write\", \"sccache:read\", \"sccache:write\", \"bazel:read\", or \"bazel:write\""
                 )));
             }
             s
