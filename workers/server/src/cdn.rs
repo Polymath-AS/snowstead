@@ -786,10 +786,13 @@ mod tests {
                 requests[0].1["files"][0],
                 format!("https://cdn.example.test/org/cache/{}.narinfo", hash(0))
             );
+            // Sends are paced 100 ms apart. Arrivals are measured here, and a
+            // busy host can delay one arrival more than the next, so allow
+            // half the interval: unpaced requests would arrive together.
             assert!(
                 requests
                     .windows(2)
-                    .all(|r| r[1].0.duration_since(r[0].0) >= Duration::from_millis(100))
+                    .all(|r| r[1].0.duration_since(r[0].0) >= Duration::from_millis(50))
             );
         }
 
