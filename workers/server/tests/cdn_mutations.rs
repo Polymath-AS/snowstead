@@ -221,11 +221,17 @@ async fn publication_and_capacity_eviction_use_sql_membership_and_queue_no_narin
             .unwrap();
     assert_eq!(result["published"], true, "{result}");
     // Publication does not evict. The evictor withdraws the old path afterwards.
+    // Asked of SQL, not the read route: a read stamps the path as just used,
+    // which would make it the newer of the two.
     assert_eq!(
-        read(&app, &format!("/main/{old_hash}.narinfo"), false)
-            .await
-            .0,
-        StatusCode::OK
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM published_paths WHERE store_path_hash=$1"
+        )
+        .bind(&old_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
     );
     assert_eq!(
         snowstead_server::capacity::evict(&state, "default")
