@@ -12,6 +12,7 @@ use crate::{
     authz::{ApiToken, CacheGrant, Permission, Principal as Identity},
     db::{self, Transaction},
     error::ApiError,
+    wake::{Pace, Turn},
 };
 
 pub(crate) struct Claim {
@@ -26,29 +27,21 @@ pub(crate) struct Claim {
 
 // Round-robin organizations, then least-recently-claimed jobs within the org.
 // These cursors control fairness only; database leases provide correctness.
+// An idle worker waits as `wake` describes, not on a poll interval.
 pub(crate) async fn run(state: AppState, stopped: CancellationToken) {
     let mut after = String::new();
-    loop {
-        if stopped.is_cancelled() {
-            break;
-        }
-        let result = turn(&state, &mut after).await;
-        match result {
-            Ok(true) => tokio::task::yield_now().await,
-            _ => {
-                if result.is_err() {
-                    tracing::warn!("Push job publication deferred; durable candidates retained");
-                }
-                tokio::select! {
-                    _ = stopped.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            }
-        }
+    let mut pace = Pace::new(&state.publications, &stopped, state.idle_period);
+    while pace.running() {
+        let outcome = turn(&state, &mut after).await.inspect_err(|_| deferred());
+        pace.after(outcome).await;
     }
 }
 
-async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
+fn deferred() {
+    tracing::warn!("Push job publication deferred; durable candidates retained");
+}
+
+async fn turn(state: &AppState, after: &mut String) -> Result<Turn, ApiError> {
     // At most one discovery read at a time, closed before the claim.
     // Wrap only after exhausting larger org IDs, rather than sorting every org.
     let mut org = discover(state, after).await?;
@@ -57,12 +50,14 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
         org = discover(state, after).await?;
     }
     let Some(org) = org else {
-        return Ok(false);
+        return Ok(Turn::Idle(next_due(state).await?));
     };
     *after = org.clone();
     let Some(mut claim) = claim(state, &org).await? else {
-        return Ok(false);
+        return Ok(Turn::Missed);
     };
+    // This worker is now busy. Another looks for whatever else is due.
+    state.publications.wake();
     let published = crate::uploads::publish_job(state, &mut claim).await;
     // Successful publication releases the claim in its own atomic commit.
     // Only empty/failed turns need a separate backoff transaction.
@@ -85,7 +80,44 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
             }
         }
     }
-    published.map(|count| count > 0)
+    match published {
+        Ok(count) if count > 0 => Ok(Turn::Worked),
+        // Nothing was publishable yet, or publication failed. Either way the
+        // release above recorded the job's own backoff, so pause as a poll
+        // once did and then read when it is next due. The longer pause is for
+        // a worker that cannot reach SQL at all.
+        Ok(_) => Ok(Turn::Missed),
+        Err(_) => {
+            deferred();
+            Ok(Turn::Missed)
+        }
+    }
+}
+
+/// When the earliest job that is not due yet becomes due: a backoff ends or a
+/// lease another worker stopped renewing expires. Mirrors `discover` without
+/// its two clock conditions, and runs only as a worker goes idle.
+async fn next_due(state: &AppState) -> Result<Option<Duration>, ApiError> {
+    let mut tx = db::begin_read(state).await?;
+    let seconds: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM MIN(GREATEST(j.work_at,COALESCE(j.work_expires_at,j.work_at))) \
+             -clock_timestamp())::double precision \
+         FROM push_jobs j JOIN caches c ON c.id=j.cache_id \
+         JOIN api_tokens t ON t.jti=j.authorization_jti \
+         WHERE j.state='sealed' AND NOT j.work_blocked \
+         AND j.authorization_claims IS NOT NULL AND j.authorization_expires_at>NOW() \
+         AND j.idle_expires_at>NOW() AND j.hard_expires_at>NOW() AND t.revoked_at IS NULL \
+         AND EXISTS (SELECT 1 FROM push_job_members m JOIN upload_sessions u ON u.id=m.session_id \
+             JOIN nar_installations n ON n.session_id=u.id \
+             WHERE m.job_id=j.id AND m.session_id IS NOT NULL \
+             AND m.blocked_generation IS DISTINCT FROM j.grant_generation \
+             AND u.push_job_id=j.id AND u.status='finalizing' AND u.expires_at>NOW() \
+             AND n.phase='ready' AND n.expires_at>NOW())",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    Ok(crate::wake::until(seconds))
 }
 
 async fn discover(state: &AppState, after: &str) -> Result<Option<String>, ApiError> {

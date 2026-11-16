@@ -644,7 +644,7 @@ async fn resume(
     .execute(&mut *tx)
     .await?;
     // Only batches with unsettled members become runnable. A settled batch
-    // stays parked, outside the range every idle consumer polls.
+    // stays parked, outside the range every consumer scans.
     sqlx::query(
         "UPDATE upload_finalization_batches b SET \
          expires_at=LEAST(j.authorization_expires_at,j.idle_expires_at,j.hard_expires_at), \
@@ -660,6 +660,10 @@ async fn resume(
     .await?;
     let job = load(&mut *tx, cache_id, &token.id, &id, false).await?;
     tx.commit().await?;
+    // The renewed grant makes a blocked, backed-off, or expired job
+    // publishable again, and its reset batches runnable.
+    state.publications.wake();
+    state.finalizations.wake();
     Ok(response(StatusCode::OK, job, &state))
 }
 

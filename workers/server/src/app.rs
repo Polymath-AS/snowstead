@@ -44,6 +44,12 @@ pub struct AppState {
     pub(crate) manifest_slots: Arc<Semaphore>,
     /// Organizations whose retained usage may have grown since eviction.
     pub(crate) evictions: Arc<crate::capacity::Wakes>,
+    /// Sent after a commit that makes a finalization batch runnable.
+    pub(crate) finalizations: Arc<crate::wake::Wake>,
+    /// Sent after a commit that leaves a push job a candidate to publish.
+    pub(crate) publications: Arc<crate::wake::Wake>,
+    /// How long an idle worker sleeps before it looks without being woken.
+    pub(crate) idle_period: Duration,
     pub(crate) cdn: Option<Arc<dyn cdn::PurgeTransport>>,
     proxy_ips: Arc<[IpAddr]>,
 }
@@ -76,6 +82,9 @@ impl AppState {
             cdn: None,
             read_pool: pool.clone(),
             evictions: Arc::default(),
+            finalizations: Arc::default(),
+            publications: Arc::default(),
+            idle_period: crate::wake::FALLBACK,
             pool,
             storage,
             verification_slots: Arc::new(Semaphore::new(config.resources.verifications)),
@@ -105,6 +114,14 @@ impl AppState {
         );
         self.cdn = Some(transport);
         Ok(self)
+    }
+
+    /// Change, before starting workers, how long an idle one sleeps before it
+    /// looks for work nothing in this process announced. Thirty seconds by
+    /// default. Work this process commits is picked up without it.
+    pub fn with_idle_period(mut self, period: Duration) -> Self {
+        self.idle_period = period;
+        self
     }
 
     /// Start the durable multipart consumers once. Tower hosts and tests use

@@ -2,6 +2,7 @@
 //! batch leases bound scheduling. Neither lease holds a SQL connection.
 use super::*;
 use crate::authz::{ApiToken, CacheGrant, Permission};
+use crate::wake::{Pace, Turn};
 use tokio_util::sync::CancellationToken;
 
 pub(super) async fn enqueue_finalizations(
@@ -49,10 +50,16 @@ pub(super) async fn enqueue_finalizations(
     // A crashed admission becomes runnable after 60 seconds. Its already
     // sealed members are complete durable work, not an incomplete receipt.
     let batches: Vec<_> = batches.into_values().collect();
-    sqlx::query("UPDATE upload_finalization_batches SET admitted=true WHERE id=ANY($1)")
-        .bind(&batches)
-        .execute(&state.pool)
-        .await?;
+    let admitted =
+        sqlx::query("UPDATE upload_finalization_batches SET admitted=true WHERE id=ANY($1)")
+            .bind(&batches)
+            .execute(&state.pool)
+            .await;
+    // Wake a consumer whether or not that committed. A seal above may have
+    // made an older, already admitted batch runnable again, and a consumer
+    // that finds nothing rereads when a batch left unadmitted becomes due.
+    state.finalizations.wake();
+    admitted?;
     sqlx::query(
         "DELETE FROM upload_finalization_batches b WHERE id=ANY($1) \
         AND NOT EXISTS(SELECT 1 FROM upload_finalizations f WHERE f.batch_id=b.id)",
@@ -216,39 +223,55 @@ struct Work {
 
 /// Separate preparation consumers keep slow storage from starving the
 /// existing SQL-only job publisher. Local resource gates bound actual I/O.
+/// An idle consumer waits as `wake` describes, not on a poll interval.
 pub(crate) async fn run(state: AppState, stopped: CancellationToken) {
     let mut after = String::new();
-    loop {
-        if stopped.is_cancelled() {
-            break;
-        }
-        match turn(&state, &mut after).await {
-            Ok(true) => tokio::task::yield_now().await,
-            result => {
-                if result.is_err() {
-                    tracing::warn!("Multipart finalization deferred; SQL retains work");
-                }
-                tokio::select! {
-                    _ = stopped.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            }
-        }
+    let mut pace = Pace::new(&state.finalizations, &stopped, state.idle_period);
+    while pace.running() {
+        let outcome = turn(&state, &mut after).await.inspect_err(|_| {
+            tracing::warn!("Multipart finalization deferred; SQL retains work");
+        });
+        pace.after(outcome).await;
     }
 }
 
-#[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
-    let org: Option<String> = sqlx::query_scalar(
+async fn discover(state: &AppState, after: &str) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_scalar(
         "SELECT b.org_id FROM upload_finalization_batches b WHERE b.org_id>$1 AND b.work_at<=NOW() \
          AND (b.admitted OR b.created_at<NOW()-INTERVAL '60 seconds') \
          AND (b.lease_expires_at IS NULL OR b.lease_expires_at<=NOW()) \
          AND EXISTS(SELECT 1 FROM upload_finalizations f WHERE f.batch_id=b.id AND f.result IS NULL) \
          ORDER BY b.org_id LIMIT 1",
-    ).bind(&*after).fetch_optional(&state.pool).await?;
-    let Some(org) = org else {
+    ).bind(after).fetch_optional(&state.pool).await?)
+}
+
+/// When the earliest batch that is not runnable yet becomes so: a retry
+/// backoff ends, a lease its consumer stopped renewing expires, or a crashed
+/// admission turns 60 seconds old. Mirrors `discover`, and runs only as a
+/// consumer goes idle. Settled batches are parked at infinity, outside the
+/// range this reads.
+async fn next_due(state: &AppState) -> Result<Option<Duration>, ApiError> {
+    let seconds: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM MIN(GREATEST(b.work_at,COALESCE(b.lease_expires_at,b.work_at), \
+             CASE WHEN b.admitted THEN b.work_at ELSE b.created_at+INTERVAL '60 seconds' END)) \
+             -clock_timestamp())::double precision \
+         FROM upload_finalization_batches b WHERE b.work_at<'infinity' \
+         AND EXISTS(SELECT 1 FROM upload_finalizations f WHERE f.batch_id=b.id AND f.result IS NULL)",
+    ).fetch_one(&state.pool).await?;
+    Ok(crate::wake::until(seconds))
+}
+
+#[cfg_attr(feature = "profiling", hotpath::measure)]
+async fn turn(state: &AppState, after: &mut String) -> Result<Turn, ApiError> {
+    // Wrap only after exhausting larger org IDs: a consumer goes idle on a
+    // scan of every organization, not on the tail its cursor had left.
+    let mut org = discover(state, after).await?;
+    if org.is_none() && !after.is_empty() {
         after.clear();
-        return Ok(false);
+        org = discover(state, after).await?;
+    }
+    let Some(org) = org else {
+        return Ok(Turn::Idle(next_due(state).await?));
     };
     *after = org.clone();
     let mut tx = db::begin(state).await?;
@@ -262,7 +285,8 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
          ORDER BY b.work_at,b.id LIMIT 1 FOR UPDATE OF b NOWAIT",
     ).bind(&org).fetch_optional(&mut *tx).await?;
     let Some(work) = work else {
-        return Ok(false);
+        // Another consumer claimed it between the two reads.
+        return Ok(Turn::Missed);
     };
     let started = std::time::Instant::now();
     let claim = uuid::Uuid::now_v7().to_string();
@@ -272,6 +296,8 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
         "SELECT receipt FROM upload_finalizations WHERE batch_id=$1 AND result IS NULL ORDER BY ordinal",
     ).bind(&work.id).fetch_all(&mut *tx).await?;
     tx.commit().await?;
+    // This consumer is now busy. Another looks for whatever else is due.
+    state.finalizations.wake();
     let result = async {
     let inputs: Vec<_> = receipts.into_iter().map(|r| r.0).collect();
     let ids: Vec<_> = inputs.iter().map(|r| r.session_id.clone()).collect();
@@ -421,13 +447,13 @@ async fn turn(state: &AppState, after: &mut String) -> Result<bool, ApiError> {
         tracing::warn!(batch_id=%work.id,work_id=%claim,status=error.status.as_u16(),
             requeued=released.as_ref().is_ok_and(|row| row.rows_affected()>0),"Multipart finalization settlement deferred");
     }
-    result
+    result.map(|_| Turn::Worked)
 }
 
 /// Release non-job staging admission at the delegation deadline. Revoked
 /// credentials release job staging too; a revoked token cannot resume a job.
 pub(crate) async fn expire(state: &AppState) -> anyhow::Result<u64> {
-    // This runs every second. Start from the sessions still finalizing and
+    // This runs on every drain pass. Start from the sessions still finalizing and
     // from the deadline index, never from every retained batch and member.
     let batches: Vec<(String, String)> = sqlx::query_as(
         "SELECT id,org_id FROM ( \
@@ -472,10 +498,12 @@ pub(crate) async fn expire(state: &AppState) -> anyhow::Result<u64> {
              SELECT TRUE,r2_upload_key,NULLIF(r2_upload_id,id) FROM expired WHERE r2_upload_key IS NOT NULL \
              ON CONFLICT(is_private,key) DO UPDATE SET upload_id=COALESCE(EXCLUDED.upload_id,object_cleanup.upload_id)",
         ).bind(&id).bind(shared_generation(state)).execute(&mut *tx).await?.rows_affected();
-        sqlx::query("DELETE FROM upload_finalization_batches b WHERE b.id=$1 AND b.expires_at<NOW()-INTERVAL '24 hours' \
+        // A batch deleted here is progress too: its caller keeps going while
+        // a pass retires something, and more than twenty can be due at once.
+        count += sqlx::query("DELETE FROM upload_finalization_batches b WHERE b.id=$1 AND b.expires_at<NOW()-INTERVAL '24 hours' \
             AND NOT EXISTS(SELECT 1 FROM upload_finalizations f JOIN upload_sessions u ON u.id=f.session_id \
                 WHERE f.batch_id=b.id AND u.status='finalizing' AND u.expires_at>NOW())")
-            .bind(&id).execute(&mut *tx).await?;
+            .bind(&id).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
     }
     Ok(count)
@@ -698,7 +726,10 @@ mod tests {
         assert!(requeued);
         sqlx::raw_sql("DROP TRIGGER fail_finalization_result ON upload_finalizations; DROP FUNCTION fail_finalization_result(); UPDATE upload_finalization_batches SET work_at=NOW();")
             .execute(&pool).await.unwrap();
-        assert!(turn(&state, &mut String::new()).await.unwrap());
+        assert!(matches!(
+            turn(&state, &mut String::new()).await.unwrap(),
+            Turn::Worked
+        ));
         let ids = vec![receipt.session_id.clone()];
         let parked: bool = sqlx::query_scalar(
             "SELECT admitted AND work_at='infinity'::timestamptz FROM upload_finalization_batches",
@@ -762,7 +793,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows[0].status, Some(410));
-        assert!(turn(&state, &mut String::new()).await.unwrap());
+        assert!(matches!(
+            turn(&state, &mut String::new()).await.unwrap(),
+            Turn::Worked
+        ));
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM published_paths")
             .fetch_one(&pool)
             .await
@@ -1199,7 +1233,10 @@ mod tests {
         assert!(unclaimed);
         append.rollback().await.unwrap();
         // The next tick claims it.
-        assert!(turn(&state, &mut String::new()).await.unwrap());
+        assert!(matches!(
+            turn(&state, &mut String::new()).await.unwrap(),
+            Turn::Worked
+        ));
         let admitted: bool = sqlx::query_scalar("SELECT admitted FROM upload_finalization_batches")
             .fetch_one(&pool)
             .await
@@ -1244,7 +1281,10 @@ mod tests {
             "UPDATE upload_finalization_batches SET work_id=NULL,lease_expires_at=NULL",
         )
         .await;
-        assert!(turn(&state, &mut String::new()).await.unwrap());
+        assert!(matches!(
+            turn(&state, &mut String::new()).await.unwrap(),
+            Turn::Worked
+        ));
         // Both members have a terminal result to write; only the one settled
         // while the claim was still held may be recorded.
         let (completed, unsettled, unclaimed): (i64, i64, bool) = sqlx::query_as(

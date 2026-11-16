@@ -1492,7 +1492,10 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
             storage.clone(),
             reqwest::Client::new(),
         )
-        .unwrap();
+        .unwrap()
+        // These workers learn of every change below as another process
+        // would: from SQL, on their idle period. Keep that short.
+        .with_idle_period(std::time::Duration::from_millis(100));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         stops.push(stop);
@@ -5029,7 +5032,10 @@ async fn independent_publishers_reuse_candidates_after_rollback_and_publish_over
                 storage.clone(),
                 reqwest::Client::new(),
             )
-            .unwrap(),
+            .unwrap()
+            // This test parks and releases batches with SQL, which wakes
+            // nobody. Its consumers find them on their idle period.
+            .with_idle_period(Duration::from_millis(100)),
         ));
         pools.push(independent);
     }

@@ -2400,8 +2400,18 @@ async fn publish_prepared(
         .tasks
         .spawn(crate::profile_future!(
             async move {
-                let ready = finish_preparation(&owned, &identity, ready).await?;
-                publish(&owned, &identity, &ready).await
+                let job = ready.session.push_job_id.is_some();
+                let result = async {
+                    let ready = finish_preparation(&owned, &identity, ready).await?;
+                    publish(&owned, &identity, &ready).await
+                }
+                .await;
+                if job && !matches!(&result, Ok(row) if row.published) {
+                    // A job member this could not publish keeps any candidate
+                    // it confirmed, which the job's worker then publishes.
+                    owned.publications.wake();
+                }
+                result
             },
             label = "uploads.publication"
         ))
@@ -2543,8 +2553,15 @@ async fn finalize_batch(
             Err(e) => results[index] = result_value(&id, Err(e)),
         }
     }
+    let hand_over = options.prepare_only;
     let preparations = stream::iter(sealed.into_iter().map(|(index, id, prepared)| async move {
-        (index, id, prepare(state, identity, prepared).await)
+        let result = prepare(state, identity, prepared).await;
+        if hand_over && result.is_ok() {
+            // This member's candidate is confirmed and its job's worker
+            // publishes it. Do not hold that back for the rest of the batch.
+            state.publications.wake();
+        }
+        (index, id, result)
     }))
     .buffered(4);
     tokio::pin!(preparations);
@@ -2610,13 +2627,23 @@ async fn publish_batch(
         .tasks
         .spawn(async move {
             let mut pending = Vec::new();
+            let jobs: Vec<_> = ready
+                .iter()
+                .filter(|(_, p)| p.session.push_job_id.is_some())
+                .map(|(index, _)| *index)
+                .collect();
             for (index, p) in ready {
                 if results[index].is_some() {
                     continue;
                 }
                 let id = p.session.id.clone();
+                let unconfirmed = p.key.is_empty();
                 match finish_preparation(&owned, &identity, p).await {
                     Ok(p) if options.prepare_only => {
+                        if unconfirmed {
+                            // Confirmed just now, for the job's worker.
+                            owned.publications.wake();
+                        }
                         results[index] = Some(prepared_value(&p));
                     }
                     Ok(p) => pending.push((index, p)),
@@ -2653,6 +2680,15 @@ async fn publish_batch(
                         }
                     }
                 }
+            }
+            // A job member this request meant to publish and could not keeps
+            // its confirmed candidate, which the job's worker then publishes.
+            if !options.prepare_only
+                && jobs
+                    .iter()
+                    .any(|index| !results[*index].as_ref().is_some_and(|row| row.published))
+            {
+                owned.publications.wake();
             }
             results
         })
@@ -2891,6 +2927,8 @@ async fn inline(
                 .tasks
                 .spawn(async move {
                     let ready = finish_preparation(&owned, &identity, ready).await?;
+                    // Confirmed, for the job's worker to publish.
+                    owned.publications.wake();
                     Ok(prepared_value(&ready))
                 })
                 .await

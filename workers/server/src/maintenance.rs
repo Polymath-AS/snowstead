@@ -26,6 +26,8 @@ const SESSION_PAGES: usize = 5_000;
 const SESSION_BUDGET: Duration = Duration::from_secs(300);
 const ROW_BATCHES: usize = 2_000;
 const ROW_BUDGET: Duration = Duration::from_secs(60);
+/// The pause between drain passes while there is work, as it has always been.
+const BUSY: Duration = Duration::from_secs(1);
 // Retain revocations beyond the verifier's entire acceptance window, with
 // a small margin for clock/precision differences between SQL and the server.
 const TOKEN_EXPIRY_MARGIN_SECONDS: i64 = 5;
@@ -38,26 +40,60 @@ struct CleanupCursor {
 }
 
 /// Drain durable retirement work independently of the slow discovery sweep.
-/// Each tick finishes one bounded page before shutdown. The cursor passes
+/// Each pass finishes one bounded page before shutdown. The cursor passes
 /// failed entries and wraps, so neither retries nor new arrivals can starve.
+///
+/// Nobody waits on this, and its queues fill from many writers and triggers,
+/// so nothing wakes it. A pass that retired something, or left cleanup pages
+/// of its frozen range unread, is followed a second later by the next: the
+/// pace it always had, so a backlog drains as before and a stage that keeps
+/// reporting progress cannot spin. A pass that found nothing waits out the
+/// idle period, which is how late an expiry here can now run. A pass
+/// that only failed backs off instead.
 pub(crate) async fn drain(state: AppState, stopped: CancellationToken) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cursor = CleanupCursor::default();
-    loop {
+    let mut failures = crate::wake::Backoff::default();
+    while !stopped.is_cancelled() {
+        let mut counts = Counts::default();
+        record(
+            &mut counts.push_jobs,
+            &mut counts.failed_stages,
+            "push manifests",
+            expire_manifests(&state).await,
+        );
+        record(
+            &mut counts.sessions,
+            &mut counts.failed_stages,
+            "finalization batches",
+            crate::uploads::expire_finalizations(&state).await,
+        );
+        record(
+            &mut counts.orphan_objects,
+            &mut counts.failed_stages,
+            "publication reservations",
+            expire_installations(&state).await,
+        );
+        record(
+            &mut counts.orphan_objects,
+            &mut counts.failed_stages,
+            "object cleanup",
+            cleanup_objects(&state, &mut cursor).await,
+        );
+        let retired = counts.push_jobs + counts.sessions + counts.orphan_objects > 0;
+        let pause = if retired {
+            failures.reset();
+            BUSY
+        } else if counts.failed_stages > 0 {
+            failures.next()
+        } else if cursor.after < cursor.through {
+            BUSY
+        } else {
+            failures.reset();
+            state.idle_period
+        };
         tokio::select! {
             _ = stopped.cancelled() => break,
-            _ = interval.tick() => {
-                let mut counts = Counts::default();
-                record(&mut counts.push_jobs, &mut counts.failed_stages,
-                    "push manifests", expire_manifests(&state).await);
-                record(&mut counts.sessions, &mut counts.failed_stages,
-                    "finalization batches", crate::uploads::expire_finalizations(&state).await);
-                record(&mut counts.orphan_objects, &mut counts.failed_stages,
-                    "publication reservations", expire_installations(&state).await);
-                record(&mut counts.orphan_objects, &mut counts.failed_stages,
-                    "object cleanup", cleanup_objects(&state, &mut cursor).await);
-            }
+            _ = tokio::time::sleep(pause) => {}
         }
     }
 }
