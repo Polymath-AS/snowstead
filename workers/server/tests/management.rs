@@ -309,6 +309,8 @@ async fn reporting_uses_replica_but_policy_and_mutations_use_primary(pool: PgPoo
         CREATE TABLE replica.org_api_keys (LIKE public.org_api_keys INCLUDING ALL);
         CREATE TABLE replica.go_entries (LIKE public.go_entries INCLUDING ALL);
         CREATE TABLE replica.sccache_entries (LIKE public.sccache_entries INCLUDING ALL);
+        CREATE TABLE replica.bazel_caches (LIKE public.bazel_caches INCLUDING ALL);
+        CREATE TABLE replica.bazel_usage (LIKE public.bazel_usage INCLUDING ALL);
         CREATE TABLE replica.cache_protocols (LIKE public.cache_protocols INCLUDING ALL);
         CREATE TABLE replica.published_paths (LIKE public.published_paths INCLUDING ALL);
         INSERT INTO replica.orgs(id,slug) VALUES ('old_alpha','old-alpha'),('old_beta','old-beta');

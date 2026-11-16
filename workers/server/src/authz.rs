@@ -16,16 +16,20 @@ pub enum Permission {
     GoWrite,
     SccacheRead,
     SccacheWrite,
+    BazelRead,
+    BazelWrite,
 }
 
 impl Permission {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Pull,
         Self::Push,
         Self::GoRead,
         Self::GoWrite,
         Self::SccacheRead,
         Self::SccacheWrite,
+        Self::BazelRead,
+        Self::BazelWrite,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -36,6 +40,8 @@ impl Permission {
             Self::GoWrite => "go:write",
             Self::SccacheRead => "sccache:read",
             Self::SccacheWrite => "sccache:write",
+            Self::BazelRead => "bazel:read",
+            Self::BazelWrite => "bazel:write",
         }
     }
 
@@ -220,10 +226,12 @@ pub enum Action {
     GoWrite,
     SccacheRead,
     SccacheWrite,
+    BazelRead,
+    BazelWrite,
 }
 
 impl Action {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::Operate,
         Self::OrgLimitsWrite,
         Self::OrgRead,
@@ -245,6 +253,8 @@ impl Action {
         Self::GoWrite,
         Self::SccacheRead,
         Self::SccacheWrite,
+        Self::BazelRead,
+        Self::BazelWrite,
     ];
 }
 
@@ -304,7 +314,7 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
                         user.role.owns()
                     }
                     Operate | OrgLimitsWrite | NixPull | NixPush | GoRead | GoWrite
-                    | SccacheRead | SccacheWrite => false,
+                    | SccacheRead | SccacheWrite | BazelRead | BazelWrite => false,
                 }
         }
         Principal::OrgKey { org, .. } => {
@@ -334,6 +344,8 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
                     GoWrite => token.allows(Permission::GoWrite, resource),
                     SccacheRead => token.allows(Permission::SccacheRead, resource),
                     SccacheWrite => token.allows(Permission::SccacheWrite, resource),
+                    BazelRead => token.allows(Permission::BazelRead, resource),
+                    BazelWrite => token.allows(Permission::BazelWrite, resource),
                     Operate | OrgLimitsWrite | OrgRead | OrgSlugWrite | OrgMove | CacheWrite
                     | TokenRead | TokenWrite | ApiKeyRead | ApiKeyCreate | ApiKeyRevoke
                     | SigningKeyRead | SigningKeyWrite | AuditRead => false,
@@ -373,6 +385,8 @@ mod tests {
             GoWrite => 18,
             SccacheRead => 19,
             SccacheWrite => 20,
+            BazelRead => 21,
+            BazelWrite => 22,
         }
     }
 
@@ -470,6 +484,8 @@ mod tests {
                     GoWrite,
                     SccacheRead,
                     SccacheWrite,
+                    BazelRead,
+                    BazelWrite,
                 ],
             ),
             (
@@ -564,6 +580,8 @@ mod tests {
                             GoWrite => Some(Permission::GoWrite),
                             SccacheRead => Some(Permission::SccacheRead),
                             SccacheWrite => Some(Permission::SccacheWrite),
+                            BazelRead => Some(Permission::BazelRead),
+                            BazelWrite => Some(Permission::BazelWrite),
                             _ => None,
                         };
                         required.is_some_and(|p| token.permissions.contains(&p))

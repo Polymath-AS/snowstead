@@ -3,6 +3,35 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-changed=proto");
+    let mut proto = tonic_prost_build::Config::new();
+    proto.protoc_executable(protoc_bin_vendored::protoc_bin_path().unwrap());
+    let mut descriptors = proto
+        .load_fds(
+            &[
+                root.join("proto/build/bazel/remote/execution/v2/remote_execution.proto"),
+                root.join("proto/google/bytestream/bytestream.proto"),
+            ],
+            &[
+                root.join("proto"),
+                protoc_bin_vendored::include_path().unwrap(),
+            ],
+        )
+        .expect("load Bazel remote cache protocol");
+    // Upstream prose uses protobuf, not Rustdoc, markup. Keep its documentation
+    // in the vendored sources without copying it into generated Rust APIs.
+    for file in &mut descriptors.file {
+        if let Some(info) = &mut file.source_code_info {
+            for location in &mut info.location {
+                location.leading_comments = None;
+                location.trailing_comments = None;
+                location.leading_detached_comments.clear();
+            }
+        }
+    }
+    tonic_prost_build::configure()
+        .compile_fds_with_config(descriptors, proto)
+        .expect("compile Bazel remote cache protocol");
     println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-changed=../../pkg/nix-archive");
     println!("cargo:rerun-if-changed=../../pkg/snitch");

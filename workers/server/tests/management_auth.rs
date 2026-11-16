@@ -211,6 +211,16 @@ async fn created_tokens_work_on_protocol_and_follow_cache_ids(pool: PgPool) {
     let alpha = key(&app, "org_alpha").await;
     let credential = alpha["key"].as_str().unwrap();
     let path = "/_api/v1/orgs/org_alpha/tokens";
+    let (status, bazel) = call(
+        &app,
+        "POST",
+        path,
+        Some(credential),
+        json!({"subject":"bazel-ci","caches":["main"],"perms":["bazel:read","bazel:write"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bazel}");
+    assert_eq!(bazel["perms"], json!(["bazel:read", "bazel:write"]));
     let (status, made) = call(&app,"POST",path,Some(credential),json!({"org":"org_beta","subject":"ci","caches":["main","main","ci-*"],"perms":["pull","push","push"],"expiresInDays":null})).await;
     assert_eq!(status, StatusCode::CREATED, "{made}");
     assert_eq!(made["caches"], json!(["main", "ci-*"]));

@@ -337,6 +337,17 @@ impl Storage {
         if private { &self.private } else { &self.public }
     }
 
+    pub(crate) fn private_store(&self) -> Arc<dyn ObjectStore> {
+        self.private.clone()
+    }
+
+    pub(crate) fn upload_buffer(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.upload_memory
+            .clone()
+            .try_acquire_many_owned(bytes.div_ceil(MEMORY_UNIT) as u32)
+            .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Upload memory exhausted"))
+    }
+
     #[cfg_attr(
         feature = "observability",
         tracing::instrument(target = "snowstead_observability", skip_all, name = "storage.open")

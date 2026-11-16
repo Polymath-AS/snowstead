@@ -139,8 +139,10 @@ pub(crate) fn org_router() -> Router<AppState> {
         .route("/caches/{cache}/pins/{pin}", delete(remove_pin))
         .route("/caches/{cache}/go", get(get_go))
         .route("/caches/{cache}/sccache", get(get_sccache))
+        .route("/caches/{cache}/bazel", get(get_bazel))
         .route("/caches/{cache}/go/reset", post(reset_go))
         .route("/caches/{cache}/sccache/reset", post(reset_sccache))
+        .route("/caches/{cache}/bazel/reset", post(reset_bazel))
         .route("/caches/{cache}/paths", get(get_paths))
         .route("/caches/{cache}/paths/delete", post(remove_paths))
         .route("/caches/{cache}/delete", post(remove_cache))
@@ -506,6 +508,46 @@ async fn reset_sccache(
     compiler_stats(state, context, path.cache, "sccache", true).await
 }
 
+async fn get_bazel(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    Path(path): Path<CachePath>,
+) -> Result<Response, ApiError> {
+    let FencedCache { mut tx, id, .. } =
+        load_cache(&state, context_org(&context), &path.cache, true).await?;
+    let result: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('capacity',b.capacity,'target',b.target,'eviction','approximate-lru',
+            'entries',COALESCE(u.entries,0),'size',COALESCE(u.size,0),
+            'physicalSize',COALESCE(u.physical_size,0),'stagingSize',COALESCE(u.staging_size,0),
+            'usageUpdatedAt',u.updated_at)
+         FROM bazel_retention b LEFT JOIN bazel_usage u ON u.cache_id=b.cache_id AND u.generation=b.generation
+         WHERE b.cache_id=$1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(missing)?;
+    tx.commit().await?;
+    Ok(ok(result))
+}
+
+async fn reset_bazel(
+    State(state): State<AppState>,
+    Extension(context): Extension<ManagementContext>,
+    Path(path): Path<CachePath>,
+) -> Result<Response, ApiError> {
+    let FencedCache { mut tx, id, .. } =
+        load_cache(&state, context_org(&context), &path.cache, false).await?;
+    protocol(&mut tx, id, "bazel").await?;
+    sqlx::query("UPDATE bazel_caches SET generation=$2 WHERE cache_id=$1")
+        .bind(id)
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ok(json!({"reset":true})))
+}
+
 async fn get_paths(
     State(state): State<AppState>,
     Extension(context): Extension<ManagementContext>,
@@ -667,6 +709,11 @@ async fn withdraw_cache(
         removed[kind] = json!(count);
         reset_compiler_generation(&mut tx, id, kind).await?;
     }
+    sqlx::query("UPDATE bazel_caches SET generation=$2 WHERE cache_id=$1")
+        .bind(id)
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(&mut *tx)
+        .await?;
     let response = if delete {
         metadata.withdraw_cache_info(&mut tx).await?;
         // These foreign keys deliberately do not cascade. A transfer

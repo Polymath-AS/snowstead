@@ -51,6 +51,7 @@ mod app;
 mod artifacts;
 pub mod auth;
 pub mod authz;
+pub mod bazel;
 mod cache;
 mod cache_host;
 pub mod capacity;
