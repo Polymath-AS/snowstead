@@ -1166,13 +1166,40 @@ fn shared_generation(state: &AppState) -> Option<String> {
 /// orders revocation against it: a revocation in flight is waited for and then
 /// seen, and a later one waits for this transaction. Never store the bearer
 /// credential, and never trust middleware's old token snapshot.
+///
+/// Returns the session's finalization claim when a delegated caller's batch
+/// was read, and so held: that claim cannot change before the commit.
 async fn finalization_authority(
     state: &AppState,
     tx: &mut Transaction,
     identity: &Identity,
     session: &Session,
     delegated: bool,
-) -> Result<(), ApiError> {
+) -> Result<Option<String>, ApiError> {
+    let authority = token_authority(state, tx, identity).await?;
+    session_authority(
+        state,
+        tx,
+        identity,
+        authority.as_ref(),
+        session,
+        delegated,
+        None,
+    )
+    .await
+}
+
+/// The token half of `finalization_authority`: what the token grants now, or
+/// nothing for the shared token. One read serves every session a transaction
+/// decides. Until it commits, the share lock keeps the token unrevoked and
+/// its `NOW()` does not move; grant rows are only ever inserted with their
+/// token or removed with a cache, and a transaction that decides several
+/// sessions holds their caches FOR KEY SHARE.
+async fn token_authority(
+    state: &AppState,
+    tx: &mut Transaction,
+    identity: &Identity,
+) -> Result<Option<Identity>, ApiError> {
     use crate::authz::{ApiToken, CacheGrant, Permission};
     match identity {
         Identity::ApiToken(token) => {
@@ -1193,7 +1220,7 @@ async fn finalization_authority(
                  AND (t.expires_at IS NULL OR t.expires_at>NOW()) FOR SHARE OF t",
             ).bind(&token.id).fetch_optional(&mut **tx).await?
                 .ok_or_else(|| error(401, "Token revoked or expired"))?;
-            let current = Identity::ApiToken(ApiToken {
+            Ok(Some(Identity::ApiToken(ApiToken {
                 id: token.id.clone(),
                 org: grant.org,
                 expires_at: grant.expires_at,
@@ -1208,39 +1235,61 @@ async fn finalization_authority(
                     .map(CacheGrant::Id)
                     .chain(grant.patterns.into_iter().map(CacheGrant::Pattern))
                     .collect(),
-            });
-            decide(
-                &current,
-                Action::NixPush,
-                &Resource::cache(&session.org_id, session.cache_id, &session.name),
-            )
-            .map_err(|_| error(403, "Forbidden"))?;
+            })))
         }
-        Identity::SharedToken if shared_generation(state).is_some() => {}
-        _ => return Err(error(403, "Forbidden")),
+        Identity::SharedToken if shared_generation(state).is_some() => Ok(None),
+        _ => Err(error(403, "Forbidden")),
     }
-    if delegated && session.status != UploadStatus::Completed {
-        // The share lock on the batch holds what this reads until the caller
-        // commits: a consumer's claim, a settlement, and a job resume all take
-        // the batch exclusively, so each runs wholly before or after it.
-        let active: Option<bool> = sqlx::query_scalar(
-            "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND \
-             (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND \
-             (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND \
-             ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false) \
-             FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id \
-             WHERE f.session_id=$1 FOR SHARE OF b",
+}
+
+/// The session half of `finalization_authority`, under the `authority` its
+/// transaction read. A publisher passes the claim it `expected` to still own.
+async fn session_authority(
+    state: &AppState,
+    tx: &mut Transaction,
+    identity: &Identity,
+    authority: Option<&Identity>,
+    session: &Session,
+    delegated: bool,
+    expected: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if let Some(current) = authority {
+        decide(
+            current,
+            Action::NixPush,
+            &Resource::cache(&session.org_id, session.cache_id, &session.name),
         )
-        .bind(&session.id)
-        .bind(identity.actor())
-        .bind(shared_generation(state))
-        .fetch_optional(&mut **tx)
-        .await?;
-        if active == Some(false) {
-            return Err(error(401, "Finalization authorization expired or replaced"));
-        }
+        .map_err(|_| error(403, "Forbidden"))?;
     }
-    Ok(())
+    if !delegated || session.status == UploadStatus::Completed {
+        return Ok(None);
+    }
+    // The share lock on the batch holds what this reads until the caller
+    // commits: a consumer's claim, a settlement, and a job resume all take
+    // the batch exclusively, so each runs wholly before or after it.
+    let batch: Option<(bool, Option<String>, bool)> = sqlx::query_as(
+        "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND \
+         (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND \
+         (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND \
+         ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false), \
+         b.work_id,COALESCE(b.work_id=$4 AND b.lease_expires_at>clock_timestamp() \
+         AND b.expires_at>clock_timestamp(),false) \
+         FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id \
+         WHERE f.session_id=$1 FOR SHARE OF b",
+    )
+    .bind(&session.id)
+    .bind(identity.actor())
+    .bind(shared_generation(state))
+    .bind(expected)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if matches!(batch, Some((false, ..))) {
+        return Err(error(401, "Finalization authorization expired or replaced"));
+    }
+    if expected.is_some() && !matches!(batch, Some((_, _, true))) {
+        return Err(error(409, "Finalization claim expired or replaced"));
+    }
+    Ok(batch.and_then(|(_, claim, _)| claim))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1255,32 +1304,30 @@ async fn seal(
     let inline = bytes.is_some();
     let nar_hash = receipt.validate()?;
     let (mut tx, mut s) = locked(state, session, identity).await?;
-    finalization_authority(state, &mut tx, identity, &s, admission.is_none()).await?;
+    let claim = finalization_authority(state, &mut tx, identity, &s, admission.is_none()).await?;
     if let Some((batch, _, prepare_only)) = admission {
-        let existing: Option<bool> = sqlx::query_scalar(
-            "SELECT b.prepare_only FROM upload_finalizations f JOIN upload_finalization_batches b \
-             ON b.id=f.batch_id WHERE f.session_id=$1",
+        // Never strand a late member in settled work. Only a session with no
+        // batch yet looks at the offered one, and the share lock then holds
+        // its admission open until this append commits: a consumer's claim
+        // fails its NOWAIT and retries, and a close that got there first is
+        // waited for and then seen. The session's own membership cannot
+        // change under its locks, so one statement reads both.
+        let (existing, open): (Option<bool>, Option<bool>) = sqlx::query_as(
+            "SELECT e.prepare_only,(SELECT TRUE FROM upload_finalization_batches \
+             WHERE e.prepare_only IS NULL AND id=$2 AND NOT admitted FOR SHARE) \
+             FROM (SELECT (SELECT b.prepare_only FROM upload_finalizations f \
+             JOIN upload_finalization_batches b ON b.id=f.batch_id WHERE f.session_id=$1) \
+             AS prepare_only OFFSET 0) e",
         )
         .bind(&s.id)
-        .fetch_optional(&mut *tx)
+        .bind(batch)
+        .fetch_one(&mut *tx)
         .await?;
         if existing.is_some_and(|saved| saved != prepare_only) {
             return Err(error(409, "Finalization intent cannot change"));
         }
-        if existing.is_none() {
-            // Never strand a late member in settled work. The share lock holds
-            // admission open until this append commits: a consumer's claim
-            // fails its NOWAIT and retries, and a close that got there first
-            // is waited for and then seen.
-            let open: Option<bool> = sqlx::query_scalar(
-                "SELECT TRUE FROM upload_finalization_batches WHERE id=$1 AND NOT admitted FOR SHARE",
-            )
-            .bind(batch)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if open.is_none() {
-                return Err(error(503, "Finalization admission closed; retry"));
-            }
+        if existing.is_none() && open.is_none() {
+            return Err(error(503, "Finalization admission closed; retry"));
         }
     }
     if (s.r2_upload_id.is_none()) != inline {
@@ -1399,27 +1446,28 @@ async fn seal(
         s.status = UploadStatus::Finalizing;
     }
     if let Some((batch, ordinal, _)) = admission {
+        // An explicit retry may reconsider changed capacity. It cannot renew
+        // a deadline, replace the actor, or change immutable verification.
+        // A session is appended or retried, never both: an appended row has
+        // no result yet, and a row that exists is not appended again.
         sqlx::query(
-            "INSERT INTO upload_finalizations(session_id,batch_id,ordinal,receipt) \
-            VALUES($1,$2,$3,$4) ON CONFLICT(session_id) DO NOTHING",
+            "WITH appended AS (INSERT INTO upload_finalizations(session_id,batch_id,ordinal,receipt) \
+             VALUES($1,$3,$4,$5) ON CONFLICT(session_id) DO NOTHING), \
+             retried AS (UPDATE upload_finalizations f SET result=NULL \
+             FROM upload_finalization_batches b WHERE f.session_id=$1 AND b.id=f.batch_id \
+             AND b.actor=$2 AND b.expires_at>clock_timestamp() \
+             AND (f.result->>'status')::integer IN (413,507) RETURNING f.batch_id) \
+             UPDATE upload_finalization_batches SET work_at=NOW(),failures=0 WHERE id IN (SELECT batch_id FROM retried)",
         )
         .bind(&s.id)
+        .bind(identity.actor())
         .bind(batch)
         .bind(ordinal as i32)
         .bind(sqlx::types::Json(receipt))
         .execute(&mut *tx)
         .await?;
-        // An explicit retry may reconsider changed capacity. It cannot renew
-        // a deadline, replace the actor, or change immutable verification.
-        sqlx::query(
-            "WITH retried AS (UPDATE upload_finalizations f SET result=NULL \
-             FROM upload_finalization_batches b WHERE f.session_id=$1 AND b.id=f.batch_id \
-             AND b.actor=$2 AND b.expires_at>clock_timestamp() \
-             AND (f.result->>'status')::integer IN (413,507) RETURNING f.batch_id) \
-             UPDATE upload_finalization_batches SET work_at=NOW(),failures=0 WHERE id IN (SELECT batch_id FROM retried)",
-        ).bind(&s.id).bind(identity.actor()).execute(&mut *tx).await?;
     }
-    let prepared = prepare_sealed(&mut tx, s, stored, bytes).await?;
+    let prepared = prepare_sealed(&mut tx, s, stored, bytes, claim).await?;
     tx.commit().await?;
     Ok(prepared)
 }
@@ -1704,6 +1752,7 @@ async fn publish_group(
     }
     let mut results = Vec::with_capacity(ready.len());
     let mut incoming = Vec::new();
+    let mut authority = None;
     for p in ready {
         let s = &p.session;
         let current = sessions.get(&s.id).ok_or_else(|| error(404, "Not found"))?;
@@ -1711,19 +1760,22 @@ async fn publish_group(
             results.push(completed_result(current));
             continue;
         }
-        finalization_authority(state, &mut tx, identity, current, true).await?;
-        // The authority check above share-locked this session's batch, so
-        // its claim cannot be replaced between this read and the commit.
-        if let Some(expected) = &p.finalization_claim {
-            let owned: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM upload_finalizations f JOIN upload_finalization_batches b \
-                 ON b.id=f.batch_id WHERE f.session_id=$1 AND b.work_id=$2 \
-                 AND b.lease_expires_at>clock_timestamp() AND b.expires_at>clock_timestamp())",
-            ).bind(&s.id).bind(expected).fetch_one(&mut *tx).await?;
-            if !owned {
-                return Err(error(409,"Finalization claim expired or replaced"));
-            }
+        // The token is read, and share-locked, by the first member that
+        // needs it. The authority check share-locks this session's batch as
+        // it reads the claim, which cannot then be replaced before the commit.
+        if authority.is_none() {
+            authority = Some(token_authority(state, &mut tx, identity).await?);
         }
+        session_authority(
+            state,
+            &mut tx,
+            identity,
+            authority.as_ref().unwrap().as_ref(),
+            current,
+            true,
+            p.finalization_claim.as_deref(),
+        )
+        .await?;
         if current.status != UploadStatus::Finalizing || current.file_hash != s.file_hash {
             return Err(error(409, "Conflict"));
         }
@@ -2134,15 +2186,8 @@ async fn prepare_sealed(
     s: Session,
     parts: Vec<Part>,
     inline: Option<axum::body::Bytes>,
+    finalization_claim: Option<String>,
 ) -> Result<Prepared, ApiError> {
-    let finalization_claim: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT b.work_id FROM upload_finalizations f JOIN upload_finalization_batches b \
-         ON b.id=f.batch_id WHERE f.session_id=$1",
-    )
-    .bind(&s.id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
     if s.status == UploadStatus::Completed {
         return Ok(Prepared {
             session: s,
