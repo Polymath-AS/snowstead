@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.staged AS \"staged!\",p.session_id AS \"session_id?\",p.part_number AS \"part_number?\",p.size AS \"size?\" FROM (SELECT COALESCE(SUM(u.file_size),0)::bigint AS staged FROM upload_sessions u JOIN caches c ON c.id=u.cache_id WHERE c.org_id=$3 AND u.expires_at>NOW() AND u.status IN ('streaming','finalizing')) s LEFT JOIN (SELECT p.session_id,p.part_number,p.size FROM upload_parts p JOIN UNNEST($1::text[],$2::integer[]) r(session_id,part_number) USING(session_id,part_number)) p ON TRUE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "staged!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "session_id?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_parts",
+            "name": "session_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "part_number?",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "upload_parts",
+            "name": "part_number"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "size?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "upload_parts",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int4Array",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "39245cbe296e63ec7fafe36015a81777e0ed18f49651d363c3b96437132258d3"
+}

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT held.ok AS \"held!\",(SELECT count(*) FROM (SELECT FROM upload_sessions WHERE held.ok AND id=ANY($1) ORDER BY id FOR NO KEY UPDATE) locked) AS locked FROM (SELECT COALESCE(bool_and(pg_try_advisory_xact_lock(hashtextextended(key,0))),TRUE) AS ok FROM (SELECT DISTINCT 'upload:'||id AS key FROM UNNEST($1::text[]) AS id ORDER BY key OFFSET 0) ordered) held",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "held!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "locked",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "117a7f3d3d7a7f6a1127261838e8a1d9c01a6aced7b469094dd913a2820e271e"
+}
