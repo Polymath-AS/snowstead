@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT generation AS \"generation!\", target AS \"target!\"\n            FROM bazel_retention WHERE generation = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "generation!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bazel_retention",
+            "name": "generation"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "target!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bazel_retention",
+            "name": "target"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "c6ead782979af8e72a39d9627d71499e10e5d86311649a454db007eb1f555640"
+}
