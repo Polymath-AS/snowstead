@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH target AS (\n            SELECT c.id, ($4 OR c.id = ANY($5)) AS permitted\n            FROM caches c\n            WHERE c.org_id = $1\n                AND c.name = $2\n                AND EXISTS (\n                    SELECT 1\n                    FROM cache_protocols p\n                    WHERE p.cache_id = c.id\n                        AND p.protocol = 'nix'\n                )\n        ), refreshed AS (\n            UPDATE published_paths\n            SET last_pushed_at = NOW()\n            WHERE cache_id = (SELECT id FROM target WHERE permitted)\n                AND store_path_hash = ANY($3)\n                AND last_pushed_at < NOW() - INTERVAL '1 day'\n            RETURNING id\n        )\n        SELECT\n            t.id AS \"id!\",\n            ARRAY(\n                SELECT p.store_path_hash\n                FROM published_paths p\n                WHERE t.permitted\n                    AND p.cache_id = t.id\n                    AND p.store_path_hash = ANY($3)\n            ) AS \"existing!\",\n            -- Without configured upstreams this lookup never starts.\n            ARRAY(\n                SELECT u.store_path_hash\n                FROM upstream_paths u\n                WHERE t.permitted\n                    AND CARDINALITY($6::text[]) > 0\n                    AND u.store_path_hash = ANY($3)\n                    AND u.upstream = ANY($6)\n            ) AS \"served!\"\n        FROM target t\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "existing!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "served!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray",
+        "Bool",
+        "Int4Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "690f3e03e2f723475251396abb658e6ecb1c9c5c907fd6ef196c36a171b5c01c"
+}

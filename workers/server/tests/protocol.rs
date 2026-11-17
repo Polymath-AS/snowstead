@@ -450,6 +450,172 @@ async fn hosted_v1_missing_paths_and_authorization(pool: PgPool) {
     server.await.unwrap();
 }
 
+/// The lookup, refresh, and membership answer share one statement, so a
+/// request it rejects must leave retention exactly as it found it.
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn missing_paths_resolves_the_cache_and_refreshes_only_within_scope(pool: PgPool) {
+    sqlx::raw_sql("INSERT INTO orgs (id,slug) VALUES ('org_alpha','alpha'),('org_beta','beta');
+        INSERT INTO caches (name,org_id) VALUES ('main','org_alpha'),('other','org_alpha'),('go-only','org_alpha'),('main','org_beta');
+        INSERT INTO cache_protocols (cache_id,protocol) SELECT id, CASE WHEN name='go-only' THEN 'go' ELSE 'nix' END FROM caches;
+        INSERT INTO blob_objects (file_hash,file_size,compression,r2_key) VALUES (repeat('a',64),17,'zstd','nar/existing');
+        INSERT INTO published_paths (cache_id,store_path_hash,store_path,nar_hash,nar_size,blob_object_id,last_pushed_at)
+        SELECT c.id, repeat('0',32), '/nix/store/test', 'sha256:test', 41, b.id, now()-interval '3 days'
+        FROM caches c CROSS JOIN blob_objects b;
+        INSERT INTO upstream_paths (store_path_hash,upstream) VALUES (repeat('2',32),'https://upstream.example.test');")
+        .execute(&pool).await.unwrap();
+    let state = AppState::new(
+        pool.clone(),
+        Config {
+            jwt_secret: "contract-secret".into(),
+            ..Default::default()
+        },
+        common::storage(),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let app = router(state);
+    let cache_id = async |name: &str| -> i32 {
+        sqlx::query_scalar("SELECT id FROM caches WHERE org_id='org_alpha' AND name=$1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let (main, other, go) = (
+        cache_id("main").await,
+        cache_id("other").await,
+        cache_id("go-only").await,
+    );
+    let refreshed = async || -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT c.org_id, c.name FROM published_paths p JOIN caches c ON c.id=p.cache_id \
+             WHERE p.last_pushed_at > now()-interval '1 minute' ORDER BY 1, 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let path = "/_api/v1/get-missing-paths";
+    let known = "0".repeat(32);
+    let recorded_upstream = "2".repeat(32);
+    let absent = "3".repeat(32);
+    let other_id = format!("id:{other}");
+    let go_id = format!("id:{go}");
+    let main_id = format!("id:{main}");
+    for (jti, caches, cache, expected, message) in [
+        // A cache that is unknown, in another org, or not serving Nix is
+        // reported before the caller's scope is.
+        (
+            "unknown",
+            vec!["*"],
+            "absent",
+            StatusCode::NOT_FOUND,
+            "Cache not found",
+        ),
+        (
+            "unknown-unscoped",
+            vec!["other"],
+            "absent",
+            StatusCode::NOT_FOUND,
+            "Cache not found",
+        ),
+        (
+            "wrong-protocol",
+            vec!["*"],
+            "go-only",
+            StatusCode::NOT_FOUND,
+            "Cache not found",
+        ),
+        (
+            "wrong-protocol-by-id",
+            vec![go_id.as_str()],
+            "go-only",
+            StatusCode::NOT_FOUND,
+            "Cache not found",
+        ),
+        (
+            "other-name",
+            vec!["other"],
+            "main",
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+        ),
+        (
+            "other-id",
+            vec![other_id.as_str()],
+            "main",
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+        ),
+    ] {
+        let credential = token(&pool, Some("org_alpha"), &caches, &["push"], jti).await;
+        let (status, _, result) = request(
+            &app,
+            "POST",
+            path,
+            Some(&credential),
+            json!({"cache":cache,"storePathHashes":[known, absent]}),
+        )
+        .await;
+        assert_eq!(status, expected, "{jti}");
+        assert_eq!(result, json!({"error":message}), "{jti}");
+        assert!(refreshed().await.is_empty(), "{jti}");
+    }
+    // A grant by ID authorizes the cache whatever else the token names, and
+    // refreshes only that cache. Upstream records are ignored when no
+    // upstream is configured.
+    let by_id = token(
+        &pool,
+        Some("org_alpha"),
+        &["elsewhere", &main_id],
+        &["push"],
+        "main-id",
+    )
+    .await;
+    let (status, _, result) = request(
+        &app,
+        "POST",
+        path,
+        Some(&by_id),
+        json!({"cache":"main","storePathHashes":[known, recorded_upstream, absent]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result,
+        json!({"missing":[recorded_upstream, absent],"upstream":[],"unchecked":[],"upstreams":[]})
+    );
+    assert_eq!(
+        refreshed().await,
+        [("org_alpha".to_owned(), "main".to_owned())]
+    );
+    let by_name = token(
+        &pool,
+        Some("org_alpha"),
+        &["oth*"],
+        &["push"],
+        "other-name-ok",
+    )
+    .await;
+    let (status, _, result) = request(
+        &app,
+        "POST",
+        path,
+        Some(&by_name),
+        json!({"cache":"other","storePathHashes":[known]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["missing"], json!([]));
+    assert_eq!(
+        refreshed().await,
+        [
+            ("org_alpha".to_owned(), "main".to_owned()),
+            ("org_alpha".to_owned(), "other".to_owned())
+        ]
+    );
+}
+
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool) {
     sqlx::raw_sql(
