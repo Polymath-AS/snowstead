@@ -1383,13 +1383,43 @@ async fn manifest_uploads_reuse_sessions_and_fence_dependency_publication(pool: 
     assert_eq!(recovered_receipt, receipt["uploads"][0]);
     assert!(recovery["sessions"][1]["receipt"].is_null());
     pool_execute(&pool, "DROP TRIGGER reject_preparation_start ON nar_installations; DROP FUNCTION reject_preparation_start();").await;
-    let (status, prepared) = post(
+    // The durable worker may still own this session when recovery resubmits.
+    // Force that admission race once, then honor its retryable response.
+    let mut busy = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("upload:{parent_id}"))
+        .execute(&mut *busy)
+        .await
+        .unwrap();
+    let recovery_body = json!({"uploads":[recovery["sessions"][0]["receipt"]]});
+    let (_, rejected) = post_raw(
         &app,
         "/_api/v1/uploads/finalize?prepareOnly=true",
         &auth,
-        json!({"uploads":[recovery["sessions"][0]["receipt"]]}),
+        recovery_body.clone(),
     )
     .await;
+    assert_eq!(rejected["results"][0]["status"], 503, "{rejected}");
+    busy.rollback().await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (status, prepared) = loop {
+        let response = post(
+            &app,
+            "/_api/v1/uploads/finalize?prepareOnly=true",
+            &auth,
+            recovery_body.clone(),
+        )
+        .await;
+        if response.1["results"][0]["status"] != 503 {
+            break response;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovery admission stayed busy: {}",
+            response.1
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
     assert_eq!(status, StatusCode::OK, "{prepared}");
     assert_eq!(prepared["results"][0]["prepared"], true, "{prepared}");
     assert_eq!(prepared["results"][0]["published"], false);
