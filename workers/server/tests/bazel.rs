@@ -341,6 +341,195 @@ async fn grpc_batch_and_resumable_bytestream(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires disposable S3 from scripts/with-r2.sh"]
+async fn bytestream_buffer_boundary_and_delayed_finish(pool: PgPool) {
+    let storage = common::s3_storage();
+    let mut host = host(&pool, storage.clone()).await;
+    let channel = Channel::from_shared(host.url.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = byte_stream_client::ByteStreamClient::new(channel);
+    let http = reqwest::Client::new();
+    for delayed in [false, true] {
+        for size in [
+            0,
+            1,
+            8 * 1024 * 1024 - 1,
+            8 * 1024 * 1024,
+            8 * 1024 * 1024 + 1,
+        ] {
+            let expected: Vec<u8> = (0..size)
+                .map(|i| ((i + usize::from(delayed)) % 251) as u8)
+                .collect();
+            let digest = digest(&expected);
+            let resource = format!(
+                "alpha/private/uploads/{}/blobs/{}/{}",
+                uuid::Uuid::now_v7(),
+                digest.hash,
+                size
+            );
+            let url = format!(
+                "{}/_api/v1/bazel/alpha/private/cas/{}",
+                host.url, digest.hash
+            );
+            let messages = |bytes: &[u8], finish: bool| {
+                let mut messages: Vec<_> = bytes
+                    .chunks(1024 * 1024)
+                    .enumerate()
+                    .map(|(i, part)| WriteRequest {
+                        resource_name: resource.clone(),
+                        write_offset: (i * 1024 * 1024) as i64,
+                        finish_write: false,
+                        data: part.to_vec(),
+                    })
+                    .collect();
+                messages.push(WriteRequest {
+                    resource_name: resource.clone(),
+                    write_offset: size as i64,
+                    finish_write: finish,
+                    data: Vec::new(),
+                });
+                messages
+            };
+            if size > 0 {
+                let mut corrupt = expected.clone();
+                corrupt[size - 1] ^= 1;
+                assert_eq!(
+                    client
+                        .write(authorized(stream::iter(messages(&corrupt, true)), &host))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+                assert_eq!(
+                    http.get(&url)
+                        .bearer_auth(&host.token)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    404
+                );
+            }
+            // A failed multi-chunk session is sealed. Use a fresh upload ID for
+            // the valid retry, as a real ByteStream client must do.
+            let resource = resource.replace("/uploads/", "/uploads/retry-");
+            let mut requests = messages(&expected, !delayed);
+            for request in &mut requests {
+                request.resource_name = resource.clone();
+            }
+            let response = client
+                .write(authorized(stream::iter(requests), &host))
+                .await;
+            if delayed && size > 0 {
+                assert_eq!(response.unwrap_err().code(), tonic::Code::InvalidArgument);
+                assert_eq!(
+                    http.get(&url)
+                        .bearer_auth(&host.token)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    404
+                );
+                // Collection must not reclaim a verified but unpublished object.
+                let generation: String = sqlx::query_scalar(
+                    "SELECT b.generation FROM bazel_caches b JOIN caches c ON c.id=b.cache_id WHERE c.name='private'"
+                ).fetch_one(&pool).await.unwrap();
+                let store = snowstead_server::bazel::store::Store::new(
+                    storage.clone(),
+                    &generation,
+                    u64::MAX,
+                );
+                store.collect().await.unwrap();
+                let physical = store.physical_usage().await.unwrap();
+                if size == 8 * 1024 * 1024 {
+                    host.task.abort();
+                    let state = AppState::new(
+                        pool.clone(),
+                        Config::default(),
+                        storage.clone(),
+                        reqwest::Client::new(),
+                    )
+                    .unwrap();
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    host.url = format!("http://{}", listener.local_addr().unwrap());
+                    host.task = tokio::spawn(async move {
+                        axum::serve(listener, router(state)).await.unwrap();
+                    });
+                    client = byte_stream_client::ByteStreamClient::new(
+                        Channel::from_shared(host.url.clone())
+                            .unwrap()
+                            .connect()
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let status = client
+                    .query_write_status(authorized(
+                        QueryWriteStatusRequest {
+                            resource_name: resource.clone(),
+                        },
+                        &host,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(status.committed_size, size as i64);
+                assert!(!status.complete);
+                let finish = WriteRequest {
+                    resource_name: resource.clone(),
+                    write_offset: size as i64,
+                    finish_write: true,
+                    data: Vec::new(),
+                };
+                assert_eq!(
+                    client
+                        .write(authorized(stream::iter([finish]), &host))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .committed_size,
+                    size as i64
+                );
+                let retained = store.physical_usage().await.unwrap();
+                // Finalization must not retain a second copy of the payload.
+                assert_eq!(retained.0 + retained.1, physical.0 + physical.1);
+                store.collect().await.unwrap();
+            } else {
+                assert_eq!(response.unwrap().into_inner().committed_size, size as i64);
+            }
+            let status = client
+                .query_write_status(authorized(
+                    QueryWriteStatusRequest {
+                        resource_name: resource,
+                    },
+                    &host,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(status.committed_size, size as i64);
+            assert!(status.complete);
+            let downloaded = http
+                .get(format!(
+                    "{}/_api/v1/bazel/alpha/private/cas/{}",
+                    host.url, digest.hash
+                ))
+                .bearer_auth(&host.token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(downloaded.status(), 200);
+            assert_eq!(downloaded.bytes().await.unwrap().as_ref(), expected);
+        }
+    }
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn upload_memory_pressure_is_retryable(pool: PgPool) {
     let mut host = host(&pool, common::storage()).await;
     host.task.abort();

@@ -607,7 +607,10 @@ impl ByteStream for Cache {
                     let count = data.len().min(8 * 1024 * 1024 - buffer.len());
                     buffer.extend_from_slice(&data[..count]);
                     data = &data[count..];
-                    if buffer.len() == 8 * 1024 * 1024 {
+                    // Keep a complete one-buffer blob until finish_write (which
+                    // may arrive in an empty message). EOF still persists it for
+                    // resume. Larger blobs retain the bounded chunked path.
+                    if buffer.len() == 8 * 1024 * 1024 && size > 8 * 1024 * 1024 {
                         offset = store
                             .append(
                                 &name,
@@ -627,6 +630,15 @@ impl ByteStream for Cache {
                 next = tokio::time::timeout_at(progress_deadline, stream.message())
                     .await
                     .map_err(|_| Status::deadline_exceeded("Upload made no byte progress"))??;
+            }
+            if finished && offset == 0 && buffer.len() as u64 == size {
+                store
+                    .write_buffered(&digest.hash, buffer, _memory)
+                    .await
+                    .map_err(io)?;
+                return Ok(Response::new(bs::WriteResponse {
+                    committed_size: size as i64,
+                }));
             }
             if !buffer.is_empty() || size == 0 {
                 offset = store

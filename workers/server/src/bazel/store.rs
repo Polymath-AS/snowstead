@@ -14,6 +14,8 @@ use chrono::Utc;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::storage::{Storage, StoredObject};
 
@@ -213,6 +215,46 @@ impl Store {
             self.storage.delete(true, &key).await?;
             return Err(invalid("Bazel digest mismatch"));
         }
+        self.publish(index, key, size).await
+    }
+
+    // The receive buffer already owns its memory reservation. Move both into
+    // the provider task instead of allocating another buffer or multipart upload.
+    pub(crate) async fn write_buffered(
+        &self,
+        digest: &str,
+        bytes: Vec<u8>,
+        memory: OwnedSemaphorePermit,
+    ) -> io::Result<()> {
+        let index = self.entry_key("cas", digest)?;
+        let size = bytes.len() as u64;
+        let key = self.verified_candidate(digest, &bytes)?;
+        let metadata = self.metadata.clone();
+        let path = Path::from(key.clone());
+        tokio::spawn(async move {
+            let _memory = memory;
+            metadata
+                .put(&path, bytes.into())
+                .await
+                .map_err(storage_error)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        self.publish(index, key, size).await
+    }
+
+    fn verified_candidate(&self, digest: &str, bytes: &[u8]) -> io::Result<String> {
+        if bytes.len() > 8 * 1024 * 1024 || hex::encode(Sha256::digest(bytes)) != digest {
+            return Err(invalid("Bazel digest mismatch or receive buffer exceeded"));
+        }
+        Ok(format!(
+            "{}/objects/cas/{digest}/{}",
+            self.prefix,
+            uuid::Uuid::now_v7()
+        ))
+    }
+
+    async fn publish(&self, index: Path, key: String, size: u64) -> io::Result<()> {
         let entry = Entry {
             key,
             size,
@@ -420,7 +462,6 @@ impl Store {
     }
 
     fn session_key(&self, resource: &str) -> String {
-        use sha2::{Digest, Sha256};
         format!(
             "{}/sessions/{}",
             self.prefix,
@@ -525,7 +566,14 @@ impl Store {
             .filter(|n| *n <= size)
             .ok_or_else(|| invalid("Upload exceeds declared size"))?;
         if !bytes.is_empty() {
-            let chunk = format!("{key}/chunks/{}", uuid::Uuid::now_v7());
+            // A complete receive buffer can be verified before its first PUT.
+            // Store it at its immutable final location, but do not publish until
+            // finish_write. Unpublished candidates retain the two-hour GC grace.
+            let chunk = if offset == 0 && next == size {
+                self.verified_candidate(digest, &bytes)?
+            } else {
+                format!("{key}/chunks/{}", uuid::Uuid::now_v7())
+            };
             self.storage.put(true, &chunk, &bytes).await?;
             session.chunks.push(chunk);
         }
@@ -555,22 +603,38 @@ impl Store {
             session.sealed = true;
             self.save_session(&key, &mut session, mode).await?;
         }
-        let storage = self.storage.clone();
-        let bodies = stream::iter(session.chunks.clone().into_iter().map(move |key| {
-            let storage = storage.clone();
-            async move {
-                let object = storage.open(true, &key).await?;
-                Ok::<_, io::Error>(tokio_util::io::ReaderStream::new(object.reader))
-            }
-        }))
-        .buffered(1);
-        self.write("cas", digest, size, Body::from_stream(bodies.try_flatten()))
+        let candidate_prefix = format!("{}/objects/cas/{digest}/", self.prefix);
+        let candidate =
+            session.chunks.len() == 1 && session.chunks[0].starts_with(&candidate_prefix);
+        if candidate {
+            // Only append creates this form, after verifying the complete blob.
+            // Unique physical keys cannot be overwritten by another session.
+            self.publish(
+                self.entry_key("cas", digest)?,
+                session.chunks[0].clone(),
+                size,
+            )
             .await?;
+        } else {
+            let storage = self.storage.clone();
+            let bodies = stream::iter(session.chunks.clone().into_iter().map(move |key| {
+                let storage = storage.clone();
+                async move {
+                    let object = storage.open(true, &key).await?;
+                    Ok::<_, io::Error>(tokio_util::io::ReaderStream::new(object.reader))
+                }
+            }))
+            .buffered(1);
+            self.write("cas", digest, size, Body::from_stream(bodies.try_flatten()))
+                .await?;
+        }
         let (mut session, mode) = self.session(&key).await?;
         session.complete = true;
         self.save_session(&key, &mut session, mode).await?;
-        for chunk in session.chunks {
-            self.storage.delete(true, &chunk).await?;
+        if !candidate {
+            for chunk in session.chunks {
+                self.storage.delete(true, &chunk).await?;
+            }
         }
         Ok(())
     }
