@@ -407,6 +407,15 @@ async fn turn(state: &AppState, after: &mut String) -> Result<Turn, ApiError> {
             WHERE f.session_id=$1 AND f.batch_id=$3 AND f.result IS NULL AND b.id=f.batch_id AND b.work_id=$4")
             .bind(id).bind(sqlx::types::Json(&result)).bind(&work.id).bind(&claim).execute(&mut *tx).await?;
     }
+    // Capacity retries may requeue another member after this claim read its
+    // receipts. The batch row is held here, so inspect all remaining work
+    // before parking it; this turn's results alone are not authoritative.
+    retry |= sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM upload_finalizations WHERE batch_id=$1 AND result IS NULL)",
+    )
+    .bind(&work.id)
+    .fetch_one(&mut *tx)
+    .await?;
     let failures = if retry { (work.failures + 1).min(6) } else { 0 };
     let delay = if retry {
         (25 * (1i32 << failures)).min(1000) + (uuid::Uuid::now_v7().as_u128() % 26) as i32
@@ -759,6 +768,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn capacity_retry_after_claim_does_not_strand_another_member(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        sqlx::query("INSERT INTO upload_sessions(id,cache_id,store_path_hash,store_path,nar_hash,nar_size,file_size,compression,status,r2_upload_key,r2_upload_id,expires_at,part_size) \
+            SELECT 'second-session',cache_id,repeat('1',32),'/nix/store/'||repeat('1',32)||'-second',nar_hash,nar_size,file_size,compression,'streaming','staging/second/source','second-provider',expires_at,part_size FROM upload_sessions WHERE id=$1")
+            .bind(&receipt.session_id).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO upload_parts(session_id,part_number,size) VALUES('second-session',1,1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = Receipt {
+            session_id: "second-session".into(),
+            ..receipt.clone()
+        };
+        enqueue_finalizations(
+            &state,
+            &Identity::SharedToken,
+            vec![receipt.clone(), second],
+            Finalization::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO nar_installations(key,operation_id,file_hash,compression,is_private,file_size,cache_id,session_id,expires_at,phase) \
+            SELECT 'nar/objects/'||id,id,file_hash,'zstd',false,file_size,cache_id,id,expires_at,'ready' FROM upload_sessions")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE upload_finalizations SET result=$1 WHERE session_id='second-session'")
+            .bind(sqlx::types::Json(UploadResult::failed(
+                "second-session",
+                413,
+                "capacity",
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Force the durable state produced when the second capacity retry
+        // commits after the worker reads its receipts. This worker must not
+        // park the batch based only on the first member it claimed.
+        sqlx::raw_sql("CREATE FUNCTION retry_other_member() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.session_id='queued-session' AND NEW.result IS NOT NULL THEN
+                    UPDATE upload_finalizations SET result=NULL WHERE session_id='second-session';
+                    UPDATE upload_finalization_batches SET work_at=NOW() WHERE id=NEW.batch_id;
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER retry_other_member AFTER UPDATE ON upload_finalizations FOR EACH ROW EXECUTE FUNCTION retry_other_member();")
+            .execute(&pool).await.unwrap();
+        turn(&state, &mut String::new()).await.unwrap();
+        sqlx::raw_sql("DROP TRIGGER retry_other_member ON upload_finalizations; DROP FUNCTION retry_other_member();")
+            .execute(&pool).await.unwrap();
+        let stop = state.start_upload_finalizers();
+        let ids = vec![receipt.session_id, "second-session".into()];
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if status_rows(&state, &Identity::SharedToken, &ids)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.published)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a member retried after the claim must still publish");
+        stop.cancel();
         state.finish_background().await;
     }
 
