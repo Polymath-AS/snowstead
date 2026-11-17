@@ -399,3 +399,54 @@ async fn narinfo_reads_send_an_access_stamp_only_when_due(pool: PgPool) {
     reads("HEAD", &hit, StatusCode::OK).await;
     assert_eq!((sent().await, fresh().await), (2, 2));
 }
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn private_nar_streams_wide_frames_and_meters_beside_the_response(pool: PgPool) {
+    use futures_util::StreamExt;
+    let storage = common::storage();
+    let state = fixture(&pool, CDN, storage.clone()).await;
+    let app = router(state.clone());
+    let hash = "a".repeat(64);
+    let bytes: Vec<u8> = (0..(1 << 20) + 1).map(|i| i as u8).collect();
+    storage
+        .put(true, &format!("nars/sha256/{hash}/zstd.nar"), &bytes)
+        .await
+        .unwrap();
+    let path = format!("/alpha/secret/nar/{hash}/zstd.nar");
+    let credential = credential();
+    let auth = [("authorization", credential.as_str())];
+    // Metering is tracked background work: it is complete once that drains.
+    let metered = async || {
+        state.finish_background().await;
+        sqlx::query_scalar::<_, Option<i64>>("SELECT sum(bytes)::bigint FROM bandwidth_daily")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let response = read(&app, "HEAD", &path, &auth).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_LENGTH],
+        bytes.len().to_string()
+    );
+    assert_eq!(
+        read(&app, "GET", &path, &[]).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(metered().await, None);
+    let response = read(&app, "GET", &path, &auth).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = response.into_body().into_data_stream();
+    let (mut body, mut widest) = (Vec::new(), 0);
+    while let Some(frame) = frames.next().await {
+        let frame = frame.unwrap();
+        widest = widest.max(frame.len());
+        body.extend_from_slice(&frame);
+    }
+    assert!(body == bytes);
+    assert_eq!(widest, 256 * 1024);
+    assert_eq!(metered().await, Some(bytes.len() as i64));
+    // The admitted transfer counts in full at its start, read or not.
+    drop(read(&app, "GET", &path, &auth).await);
+    assert_eq!(metered().await, Some(2 * bytes.len() as i64));
+}

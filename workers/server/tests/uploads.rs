@@ -3739,6 +3739,12 @@ async fn inline_private_publication_and_read_isolation(pool: PgPool) {
         .0,
         StatusCode::NOT_FOUND
     );
+    // Metering runs beside the response, not ahead of its first byte.
+    wait_sql(
+        &pool,
+        "SELECT EXISTS (SELECT 1 FROM bandwidth_daily WHERE org_id='org_a')",
+    )
+    .await;
     let metered: i64 = sqlx::query_scalar("SELECT bytes FROM bandwidth_daily WHERE org_id='org_a'")
         .fetch_one(&pool)
         .await
