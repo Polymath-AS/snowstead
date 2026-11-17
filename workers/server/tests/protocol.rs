@@ -637,7 +637,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
         reqwest::Client::new(),
     )
     .unwrap();
-    let app = router(state);
+    let app = router(state.clone());
     let pull = token(&pool, None, &["*"], &["pull"], "pull-only").await;
     let response = app
         .clone()
@@ -687,6 +687,8 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Endpoint audits are recorded after the response, as tracked work.
+    state.finish_background().await;
     for (method, path, endpoint, cache, expected) in [
         (
             "POST",
@@ -733,6 +735,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     ] {
         let (status, _, _) = request(&app, method, path, Some("legacy-secret"), json!({})).await;
         assert_eq!(status, expected, "{endpoint}");
+        state.finish_background().await;
         let row: (String, String, Option<String>, i32, String) = sqlx::query_as(
             "SELECT actor,action,cache_name,status,detail FROM audit_logs ORDER BY id DESC LIMIT 1",
         )
@@ -763,6 +766,7 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     ] {
         request(&app, method, path, credential, json!({})).await;
     }
+    state.finish_background().await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_logs")
         .fetch_one(&pool)
         .await
@@ -783,4 +787,5 @@ async fn nix_push_audits_permission_failures_and_endpoint_responses(pool: PgPool
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["missing"], json!([]));
+    state.finish_background().await;
 }
