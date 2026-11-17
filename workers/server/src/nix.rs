@@ -55,6 +55,8 @@ pub(crate) async fn write_access(
         authz::authorize(&identity, Action::NixPush, &Resource::Org(identity.org()))
     {
         if matches!(identity, Identity::ApiToken(_)) {
+            // A token reaching past its permissions is the security record
+            // here: write it before the refusal is sent.
             audit(
                 &state.pool,
                 &identity,
@@ -99,15 +101,22 @@ pub(crate) async fn write_access(
     };
     request.extensions_mut().insert(identity.clone());
     let response = next.run(request).await;
-    audit(
-        &state.pool,
-        &identity,
-        cache.as_deref(),
-        response.status(),
-        json!({"endpoint":endpoint}),
-        ip.as_deref(),
-    )
-    .await;
+    // The response is decided, so recording it must not hold it back. Tracked
+    // work still finishes before a graceful shutdown closes SQL; only a crash
+    // between the response and this insert loses the row.
+    let status = response.status();
+    let pool = state.pool.clone();
+    state.tasks.spawn(async move {
+        audit(
+            &pool,
+            &identity,
+            cache.as_deref(),
+            status,
+            json!({"endpoint":endpoint}),
+            ip.as_deref(),
+        )
+        .await;
+    });
     Ok(response)
 }
 

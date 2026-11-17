@@ -4034,14 +4034,16 @@ async fn inline_batch_cli_contract_validates_before_work_and_protects_capacity(p
         .0,
         StatusCode::NOT_FOUND
     );
-    let audit: (String, i32, String) = sqlx::query_as(
-        "SELECT action, status, detail::jsonb->>'endpoint' FROM audit_logs ORDER BY id DESC LIMIT 1",
+    // The audit is recorded after the response, as tracked work.
+    state.finish_background().await;
+    let audit: (String, i32) = sqlx::query_as(
+        "SELECT action, status FROM audit_logs \
+         WHERE detail::jsonb->>'endpoint' = 'inline-upload-batch' ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(audit, ("push".into(), 200, "inline-upload-batch".into()));
-    state.finish_background().await;
+    assert_eq!(audit, ("push".into(), 200));
 }
 
 async fn upload_inline(app: &Router, cache: &str, input: Value, compressed: &[u8]) -> Value {
