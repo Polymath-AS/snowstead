@@ -380,6 +380,109 @@ async fn private_stays_authenticated_and_streamed(pool: PgPool) {
     }
 }
 
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn private_reads_reveal_no_path_before_authorization(pool: PgPool) {
+    // The cache and the path are read together, so a rejected caller must get
+    // the same answer whether or not the path is published.
+    let state = fixture(pool.clone(), CDN).await;
+    let app = router(state.clone());
+    let credential = format!("Bearer {}", token(&pool, "org_alpha", "secret").await);
+    let wrong_org = format!("Bearer {}", token(&pool, "org_beta", "secret").await);
+    let wrong_cache = format!("Bearer {}", token(&pool, "org_alpha", "main").await);
+    let published = format!("/alpha/secret/{}.narinfo", "0".repeat(32));
+    let unpublished = format!("/alpha/secret/{}.narinfo", "1".repeat(32));
+    let stored = format!("/alpha/secret/nar/{}/zstd.nar", "b".repeat(64));
+    let unstored = format!("/alpha/secret/nar/{}/zstd.nar", "c".repeat(64));
+    async fn answer(response: Response) -> (StatusCode, Vec<(String, String)>, Bytes) {
+        let mut headers: Vec<_> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        headers.sort();
+        let status = response.status();
+        (
+            status,
+            headers,
+            to_bytes(response.into_body(), 4096).await.unwrap(),
+        )
+    }
+    for (present, absent) in [(&published, &unpublished), (&stored, &unstored)] {
+        for method in ["GET", "HEAD"] {
+            for (denied, status) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some("Bearer not-a-token"), StatusCode::UNAUTHORIZED),
+                (Some(wrong_org.as_str()), StatusCode::FORBIDDEN),
+                (Some(wrong_cache.as_str()), StatusCode::FORBIDDEN),
+            ] {
+                let headers: Vec<_> = denied.map(|v| ("authorization", v)).into_iter().collect();
+                let hit = answer(read(&app, method, present, &headers).await).await;
+                assert_eq!(hit.0, status, "{method} {present}");
+                assert_eq!(
+                    hit,
+                    answer(read(&app, method, absent, &headers).await).await,
+                    "{method} {absent}"
+                );
+            }
+            let response = read(&app, method, absent, &[("authorization", &credential)]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-cache"
+            );
+        }
+    }
+    assert_eq!(
+        read(&app, "GET", &published, &[("authorization", &credential)])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    // A former address still authenticates, then exposes nothing published.
+    sqlx::query("UPDATE orgs SET slug='renamed',moving_from='alpha' WHERE id='org_alpha'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for path in [&published, &unpublished, &stored] {
+        assert_eq!(
+            read(&app, "GET", path, &[]).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = read(&app, "GET", path, &[("authorization", &credential)]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+    }
+    for (path, status) in [
+        (
+            format!("/renamed/secret/{}.narinfo", "0".repeat(32)),
+            StatusCode::OK,
+        ),
+        (
+            format!("/alpha/main/{}.narinfo", "0".repeat(32)),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/renamed/main/{}.narinfo", "0".repeat(32)),
+            StatusCode::OK,
+        ),
+        (
+            format!("/renamed/main/{}.narinfo", "1".repeat(32)),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/renamed/go-only/{}.narinfo", "0".repeat(32)),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = read(&app, "GET", &path, &[("authorization", &credential)]).await;
+        assert_eq!(response.status(), status, "{path}");
+    }
+    state.finish_background().await;
+}
+
 async fn signing_post(app: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
     let (path, credential) = web::dashboard("POST", path, "operator-secret", None);
     let response = app
