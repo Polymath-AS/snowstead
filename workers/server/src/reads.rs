@@ -54,6 +54,33 @@ fn record_access(state: &AppState, cache: i32, hash: &str) {
     });
 }
 
+/// Count an admitted private transfer at its start, for its full size.
+fn record_transfer(state: &AppState, org: &str, cache: i32, bytes: u64) {
+    // Metering is not part of delivering bytes, so it stays off the path to
+    // the first one. Tracked tasks still finish before a graceful shutdown.
+    let owned = state.clone();
+    let org = org.to_owned();
+    state.tasks.spawn(async move {
+        if sqlx::query!(
+            r#"
+            INSERT INTO bandwidth_daily (org_id, cache_id, product, day, bytes)
+            VALUES ($1, $2, 'nix', (NOW() AT TIME ZONE 'UTC')::date, $3)
+            ON CONFLICT (org_id, cache_id, product, day)
+            DO UPDATE SET bytes = bandwidth_daily.bytes + EXCLUDED.bytes
+            "#,
+            org,
+            cache,
+            bytes as i64,
+        )
+        .execute(&owned.pool)
+        .await
+        .is_err()
+        {
+            tracing::warn!("Recording Nix bandwidth failed");
+        }
+    });
+}
+
 fn missing(private: bool) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -242,56 +269,19 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             .filter(|hash| hash.len() == 32 && hash.bytes().all(|b| NIX32.contains(&b))),
         _ => None,
     };
-    // One statement admits the cache and reads the requested publication, so
-    // a public narinfo hit or miss is a single round trip. SQL publication is
-    // authoritative. Never consult mutable metadata objects: new publications
-    // no longer write them, and old ones may be stale. Signing columns come
-    // from the same fresh statement snapshot as publication.
-    let cache = sqlx::query_as!(
-        ScopedCache,
-        r#"
-        SELECT
-            c.id,
-            c.org_id,
-            c.is_public,
-            o.slug,
-            c.signing_key_name,
-            c.signing_public_key,
-            c.signing_key_sealed,
-            p.store_path AS "store_path?",
-            p.nar_hash AS "nar_hash?",
-            p.nar_size AS "nar_size?",
-            p.references_json AS "references_json?",
-            p.deriver,
-            p.system,
-            p.signatures_json AS "signatures_json?",
-            b.file_hash AS "file_hash?",
-            b.file_size AS "file_size?",
-            b.compression AS "compression?",
-            (
-                p.last_accessed_at IS NULL
-                OR p.last_accessed_at < NOW() - INTERVAL '5 minutes'
-            ) AS "stamp_due!"
-        FROM caches c
-        JOIN orgs o ON o.id = c.org_id
-        LEFT JOIN published_paths p ON p.cache_id = c.id
-            AND p.store_path_hash = $3
-        LEFT JOIN blob_objects b ON b.id = p.blob_object_id
-        WHERE c.name = $1
-            AND (o.slug = $2 OR o.moving_from = $2)
-            AND EXISTS (
-                SELECT 1
-                FROM cache_protocols cp
-                WHERE cp.cache_id = c.id
-                    AND cp.protocol = 'nix'
-            )
-        "#,
-        name,
-        slug,
-        narinfo,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
+    let blob = match rest {
+        ["nar", hash, file] => file
+            .strip_suffix(".nar")
+            .filter(|compression| valid_blob(hash, compression))
+            .map(|compression| (*hash, compression)),
+        _ => None,
+    };
+    // One statement admits the cache and reads what the request names, so a
+    // public read is a single round trip whether or not the path exists.
+    let (cache, key) = match blob {
+        Some((hash, compression)) => scoped_nar(&state, name, slug, hash, compression).await?,
+        None => (scoped_cache(&state, name, slug, narinfo).await?, None),
+    };
     let Some(cache) = cache else {
         return Ok(missing(false));
     };
@@ -349,35 +339,7 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             }
             Ok(response)
         }
-        ["nar", hash, file] if file.ends_with(".nar") => {
-            let compression = file.strip_suffix(".nar").unwrap();
-            if !valid_blob(hash, compression) {
-                return Ok(missing(private));
-            }
-            let key = sqlx::query_scalar::<_, Option<String>>(
-                r#"
-                    SELECT CASE WHEN $4 THEN
-                        COALESCE(b.private_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
-                            THEN 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar' END)
-                    ELSE
-                        COALESCE(b.public_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
-                            THEN 'nar/' || b.file_hash || '/' || b.compression || '.nar' END)
-                    END
-                    FROM published_paths p
-                    JOIN blob_objects b ON b.id = p.blob_object_id
-                    WHERE p.cache_id = $1
-                        AND b.file_hash = $2
-                        AND b.compression = $3
-                    LIMIT 1
-                "#,
-            )
-            .bind(id)
-            .bind(hash)
-            .bind(compression)
-            .bind(private)
-            .fetch_optional(&state.pool)
-            .await?
-            .flatten();
+        ["nar", _, file] if file.ends_with(".nar") => {
             let Some(key) = key else {
                 return Ok(missing(private));
             };
@@ -394,6 +356,126 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
         }
         _ => Ok(missing(private)),
     }
+}
+
+/// Admit a scoped Nix cache, reading the narinfo publication when one is named.
+async fn scoped_cache(
+    state: &AppState,
+    name: &str,
+    slug: &str,
+    narinfo: Option<&str>,
+) -> Result<Option<ScopedCache>, ApiError> {
+    // SQL publication is authoritative. Never consult mutable metadata objects:
+    // new publications no longer write them, and old ones may be stale.
+    // Read signing columns in the same fresh statement snapshot as publication.
+    let cache = sqlx::query_as!(
+        ScopedCache,
+        r#"
+        SELECT
+            c.id,
+            c.org_id,
+            c.is_public,
+            o.slug,
+            c.signing_key_name,
+            c.signing_public_key,
+            c.signing_key_sealed,
+            p.store_path AS "store_path?",
+            p.nar_hash AS "nar_hash?",
+            p.nar_size AS "nar_size?",
+            p.references_json AS "references_json?",
+            p.deriver,
+            p.system,
+            p.signatures_json AS "signatures_json?",
+            b.file_hash AS "file_hash?",
+            b.file_size AS "file_size?",
+            b.compression AS "compression?",
+            (
+                p.last_accessed_at IS NULL
+                OR p.last_accessed_at < NOW() - INTERVAL '5 minutes'
+            ) AS "stamp_due!"
+        FROM caches c
+        JOIN orgs o ON o.id = c.org_id
+        LEFT JOIN published_paths p ON p.cache_id = c.id
+            AND p.store_path_hash = $3
+        LEFT JOIN blob_objects b ON b.id = p.blob_object_id
+        WHERE c.name = $1
+            AND (o.slug = $2 OR o.moving_from = $2)
+            AND EXISTS (
+                SELECT 1
+                FROM cache_protocols cp
+                WHERE cp.cache_id = c.id
+                    AND cp.protocol = 'nix'
+            )
+        "#,
+        name,
+        slug,
+        narinfo,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(cache)
+}
+
+/// Admit a scoped Nix cache and resolve a published NAR's key in its bucket.
+async fn scoped_nar(
+    state: &AppState,
+    name: &str,
+    slug: &str,
+    hash: &str,
+    compression: &str,
+) -> Result<(Option<ScopedCache>, Option<String>), ApiError> {
+    let (cache, key) = sqlx::query_as::<_, (i32, String, bool, String, Option<String>)>(
+        r#"
+            SELECT
+                c.id,
+                c.org_id,
+                c.is_public,
+                o.slug,
+                (
+                    SELECT CASE WHEN NOT c.is_public THEN
+                        COALESCE(b.private_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
+                            THEN 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar' END)
+                    ELSE
+                        COALESCE(b.public_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'
+                            THEN 'nar/' || b.file_hash || '/' || b.compression || '.nar' END)
+                    END
+                    FROM published_paths p
+                    JOIN blob_objects b ON b.id = p.blob_object_id
+                    WHERE p.cache_id = c.id
+                        AND b.file_hash = $3
+                        AND b.compression = $4
+                    LIMIT 1
+                )
+            FROM caches c
+            JOIN orgs o ON o.id = c.org_id
+            WHERE c.name = $1
+                AND (o.slug = $2 OR o.moving_from = $2)
+                AND EXISTS (
+                    SELECT 1
+                    FROM cache_protocols cp
+                    WHERE cp.cache_id = c.id
+                        AND cp.protocol = 'nix'
+                )
+        "#,
+    )
+    .bind(name)
+    .bind(slug)
+    .bind(hash)
+    .bind(compression)
+    .fetch_optional(&state.pool)
+    .await?
+    .map(|(id, org_id, is_public, slug, key)| {
+        let cache = ScopedCache {
+            id,
+            org_id,
+            is_public,
+            slug,
+            ..Default::default()
+        };
+        (cache, key)
+    })
+    .unzip();
+    Ok((cache, key.flatten()))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -425,28 +507,12 @@ async fn nar(
     if let Some((id, org)) = scope
         && request.method == Method::GET
     {
-        // Count the admitted transfer, like the hosted read path; HEADs do not count.
-        if sqlx::query!(
-            r#"
-            INSERT INTO bandwidth_daily (org_id, cache_id, product, day, bytes)
-            VALUES ($1, $2, 'nix', (NOW() AT TIME ZONE 'UTC')::date, $3)
-            ON CONFLICT (org_id, cache_id, product, day)
-            DO UPDATE SET bytes = bandwidth_daily.bytes + EXCLUDED.bytes
-            "#,
-            org,
-            id,
-            size as i64,
-        )
-        .execute(&state.pool)
-        .await
-        .is_err()
-        {
-            tracing::warn!("Recording Nix bandwidth failed");
-        }
+        // Like the hosted read path; HEADs do not count.
+        record_transfer(state, org, id, size);
     }
     let body = reader.map_or_else(Body::empty, |reader| {
         Body::from_stream(crate::profile_stream!(
-            ReaderStream::new(reader),
+            ReaderStream::with_capacity(reader, 256 * 1024),
             label = "reads.nar_body"
         ))
     });
@@ -469,7 +535,9 @@ async fn nar(
 }
 
 /// A Nix cache as a scoped read addresses it. The publication columns are
-/// present only when the requested narinfo is published in that cache.
+/// present only when the requested narinfo is published in that cache; a NAR
+/// request reads none of them.
+#[derive(Default)]
 struct ScopedCache {
     id: i32,
     org_id: String,
