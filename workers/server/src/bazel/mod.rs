@@ -184,15 +184,22 @@ async fn collect(
 ) -> anyhow::Result<u64> {
     use futures_util::{StreamExt, TryStreamExt, stream};
     let mut active: Vec<(String, i64)> = if full || pending.targets {
-        sqlx::query_as("SELECT generation, target FROM bazel_retention")
-            .fetch_all(&state.pool)
-            .await?
+        sqlx::query!(
+            r#"SELECT generation AS "generation!", target AS "target!" FROM bazel_retention"#
+        )
+        .map(|row| (row.generation, row.target))
+        .fetch_all(&state.pool)
+        .await?
     } else {
-        let marked: Vec<&str> = pending.generations.iter().map(String::as_str).collect();
-        sqlx::query_as("SELECT generation, target FROM bazel_retention WHERE generation = ANY($1)")
-            .bind(marked)
-            .fetch_all(&state.pool)
-            .await?
+        let marked: Vec<String> = pending.generations.iter().cloned().collect();
+        sqlx::query!(
+            r#"SELECT generation AS "generation!", target AS "target!"
+            FROM bazel_retention WHERE generation = ANY($1)"#,
+            &marked,
+        )
+        .map(|row| (row.generation, row.target))
+        .fetch_all(&state.pool)
+        .await?
     };
     let mut generations: HashMap<String, bool> = active
         .iter()
@@ -216,13 +223,13 @@ async fn collect(
             let (physical, staging) = store.physical_usage().await?;
             // Background observations only. A reset cannot inherit the old generation's
             // totals, and a slow collector cannot replace a more recent observation.
-            sqlx::query("INSERT INTO bazel_usage(cache_id,generation,entries,size,physical_size,staging_size,updated_at)
+            sqlx::query!("INSERT INTO bazel_usage(cache_id,generation,entries,size,physical_size,staging_size,updated_at)
                 SELECT cache_id,generation,$2,$3,$4,$5,$6 FROM bazel_caches WHERE generation=$1
                 ON CONFLICT(cache_id) DO UPDATE SET generation=EXCLUDED.generation,entries=EXCLUDED.entries,
                     size=EXCLUDED.size,physical_size=EXCLUDED.physical_size,staging_size=EXCLUDED.staging_size,
-                    updated_at=EXCLUDED.updated_at WHERE bazel_usage.updated_at < EXCLUDED.updated_at")
-                .bind(&generation).bind(entries as i64).bind(size as i64).bind(physical as i64)
-                .bind(staging as i64).bind(started).execute(&state.pool).await?;
+                    updated_at=EXCLUDED.updated_at WHERE bazel_usage.updated_at < EXCLUDED.updated_at",
+                generation, entries as i64, size as i64, physical as i64, staging as i64, started)
+                .execute(&state.pool).await?;
             Ok::<_, anyhow::Error>((deleted, size))
         }
         .await;
