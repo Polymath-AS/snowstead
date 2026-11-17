@@ -279,7 +279,11 @@ pub async fn connect_pool(
                 Ok(true)
             })
         })
-        .idle_timeout(Duration::from_secs(60));
+        // sqlx closes every connection idle past this, the minimum included,
+        // and then reconnects to restore the minimum. A short timeout therefore
+        // costs a TLS handshake and login per warm connection per period while
+        // nothing is happening. Ten minutes still returns burst capacity.
+        .idle_timeout(Duration::from_secs(600));
     #[cfg(feature = "observability")]
     let options = if crate::observability::enabled() {
         options.acquire_time_level(log::LevelFilter::Debug)
