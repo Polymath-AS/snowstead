@@ -22,6 +22,8 @@ pub(crate) const INFO: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority:
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 static ACCESS_WRITES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 
+/// Stamp a publication the narinfo read found due. Readers skip this round
+/// trip while the stamp is fresh; the predicate still guards concurrent ones.
 fn record_access(state: &AppState, cache: i32, hash: &str) {
     // LRU telemetry is best-effort, not part of delivering bytes. Bound tasks
     // rather than growing a per-path map or queue behind the database pool.
@@ -265,7 +267,11 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             p.signatures_json AS "signatures_json?",
             b.file_hash AS "file_hash?",
             b.file_size AS "file_size?",
-            b.compression AS "compression?"
+            b.compression AS "compression?",
+            (
+                p.last_accessed_at IS NULL
+                OR p.last_accessed_at < NOW() - INTERVAL '5 minutes'
+            ) AS "stamp_due!"
         FROM caches c
         JOIN orgs o ON o.id = c.org_id
         LEFT JOIN published_paths p ON p.cache_id = c.id
@@ -336,8 +342,9 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
             let Some(hash) = narinfo else {
                 return Ok(missing(private));
             };
+            let stamp_due = cache.stamp_due;
             let response = scoped_narinfo(&state, &request, cache, &cache_path, hash)?;
-            if response.status().is_success() {
+            if stamp_due && response.status().is_success() {
                 record_access(&state, id, hash);
             }
             Ok(response)
@@ -481,6 +488,8 @@ struct ScopedCache {
     file_hash: Option<String>,
     file_size: Option<i64>,
     compression: Option<String>,
+    /// The publication's access stamp is missing or older than five minutes.
+    stamp_due: bool,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]

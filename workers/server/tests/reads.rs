@@ -322,3 +322,80 @@ async fn nar_delivery_uses_only_admitted_bucket_pointer(pool: PgPool) {
     );
     state.finish_background().await;
 }
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn narinfo_reads_send_an_access_stamp_only_when_due(pool: PgPool) {
+    let state = fixture(&pool, CDN, common::storage()).await;
+    let app = router(state.clone());
+    // A statement trigger sees every UPDATE sent, even one that matches no
+    // row, so a stamp skipped by the reader differs from one skipped in SQL.
+    sqlx::raw_sql(
+        "CREATE TABLE stamp_updates (id SERIAL PRIMARY KEY);
+        CREATE FUNCTION count_stamp_update() RETURNS trigger LANGUAGE plpgsql AS
+        $$ BEGIN INSERT INTO stamp_updates DEFAULT VALUES; RETURN NULL; END $$;
+        CREATE TRIGGER count_stamp_update BEFORE UPDATE ON published_paths
+        FOR EACH STATEMENT EXECUTE FUNCTION count_stamp_update();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let credential = credential();
+    let hit = format!("{}.narinfo", "0".repeat(32));
+    let miss = format!("{}.narinfo", "1".repeat(32));
+    let reads = async |method: &str, file: &str, status: StatusCode| {
+        for (cache, headers) in [
+            ("main", &[][..]),
+            ("secret", &[("authorization", credential.as_str())][..]),
+        ] {
+            let response = read(&app, method, &format!("/alpha/{cache}/{file}"), headers).await;
+            assert_eq!(response.status(), status, "{method} {cache}/{file}");
+        }
+        state.finish_background().await;
+    };
+    let sent = async || {
+        sqlx::query_scalar::<_, i64>(
+            "WITH sent AS (DELETE FROM stamp_updates RETURNING 1) SELECT count(*) FROM sent",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let fresh = async || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM published_paths WHERE last_accessed_at > NOW() - INTERVAL '1 minute'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    // Never-read paths are due, and a miss has nothing to stamp.
+    reads("GET", &miss, StatusCode::NOT_FOUND).await;
+    assert_eq!(sent().await, 0);
+    reads("GET", &hit, StatusCode::OK).await;
+    assert_eq!((sent().await, fresh().await), (2, 2));
+    // Within five minutes of the last stamp a hit sends nothing.
+    for age in ["0 minutes", "4 minutes"] {
+        sqlx::query("UPDATE published_paths SET last_accessed_at=NOW() - $1::interval")
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sent().await, 1);
+        for method in ["GET", "HEAD"] {
+            reads(method, &hit, StatusCode::OK).await;
+        }
+        assert_eq!(sent().await, 0, "{age}");
+    }
+    // An older stamp is due again, but never for a rejected private read.
+    sqlx::query("UPDATE published_paths SET last_accessed_at=NOW() - INTERVAL '6 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!((sent().await, fresh().await), (1, 0));
+    let denied = read(&app, "GET", &format!("/alpha/secret/{hit}"), &[]).await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    state.finish_background().await;
+    assert_eq!(sent().await, 0);
+    reads("HEAD", &hit, StatusCode::OK).await;
+    assert_eq!((sent().await, fresh().await), (2, 2));
+}
