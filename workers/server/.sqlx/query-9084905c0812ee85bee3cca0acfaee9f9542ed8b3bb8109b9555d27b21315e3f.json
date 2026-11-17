@@ -1,0 +1,222 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.id,\n            c.org_id,\n            c.is_public,\n            o.slug,\n            c.signing_key_name,\n            c.signing_public_key,\n            c.signing_key_sealed,\n            p.store_path AS \"store_path?\",\n            p.nar_hash AS \"nar_hash?\",\n            p.nar_size AS \"nar_size?\",\n            p.references_json AS \"references_json?\",\n            p.deriver,\n            p.system,\n            p.signatures_json AS \"signatures_json?\",\n            b.file_hash AS \"file_hash?\",\n            b.file_size AS \"file_size?\",\n            b.compression AS \"compression?\"\n        FROM caches c\n        JOIN orgs o ON o.id = c.org_id\n        LEFT JOIN published_paths p ON p.cache_id = c.id\n            AND p.store_path_hash = $3\n        LEFT JOIN blob_objects b ON b.id = p.blob_object_id\n        WHERE c.name = $1\n            AND (o.slug = $2 OR o.moving_from = $2)\n            AND EXISTS (\n                SELECT 1\n                FROM cache_protocols cp\n                WHERE cp.cache_id = c.id\n                    AND cp.protocol = 'nix'\n            )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "is_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "signing_key_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_key_name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "signing_public_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "signing_key_sealed",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "signing_key_sealed"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "store_path?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "store_path"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "nar_hash?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "nar_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "nar_size?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "nar_size"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "references_json?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "references_json"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "deriver",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "deriver"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "system",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "system"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "signatures_json?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "published_paths",
+            "name": "signatures_json"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "file_hash?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "file_size?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "file_size"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "compression?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_objects",
+            "name": "compression"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9084905c0812ee85bee3cca0acfaee9f9542ed8b3bb8109b9555d27b21315e3f"
+}

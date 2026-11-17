@@ -234,22 +234,43 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
     {
         return Ok(missing(false));
     }
-    struct Cache {
-        id: i32,
-        org_id: String,
-        is_public: bool,
-        slug: String,
-    }
+    let narinfo = match rest {
+        [file] => file
+            .strip_suffix(".narinfo")
+            .filter(|hash| hash.len() == 32 && hash.bytes().all(|b| NIX32.contains(&b))),
+        _ => None,
+    };
+    // One statement admits the cache and reads the requested publication, so
+    // a public narinfo hit or miss is a single round trip. SQL publication is
+    // authoritative. Never consult mutable metadata objects: new publications
+    // no longer write them, and old ones may be stale. Signing columns come
+    // from the same fresh statement snapshot as publication.
     let cache = sqlx::query_as!(
-        Cache,
+        ScopedCache,
         r#"
         SELECT
             c.id,
             c.org_id,
             c.is_public,
-            o.slug
+            o.slug,
+            c.signing_key_name,
+            c.signing_public_key,
+            c.signing_key_sealed,
+            p.store_path AS "store_path?",
+            p.nar_hash AS "nar_hash?",
+            p.nar_size AS "nar_size?",
+            p.references_json AS "references_json?",
+            p.deriver,
+            p.system,
+            p.signatures_json AS "signatures_json?",
+            b.file_hash AS "file_hash?",
+            b.file_size AS "file_size?",
+            b.compression AS "compression?"
         FROM caches c
         JOIN orgs o ON o.id = c.org_id
+        LEFT JOIN published_paths p ON p.cache_id = c.id
+            AND p.store_path_hash = $3
+        LEFT JOIN blob_objects b ON b.id = p.blob_object_id
         WHERE c.name = $1
             AND (o.slug = $2 OR o.moving_from = $2)
             AND EXISTS (
@@ -261,21 +282,19 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
         "#,
         name,
         slug,
+        narinfo,
     )
     .fetch_optional(&state.pool)
     .await?;
-    let Some(Cache {
-        id,
-        org_id: org,
-        is_public: public,
-        slug: current_slug,
-    }) = cache
-    else {
+    let Some(cache) = cache else {
         return Ok(missing(false));
     };
-    let private = !public;
+    let (id, org) = (cache.id, cache.org_id.as_str());
+    let private = !cache.is_public;
+    // Nothing read about the path is used, or changes the response, until a
+    // private cache's caller is authorized.
     if private {
-        authorize_read(&request.headers, &state, id, name, &org).await?;
+        authorize_read(&request.headers, &state, id, name, org).await?;
         let path = if slug == "default" {
             name.to_owned()
         } else {
@@ -288,7 +307,7 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
     }
     // Historical private addresses stay authenticated but do not expose
     // leftovers after an organization moves to a new slug.
-    if current_slug != slug {
+    if cache.slug != slug {
         return Ok(missing(private));
     }
     let cache_path = if slug == "default" {
@@ -314,11 +333,10 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
         )
             .into_response()),
         [file] if file.ends_with(".narinfo") => {
-            let hash = file.strip_suffix(".narinfo").unwrap();
-            if hash.len() != 32 || !hash.bytes().all(|b| NIX32.contains(&b)) {
+            let Some(hash) = narinfo else {
                 return Ok(missing(private));
-            }
-            let response = scoped_narinfo(&state, &request, id, &cache_path, hash, private).await?;
+            };
+            let response = scoped_narinfo(&state, &request, cache, &cache_path, hash)?;
             if response.status().is_success() {
                 record_access(&state, id, hash);
             }
@@ -363,7 +381,7 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Result<R
                 &state,
                 &request,
                 &key,
-                if private { Some((id, &org)) } else { None },
+                if private { Some((id, org)) } else { None },
             )
             .await
         }
@@ -443,77 +461,71 @@ async fn nar(
         .into_response())
 }
 
-struct ScopedNarinfo {
-    store_path: String,
-    nar_hash: String,
-    nar_size: i64,
-    references_json: String,
-    deriver: Option<String>,
-    system: Option<String>,
-    signatures_json: String,
-    file_hash: String,
-    file_size: i64,
-    compression: String,
+/// A Nix cache as a scoped read addresses it. The publication columns are
+/// present only when the requested narinfo is published in that cache.
+struct ScopedCache {
+    id: i32,
+    org_id: String,
+    is_public: bool,
+    slug: String,
     signing_key_name: Option<String>,
     signing_public_key: Option<String>,
     signing_key_sealed: Option<String>,
+    store_path: Option<String>,
+    nar_hash: Option<String>,
+    nar_size: Option<i64>,
+    references_json: Option<String>,
+    deriver: Option<String>,
+    system: Option<String>,
+    signatures_json: Option<String>,
+    file_hash: Option<String>,
+    file_size: Option<i64>,
+    compression: Option<String>,
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn scoped_narinfo(
+fn scoped_narinfo(
     state: &AppState,
     request: &axum::http::request::Parts,
-    cache: i32,
+    p: ScopedCache,
     cache_path: &str,
     hash: &str,
-    private: bool,
 ) -> Result<Response, ApiError> {
-    // SQL publication is authoritative. Never consult mutable metadata objects:
-    // new publications no longer write them, and old ones may be stale.
-    // Read signing columns in the same fresh statement snapshot as publication.
-    let published = sqlx::query_as!(
-        ScopedNarinfo,
-        r#"
-        SELECT
-            p.store_path,
-            p.nar_hash,
-            p.nar_size,
-            p.references_json,
-            p.deriver,
-            p.system,
-            p.signatures_json,
-            b.file_hash,
-            b.file_size,
-            b.compression,
-            c.signing_key_name,
-            c.signing_public_key,
-            c.signing_key_sealed
-        FROM published_paths p
-        JOIN blob_objects b ON b.id = p.blob_object_id
-        JOIN caches c ON c.id = p.cache_id
-        WHERE p.cache_id = $1
-            AND p.store_path_hash = $2
-        "#,
-        cache,
-        hash,
+    let private = !p.is_public;
+    let (
+        Some(store_path),
+        Some(nar_hash),
+        Some(nar_size),
+        Some(references_json),
+        Some(signatures_json),
+        Some(file_hash),
+        Some(file_size),
+        Some(compression),
+    ) = (
+        p.store_path,
+        p.nar_hash,
+        p.nar_size,
+        p.references_json,
+        p.signatures_json,
+        p.file_hash,
+        p.file_size,
+        p.compression,
     )
-    .fetch_optional(&state.pool)
-    .await?;
-    let Some(p) = published else {
+    else {
         return Ok(missing(private));
     };
-    if !valid_blob(&p.file_hash, &p.compression) {
+    if !valid_blob(&file_hash, &compression) {
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Invalid stored blob",
         ));
     }
     let nar = signing::Narinfo {
-        store_path: p.store_path,
+        store_path,
         store_path_hash: hash.to_owned(),
-        nar_hash: p.nar_hash,
-        nar_size: p.nar_size,
-        references: serde_json::from_str(&p.references_json).map_err(|_| {
+        nar_hash,
+        nar_size,
+        references: serde_json::from_str(&references_json).map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid stored references",
@@ -521,19 +533,19 @@ async fn scoped_narinfo(
         })?,
         deriver: p.deriver,
         system: p.system,
-        signatures: serde_json::from_str(&p.signatures_json).map_err(|_| {
+        signatures: serde_json::from_str(&signatures_json).map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid stored signatures",
             )
         })?,
-        file_hash: p.file_hash,
-        file_size: p.file_size,
-        compression: p.compression,
+        file_hash,
+        file_size,
+        compression,
     };
     let key = signing::select_key(
         &state.config,
-        cache,
+        p.id,
         p.signing_key_name.as_deref(),
         p.signing_public_key.as_deref(),
         p.signing_key_sealed.as_deref(),
