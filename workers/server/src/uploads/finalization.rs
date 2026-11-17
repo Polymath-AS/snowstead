@@ -1246,6 +1246,46 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
     #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
+    async fn a_held_upload_lock_is_refused_before_any_session_row_is_locked(pool: sqlx::PgPool) {
+        let (state, receipt) = fixture(pool.clone()).await;
+        let ids = [receipt.session_id.clone()];
+        let key = format!("upload:{}", ids[0]);
+        let row = "SELECT FROM upload_sessions WHERE id=$1 FOR UPDATE NOWAIT";
+        // Another writer of this session holds its advisory lock.
+        let mut holder = db::begin(&state).await.unwrap();
+        db::advisory_lock(&mut holder, &key).await.unwrap();
+        let mut tx = db::begin(&state).await.unwrap();
+        assert!(!lock_sessions(&mut tx, &ids).await.unwrap());
+        // The refused writer requested no row lock: the holder takes the row
+        // without waiting, while the refused transaction is still open.
+        sqlx::query(row)
+            .bind(&ids[0])
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        holder.rollback().await.unwrap();
+        // A free session is locked both ways by the one statement.
+        let mut tx = db::begin(&state).await.unwrap();
+        assert!(lock_sessions(&mut tx, &ids).await.unwrap());
+        let mut other = db::begin(&state).await.unwrap();
+        assert!(!db::try_advisory_lock(&mut other, &key).await.unwrap());
+        let blocked = sqlx::query(row)
+            .bind(&ids[0])
+            .execute(&mut *other)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blocked.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        other.rollback().await.unwrap();
+        tx.rollback().await.unwrap();
+        state.finish_background().await;
+    }
+
+    #[sqlx::test(migrator = "crate::migrations::MIGRATOR")]
+    #[ignore = "requires disposable PostgreSQL and S3 via the server test script"]
     async fn an_append_orders_against_admission_closing(pool: sqlx::PgPool) {
         let (state, receipt) = fixture(pool.clone()).await;
         let identity = Identity::SharedToken;

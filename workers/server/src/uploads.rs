@@ -12,7 +12,7 @@ use axum::{
     Extension, Router,
     body::{Body, to_bytes},
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     middleware,
     response::Response,
     routing::post,
@@ -364,15 +364,6 @@ async fn load_reservation_rows(
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn lock(tx: &mut Transaction, key: &str) -> Result<(), ApiError> {
-    crate::profile_future!(
-        crate::db::advisory_lock(tx, key),
-        label = "uploads.advisory_lock_wait"
-    )
-    .await?;
-    Ok(())
-}
-#[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn locked(
     state: &AppState,
     s: &Session,
@@ -396,11 +387,37 @@ async fn lock_session(
     s: &Session,
     identity: &Identity,
 ) -> Result<(Transaction, Session), ApiError> {
-    lock(&mut tx, &format!("upload:{}", s.id)).await?;
-    lock_rows(&mut tx, std::slice::from_ref(&s.id)).await?;
+    let held = crate::profile_future!(
+        lock_sessions(&mut tx, std::slice::from_ref(&s.id)),
+        label = "uploads.advisory_lock_wait"
+    )
+    .await?;
+    if !held {
+        return Err(error(503, "Concurrent write; retry")
+            .header(header::RETRY_AFTER, HeaderValue::from_static("1")));
+    }
     // Re-read and reauthorize after the locks, using the same query as preflight.
     let current = load(&mut *tx, &s.id, identity).await?;
     Ok((tx, current))
+}
+
+/// Try every session's `upload:<session>` advisory lock, in sorted order, and
+/// only if all were free lock the session rows as `lock_rows` does. It is one
+/// statement, in that order: the row locks read the outcome of the advisory
+/// locks, so none is requested before every advisory lock has been tried, and
+/// none at all when one was held. Returns whether the locks were taken.
+async fn lock_sessions(tx: &mut Transaction, ids: &[String]) -> Result<bool, ApiError> {
+    let (held, _): (bool, i64) = sqlx::query_as(
+        "SELECT held.ok,(SELECT count(*) FROM (SELECT FROM upload_sessions \
+         WHERE held.ok AND id=ANY($1) ORDER BY id FOR NO KEY UPDATE) locked) \
+         FROM (SELECT COALESCE(bool_and(pg_try_advisory_xact_lock(hashtextextended(key,0))),TRUE) AS ok \
+         FROM (SELECT DISTINCT 'upload:'||id AS key FROM UNNEST($1::text[]) AS id \
+         ORDER BY key OFFSET 0) ordered) held",
+    )
+    .bind(ids)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(held)
 }
 
 /// Lock session rows in ID order, so two multi-session writers cannot wait on
@@ -978,16 +995,10 @@ async fn reserve_org(
     requests: &[(String, &[Reservation])],
 ) -> Result<Vec<Result<Session, ApiError>>, ApiError> {
     let mut tx = crate::db::begin(state).await?;
-    lock_set(
-        &mut tx,
-        requests
-            .iter()
-            .map(|(id, _)| format!("upload:{id}"))
-            .collect(),
-    )
-    .await?;
     let ids: Vec<_> = requests.iter().map(|(id, _)| id.clone()).collect();
-    lock_rows(&mut tx, &ids).await?;
+    if !lock_sessions(&mut tx, &ids).await? {
+        return Err(error(503, "Concurrent write; retry"));
+    }
     let mut sessions: HashMap<_, _> = load_session_rows(&mut *tx, &ids, identity)
         .await?
         .into_iter()
