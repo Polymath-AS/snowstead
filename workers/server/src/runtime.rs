@@ -39,7 +39,7 @@ pub async fn application_state(pool: PgPool, config: Config) -> anyhow::Result<A
                 max_connections > 0,
                 "DATABASE_READ_MAX_CONNECTIONS must be positive"
             );
-            state.read_pool = connect_pool(&url, max_connections, 1)
+            state.read_pool = connect_pool(&url, max_connections, 5)
                 .await
                 .map_err(|_| anyhow::anyhow!("Read database connection failed"))?;
         }
