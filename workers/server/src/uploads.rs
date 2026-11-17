@@ -780,27 +780,35 @@ async fn reserve_group(
         .iter()
         .flat_map(|(_, parts)| parts.iter().map(|p| p.part_number))
         .collect();
-    let previous: Vec<(String, i32, i64)> = sqlx::query_as(
-        "SELECT p.session_id,p.part_number,p.size FROM upload_parts p \
+    // The staging total, on every row, beside the parts already reserved.
+    // The callers' session locks hold those parts still, so reading both in
+    // one snapshot sees what reading them one after the other did.
+    #[derive(sqlx::FromRow)]
+    struct Reserved {
+        staged: i64,
+        session_id: Option<String>,
+        part_number: Option<i32>,
+        size: Option<i64>,
+    }
+    let previous: Vec<Reserved> = sqlx::query_as(
+        "SELECT s.staged,p.session_id,p.part_number,p.size FROM \
+         (SELECT COALESCE(SUM(u.file_size),0)::bigint AS staged FROM upload_sessions u \
+         JOIN caches c ON c.id=u.cache_id WHERE c.org_id=$3 AND u.expires_at>NOW() \
+         AND u.status IN ('streaming','finalizing')) s \
+         LEFT JOIN (SELECT p.session_id,p.part_number,p.size FROM upload_parts p \
          JOIN UNNEST($1::text[],$2::integer[]) r(session_id,part_number) \
-         USING(session_id,part_number)",
+         USING(session_id,part_number)) p ON TRUE",
     )
     .bind(&ids)
     .bind(&numbers)
+    .bind(&requests[0].0.org_id)
     .fetch_all(&mut **tx)
     .await?;
+    let mut staged = previous[0].staged;
     let previous: HashMap<_, _> = previous
         .into_iter()
-        .map(|(id, number, size)| ((id, number), size))
+        .filter_map(|p| Some(((p.session_id?, p.part_number?), p.size?)))
         .collect();
-    let mut staged: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(u.file_size),0)::bigint FROM upload_sessions u \
-         JOIN caches c ON c.id=u.cache_id WHERE c.org_id=$1 AND u.expires_at>NOW() \
-         AND u.status IN ('streaming','finalizing')",
-    )
-    .bind(&requests[0].0.org_id)
-    .fetch_one(&mut **tx)
-    .await?;
     let mut ids = Vec::new();
     let mut numbers = Vec::new();
     let mut sizes = Vec::new();
@@ -825,20 +833,17 @@ async fn reserve_group(
         }
     }
     if !sessions.is_empty() {
+        // Neither write reads what the other changes.
         sqlx::query(
-            "INSERT INTO upload_parts(session_id,part_number,size) \
+            "WITH reserved AS (INSERT INTO upload_parts(session_id,part_number,size) \
              SELECT * FROM UNNEST($1::text[],$2::integer[],$3::bigint[]) \
-             ON CONFLICT(session_id,part_number) DO NOTHING",
+             ON CONFLICT(session_id,part_number) DO NOTHING) \
+             UPDATE upload_sessions u SET file_size=u.file_size+r.added \
+             FROM UNNEST($4::text[],$5::bigint[]) r(id,added) WHERE u.id=r.id",
         )
         .bind(&ids)
         .bind(&numbers)
         .bind(&sizes)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            "UPDATE upload_sessions u SET file_size=u.file_size+r.added \
-             FROM UNNEST($1::text[],$2::bigint[]) r(id,added) WHERE u.id=r.id",
-        )
         .bind(&sessions)
         .bind(&additions)
         .execute(&mut **tx)
@@ -973,20 +978,18 @@ async fn reserve_batch(
             }
         }
     }
-    let mut results = Vec::with_capacity(pending.len());
-    for (index, row) in pending.into_iter().enumerate() {
-        let result = async {
+    // The sessions are distinct, and each adopts its provider upload in its
+    // own transaction. Start first reservations' uploads a few at a time.
+    let initialized = stream::iter(pending.into_iter().zip(reserved).map(
+        |(row, session)| async move {
             let (_, parts) = row?;
-            let session = reserved[index]
-                .take()
-                .ok_or_else(|| error(500, "Internal server error"))?;
+            let session = session.ok_or_else(|| error(500, "Internal server error"))?;
             let session = initialize_multipart(state, identity, session).await?;
             grants(state, &session, &parts).await
-        }
-        .await;
-        results.push(result);
-    }
-    Ok(results)
+        },
+    ))
+    .buffered(4);
+    Ok(initialized.collect().await)
 }
 
 async fn reserve_org(
