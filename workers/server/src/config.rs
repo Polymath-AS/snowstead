@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{Connection, PgPool, postgres::PgPoolOptions};
 
 /// Secrets deliberately do not implement Debug.
 #[derive(Clone, Default)]
@@ -267,6 +267,18 @@ pub async fn connect_pool(
         .max_connections(max_connections)
         .min_connections(min_connections.min(max_connections))
         .acquire_timeout(Duration::from_secs(5))
+        .test_before_acquire(false)
+        .before_acquire(|connection, metadata| {
+            Box::pin(async move {
+                // A hot connection just completed a round trip. Avoid another
+                // Sync/ReadyForQuery exchange on every checkout, but validate
+                // connections returning from idle before handing them out.
+                if metadata.idle_for >= Duration::from_secs(1) {
+                    connection.ping().await?;
+                }
+                Ok(true)
+            })
+        })
         .idle_timeout(Duration::from_secs(60));
     #[cfg(feature = "observability")]
     let options = if crate::observability::enabled() {
@@ -280,6 +292,54 @@ pub async fn connect_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn idle_pool_recovers_a_closed_connection(pool: PgPool) {
+        use sqlx::ConnectOptions;
+        let url = pool.connect_options().to_url_lossy();
+        let client = connect_pool(url.as_str(), 1, 1).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&client)
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            let current: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&client)
+                .await
+                .unwrap();
+            assert_eq!(current, pid);
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(terminated);
+        let replacement: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&client)
+            .await
+            .unwrap();
+        assert_ne!(replacement, pid);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                sqlx::raw_sql("SELECT pg_sleep(0.1); SELECT 7").execute(&client),
+            )
+            .await
+            .is_err()
+        );
+        let value: i32 = sqlx::query_scalar("SELECT 42")
+            .fetch_one(&client)
+            .await
+            .unwrap();
+        assert_eq!(
+            value, 42,
+            "cancelled results must not leak into the next checkout"
+        );
+        client.close().await;
+    }
 
     #[test]
     fn auth_configuration_fails_closed_at_startup() {
