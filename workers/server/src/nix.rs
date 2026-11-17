@@ -15,7 +15,7 @@ use snowstead_protocol::{MissingPaths, limits, routes};
 
 use crate::{
     AppState,
-    authz::{self, Action, Principal as Identity, Resource},
+    authz::{self, Action, CacheGrant, Principal as Identity, Resource},
     cache,
     error::ApiError,
     protocol_policy::CallerLimit,
@@ -154,76 +154,73 @@ async fn get_missing_paths(
     let body: Value = serde_json::from_slice(&bytes)
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid JSON in request body"))?;
     let (cache_name, hashes) = parse_missing(&body)?;
-    let cache = sqlx::query_scalar!(
+    let (by_name, by_id) = push_scope(&identity, cache_name);
+    // Resolve the cache, refresh retention, and return membership in one
+    // statement, without rewriting paths whose daily retention refresh is not
+    // due. The cache's ID is unknown until the statement runs, so it receives
+    // the caller's scope and neither reads nor refreshes paths outside it.
+    let found = sqlx::query!(
         r#"
-        SELECT c.id
-        FROM caches c
-        WHERE c.org_id = $1
-            AND c.name = $2
-            AND EXISTS (
-                SELECT 1
-                FROM cache_protocols p
-                WHERE p.cache_id = c.id
-                    AND p.protocol = 'nix'
-            )
-        "#,
-        identity.org(),
-        cache_name,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
-    let cache_id = cache.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Cache not found"))?;
-    authz::authorize(
-        &identity,
-        Action::NixPush,
-        &Resource::cache(identity.org(), cache_id, cache_name),
-    )?;
-    // Refresh retention and return membership in one statement, without
-    // rewriting paths whose daily retention refresh is not due.
-    let existing: HashSet<String> = sqlx::query_scalar!(
-        r#"
-        WITH refreshed AS (
+        WITH target AS (
+            SELECT c.id, ($4 OR c.id = ANY($5)) AS permitted
+            FROM caches c
+            WHERE c.org_id = $1
+                AND c.name = $2
+                AND EXISTS (
+                    SELECT 1
+                    FROM cache_protocols p
+                    WHERE p.cache_id = c.id
+                        AND p.protocol = 'nix'
+                )
+        ), refreshed AS (
             UPDATE published_paths
             SET last_pushed_at = NOW()
-            WHERE cache_id = $1
-                AND store_path_hash = ANY($2)
+            WHERE cache_id = (SELECT id FROM target WHERE permitted)
+                AND store_path_hash = ANY($3)
                 AND last_pushed_at < NOW() - INTERVAL '1 day'
             RETURNING id
         )
-        SELECT store_path_hash
-        FROM published_paths
-        WHERE cache_id = $1
-            AND store_path_hash = ANY($2)
+        SELECT
+            t.id AS "id!",
+            ARRAY(
+                SELECT p.store_path_hash
+                FROM published_paths p
+                WHERE t.permitted
+                    AND p.cache_id = t.id
+                    AND p.store_path_hash = ANY($3)
+            ) AS "existing!",
+            -- Without configured upstreams this lookup never starts.
+            ARRAY(
+                SELECT u.store_path_hash
+                FROM upstream_paths u
+                WHERE t.permitted
+                    AND CARDINALITY($6::text[]) > 0
+                    AND u.store_path_hash = ANY($3)
+                    AND u.upstream = ANY($6)
+            ) AS "served!"
+        FROM target t
         "#,
-        cache_id,
+        identity.org(),
+        cache_name,
         &hashes,
+        by_name,
+        &by_id,
+        &state.config.upstreams,
     )
-    .fetch_all(&state.pool)
+    .fetch_optional(&state.pool)
     .await?
-    .into_iter()
-    .collect();
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Cache not found"))?;
+    authz::authorize(
+        &identity,
+        Action::NixPush,
+        &Resource::cache(identity.org(), found.id, cache_name),
+    )?;
+    let existing: HashSet<String> = found.existing.into_iter().collect();
+    let served: HashSet<String> = found.served.into_iter().collect();
     let absent: Vec<String> = hashes
         .into_iter()
         .filter(|hash| !existing.contains(hash))
         .collect();
-    let served: HashSet<String> = if absent.is_empty() || state.config.upstreams.is_empty() {
-        HashSet::new()
-    } else {
-        sqlx::query_scalar!(
-            r#"
-            SELECT store_path_hash
-            FROM upstream_paths
-            WHERE store_path_hash = ANY($1)
-                AND upstream = ANY($2)
-            "#,
-            &absent,
-            &state.config.upstreams,
-        )
-        .fetch_all(&state.pool)
-        .await?
-        .into_iter()
-        .collect()
-    };
     let missing: Vec<_> = absent
         .iter()
         .filter(|hash| !served.contains(*hash))
@@ -248,6 +245,36 @@ async fn get_missing_paths(
             upstreams: state.config.upstreams.clone(),
         },
     ))
+}
+
+/// The caller's push scope for a cache known only by name: whether the name
+/// alone authorizes it, and otherwise the cache IDs that would. `authorize`
+/// makes each decision; a statement that resolves the name itself uses the
+/// answer to stay inside that scope.
+fn push_scope(identity: &Identity, name: &str) -> (bool, Vec<i32>) {
+    let allowed = |id| {
+        let resource = Resource::Cache {
+            org: identity.org(),
+            id,
+            name,
+        };
+        authz::authorize(identity, Action::NixPush, &resource).is_ok()
+    };
+    if allowed(None) {
+        return (true, Vec::new());
+    }
+    let Identity::ApiToken(token) = identity else {
+        return (false, Vec::new());
+    };
+    let ids = token
+        .caches
+        .iter()
+        .filter_map(|grant| match grant {
+            CacheGrant::Id(id) if allowed(Some(*id)) => Some(*id),
+            CacheGrant::Id(_) | CacheGrant::Pattern(_) => None,
+        })
+        .collect();
+    (false, ids)
 }
 
 fn parse_missing(body: &Value) -> Result<(&str, Vec<String>), ApiError> {
