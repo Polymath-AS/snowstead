@@ -48,6 +48,9 @@ pub struct AppState {
     pub(crate) finalizations: Arc<crate::wake::Wake>,
     /// Sent after a commit that leaves a push job a candidate to publish.
     pub(crate) publications: Arc<crate::wake::Wake>,
+    /// Bazel generations whose objects or targets may have changed since
+    /// they were swept.
+    pub(crate) bazel: Arc<crate::bazel::Sweeps>,
     /// How long an idle worker sleeps before it looks without being woken.
     pub(crate) idle_period: Duration,
     pub(crate) cdn: Option<Arc<dyn cdn::PurgeTransport>>,
@@ -84,6 +87,7 @@ impl AppState {
             evictions: Arc::default(),
             finalizations: Arc::default(),
             publications: Arc::default(),
+            bazel: Arc::default(),
             idle_period: crate::wake::FALLBACK,
             pool,
             storage,
@@ -121,6 +125,14 @@ impl AppState {
     /// default. Work this process commits is picked up without it.
     pub fn with_idle_period(mut self, period: Duration) -> Self {
         self.idle_period = period;
+        self
+    }
+
+    /// Change, before starting workers or requests, how soon one Bazel sweep
+    /// pass may follow another, and how often every generation is swept
+    /// unasked. A minute and an hour by default.
+    pub fn with_bazel_sweep_periods(mut self, settle: Duration, fallback: Duration) -> Self {
+        self.bazel = Arc::new(crate::bazel::Sweeps::new(settle, fallback));
         self
     }
 

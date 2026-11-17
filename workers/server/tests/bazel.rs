@@ -1825,3 +1825,416 @@ async fn grpc_through_the_organization_host(pool: PgPool) {
         tonic::Code::PermissionDenied
     );
 }
+
+/// Every request the private store received, as `operation key`.
+#[derive(Debug)]
+struct ObservedStore {
+    inner: std::sync::Arc<dyn object_store::ObjectStore>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ObservedStore {
+    fn saw(&self, operation: &str, key: &dyn std::fmt::Display) {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("{operation} {key}"));
+    }
+}
+
+impl std::fmt::Display for ObservedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObservedStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for ObservedStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        bytes: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.saw("put", path);
+        self.inner.put_opts(path, bytes, options).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.saw("multipart", path);
+        self.inner.put_multipart_opts(path, options).await
+    }
+    async fn get_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.saw("get", path);
+        self.inner.get_opts(path, options).await
+    }
+    fn delete_stream(
+        &self,
+        paths: stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.saw("delete", &"");
+        self.inner.delete_stream(paths)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.saw("list", prefix.unwrap());
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.saw("list", prefix.unwrap());
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.saw("copy", from);
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Far below the hour, and far above what a slow runner needs.
+const PROMPT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fixture caches under `serve`, so the collector runs as it does in
+/// production, on a pool only the server uses. Every other worker's fallback
+/// is an hour.
+struct Sweeping {
+    host: Host,
+    storage: snowstead_server::storage::Storage,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Connections the server's pool handed out: one for each statement sent
+    /// to the pool, and one for each transaction.
+    checkouts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+async fn sweeping(
+    pool: &PgPool,
+    settle: std::time::Duration,
+    fallback: std::time::Duration,
+) -> Sweeping {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let storage = snowstead_server::storage::Storage::from_stores(
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(ObservedStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            requests: requests.clone(),
+        }),
+    );
+    let mut host = host(pool, storage.clone()).await;
+    host.task.abort();
+    let checkouts = Arc::new(AtomicU64::new(0));
+    let (opened, reused) = (checkouts.clone(), checkouts.clone());
+    let server = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .after_connect(move |_, _| {
+            opened.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        })
+        .before_acquire(move |_, _| {
+            reused.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(true) })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let state = AppState::new(
+        server,
+        Config {
+            admin_secret: "bazel-sweep-operator".into(),
+            ..Default::default()
+        },
+        storage.clone(),
+        reqwest::Client::new(),
+    )
+    .unwrap()
+    .with_idle_period(HOUR)
+    .with_bazel_sweep_periods(settle, fallback);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    host.url = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    host.task = tokio::spawn(async move {
+        snowstead_server::serve(listener, state, async move {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    Sweeping {
+        host,
+        storage,
+        requests,
+        checkouts,
+        stop,
+    }
+}
+
+impl Sweeping {
+    /// Wait until the server has issued no statement for a while: startup's
+    /// passes are over and every worker waits.
+    async fn quiet(&self) {
+        use std::sync::atomic::Ordering;
+        tokio::time::timeout(PROMPT, async {
+            let mut seen = self.checkouts.load(Ordering::Relaxed);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let now = self.checkouts.load(Ordering::Relaxed);
+                if now == seen {
+                    break;
+                }
+                seen = now;
+            }
+        })
+        .await
+        .expect("the workers never stopped issuing statements");
+    }
+
+    /// Storage requests so far that name `generation`, and how many of them
+    /// began a sweep of it: each sweep lists its publication receipts once.
+    fn requests(&self, generation: &str) -> (usize, usize) {
+        let requests = self.requests.lock().unwrap();
+        let prefix = format!("bazel/{generation}/");
+        (
+            requests.iter().filter(|r| r.contains(&prefix)).count(),
+            requests
+                .iter()
+                .filter(|r| **r == format!("list {prefix}published"))
+                .count(),
+        )
+    }
+
+    async fn put(&self, cache: &str, bytes: &[u8]) {
+        let response = reqwest::Client::new()
+            .put(format!(
+                "{}/_api/v1/bazel/alpha/{cache}/cas/{}",
+                self.host.url,
+                digest(bytes).hash
+            ))
+            .bearer_auth(&self.host.token)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+    }
+
+    async fn stop(mut self) {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(PROMPT, &mut self.host.task)
+            .await
+            .expect("workers did not stop")
+            .unwrap();
+    }
+}
+
+async fn generation(pool: &PgPool, cache: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT generation FROM bazel_caches b JOIN caches c ON c.id=b.cache_id WHERE c.name=$1",
+    )
+    .bind(cache)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The collector's latest observation of a cache's current generation:
+/// entries, retained bytes, and when the sweep that made it began.
+async fn observed(pool: &PgPool, cache: &str) -> Option<(i64, i64, chrono::DateTime<chrono::Utc>)> {
+    sqlx::query_as(
+        "SELECT u.entries, u.size, u.updated_at FROM bazel_usage u
+            JOIN bazel_caches b ON b.cache_id=u.cache_id AND b.generation=u.generation
+            JOIN caches c ON c.id=b.cache_id WHERE c.name=$1",
+    )
+    .bind(cache)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// Wait for a cache's observation to satisfy `met`, and return it.
+async fn observes(
+    pool: &PgPool,
+    cache: &str,
+    why: &str,
+    met: impl Fn(i64, i64, chrono::DateTime<chrono::Utc>) -> bool,
+) -> chrono::DateTime<chrono::Utc> {
+    tokio::time::timeout(PROMPT, async {
+        loop {
+            if let Some((entries, size, at)) = observed(pool, cache).await
+                && met(entries, size, at)
+            {
+                return at;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{why}"))
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn only_a_written_generation_is_swept_and_an_idle_collector_does_nothing(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    let settle = std::time::Duration::from_secs(1);
+    // Only startup's pass and a mark can sweep: the fallback is an hour away.
+    let server = sweeping(&pool, settle, HOUR).await;
+    let (public, private) = (
+        generation(&pool, "public").await,
+        generation(&pool, "private").await,
+    );
+    let started = observes(&pool, "public", "startup did not sweep", |_, _, _| true).await;
+    observes(&pool, "private", "startup did not sweep", |_, _, _| true).await;
+    server.quiet().await;
+
+    // Several settle periods, in each of which the former collector's interval
+    // would have swept both generations again.
+    let requests = server.requests.lock().unwrap().len();
+    let checkouts = server.checkouts.load(Ordering::Relaxed);
+    tokio::time::sleep(3 * settle).await;
+    assert_eq!(server.requests.lock().unwrap().len(), requests);
+    assert_eq!(server.checkouts.load(Ordering::Relaxed), checkouts);
+
+    let before = (server.requests(&public), server.requests(&private));
+    let wrote = std::time::Instant::now();
+    server.put("private", b"first").await;
+    observes(
+        &pool,
+        "private",
+        "a write was not swept",
+        |entries, size, _| (entries, size) == (1, 5),
+    )
+    .await;
+    // The settle period had long passed, so nothing held this sweep back.
+    assert!(wrote.elapsed() < 10 * settle, "{:?}", wrote.elapsed());
+
+    // A burst inside one settle period shares the pass that follows it.
+    for value in 0..5u8 {
+        server.put("private", &[value; 3]).await;
+    }
+    observes(
+        &pool,
+        "private",
+        "a burst was not swept",
+        |entries, size, _| (entries, size) == (6, 20),
+    )
+    .await;
+    server.quiet().await;
+    let sweeps = server.requests(&private).1 - before.1.1;
+    assert!((1..=3).contains(&sweeps), "{sweeps} sweeps for six writes");
+
+    // None of that touched the generation nothing wrote to.
+    assert_eq!(server.requests(&public), before.0);
+    assert_eq!(observed(&pool, "public").await.unwrap().2, started);
+    server.stop().await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn the_fallback_sweeps_what_no_mark_announced(pool: PgPool) {
+    let server = sweeping(
+        &pool,
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    let started = observes(&pool, "public", "startup did not sweep", |_, _, _| true).await;
+    observes(&pool, "private", "startup did not sweep", |_, _, _| true).await;
+
+    // As another instance publishes: straight to storage, past this process.
+    let store = snowstead_server::bazel::store::Store::new(
+        server.storage.clone(),
+        &generation(&pool, "private").await,
+        33554432,
+    );
+    store
+        .write(
+            "cas",
+            &digest(b"elsewhere").hash,
+            9,
+            axum::body::Body::from("elsewhere"),
+        )
+        .await
+        .unwrap();
+    observes(
+        &pool,
+        "private",
+        "the fallback missed an unannounced write",
+        |entries, size, _| (entries, size) == (1, 9),
+    )
+    .await;
+    // A generation with no change at all is swept by the fallback too.
+    observes(
+        &pool,
+        "public",
+        "the fallback skipped a clean generation",
+        |_, _, at| at > started,
+    )
+    .await;
+    server.stop().await;
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn a_lowered_capacity_evicts_without_waiting_for_the_fallback(pool: PgPool) {
+    let server = sweeping(&pool, std::time::Duration::from_millis(200), HOUR).await;
+    observes(&pool, "private", "startup did not sweep", |_, _, _| true).await;
+    for bytes in [b"old!", b"new!"] {
+        server.put("public", bytes).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    observes(
+        &pool,
+        "public",
+        "writes were not swept",
+        |entries, size, _| (entries, size) == (2, 8),
+    )
+    .await;
+    server.quiet().await;
+    let untouched = generation(&pool, "private").await;
+    let before = server.requests(&untouched);
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/_api/v1/admin/caches", server.host.url))
+        .bearer_auth("bazel-sweep-operator")
+        .json(
+            &serde_json::json!({"name":"public","org":"bazel-org","private":false,
+            "protocols":["bazel"],"bazelCapacity":4}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "{status} {}",
+        response.text().await.unwrap()
+    );
+    observes(
+        &pool,
+        "public",
+        "a lowered capacity did not evict",
+        |entries, size, _| (entries, size) == (1, 4),
+    )
+    .await;
+    // Rereading the targets swept only the generation above its own.
+    assert_eq!(server.requests(&untouched), before);
+    server.stop().await;
+}

@@ -11,6 +11,11 @@ use axum::{
     routing::get,
 };
 use prost::Message;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
@@ -20,65 +25,229 @@ use crate::{
     cache,
     error::ApiError,
     protocol_policy::CallerLimit,
+    wake::{Pace, Turn, Wake},
 };
 use proto::build::bazel::remote::execution::v2::{ActionResult, Digest, Tree};
 
 const MAX_METADATA: usize = 4 * 1024 * 1024;
 
+/// The soonest one sweep pass may follow another. A build's writes are swept
+/// together, at most this often, as the former fixed interval swept them.
+const SETTLE: Duration = Duration::from_secs(60);
+/// How often every generation is swept whether or not anything announced it.
+const FALLBACK: Duration = Duration::from_secs(60 * 60);
+
+/// What the collector has been told may have changed. A sweep reads object
+/// storage in proportion to a generation's size, so a generation is swept
+/// when a sweep could find something new, and otherwise costs nothing: no
+/// storage request and no statement.
+///
+/// A generation is marked by every `Store` operation that writes its objects
+/// (`write`, `write_buffered`, `append`, `write_stream`, `finish_upload`),
+/// over HTTP and gRPC alike, as the operation ends, however it ends. The
+/// collector marks it again when a sweep fails or leaves it above its target.
+/// Targets are reread when management creates a Bazel cache or changes a
+/// capacity or an organization's limit; a generation is then swept only if
+/// its target fell below the size last observed.
+///
+/// Access markers mark nothing. A sweep leaves a generation within its
+/// target, so a marker alone evicts nothing and changes no usage; the sweep
+/// that next evicts reads the markers then.
+///
+/// The fallback sweeps every generation for what this process never saw:
+/// another instance's writes, a manual change, and targets moved by the other
+/// products' usage. It is also the timer for everything a sweep removes by
+/// age (uploads never published, staging chunks, access markers, and the
+/// objects of retired generations): two hours is their minimum age, not a
+/// deadline, so no sweep is scheduled for it.
+pub(crate) struct Sweeps {
+    wake: Wake,
+    pending: Mutex<Pending>,
+    settle: Duration,
+    fallback: Duration,
+}
+
+#[derive(Default)]
+struct Pending {
+    generations: HashSet<String>,
+    targets: bool,
+}
+
+impl Default for Sweeps {
+    fn default() -> Self {
+        Self::new(SETTLE, FALLBACK)
+    }
+}
+
+impl Sweeps {
+    pub(crate) fn new(settle: Duration, fallback: Duration) -> Self {
+        Self {
+            wake: Wake::default(),
+            pending: Mutex::default(),
+            settle,
+            fallback,
+        }
+    }
+
+    /// Call after the change, never before: a sweep that looks first records
+    /// the old state and nothing asks for another.
+    pub(crate) fn mark(&self, generation: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        let added = !pending.generations.contains(generation)
+            && pending.generations.insert(generation.to_owned());
+        drop(pending);
+        // Later marks of a waiting generation join the pass already owed.
+        if added {
+            self.wake.wake();
+        }
+    }
+
+    /// Call after a commit that may have lowered a retention target.
+    pub(crate) fn retarget(&self) {
+        self.pending.lock().unwrap().targets = true;
+        self.wake.wake();
+    }
+}
+
+/// The collector's own record between passes.
+struct Collector {
+    /// No pass starts before this.
+    next: Instant,
+    /// The next pass at or after this sweeps everything.
+    full: Instant,
+    /// Retained bytes each generation was last observed to hold.
+    sizes: HashMap<String, u64>,
+}
+
 pub(crate) async fn maintain(state: AppState, stopped: tokio_util::sync::CancellationToken) {
-    let period = std::time::Duration::from_secs(60);
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
+    let sweeps = state.bazel.clone();
+    let mut pace = Pace::new(&sweeps.wake, &stopped, sweeps.fallback);
+    // The first pass sweeps everything: nothing before this start was seen.
+    let start = Instant::now() + sweeps.settle;
+    let mut collector = Collector {
+        next: start,
+        full: start,
+        sizes: HashMap::new(),
+    };
+    while pace.running() {
+        let turn = tokio::select! {
             _ = stopped.cancelled() => break,
-            _ = interval.tick() => {
-                tokio::select! {
-                    _ = stopped.cancelled() => break,
-                    result = collect(&state) => {
-                        if result.is_err() { tracing::warn!("Bazel retention sweep failed; retrying next minute"); }
-                    }
+            turn = collector.turn(&state) => turn,
+        };
+        if turn.is_err() {
+            tracing::warn!("Bazel retention sweep failed; retrying after the settle period");
+        }
+        pace.after(turn).await;
+    }
+}
+
+impl Collector {
+    async fn turn(&mut self, state: &AppState) -> anyhow::Result<Turn> {
+        let sweeps = &state.bazel;
+        let now = Instant::now();
+        if now < self.next {
+            // A wake inside the settle period waits it out. Its marks stay.
+            return Ok(Turn::Idle(Some(self.next - now)));
+        }
+        let full = now >= self.full;
+        // Take the marks before reading anything, so a change that lands
+        // during this pass asks for the next one.
+        let pending = std::mem::take(&mut *sweeps.pending.lock().unwrap());
+        if !full && !pending.targets && pending.generations.is_empty() {
+            return Ok(Turn::Idle(Some(self.full - now)));
+        }
+        self.next = now + sweeps.settle;
+        match collect(state, &mut self.sizes, full, &pending).await {
+            Ok(_) => {
+                if full {
+                    self.full = now + sweeps.fallback;
                 }
+                Ok(Turn::Worked)
+            }
+            Err(error) => {
+                let mut again = sweeps.pending.lock().unwrap();
+                again.generations.extend(pending.generations);
+                again.targets |= pending.targets;
+                Err(error)
             }
         }
     }
 }
 
-pub(crate) async fn collect(state: &AppState) -> anyhow::Result<u64> {
+/// Sweep every generation and retire unknown ones, or with `full` unset only
+/// the marked generations and, after a retargeting, those above their target.
+async fn collect(
+    state: &AppState,
+    sizes: &mut HashMap<String, u64>,
+    full: bool,
+    pending: &Pending,
+) -> anyhow::Result<u64> {
     use futures_util::{StreamExt, TryStreamExt, stream};
-    let active: Vec<(String, i64)> =
+    let mut active: Vec<(String, i64)> = if full || pending.targets {
         sqlx::query_as("SELECT generation, target FROM bazel_retention")
             .fetch_all(&state.pool)
-            .await?;
-    let mut generations: std::collections::HashMap<String, bool> = active
+            .await?
+    } else {
+        let marked: Vec<&str> = pending.generations.iter().map(String::as_str).collect();
+        sqlx::query_as("SELECT generation, target FROM bazel_retention WHERE generation = ANY($1)")
+            .bind(marked)
+            .fetch_all(&state.pool)
+            .await?
+    };
+    let mut generations: HashMap<String, bool> = active
         .iter()
         .map(|(generation, _)| (generation.clone(), true))
         .collect();
+    if full {
+        sizes.retain(|generation, _| generations.contains_key(generation));
+    }
+    active.retain(|(generation, target)| {
+        full || pending.generations.contains(generation)
+            // Never observed, or observed above what it may now retain.
+            || sizes.get(generation).is_none_or(|size| *size > *target as u64)
+    });
     let mut deleted = 0;
     let mut sweeps = stream::iter(active.into_iter().map(|(generation, capacity)| async move {
         let started = chrono::Utc::now();
         let store = store::Store::new(state.storage.clone(), &generation, capacity as u64);
-        let deleted = store.collect().await?;
-        let (entries, size) = store.usage().await?;
-        let (physical, staging) = store.physical_usage().await?;
-        // Background observations only. A reset cannot inherit the old generation's
-        // totals, and a slow collector cannot replace a more recent observation.
-        sqlx::query("INSERT INTO bazel_usage(cache_id,generation,entries,size,physical_size,staging_size,updated_at)
-            SELECT cache_id,generation,$2,$3,$4,$5,$6 FROM bazel_caches WHERE generation=$1
-            ON CONFLICT(cache_id) DO UPDATE SET generation=EXCLUDED.generation,entries=EXCLUDED.entries,
-                size=EXCLUDED.size,physical_size=EXCLUDED.physical_size,staging_size=EXCLUDED.staging_size,
-                updated_at=EXCLUDED.updated_at WHERE bazel_usage.updated_at < EXCLUDED.updated_at")
-            .bind(generation).bind(entries as i64).bind(size as i64).bind(physical as i64)
-            .bind(staging as i64).bind(started).execute(&state.pool).await?;
-        Ok::<_, anyhow::Error>(deleted)
-    })).buffer_unordered(4);
-    while let Some(sweep) = sweeps.next().await {
-        match sweep {
-            Ok(count) => deleted += count,
+        let swept = async {
+            let deleted = store.collect().await?;
+            let (entries, size) = store.usage().await?;
+            let (physical, staging) = store.physical_usage().await?;
+            // Background observations only. A reset cannot inherit the old generation's
+            // totals, and a slow collector cannot replace a more recent observation.
+            sqlx::query("INSERT INTO bazel_usage(cache_id,generation,entries,size,physical_size,staging_size,updated_at)
+                SELECT cache_id,generation,$2,$3,$4,$5,$6 FROM bazel_caches WHERE generation=$1
+                ON CONFLICT(cache_id) DO UPDATE SET generation=EXCLUDED.generation,entries=EXCLUDED.entries,
+                    size=EXCLUDED.size,physical_size=EXCLUDED.physical_size,staging_size=EXCLUDED.staging_size,
+                    updated_at=EXCLUDED.updated_at WHERE bazel_usage.updated_at < EXCLUDED.updated_at")
+                .bind(&generation).bind(entries as i64).bind(size as i64).bind(physical as i64)
+                .bind(staging as i64).bind(started).execute(&state.pool).await?;
+            Ok::<_, anyhow::Error>((deleted, size))
+        }
+        .await;
+        (generation, capacity as u64, swept)
+    }))
+    .buffer_unordered(4);
+    while let Some((generation, capacity, swept)) = sweeps.next().await {
+        match swept {
+            Ok((count, size)) => {
+                deleted += count;
+                // Candidates are bounded and a racing collector may win an
+                // entry: a large excess drains over successive passes.
+                if size > capacity {
+                    state.bazel.mark(&generation);
+                }
+                sizes.insert(generation, size);
+            }
             Err(_) => {
-                tracing::warn!("Bazel cache sweep failed; retaining its previous usage snapshot")
+                tracing::warn!("Bazel cache sweep failed; retaining its previous usage snapshot");
+                state.bazel.mark(&generation);
             }
         }
+    }
+    if !full {
+        return Ok(deleted);
     }
     let metadata = state.storage.private_store();
     let prefix = object_store::path::Path::from("bazel/");
@@ -194,7 +363,8 @@ async fn open(
             state.storage.clone(),
             &target.generation,
             target.capacity as u64,
-        ),
+        )
+        .announcing(state.bazel.clone()),
         target.public,
     ))
 }
