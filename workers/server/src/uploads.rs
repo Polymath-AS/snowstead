@@ -407,17 +407,17 @@ async fn lock_session(
 /// locks, so none is requested before every advisory lock has been tried, and
 /// none at all when one was held. Returns whether the locks were taken.
 async fn lock_sessions(tx: &mut Transaction, ids: &[String]) -> Result<bool, ApiError> {
-    let (held, _): (bool, i64) = sqlx::query_as(
-        "SELECT held.ok,(SELECT count(*) FROM (SELECT FROM upload_sessions \
-         WHERE held.ok AND id=ANY($1) ORDER BY id FOR NO KEY UPDATE) locked) \
+    let locks = sqlx::query!(
+        "SELECT held.ok AS \"held!\",(SELECT count(*) FROM (SELECT FROM upload_sessions \
+         WHERE held.ok AND id=ANY($1) ORDER BY id FOR NO KEY UPDATE) locked) AS locked \
          FROM (SELECT COALESCE(bool_and(pg_try_advisory_xact_lock(hashtextextended(key,0))),TRUE) AS ok \
          FROM (SELECT DISTINCT 'upload:'||id AS key FROM UNNEST($1::text[]) AS id \
          ORDER BY key OFFSET 0) ordered) held",
+        ids,
     )
-    .bind(ids)
     .fetch_one(&mut **tx)
     .await?;
-    Ok(held)
+    Ok(locks.held)
 }
 
 /// Lock session rows in ID order, so two multi-session writers cannot wait on
@@ -783,25 +783,19 @@ async fn reserve_group(
     // The staging total, on every row, beside the parts already reserved.
     // The callers' session locks hold those parts still, so reading both in
     // one snapshot sees what reading them one after the other did.
-    #[derive(sqlx::FromRow)]
-    struct Reserved {
-        staged: i64,
-        session_id: Option<String>,
-        part_number: Option<i32>,
-        size: Option<i64>,
-    }
-    let previous: Vec<Reserved> = sqlx::query_as(
-        "SELECT s.staged,p.session_id,p.part_number,p.size FROM \
+    let previous = sqlx::query!(
+        "SELECT s.staged AS \"staged!\",p.session_id AS \"session_id?\",\
+         p.part_number AS \"part_number?\",p.size AS \"size?\" FROM \
          (SELECT COALESCE(SUM(u.file_size),0)::bigint AS staged FROM upload_sessions u \
          JOIN caches c ON c.id=u.cache_id WHERE c.org_id=$3 AND u.expires_at>NOW() \
          AND u.status IN ('streaming','finalizing')) s \
          LEFT JOIN (SELECT p.session_id,p.part_number,p.size FROM upload_parts p \
          JOIN UNNEST($1::text[],$2::integer[]) r(session_id,part_number) \
          USING(session_id,part_number)) p ON TRUE",
+        &ids,
+        &numbers,
+        &requests[0].0.org_id,
     )
-    .bind(&ids)
-    .bind(&numbers)
-    .bind(&requests[0].0.org_id)
     .fetch_all(&mut **tx)
     .await?;
     let mut staged = previous[0].staged;
@@ -1267,22 +1261,23 @@ async fn session_authority(
     // The share lock on the batch holds what this reads until the caller
     // commits: a consumer's claim, a settlement, and a job resume all take
     // the batch exclusively, so each runs wholly before or after it.
-    let batch: Option<(bool, Option<String>, bool)> = sqlx::query_as(
+    let batch = sqlx::query!(
         "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND \
          (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND \
          (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND \
-         ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false), \
+         ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false) AS \"authorized!\", \
          b.work_id,COALESCE(b.work_id=$4 AND b.lease_expires_at>clock_timestamp() \
-         AND b.expires_at>clock_timestamp(),false) \
+         AND b.expires_at>clock_timestamp(),false) AS \"claimed!\" \
          FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id \
          WHERE f.session_id=$1 FOR SHARE OF b",
+        session.id,
+        identity.actor(),
+        shared_generation(state),
+        expected,
     )
-    .bind(&session.id)
-    .bind(identity.actor())
-    .bind(shared_generation(state))
-    .bind(expected)
     .fetch_optional(&mut **tx)
-    .await?;
+    .await?
+    .map(|b| (b.authorized, b.work_id, b.claimed));
     if matches!(batch, Some((false, ..))) {
         return Err(error(401, "Finalization authorization expired or replaced"));
     }
@@ -1312,17 +1307,18 @@ async fn seal(
         // fails its NOWAIT and retries, and a close that got there first is
         // waited for and then seen. The session's own membership cannot
         // change under its locks, so one statement reads both.
-        let (existing, open): (Option<bool>, Option<bool>) = sqlx::query_as(
-            "SELECT e.prepare_only,(SELECT TRUE FROM upload_finalization_batches \
-             WHERE e.prepare_only IS NULL AND id=$2 AND NOT admitted FOR SHARE) \
+        let membership = sqlx::query!(
+            "SELECT e.prepare_only AS existing,(SELECT TRUE FROM upload_finalization_batches \
+             WHERE e.prepare_only IS NULL AND id=$2 AND NOT admitted FOR SHARE) AS open \
              FROM (SELECT (SELECT b.prepare_only FROM upload_finalizations f \
              JOIN upload_finalization_batches b ON b.id=f.batch_id WHERE f.session_id=$1) \
              AS prepare_only OFFSET 0) e",
+            s.id,
+            batch,
         )
-        .bind(&s.id)
-        .bind(batch)
         .fetch_one(&mut *tx)
         .await?;
+        let (existing, open) = (membership.existing, membership.open);
         if existing.is_some_and(|saved| saved != prepare_only) {
             return Err(error(409, "Finalization intent cannot change"));
         }

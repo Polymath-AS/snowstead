@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(b.expires_at>clock_timestamp() AND b.actor=$2 AND (b.job_id IS NULL OR b.grant_generation=(SELECT grant_generation FROM push_jobs WHERE id=b.job_id)) AND (f.result IS NULL OR COALESCE((f.result->>'prepared')::boolean,false)) AND ((b.token_jti=$2 AND b.shared_generation IS NULL) OR b.shared_generation=$3),false) AS \"authorized!\", b.work_id,COALESCE(b.work_id=$4 AND b.lease_expires_at>clock_timestamp() AND b.expires_at>clock_timestamp(),false) AS \"claimed!\" FROM upload_finalizations f JOIN upload_finalization_batches b ON b.id=f.batch_id WHERE f.session_id=$1 FOR SHARE OF b",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "authorized!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "work_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_finalization_batches",
+            "name": "work_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "claimed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      null
+    ]
+  },
+  "hash": "c9fed8dec34c38292cff2db8577a2fd5abc24a4458947ff3aaba5c70823c0d23"
+}
