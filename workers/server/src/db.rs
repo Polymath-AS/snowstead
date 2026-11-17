@@ -80,15 +80,37 @@
 //! - Revocation locks the jobs a token authorizes, then the token, then
 //!   updates those jobs again. A job resumed between the first two steps is
 //!   locked after the token, against the order of a publisher of that job.
-use sqlx::{PgConnection, Postgres};
+use sqlx::{PgConnection, PgPool, Postgres};
 use std::ops::{Deref, DerefMut};
 
 use crate::error::ApiError;
 use axum::http::{HeaderValue, StatusCode, header};
 
-/// How long a write transaction waits for any one lock before PostgreSQL
-/// cancels the statement, which callers see as a retryable 503.
-const LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '100ms'";
+/// Starts a write transaction. `lock_timeout` is how long it waits for any
+/// one lock before PostgreSQL cancels the statement, which callers see as a
+/// retryable 503.
+const WRITE: &str = "SET LOCAL lock_timeout = '100ms'; BEGIN";
+
+/// Starts a worker discovery read, which must not hold its snapshot for long.
+const READ: &str = "SET LOCAL statement_timeout = '1s'; BEGIN READ ONLY";
+
+/// Start a transaction and apply its settings in one round trip. `statement`
+/// is a constant: any `SET LOCAL` settings, then the BEGIN that opens the
+/// transaction, sent as a single simple-query message.
+///
+/// The settings come first on purpose. PostgreSQL runs a multi-statement
+/// message in an implicit transaction block, and a BEGIN in that block adopts
+/// the statements before it into the transaction it opens, so the settings
+/// last exactly as long as the transaction. If one of them fails, the
+/// implicit block is rolled back and the connection is idle again. With BEGIN
+/// first, that failure would leave an aborted transaction that SQLx has not
+/// counted, does not roll back, and returns to the pool.
+pub(crate) async fn start(
+    pool: &PgPool,
+    statement: &'static str,
+) -> Result<sqlx::Transaction<'static, Postgres>, sqlx::Error> {
+    pool.begin_with(statement).await
+}
 
 fn busy(message: &str) -> ApiError {
     ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message)
@@ -166,13 +188,7 @@ pub(crate) async fn begin_read(
     // Keep BEGIN cancellation-safe, just like writer transaction startup.
     Ok(state
         .tasks
-        .spawn(async move {
-            let mut tx = pool.begin_with("BEGIN READ ONLY").await?;
-            sqlx::query("SET LOCAL statement_timeout='1s'")
-                .execute(&mut *tx)
-                .await?;
-            Ok::<_, sqlx::Error>(tx)
-        })
+        .spawn(async move { start(&pool, READ).await })
         .await
         .map_err(|_| {
             ApiError::new(
@@ -189,9 +205,7 @@ pub(crate) async fn view(state: &crate::AppState) -> Result<Transaction, ApiErro
     state
         .tasks
         .spawn(async move {
-            let inner = pool
-                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .await?;
+            let inner = start(&pool, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await?;
             Ok(Transaction {
                 inner: Some(inner),
                 tasks,
@@ -222,14 +236,13 @@ pub(crate) async fn begin(state: &crate::AppState) -> Result<Transaction, ApiErr
     state
         .tasks
         .spawn(async move {
-            let mut tx = Transaction {
-                inner: Some(pool.begin().await?),
-                tasks,
-            };
             // Every lock this transaction waits for, explicit or taken by a
-            // foreign key, unique index, or trigger, gives up after this long.
-            sqlx::query(LOCK_TIMEOUT).execute(&mut *tx).await?;
-            Ok(tx)
+            // foreign key, unique index, or trigger, gives up after its
+            // lock timeout.
+            Ok(Transaction {
+                inner: Some(start(&pool, WRITE).await?),
+                tasks,
+            })
         })
         .await
         .map_err(|_| {
@@ -275,6 +288,95 @@ pub(crate) async fn interleave(pool: &sqlx::PgPool, event: &str, table: &str, bo
          FOR EACH STATEMENT EXECUTE FUNCTION interleaved();"
     )))
     .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A pool of one connection to `observer`'s database, through a relay that
+/// counts the server's ReadyForQuery messages. PostgreSQL ends every round
+/// trip with exactly one, whatever the client sent in it.
+#[cfg(test)]
+pub(crate) async fn counted(
+    observer: &PgPool,
+) -> (PgPool, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let options = observer.connect_options();
+    let upstream = format!("{}:{}", options.get_host(), options.get_port());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = ready.clone();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let responses = async {
+            // Without TLS, every server message is a type byte and a length
+            // that counts itself but not the type.
+            let (mut header, mut body) = (Vec::with_capacity(5), 0);
+            let mut buffer = [0; 8192];
+            loop {
+                let n = server_read.read(&mut buffer).await?;
+                if n == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                let mut bytes = &buffer[..n];
+                while !bytes.is_empty() {
+                    let taken = if body > 0 {
+                        let taken = bytes.len().min(body);
+                        body -= taken;
+                        taken
+                    } else {
+                        let taken = bytes.len().min(5 - header.len());
+                        header.extend_from_slice(&bytes[..taken]);
+                        if header.len() == 5 {
+                            if header[0] == b'Z' {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+                            body = length as usize - 4;
+                            header.clear();
+                        }
+                        taken
+                    };
+                    bytes = &bytes[taken..];
+                }
+                client_write.write_all(&buffer[..n]).await?;
+            }
+        };
+        let _ = tokio::join!(
+            tokio::io::copy(&mut client_read, &mut server_write),
+            responses
+        );
+    });
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .connect_with(
+            (*options)
+                .clone()
+                .host("127.0.0.1")
+                .port(port)
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+        )
+        .await
+        .unwrap();
+    settle(&pool).await;
+    (pool, ready)
+}
+
+/// Wait until a one-connection pool has its connection back. Release sends a
+/// health check of its own, which must not be counted against what follows.
+#[cfg(test)]
+pub(crate) async fn settle(pool: &PgPool) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pool.num_idle() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
 }
@@ -436,6 +538,191 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(timeout, "0");
+        state.finish_background().await;
+        pool.close().await;
+    }
+
+    fn state(pool: &PgPool) -> AppState {
+        AppState::new(
+            pool.clone(),
+            Config::default(),
+            Storage::from_stores(Arc::new(InMemory::new()), Arc::new(InMemory::new())),
+            reqwest::Client::new(),
+        )
+        .unwrap()
+    }
+
+    async fn one_connection(observer: &PgPool) -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*observer.connect_options()).clone())
+            .await
+            .unwrap()
+    }
+
+    async fn show(conn: impl sqlx::PgExecutor<'_>, setting: &'static str) -> String {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn every_transaction_starts_in_one_round_trip_with_its_settings(observer: PgPool) {
+        let (pool, ready) = counted(&observer).await;
+        let state = state(&pool);
+        let count = || ready.load(std::sync::atomic::Ordering::SeqCst);
+
+        let before = count();
+        let mut tx = begin(&state).await.unwrap();
+        assert_eq!(count() - before, 1);
+        assert_eq!(show(&mut *tx, "lock_timeout").await, "100ms");
+        assert_eq!(show(&mut *tx, "statement_timeout").await, "0");
+        assert_eq!(show(&mut *tx, "transaction_read_only").await, "off");
+        tx.commit().await.unwrap();
+        settle(&pool).await;
+
+        let before = count();
+        let mut tx = begin_read(&state).await.unwrap();
+        assert_eq!(count() - before, 1);
+        assert_eq!(show(&mut *tx, "statement_timeout").await, "1s");
+        assert_eq!(show(&mut *tx, "lock_timeout").await, "0");
+        assert_eq!(show(&mut *tx, "transaction_read_only").await, "on");
+        tx.commit().await.unwrap();
+        settle(&pool).await;
+
+        let before = count();
+        let mut tx = view(&state).await.unwrap();
+        assert_eq!(count() - before, 1);
+        assert_eq!(
+            show(&mut *tx, "transaction_isolation").await,
+            "repeatable read"
+        );
+        assert_eq!(show(&mut *tx, "transaction_read_only").await, "on");
+        tx.commit().await.unwrap();
+        settle(&pool).await;
+
+        // Every setting was transaction-local: the one connection has none.
+        for setting in ["lock_timeout", "statement_timeout"] {
+            assert_eq!(show(&pool, setting).await, "0");
+        }
+        assert_eq!(show(&pool, "transaction_read_only").await, "off");
+        assert_eq!(show(&pool, "transaction_isolation").await, "read committed");
+        state.finish_background().await;
+        pool.close().await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn a_dropped_transaction_rolls_back_and_returns_a_clean_connection(observer: PgPool) {
+        sqlx::query("CREATE TABLE drop_probe (id integer PRIMARY KEY)")
+            .execute(&observer)
+            .await
+            .unwrap();
+        let pool = one_connection(&observer).await;
+        let state = state(&pool);
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The tracked wrapper, then a bare SQLx transaction as sweeps hold it.
+        let mut tx = begin(&state).await.unwrap();
+        sqlx::query("INSERT INTO drop_probe VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut tx = start(&pool, WRITE).await.unwrap();
+        sqlx::query("INSERT INTO drop_probe VALUES (2)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // A savepoint nests inside it as inside any other transaction.
+        let mut nested = sqlx::Acquire::begin(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO drop_probe VALUES (3)")
+            .execute(&mut *nested)
+            .await
+            .unwrap();
+        nested.commit().await.unwrap();
+        drop(tx);
+
+        // The same connection comes back outside any transaction and without
+        // the settings: what it writes next commits on its own.
+        sqlx::query("INSERT INTO drop_probe VALUES (4)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reused: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reused, pid);
+        assert_eq!(show(&pool, "lock_timeout").await, "0");
+        let kept: Vec<i32> = sqlx::query_scalar("SELECT id FROM drop_probe ORDER BY id")
+            .fetch_all(&observer)
+            .await
+            .unwrap();
+        assert_eq!(kept, [4]);
+        state.finish_background().await;
+        pool.close().await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn a_setting_that_fails_leaves_no_transaction_on_the_connection(observer: PgPool) {
+        sqlx::query("CREATE TABLE failure_probe (id integer PRIMARY KEY)")
+            .execute(&observer)
+            .await
+            .unwrap();
+        let pool = one_connection(&observer).await;
+        let state = state(&pool);
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        for (id, statement) in [
+            "SET LOCAL lock_timeout = 'never'; BEGIN",
+            "SET LOCAL lock_timeout = '100ms'; SET LOCAL statement_timeout = 'never'; BEGIN",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = start(&pool, statement).await.err().unwrap();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("22023"),
+                "{error}"
+            );
+            // The same connection is idle, not inside an open or aborted
+            // transaction, and kept nothing of the settings that did apply.
+            let status: String =
+                sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid=$1")
+                    .bind(pid)
+                    .fetch_one(&observer)
+                    .await
+                    .unwrap();
+            assert_eq!(status, "idle");
+            assert_eq!(show(&pool, "lock_timeout").await, "0");
+            sqlx::query("INSERT INTO failure_probe VALUES ($1)")
+                .bind(id as i32)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let reused: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reused, pid);
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM failure_probe")
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+        assert_eq!(kept, 2);
+        begin(&state).await.unwrap().commit().await.unwrap();
         state.finish_background().await;
         pool.close().await;
     }

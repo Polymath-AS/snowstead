@@ -240,34 +240,28 @@ fn record(count: &mut u64, failures: &mut u64, stage: &'static str, result: anyh
     }
 }
 
+/// Sweeps give way to request writers at once and bound every statement.
+/// The settings travel with BEGIN in one round trip; see `db::start`.
 #[cfg_attr(feature = "profiling", hotpath::measure)]
 async fn begin(pool: &PgPool) -> anyhow::Result<Transaction<'static, Postgres>> {
-    let mut tx = crate::profile_future!(pool.begin(), label = "maintenance.pool_begin").await?;
-    sqlx::query!(
-        r#"
-        SET LOCAL lock_timeout = '1ms'
-        "#
+    Ok(crate::profile_future!(
+        crate::db::start(
+            pool,
+            "SET LOCAL lock_timeout = '1ms'; SET LOCAL statement_timeout = '30s'; BEGIN",
+        ),
+        label = "maintenance.pool_begin"
     )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query!(
-        r#"
-        SET LOCAL statement_timeout = '30s'
-        "#
-    )
-    .execute(&mut *tx)
-    .await?;
-    Ok(tx)
+    .await?)
 }
 
 /// For sweeps that order themselves against request writers on a row lock:
 /// the same wait budget those writers have, instead of giving up at once.
 async fn begin_patient(pool: &PgPool) -> anyhow::Result<Transaction<'static, Postgres>> {
-    let mut tx = begin(pool).await?;
-    sqlx::query("SET LOCAL lock_timeout = '100ms'")
-        .execute(&mut *tx)
-        .await?;
-    Ok(tx)
+    Ok(crate::db::start(
+        pool,
+        "SET LOCAL lock_timeout = '100ms'; SET LOCAL statement_timeout = '30s'; BEGIN",
+    )
+    .await?)
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
@@ -1267,6 +1261,43 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires disposable Postgres via DATABASE_URL"]
+    async fn sweep_transactions_start_in_one_round_trip_with_their_settings(observer: PgPool) {
+        async fn show(tx: &mut Transaction<'_, Postgres>, setting: &'static str) -> String {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap()
+        }
+        let (pool, ready) = crate::db::counted(&observer).await;
+        let count = || ready.load(std::sync::atomic::Ordering::SeqCst);
+
+        let before = count();
+        let mut tx = begin(&pool).await.unwrap();
+        assert_eq!(count() - before, 1);
+        assert_eq!(show(&mut tx, "lock_timeout").await, "1ms");
+        assert_eq!(show(&mut tx, "statement_timeout").await, "30s");
+        // Dropped, as a sweep that fails leaves it.
+        drop(tx);
+        crate::db::settle(&pool).await;
+
+        let before = count();
+        let mut tx = begin_patient(&pool).await.unwrap();
+        assert_eq!(count() - before, 1);
+        assert_eq!(show(&mut tx, "lock_timeout").await, "100ms");
+        assert_eq!(show(&mut tx, "statement_timeout").await, "30s");
+        tx.commit().await.unwrap();
+        crate::db::settle(&pool).await;
+
+        // The one connection kept neither setting past its transactions.
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(show(&mut tx, "lock_timeout").await, "0");
+        assert_eq!(show(&mut tx, "statement_timeout").await, "0");
+        tx.commit().await.unwrap();
+        pool.close().await;
     }
 
     async fn fixture(pool: PgPool) -> (AppState, i32) {
