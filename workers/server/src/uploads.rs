@@ -2691,20 +2691,28 @@ async fn publish_batch(
                 .filter(|(_, p)| p.session.push_job_id.is_some())
                 .map(|(index, _)| *index)
                 .collect();
-            for (index, p) in ready {
-                if results[index].is_some() {
-                    continue;
-                }
+            let unfinished: Vec<_> = ready
+                .into_iter()
+                .filter(|(index, _)| results[*index].is_none())
+                .collect();
+            // Each member allocates, writes, and confirms its own candidate.
+            // Do that a few at a time, as `prepare` does, in request order.
+            let (shared, caller) = (&owned, &identity);
+            let finished = stream::iter(unfinished.into_iter().map(|(index, p)| async move {
                 let id = p.session.id.clone();
                 let unconfirmed = p.key.is_empty();
-                match finish_preparation(&owned, &identity, p).await {
-                    Ok(p) if options.prepare_only => {
-                        if unconfirmed {
-                            // Confirmed just now, for the job's worker.
-                            owned.publications.wake();
-                        }
-                        results[index] = Some(prepared_value(&p));
-                    }
+                let result = finish_preparation(shared, caller, p).await;
+                if options.prepare_only && unconfirmed && result.is_ok() {
+                    // Confirmed just now, for the job's worker.
+                    shared.publications.wake();
+                }
+                (index, id, result)
+            }))
+            .buffered(4);
+            tokio::pin!(finished);
+            while let Some((index, id, result)) = finished.next().await {
+                match result {
+                    Ok(p) if options.prepare_only => results[index] = Some(prepared_value(&p)),
                     Ok(p) => pending.push((index, p)),
                     Err(e) => results[index] = result_value(&id, Err(e)),
                 }
