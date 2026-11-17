@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                c.id,\n                c.org_id,\n                c.is_public,\n                o.slug,\n                (\n                    SELECT CASE WHEN NOT c.is_public THEN\n                        COALESCE(b.private_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'\n                            THEN 'nars/sha256/' || b.file_hash || '/' || b.compression || '.nar' END)\n                    ELSE\n                        COALESCE(b.public_key, CASE WHEN b.r2_key NOT LIKE '%/objects/%'\n                            THEN 'nar/' || b.file_hash || '/' || b.compression || '.nar' END)\n                    END\n                    FROM published_paths p\n                    JOIN blob_objects b ON b.id = p.blob_object_id\n                    WHERE p.cache_id = c.id\n                        AND b.file_hash = $3\n                        AND b.compression = $4\n                    LIMIT 1\n                ) AS key\n            FROM caches c\n            JOIN orgs o ON o.id = c.org_id\n            WHERE c.name = $1\n                AND (o.slug = $2 OR o.moving_from = $2)\n                AND EXISTS (\n                    SELECT 1\n                    FROM cache_protocols cp\n                    WHERE cp.cache_id = c.id\n                        AND cp.protocol = 'nix'\n                )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "is_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "caches",
+            "name": "is_public"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "key",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "f5b2b847f87ba0bd12b38be962ae00cfc3cc5aeae3126f7fc18733204bfa43f2"
+}

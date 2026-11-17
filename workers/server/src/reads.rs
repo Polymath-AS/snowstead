@@ -424,7 +424,7 @@ async fn scoped_nar(
     hash: &str,
     compression: &str,
 ) -> Result<(Option<ScopedCache>, Option<String>), ApiError> {
-    let (cache, key) = sqlx::query_as::<_, (i32, String, bool, String, Option<String>)>(
+    let (cache, key) = sqlx::query!(
         r#"
             SELECT
                 c.id,
@@ -445,7 +445,7 @@ async fn scoped_nar(
                         AND b.file_hash = $3
                         AND b.compression = $4
                     LIMIT 1
-                )
+                ) AS key
             FROM caches c
             JOIN orgs o ON o.id = c.org_id
             WHERE c.name = $1
@@ -457,22 +457,22 @@ async fn scoped_nar(
                         AND cp.protocol = 'nix'
                 )
         "#,
+        name,
+        slug,
+        hash,
+        compression,
     )
-    .bind(name)
-    .bind(slug)
-    .bind(hash)
-    .bind(compression)
     .fetch_optional(&state.pool)
     .await?
-    .map(|(id, org_id, is_public, slug, key)| {
+    .map(|row| {
         let cache = ScopedCache {
-            id,
-            org_id,
-            is_public,
-            slug,
+            id: row.id,
+            org_id: row.org_id,
+            is_public: row.is_public,
+            slug: row.slug,
             ..Default::default()
         };
-        (cache, key)
+        (cache, row.key)
     })
     .unzip();
     Ok((cache, key.flatten()))
