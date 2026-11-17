@@ -1220,6 +1220,9 @@ async fn put_org(
         }
     }
     tx.commit().await?;
+    if raw.get("storageLimit").is_some() {
+        state.bazel.retarget();
+    }
     // Report the row this request just wrote, not the one read before it.
     org_response(state, id, None, false).await
 }
@@ -1551,6 +1554,11 @@ async fn create_cache(
     );
     set_cache_info(&mut tx, &path(&slug, name)).await?;
     tx.commit().await?;
+    if protocols.iter().any(|p| p == "bazel") {
+        // A new Bazel cache divides its organization's remaining storage
+        // further, and a capacity may have been lowered.
+        state.bazel.retarget();
+    }
     Ok(json_response(
         if created {
             StatusCode::CREATED

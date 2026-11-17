@@ -31,6 +31,20 @@ pub struct Store {
     metadata: Arc<dyn ObjectStore>,
     prefix: String,
     capacity: u64,
+    sweeps: Option<Arc<super::Sweeps>>,
+}
+
+/// Marks its generation for the collector when dropped: after the writing
+/// operation that holds it has ended, whether it published, failed, or was
+/// abandoned by its caller.
+struct Changed<'a>(&'a Store);
+
+impl Drop for Changed<'_> {
+    fn drop(&mut self) {
+        if let Some(sweeps) = &self.0.sweeps {
+            sweeps.mark(&self.0.prefix["bazel/".len()..]);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -65,7 +79,15 @@ impl Store {
             storage,
             prefix: format!("bazel/{generation}"),
             capacity,
+            sweeps: None,
         }
+    }
+
+    /// Tell the collector of every write through this store. Its own stores,
+    /// and those of tests that collect by hand, announce nothing.
+    pub(crate) fn announcing(mut self, sweeps: Arc<super::Sweeps>) -> Self {
+        self.sweeps = Some(sweeps);
+        self
     }
 
     pub fn max_blob_size(&self) -> u64 {
@@ -180,6 +202,7 @@ impl Store {
     }
 
     pub async fn write(&self, kind: &str, digest: &str, size: u64, body: Body) -> io::Result<()> {
+        let _changed = Changed(self);
         let index = self.entry_key(kind, digest)?;
         if size > self.max_blob_size() {
             return Err(invalid("Blob exceeds object-store limit"));
@@ -226,6 +249,7 @@ impl Store {
         bytes: Vec<u8>,
         memory: OwnedSemaphorePermit,
     ) -> io::Result<()> {
+        let _changed = Changed(self);
         let index = self.entry_key("cas", digest)?;
         let size = bytes.len() as u64;
         let key = self.verified_candidate(digest, &bytes)?;
@@ -546,6 +570,7 @@ impl Store {
         offset: u64,
         bytes: Vec<u8>,
     ) -> io::Result<u64> {
+        let _changed = Changed(self);
         self.entry_key("cas", digest)?;
         let key = self.session_key(resource);
         if size > self.max_blob_size() || bytes.len() > 8 * 1024 * 1024 {
@@ -593,6 +618,7 @@ impl Store {
         body: Body,
         finished: Arc<AtomicBool>,
     ) -> io::Result<u64> {
+        let _changed = Changed(self);
         let index = self.entry_key("cas", digest)?;
         if size > self.max_blob_size() {
             return Err(invalid("Upload exceeds capacity"));
@@ -648,6 +674,7 @@ impl Store {
         digest: &str,
         size: u64,
     ) -> io::Result<()> {
+        let _changed = Changed(self);
         let key = self.session_key(resource);
         let (mut session, mode) = self.session(&key).await?;
         if session.expires < Utc::now().timestamp() {
