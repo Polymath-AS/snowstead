@@ -569,12 +569,125 @@ impl ByteStream for Cache {
                     committed_size: size as i64,
                 }));
             }
-            let _memory = self
-                .0
-                .storage
-                .upload_buffer(8 * 1024 * 1024)
-                .map_err(status)?;
-            let mut buffer = Vec::new();
+            if size > 8 * 1024 * 1024 && offset < size {
+                use std::sync::{
+                    Arc,
+                    atomic::{AtomicBool, Ordering},
+                };
+                let finished = Arc::new(AtomicBool::new(false));
+                let completed_stream = finished.clone();
+                let stream_name = name.clone();
+                let (error_sender, mut error_receiver) = tokio::sync::oneshot::channel();
+                let incoming = stream::try_unfold(
+                    (
+                        stream,
+                        Some(first),
+                        offset,
+                        None::<tokio::time::Instant>,
+                        Some(error_sender),
+                    ),
+                    move |(mut stream, first, mut position, deadline, mut error_sender)| {
+                        let name = stream_name.clone();
+                        let finished = completed_stream.clone();
+                        async move {
+                            if finished.load(Ordering::Relaxed) {
+                                return Ok(None);
+                            }
+                            // Do not charge storage backpressure or prefix replay
+                            // against the client's receive-progress deadline.
+                            let deadline = deadline.unwrap_or_else(|| {
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+                            });
+                            let read = async {
+                                if tokio::time::Instant::now() >= deadline {
+                                    return Err(Status::deadline_exceeded(
+                                        "Upload made no byte progress",
+                                    ));
+                                }
+                                let message = match first {
+                                    Some(message) => Some(message),
+                                    None => tokio::time::timeout_at(deadline, stream.message())
+                                        .await
+                                        .map_err(|_| {
+                                            Status::deadline_exceeded(
+                                                "Upload made no byte progress",
+                                            )
+                                        })??,
+                                };
+                                let Some(message) = message else {
+                                    return Ok(None);
+                                };
+                                if (!message.resource_name.is_empty()
+                                    && message.resource_name != name)
+                                    || message.write_offset < 0
+                                    || message.write_offset as u64 != position
+                                {
+                                    return Err(Status::out_of_range(
+                                        "Write offset does not match committed bytes",
+                                    ));
+                                }
+                                if message.data.len() as u64 > size - position {
+                                    return Err(Status::invalid_argument(
+                                        "Write exceeds declared size",
+                                    ));
+                                }
+                                position += message.data.len() as u64;
+                                if message.finish_write {
+                                    if position != size {
+                                        return Err(Status::invalid_argument(
+                                            "Write ended before declared size",
+                                        ));
+                                    }
+                                    finished.store(true, Ordering::Relaxed);
+                                }
+                                Ok(Some(axum::body::Bytes::from(message.data)))
+                            }
+                            .await;
+                            match read {
+                                Ok(Some(bytes)) => {
+                                    let deadline = bytes.is_empty().then_some(deadline);
+                                    Ok(Some((
+                                        bytes,
+                                        (stream, None, position, deadline, error_sender),
+                                    )))
+                                }
+                                Ok(None) => Ok(None),
+                                Err(error) => {
+                                    if let Some(sender) = error_sender.take() {
+                                        let _ = sender.send(error);
+                                    }
+                                    Err(std::io::Error::other("ByteStream input failed"))
+                                }
+                            }
+                        }
+                    },
+                );
+                let result = store
+                    .write_stream(
+                        &name,
+                        &digest.hash,
+                        size,
+                        offset,
+                        Body::from_stream(incoming),
+                        finished.clone(),
+                    )
+                    .await;
+                if let Ok(error) = error_receiver.try_recv() {
+                    return Err(error);
+                }
+                let committed = result.map_err(io)?;
+                if !finished.load(Ordering::Relaxed) {
+                    return Err(Status::invalid_argument(
+                        "finish_write is required; resume at committed_size",
+                    ));
+                }
+                return Ok(Response::new(bs::WriteResponse {
+                    committed_size: committed as i64,
+                }));
+            }
+            let remaining = (size - offset) as usize;
+            let _memory = self.0.storage.upload_buffer(remaining).map_err(status)?;
+            let mut buffer = Vec::with_capacity(remaining);
             let mut next = Some(first);
             let mut finished = false;
             while let Some(message) = next {
@@ -602,27 +715,9 @@ impl ByteStream for Cache {
                 if !message.data.is_empty() {
                     progress_deadline = now + std::time::Duration::from_secs(30);
                 }
-                let mut data = message.data.as_slice();
-                while !data.is_empty() {
-                    let count = data.len().min(8 * 1024 * 1024 - buffer.len());
-                    buffer.extend_from_slice(&data[..count]);
-                    data = &data[count..];
-                    // Keep a complete one-buffer blob until finish_write (which
-                    // may arrive in an empty message). EOF still persists it for
-                    // resume. Larger blobs retain the bounded chunked path.
-                    if buffer.len() == 8 * 1024 * 1024 && size > 8 * 1024 * 1024 {
-                        offset = store
-                            .append(
-                                &name,
-                                &digest.hash,
-                                size,
-                                offset,
-                                std::mem::take(&mut buffer),
-                            )
-                            .await
-                            .map_err(io)?;
-                    }
-                }
+                // A complete small blob stays buffered until finish_write,
+                // including when that flag arrives in an empty message.
+                buffer.extend_from_slice(&message.data);
                 if message.finish_write {
                     finished = true;
                     break;

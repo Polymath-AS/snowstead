@@ -468,6 +468,41 @@ impl Storage {
     where
         S: Stream<Item = io::Result<Bytes>>,
     {
+        self.upload_inner(private, key, stream, expected_size, false)
+            .await
+            .map(|(hash, _)| hash)
+    }
+
+    /// Persist a bounded prefix for resumable protocols. The caller must verify
+    /// the returned size and hash before making the object visible to readers.
+    pub(crate) async fn write_prefix(
+        &self,
+        key: &str,
+        body: Body,
+        expected_size: u64,
+    ) -> io::Result<(String, u64)> {
+        self.upload_inner(
+            true,
+            key,
+            body.into_data_stream().map_err(io::Error::other),
+            expected_size,
+            true,
+        )
+        .await
+        .map_err(UploadError::into_io)
+    }
+
+    async fn upload_inner<S>(
+        &self,
+        private: bool,
+        key: &str,
+        stream: S,
+        expected_size: u64,
+        allow_short: bool,
+    ) -> Result<(String, u64), UploadError>
+    where
+        S: Stream<Item = io::Result<Bytes>>,
+    {
         let part_size = multipart_part_size(expected_size)?;
         if part_size > self.max_part_size {
             return Err(UploadError::TooLarge);
@@ -498,7 +533,8 @@ impl Storage {
                 crate::profile_block!("storage.small_upload_hash", hash.update(&chunk));
                 buffer.extend_from_slice(&chunk);
             }
-            if buffer.len() as u64 != expected_size {
+            let size = buffer.len() as u64;
+            if !allow_short && size != expected_size {
                 return Err(UploadError::Size);
             }
             let store = self.store(private).clone();
@@ -520,7 +556,7 @@ impl Storage {
             })
             .await
             .map_err(io::Error::other)??;
-            return Ok(hex::encode(hash.finalize()));
+            return Ok((hex::encode(hash.finalize()), size));
         }
         // Reserve every in-flight/filling buffer up front. Under memory pressure
         // retain the single-buffer path rather than queueing for more memory.
@@ -587,7 +623,7 @@ impl Storage {
                     }
                 }
             }
-            if size != expected_size {
+            if !allow_short && size != expected_size {
                 return Err(UploadError::Size);
             }
             // A single empty final part also handles a zero-length object.
@@ -604,7 +640,7 @@ impl Storage {
             .await
             .map_err(io_error)?;
             pending.upload = None;
-            Ok(hex::encode(hash.finalize()))
+            Ok((hex::encode(hash.finalize()), size))
         }
         .await;
         if result.is_err() {

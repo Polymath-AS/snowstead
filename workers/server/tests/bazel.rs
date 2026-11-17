@@ -359,6 +359,7 @@ async fn bytestream_buffer_boundary_and_delayed_finish(pool: PgPool) {
             8 * 1024 * 1024 - 1,
             8 * 1024 * 1024,
             8 * 1024 * 1024 + 1,
+            32 * 1024 * 1024 + 17,
         ] {
             let expected: Vec<u8> = (0..size)
                 .map(|i| ((i + usize::from(delayed)) % 251) as u8)
@@ -448,9 +449,12 @@ async fn bytestream_buffer_boundary_and_delayed_finish(pool: PgPool) {
                 let physical = store.physical_usage().await.unwrap();
                 if size == 8 * 1024 * 1024 {
                     host.task.abort();
+                    let mut config = Config::default();
+                    config.resources.upload_buffer_mib = 8;
+                    config.resources.upload_part_mib = 8;
                     let state = AppState::new(
                         pool.clone(),
-                        Config::default(),
+                        config,
                         storage.clone(),
                         reqwest::Client::new(),
                     )
@@ -552,7 +556,7 @@ async fn upload_memory_pressure_is_retryable(pool: PgPool) {
     let digest = digest(bytes);
     let first = WriteRequest {
         resource_name: format!(
-            "alpha/private/uploads/stalled/blobs/{}/1024",
+            "alpha/private/uploads/stalled/blobs/{}/8388608",
             "0".repeat(64)
         ),
         write_offset: 0,
@@ -650,7 +654,8 @@ async fn resumable_upload_survives_server_replacement(pool: PgPool) {
         "alpha/private/uploads/restart/blobs/{}/{}",
         digest.hash, digest.size_bytes
     );
-    let messages = expected[..8 * 1024 * 1024]
+    let checkpoint = 8 * 1024 * 1024 + 123;
+    let messages = expected[..checkpoint]
         .chunks(4 * 1024 * 1024)
         .enumerate()
         .map(|(i, bytes)| WriteRequest {
@@ -698,13 +703,13 @@ async fn resumable_upload_survives_server_replacement(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(status.committed_size, 8 * 1024 * 1024);
+    assert_eq!(status.committed_size, checkpoint as i64);
     assert!(!status.complete);
     let wrong_offset = WriteRequest {
         resource_name: resource.clone(),
         write_offset: status.committed_size - 1,
         finish_write: true,
-        data: expected[8 * 1024 * 1024..].to_vec(),
+        data: expected[checkpoint..].to_vec(),
     };
     assert_eq!(
         client
@@ -718,7 +723,7 @@ async fn resumable_upload_survives_server_replacement(pool: PgPool) {
         resource_name: resource,
         write_offset: status.committed_size,
         finish_write: true,
-        data: expected[8 * 1024 * 1024..].to_vec(),
+        data: expected[checkpoint..].to_vec(),
     };
     assert_eq!(
         client
@@ -1279,41 +1284,43 @@ async fn empty_write_messages_do_not_extend_progress_deadline(pool: PgPool) {
     let mut client = byte_stream_client::ByteStreamClient::connect(host.url.clone())
         .await
         .unwrap();
-    let first = WriteRequest {
-        resource_name: format!(
-            "alpha/private/uploads/no-progress/blobs/{}/1",
-            digest(b"x").hash
-        ),
-        ..Default::default()
-    };
-    // Always-ready empty messages exercise the explicit clock check, not only
-    // the timer branch of a timeout around the next message.
-    let messages = stream::iter([first]).chain(stream::repeat(WriteRequest::default()));
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(35),
-        client.write(authorized(messages, &host)),
-    )
-    .await
-    .expect("empty messages must not keep a write alive")
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-    let done = client
-        .write(authorized(
-            stream::iter([WriteRequest {
-                resource_name: format!(
-                    "alpha/private/uploads/after-timeout/blobs/{}/1",
-                    digest(b"x").hash
-                ),
-                data: b"x".to_vec(),
-                finish_write: true,
-                ..Default::default()
-            }]),
-            &host,
-        ))
+    for size in [1, 9 * 1024 * 1024] {
+        let first = WriteRequest {
+            resource_name: format!(
+                "alpha/private/uploads/no-progress/blobs/{}/{size}",
+                digest(b"x").hash
+            ),
+            ..Default::default()
+        };
+        // Always-ready empty messages exercise the explicit clock check, not only
+        // the timer branch of a timeout around the next message.
+        let messages = stream::iter([first]).chain(stream::repeat(WriteRequest::default()));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            client.write(authorized(messages, &host)),
+        )
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(done.committed_size, 1);
+        .expect("empty messages must not keep a write alive")
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        let done = client
+            .write(authorized(
+                stream::iter([WriteRequest {
+                    resource_name: format!(
+                        "alpha/private/uploads/after-timeout/blobs/{}/1",
+                        digest(&[size as u8]).hash
+                    ),
+                    data: vec![size as u8],
+                    finish_write: true,
+                    ..Default::default()
+                }]),
+                &host,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(done.committed_size, 1);
+    }
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]

@@ -4,7 +4,7 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -582,15 +582,72 @@ impl Store {
         Ok(next)
     }
 
+    /// Continuous uploads write each byte once. Closing the request stream
+    /// checkpoints an immutable prefix; only a resumed RPC reads it back.
+    pub(crate) async fn write_stream(
+        &self,
+        resource: &str,
+        digest: &str,
+        size: u64,
+        offset: u64,
+        body: Body,
+        finished: Arc<AtomicBool>,
+    ) -> io::Result<u64> {
+        let index = self.entry_key("cas", digest)?;
+        if size > self.max_blob_size() {
+            return Err(invalid("Upload exceeds capacity"));
+        }
+        let session_key = self.session_key(resource);
+        let (mut session, mode) = self.session(&session_key).await?;
+        if matches!(mode, PutMode::Create) {
+            session.expires = Utc::now().timestamp() + SESSION_SECONDS;
+        }
+        if session.expires < Utc::now().timestamp() || session.committed != offset {
+            return Err(invalid("Upload session expired or offset changed"));
+        }
+        let key = format!(
+            "{}/objects/cas/{digest}/{}",
+            self.prefix,
+            uuid::Uuid::now_v7()
+        );
+        let storage = self.storage.clone();
+        let prefixes = stream::iter(session.chunks.clone().into_iter().map(move |key| {
+            let storage = storage.clone();
+            async move {
+                let object = storage.open(true, &key).await?;
+                Ok::<_, io::Error>(tokio_util::io::ReaderStream::new(object.reader))
+            }
+        }))
+        .buffered(1)
+        .try_flatten();
+        let body =
+            Body::from_stream(prefixes.chain(body.into_data_stream().map_err(io::Error::other)));
+        let (hash, received) = self.storage.write_prefix(&key, body, size).await?;
+        if received == size && hash != digest {
+            self.storage.delete(true, &key).await?;
+            return Err(invalid("Bazel digest mismatch"));
+        }
+        if received == size && finished.load(Ordering::Relaxed) {
+            self.publish(index, key, size).await?;
+        } else {
+            // CAS only arbitrates competing updates to this upload ID, never
+            // publication or another user's progress. Retain old prefixes for
+            // racing readers; the orphan sweep removes them after its grace.
+            session.chunks = vec![key];
+            session.committed = received;
+            session.sealed = false;
+            session.complete = false;
+            self.save_session(&session_key, &mut session, mode).await?;
+        }
+        Ok(received)
+    }
+
     pub(crate) async fn finish_upload(
         &self,
         resource: &str,
         digest: &str,
         size: u64,
     ) -> io::Result<()> {
-        if self.upload_status(resource, digest, size).await? == (size, true) {
-            return Ok(());
-        }
         let key = self.session_key(resource);
         let (mut session, mode) = self.session(&key).await?;
         if session.expires < Utc::now().timestamp() {
@@ -599,42 +656,41 @@ impl Store {
         if session.committed != size {
             return Err(invalid("Upload is incomplete"));
         }
-        if !session.sealed {
-            session.sealed = true;
-            self.save_session(&key, &mut session, mode).await?;
-        }
         let candidate_prefix = format!("{}/objects/cas/{digest}/", self.prefix);
         let candidate =
             session.chunks.len() == 1 && session.chunks[0].starts_with(&candidate_prefix);
         if candidate {
-            // Only append creates this form, after verifying the complete blob.
-            // Unique physical keys cannot be overwritten by another session.
-            self.publish(
-                self.entry_key("cas", digest)?,
-                session.chunks[0].clone(),
-                size,
-            )
-            .await?;
-        } else {
-            let storage = self.storage.clone();
-            let bodies = stream::iter(session.chunks.clone().into_iter().map(move |key| {
-                let storage = storage.clone();
-                async move {
-                    let object = storage.open(true, &key).await?;
-                    Ok::<_, io::Error>(tokio_util::io::ReaderStream::new(object.reader))
-                }
-            }))
-            .buffered(1);
-            self.write("cas", digest, size, Body::from_stream(bodies.try_flatten()))
-                .await?;
+            // A single complete candidate was verified before its session was
+            // saved. It needs no sealing or payload transfer. upload_status
+            // observes completion through the published index.
+            return self
+                .publish(
+                    self.entry_key("cas", digest)?,
+                    session.chunks[0].clone(),
+                    size,
+                )
+                .await;
         }
+        if !session.sealed {
+            session.sealed = true;
+            self.save_session(&key, &mut session, mode).await?;
+        }
+        let storage = self.storage.clone();
+        let bodies = stream::iter(session.chunks.clone().into_iter().map(move |key| {
+            let storage = storage.clone();
+            async move {
+                let object = storage.open(true, &key).await?;
+                Ok::<_, io::Error>(tokio_util::io::ReaderStream::new(object.reader))
+            }
+        }))
+        .buffered(1);
+        self.write("cas", digest, size, Body::from_stream(bodies.try_flatten()))
+            .await?;
         let (mut session, mode) = self.session(&key).await?;
         session.complete = true;
         self.save_session(&key, &mut session, mode).await?;
-        if !candidate {
-            for chunk in session.chunks {
-                self.storage.delete(true, &chunk).await?;
-            }
+        for chunk in session.chunks {
+            self.storage.delete(true, &chunk).await?;
         }
         Ok(())
     }
