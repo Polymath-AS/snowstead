@@ -198,7 +198,7 @@ async fn claim(state: &AppState, org: &str) -> Result<Option<Claim>, ApiError> {
         identity: Identity::ApiToken(ApiToken {
             id: grant.authorization_jti,
             org: org.into(),
-            permissions: vec![Permission::Push],
+            permissions: vec![Permission::PUSH],
             caches: vec![CacheGrant::Id(grant.cache_id)],
             expires_at: None,
         }),
@@ -361,7 +361,7 @@ mod tests {
             identity: Identity::ApiToken(ApiToken {
                 id: token,
                 org: "default".into(),
-                permissions: vec![Permission::Push],
+                permissions: vec![Permission::PUSH],
                 caches: vec![CacheGrant::Id(cache)],
                 expires_at: None,
             }),

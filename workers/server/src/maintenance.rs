@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
+use snowstead_cache_types::Compiler;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -142,18 +143,19 @@ async fn run_bounded(state: &AppState, session_pages: usize) -> anyhow::Result<C
         "publication reservations",
         expire_installations(state).await,
     );
-    for kind in ["go", "sccache"] {
+    for compiler in Compiler::ALL {
+        let kind = compiler.as_str();
         record(
             &mut counts.compiler_entries,
             &mut counts.failed_stages,
             kind,
-            compiler_entries(state, kind).await,
+            compiler_entries(state, compiler).await,
         );
         record(
             &mut counts.orphan_objects,
             &mut counts.failed_stages,
             "compiler attempts",
-            orphan_page(state, &format!("{kind}-attempt/"), Some(kind)).await,
+            orphan_page(state, &format!("{kind}-attempt/"), Some(compiler)).await,
         );
     }
     record(
@@ -374,9 +376,9 @@ struct CompilerEntry {
         name = "maintenance.compiler_entries"
     )
 )]
-async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Result<u64> {
-    let candidates = match kind {
-        "go" => {
+async fn compiler_entries(state: &AppState, compiler: Compiler) -> anyhow::Result<u64> {
+    let candidates = match compiler {
+        Compiler::Go => {
             sqlx::query_as!(
                 CompilerEntry,
                 r#"
@@ -397,7 +399,7 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
             .fetch_all(&state.pool)
             .await?
         }
-        "sccache" => {
+        Compiler::Sccache => {
             sqlx::query_as!(
                 CompilerEntry,
                 r#"
@@ -418,7 +420,6 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
             .fetch_all(&state.pool)
             .await?
         }
-        _ => unreachable!("fixed compiler product"),
     };
     let mut count = 0;
     let mut failed = false;
@@ -445,8 +446,8 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                 .fetch_all(&mut *tx)
                 .await?;
             }
-            let key = match kind {
-                "go" => {
+            let key = match compiler {
+                Compiler::Go => {
                     sqlx::query_scalar!(
                         r#"
                         SELECT e.r2_key
@@ -465,7 +466,7 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                     .fetch_optional(&mut *tx)
                     .await?
                 }
-                "sccache" => {
+                Compiler::Sccache => {
                     sqlx::query_scalar!(
                         r#"
                         SELECT e.r2_key
@@ -484,7 +485,6 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                     .fetch_optional(&mut *tx)
                     .await?
                 }
-                _ => unreachable!("fixed compiler product"),
             };
             let Some(key) = key else { return Ok(false) };
             sqlx::query(
@@ -493,8 +493,8 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
             .bind(&key)
             .execute(&mut *tx)
             .await?;
-            match kind {
-                "go" => {
+            match compiler {
+                Compiler::Go => {
                     sqlx::query!(
                         r#"
                         DELETE FROM go_entries
@@ -505,7 +505,7 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                     .execute(&mut *tx)
                     .await?
                 }
-                "sccache" => {
+                Compiler::Sccache => {
                     sqlx::query!(
                         r#"
                         DELETE FROM sccache_entries
@@ -516,7 +516,6 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
                     .execute(&mut *tx)
                     .await?
                 }
-                _ => unreachable!("fixed compiler product"),
             };
             tx.commit().await?;
             Ok(true)
@@ -549,7 +548,7 @@ async fn compiler_entries(state: &AppState, kind: &'static str) -> anyhow::Resul
 async fn orphan_page(
     state: &AppState,
     prefix: &str,
-    product: Option<&'static str>,
+    product: Option<Compiler>,
 ) -> anyhow::Result<u64> {
     let cursor: Option<String> = sqlx::query_scalar!(
         r#"
@@ -580,7 +579,7 @@ async fn orphan_page(
         // These owner IDs are never reused. An absent session/reservation can
         // never adopt this key later, even if a provider write completes late.
         let live = match product {
-            Some("go") => {
+            Some(Compiler::Go) => {
                 sqlx::query_scalar!(
                     r#"
                     SELECT EXISTS(
@@ -594,7 +593,7 @@ async fn orphan_page(
                 .fetch_one(&mut *tx)
                 .await?
             }
-            Some("sccache") => {
+            Some(Compiler::Sccache) => {
                 sqlx::query_scalar!(
                     r#"
                     SELECT EXISTS(
@@ -627,7 +626,6 @@ async fn orphan_page(
                 .fetch_one(&mut *tx)
                 .await?
             }
-            Some(_) => unreachable!("fixed compiler product"),
         };
         // Reservation IDs are never reused. While a reservation exists, keep
         // *all* attempts, even a transfer not yet adopted by SQL.
@@ -2561,13 +2559,13 @@ mod tests {
     #[ignore = "requires disposable Postgres via DATABASE_URL"]
     async fn compiler_sweep_and_attempt_discovery_preserve_live_reservations(pool: PgPool) {
         let (state, cache) = fixture(pool).await;
-        for kind in ["go", "sccache"] {
+        for compiler in Compiler::ALL {
+            let kind = compiler.as_str();
             for (id, generation) in [("obsolete", "old"), ("live", "0")] {
                 let key = format!("{kind}-attempt/{id}/adopted");
-                let (column, value) = if kind == "go" {
-                    (",output", ",'checksum'")
-                } else {
-                    ("", "")
+                let (column, value) = match compiler {
+                    Compiler::Go => (",output", ",'checksum'"),
+                    Compiler::Sccache => ("", ""),
                 };
                 sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {kind}_entries(id,cache_id,generation,action,r2_key,size,expires_at{column})
                     VALUES($1,$2,$3,$1,$4,4,now()+interval '1 day'{value})")))
@@ -2579,9 +2577,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert_eq!(compiler_entries(&state, kind).await.unwrap(), 1);
+            assert_eq!(compiler_entries(&state, compiler).await.unwrap(), 1);
             assert_eq!(
-                orphan_page(&state, &format!("{kind}-attempt/"), Some(kind))
+                orphan_page(&state, &format!("{kind}-attempt/"), Some(compiler))
                     .await
                     .unwrap(),
                 1

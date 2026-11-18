@@ -5,50 +5,9 @@
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 
+pub use snowstead_cache_types::{Access, Permission, Protocol};
+
 use crate::error::ApiError;
-
-/// What an API token may do, as stored in `token_permissions`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Permission {
-    Pull,
-    Push,
-    GoRead,
-    GoWrite,
-    SccacheRead,
-    SccacheWrite,
-    BazelRead,
-    BazelWrite,
-}
-
-impl Permission {
-    pub const ALL: [Self; 8] = [
-        Self::Pull,
-        Self::Push,
-        Self::GoRead,
-        Self::GoWrite,
-        Self::SccacheRead,
-        Self::SccacheWrite,
-        Self::BazelRead,
-        Self::BazelWrite,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pull => "pull",
-            Self::Push => "push",
-            Self::GoRead => "go:read",
-            Self::GoWrite => "go:write",
-            Self::SccacheRead => "sccache:read",
-            Self::SccacheWrite => "sccache:write",
-            Self::BazelRead => "bazel:read",
-            Self::BazelWrite => "bazel:write",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == value)
-    }
-}
 
 /// A cache an API token may use: one cache by ID, or names matching a
 /// pattern in which `*` matches any run of characters.
@@ -220,18 +179,12 @@ pub enum Action {
     SigningKeyWrite,
     AuditRead,
     PinWrite,
-    NixPull,
-    NixPush,
-    GoRead,
-    GoWrite,
-    SccacheRead,
-    SccacheWrite,
-    BazelRead,
-    BazelWrite,
+    /// Read or write a cache through one of its protocols.
+    Use(Permission),
 }
 
 impl Action {
-    pub const ALL: [Self; 23] = [
+    const FIXED: [Self; 15] = [
         Self::Operate,
         Self::OrgLimitsWrite,
         Self::OrgRead,
@@ -247,15 +200,21 @@ impl Action {
         Self::SigningKeyWrite,
         Self::AuditRead,
         Self::PinWrite,
-        Self::NixPull,
-        Self::NixPush,
-        Self::GoRead,
-        Self::GoWrite,
-        Self::SccacheRead,
-        Self::SccacheWrite,
-        Self::BazelRead,
-        Self::BazelWrite,
     ];
+
+    pub const ALL: [Self; Self::FIXED.len() + Permission::ALL.len()] = {
+        let mut all = [Self::Operate; Self::FIXED.len() + Permission::ALL.len()];
+        let mut i = 0;
+        while i < all.len() {
+            all[i] = if i < Self::FIXED.len() {
+                Self::FIXED[i]
+            } else {
+                Self::Use(Permission::ALL[i - Self::FIXED.len()])
+            };
+            i += 1;
+        }
+        all
+    };
 }
 
 /// What an action applies to.
@@ -304,7 +263,12 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
     use Action::*;
     let own = |org: &str| resource.org() == Some(org);
     let allowed = match principal {
-        Principal::Operator => matches!(action, Operate | OrgLimitsWrite),
+        Principal::Operator => match action {
+            Operate | OrgLimitsWrite => true,
+            OrgRead | OrgSlugWrite | OrgMove | CacheWrite | TokenRead | TokenWrite | ApiKeyRead
+            | ApiKeyCreate | ApiKeyRevoke | SigningKeyRead | SigningKeyWrite | AuditRead
+            | PinWrite | Use(_) => false,
+        },
         Principal::WebUser(user) => {
             own(&user.org)
                 && match action {
@@ -313,45 +277,59 @@ pub fn authorize(principal: &Principal, action: Action, resource: &Resource) -> 
                     OrgSlugWrite | OrgMove | ApiKeyCreate | ApiKeyRevoke | SigningKeyWrite => {
                         user.role.owns()
                     }
-                    Operate | OrgLimitsWrite | NixPull | NixPush | GoRead | GoWrite
-                    | SccacheRead | SccacheWrite | BazelRead | BazelWrite => false,
+                    Operate | OrgLimitsWrite | Use(_) => false,
                 }
         }
         Principal::OrgKey { org, .. } => {
             own(org)
-                && matches!(
-                    action,
-                    OrgRead
-                        | OrgMove
-                        | CacheWrite
-                        | TokenRead
-                        | TokenWrite
-                        | ApiKeyRead
-                        | ApiKeyRevoke
-                        | SigningKeyRead
-                        | SigningKeyWrite
-                        | AuditRead
-                        | PinWrite
-                )
+                && match action {
+                    OrgRead | OrgMove | CacheWrite | TokenRead | TokenWrite | ApiKeyRead
+                    | ApiKeyRevoke | SigningKeyRead | SigningKeyWrite | AuditRead | PinWrite => {
+                        true
+                    }
+                    Operate | OrgLimitsWrite | OrgSlugWrite | ApiKeyCreate | Use(_) => false,
+                }
         }
         Principal::ApiToken(token) => {
             own(&token.org)
                 && match action {
-                    NixPull => token.allows(Permission::Pull, resource),
+                    Use(permission) => token.allows(permission, resource),
                     // Pins name the build a push produced, so pushers may set them.
-                    NixPush | PinWrite => token.allows(Permission::Push, resource),
-                    GoRead => token.allows(Permission::GoRead, resource),
-                    GoWrite => token.allows(Permission::GoWrite, resource),
-                    SccacheRead => token.allows(Permission::SccacheRead, resource),
-                    SccacheWrite => token.allows(Permission::SccacheWrite, resource),
-                    BazelRead => token.allows(Permission::BazelRead, resource),
-                    BazelWrite => token.allows(Permission::BazelWrite, resource),
+                    PinWrite => token.allows(Permission::PUSH, resource),
                     Operate | OrgLimitsWrite | OrgRead | OrgSlugWrite | OrgMove | CacheWrite
                     | TokenRead | TokenWrite | ApiKeyRead | ApiKeyCreate | ApiKeyRevoke
                     | SigningKeyRead | SigningKeyWrite | AuditRead => false,
                 }
         }
-        Principal::SharedToken => action == NixPush && own(SHARED_TOKEN_ORG),
+        Principal::SharedToken => match action {
+            Use(Permission {
+                protocol: Protocol::Nix,
+                access: Access::Write,
+            }) => own(SHARED_TOKEN_ORG),
+            Use(Permission {
+                protocol: Protocol::Nix,
+                access: Access::Read,
+            })
+            | Use(Permission {
+                protocol: Protocol::Go | Protocol::Sccache | Protocol::Bazel,
+                access: Access::Read | Access::Write,
+            })
+            | Operate
+            | OrgLimitsWrite
+            | OrgRead
+            | OrgSlugWrite
+            | OrgMove
+            | CacheWrite
+            | TokenRead
+            | TokenWrite
+            | ApiKeyRead
+            | ApiKeyCreate
+            | ApiKeyRevoke
+            | SigningKeyRead
+            | SigningKeyWrite
+            | AuditRead
+            | PinWrite => false,
+        },
     };
     if allowed { Ok(()) } else { Err(Denied) }
 }
@@ -379,14 +357,12 @@ mod tests {
             SigningKeyWrite => 12,
             AuditRead => 13,
             PinWrite => 14,
-            NixPull => 15,
-            NixPush => 16,
-            GoRead => 17,
-            GoWrite => 18,
-            SccacheRead => 19,
-            SccacheWrite => 20,
-            BazelRead => 21,
-            BazelWrite => 22,
+            Use(permission) => {
+                15 + Permission::ALL
+                    .iter()
+                    .position(|p| *p == permission)
+                    .unwrap()
+            }
         }
     }
 
@@ -416,6 +392,19 @@ mod tests {
         })
     }
 
+    const FULL_TOKEN: &[Action] = &[
+        Use(Permission::PULL),
+        Use(Permission::PUSH),
+        PinWrite,
+        Use(Protocol::Go.read()),
+        Use(Protocol::Go.write()),
+        Use(Protocol::Sccache.read()),
+        Use(Protocol::Sccache.write()),
+        Use(Protocol::Bazel.read()),
+        Use(Protocol::Bazel.write()),
+    ];
+    const GO_TOKEN: &[Action] = &[Use(Protocol::Go.read()), Use(Protocol::Go.write())];
+    const SCCACHE_READER: &[Action] = &[Use(Protocol::Sccache.read())];
     const MEMBER: &[Action] = &[
         OrgRead,
         CacheWrite,
@@ -476,40 +465,30 @@ mod tests {
             (
                 "full token",
                 token(&all, vec![CacheGrant::Id(7)]),
-                &[
-                    NixPull,
-                    NixPush,
-                    PinWrite,
-                    GoRead,
-                    GoWrite,
-                    SccacheRead,
-                    SccacheWrite,
-                    BazelRead,
-                    BazelWrite,
-                ],
+                FULL_TOKEN,
             ),
             (
                 "pattern pull token",
-                token(&[Permission::Pull], vec![CacheGrant::Pattern("ma*".into())]),
-                &[NixPull],
+                token(&[Permission::PULL], vec![CacheGrant::Pattern("ma*".into())]),
+                &[Use(Permission::PULL)],
             ),
             (
                 "push token",
-                token(&[Permission::Push], vec![CacheGrant::Id(7)]),
-                &[NixPush, PinWrite],
+                token(&[Permission::PUSH], vec![CacheGrant::Id(7)]),
+                &[Use(Permission::PUSH), PinWrite],
             ),
             (
                 "go token",
                 token(
-                    &[Permission::GoRead, Permission::GoWrite],
+                    &[Protocol::Go.read(), Protocol::Go.write()],
                     vec![CacheGrant::Id(7)],
                 ),
-                &[GoRead, GoWrite],
+                GO_TOKEN,
             ),
             (
                 "sccache reader",
-                token(&[Permission::SccacheRead], vec![CacheGrant::Id(7)]),
-                &[SccacheRead],
+                token(&[Protocol::Sccache.read()], vec![CacheGrant::Id(7)]),
+                SCCACHE_READER,
             ),
             (
                 "token without permissions",
@@ -574,15 +553,11 @@ mod tests {
                 let expected = match &principal {
                     Principal::ApiToken(token) => {
                         let required = match action {
-                            NixPull => Some(Permission::Pull),
-                            NixPush | PinWrite => Some(Permission::Push),
-                            GoRead => Some(Permission::GoRead),
-                            GoWrite => Some(Permission::GoWrite),
-                            SccacheRead => Some(Permission::SccacheRead),
-                            SccacheWrite => Some(Permission::SccacheWrite),
-                            BazelRead => Some(Permission::BazelRead),
-                            BazelWrite => Some(Permission::BazelWrite),
-                            _ => None,
+                            Use(permission) => Some(permission),
+                            PinWrite => Some(Permission::PUSH),
+                            Operate | OrgLimitsWrite | OrgRead | OrgSlugWrite | OrgMove
+                            | CacheWrite | TokenRead | TokenWrite | ApiKeyRead | ApiKeyCreate
+                            | ApiKeyRevoke | SigningKeyRead | SigningKeyWrite | AuditRead => None,
                         };
                         required.is_some_and(|p| token.permissions.contains(&p))
                     }
@@ -624,7 +599,7 @@ mod tests {
             ] {
                 assert_eq!(
                     authorize(&Principal::SharedToken, action, &resource).is_ok(),
-                    action == NixPush,
+                    action == Use(Permission::PUSH),
                     "{action:?}"
                 );
             }
@@ -633,22 +608,29 @@ mod tests {
 
     #[test]
     fn id_grants_need_the_cache_id_and_patterns_match_names() {
-        let by_id = token(&[Permission::Pull], vec![CacheGrant::Id(7)]);
+        let by_id = token(&[Permission::PULL], vec![CacheGrant::Id(7)]);
         let missing = Resource::Cache {
             org: "org_a",
             id: None,
             name: "main",
         };
-        assert!(authorize(&by_id, NixPull, &missing).is_err());
-        assert!(authorize(&by_id, NixPull, &Resource::cache("org_a", 7, "renamed")).is_ok());
+        assert!(authorize(&by_id, Use(Permission::PULL), &missing).is_err());
+        assert!(
+            authorize(
+                &by_id,
+                Use(Permission::PULL),
+                &Resource::cache("org_a", 7, "renamed")
+            )
+            .is_ok()
+        );
         let pattern = token(
-            &[Permission::Pull],
+            &[Permission::PULL],
             vec![CacheGrant::Pattern("ci-*-release".into())],
         );
         assert!(
             authorize(
                 &pattern,
-                NixPull,
+                Use(Permission::PULL),
                 &Resource::cache("org_a", 9, "ci-linux-release")
             )
             .is_ok()
@@ -656,7 +638,7 @@ mod tests {
         assert!(
             authorize(
                 &pattern,
-                NixPull,
+                Use(Permission::PULL),
                 &Resource::cache("org_a", 9, "ci-linux-release-extra")
             )
             .is_err()

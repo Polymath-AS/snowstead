@@ -155,7 +155,7 @@ async fn status_rows(
             };
             if decide(
                 identity,
-                Action::NixPush,
+                Action::Use(Permission::PUSH),
                 &Resource::cache(&row.org, row.cache_id, &row.name),
             )
             .is_err()
@@ -310,7 +310,7 @@ async fn turn(state: &AppState, after: &mut String) -> Result<Turn, ApiError> {
         Identity::ApiToken(ApiToken {
             id: token.clone(),
             org: work.org_id.clone(),
-            permissions: vec![Permission::Push],
+            permissions: vec![Permission::PUSH],
             caches: caches.into_iter().map(CacheGrant::Id).collect(),
             expires_at: None,
         })
@@ -912,7 +912,7 @@ mod tests {
         let identity = Identity::ApiToken(ApiToken {
             id: id.clone(),
             org: "default".into(),
-            permissions: vec![Permission::Push],
+            permissions: vec![Permission::PUSH],
             caches: vec![CacheGrant::Pattern("*".into())],
             expires_at: None,
         });
@@ -1043,7 +1043,7 @@ mod tests {
         Identity::ApiToken(ApiToken {
             id,
             org: "default".into(),
-            permissions: vec![Permission::Push],
+            permissions: vec![Permission::PUSH],
             caches: vec![CacheGrant::Pattern("*".into())],
             expires_at: None,
         })

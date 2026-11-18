@@ -12,6 +12,7 @@ use std::{
 };
 
 use axum::http::{HeaderValue, StatusCode, header};
+use snowstead_cache_types::{Compiler, Entry};
 use sqlx::PgConnection;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -217,9 +218,15 @@ pub(crate) async fn admit_upload(
     Ok(())
 }
 
-struct Victim {
+/// A candidate as the scan reports it, before its kind is read.
+struct Candidate {
     kind: String,
     id: String,
+    size: i64,
+}
+
+struct Victim {
+    entry: Entry,
     size: i64,
 }
 
@@ -307,7 +314,7 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
     // row-lock statements. SKIP LOCKED excludes work being moved by another
     // product's transfer.
     let candidates = sqlx::query_as!(
-        Victim,
+        Candidate,
         r#"
         WITH active AS MATERIALIZED (
             SELECT
@@ -383,7 +390,13 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         org,
     )
     .fetch_all(&mut *tx)
-    .await?;
+    .await?
+    .into_iter()
+    .map(|row| Victim {
+        entry: Entry::parse(&row.kind, &row.id).expect("the scan selects tracked entries"),
+        size: row.size,
+    })
+    .collect::<Vec<_>>();
     if candidates.is_empty() {
         tx.rollback().await?;
         return Ok(idle(true));
@@ -410,11 +423,7 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         return Ok(idle(false));
     }
     let mut available = HashSet::new();
-    let nix: Vec<i64> = candidates
-        .iter()
-        .filter(|v| v.kind == "nix")
-        .map(|v| v.id.parse().expect("database bigint"))
-        .collect();
+    let nix: Vec<i64> = candidates.iter().filter_map(|v| v.entry.nix_id()).collect();
     if !nix.is_empty() {
         let locked = sqlx::query_scalar!(
             r#"
@@ -454,21 +463,21 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         .fetch_all(&mut *tx)
         .await?;
         for id in locked {
-            available.insert(("nix".to_owned(), id.to_string()));
+            available.insert(Entry::Nix(id));
         }
     }
-    for kind in ["go", "sccache"] {
+    for compiler in Compiler::ALL {
         let ids: Vec<_> = candidates
             .iter()
-            .filter(|v| v.kind == kind)
-            .map(|v| v.id.clone())
+            .filter_map(|v| v.entry.compiler_id(compiler).map(str::to_owned))
             .collect();
         if ids.is_empty() {
             continue;
         }
-        let locked = if kind == "go" {
-            sqlx::query_scalar!(
-                r#"
+        let locked = match compiler {
+            Compiler::Go => {
+                sqlx::query_scalar!(
+                    r#"
                 SELECT e.id
                 FROM go_entries e
                 JOIN caches c ON c.id = e.cache_id
@@ -480,14 +489,15 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
                 ORDER BY e.id
                 FOR UPDATE OF e SKIP LOCKED
                 "#,
-                &ids,
-                org,
-            )
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            sqlx::query_scalar!(
-                r#"
+                    &ids,
+                    org,
+                )
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            Compiler::Sccache => {
+                sqlx::query_scalar!(
+                    r#"
                 SELECT e.id
                 FROM sccache_entries e
                 JOIN caches c ON c.id = e.cache_id
@@ -499,14 +509,15 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
                 ORDER BY e.id
                 FOR UPDATE OF e SKIP LOCKED
                 "#,
-                &ids,
-                org,
-            )
-            .fetch_all(&mut *tx)
-            .await?
+                    &ids,
+                    org,
+                )
+                .fetch_all(&mut *tx)
+                .await?
+            }
         };
         for id in locked {
-            available.insert((kind.to_owned(), id));
+            available.insert(Entry::compiler(compiler, id));
         }
     }
     // Stop at the limit: LRU order, skipping whatever another writer holds.
@@ -516,7 +527,7 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         if remaining <= limit {
             break;
         }
-        if !available.contains(&(v.kind.clone(), v.id.clone())) {
+        if !available.contains(&v.entry) {
             continue;
         }
         remaining = remaining.saturating_sub(v.size);
@@ -533,11 +544,7 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
     )
     .fetch_one(&mut *tx)
     .await?;
-    let ids: Vec<i64> = victims
-        .iter()
-        .filter(|v| v.kind == "nix")
-        .map(|v| v.id.parse().expect("database bigint"))
-        .collect();
+    let ids: Vec<i64> = victims.iter().filter_map(|v| v.entry.nix_id()).collect();
     if !ids.is_empty() {
         // Deleting a path aborts its unfinished sessions, in a trigger. Take
         // those rows here, in ID order, as every other bulk abort does. None
@@ -572,37 +579,39 @@ async fn pass(state: &AppState, org: &str) -> Result<Pass, ApiError> {
         .execute(&mut *tx)
         .await?;
     }
-    for kind in ["go", "sccache"] {
+    for compiler in Compiler::ALL {
         let ids: Vec<_> = victims
             .iter()
-            .filter(|v| v.kind == kind)
-            .map(|v| v.id.clone())
+            .filter_map(|v| v.entry.compiler_id(compiler).map(str::to_owned))
             .collect();
         if ids.is_empty() {
             continue;
         }
-        if kind == "go" {
-            sqlx::query!(
-                r#"
+        match compiler {
+            Compiler::Go => {
+                sqlx::query!(
+                    r#"
                 UPDATE go_entries
                 SET cache_id = NULL
                 WHERE id = ANY($1)
                 "#,
-                &ids,
-            )
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            sqlx::query!(
-                r#"
+                    &ids,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            Compiler::Sccache => {
+                sqlx::query!(
+                    r#"
                 UPDATE sccache_entries
                 SET cache_id = NULL
                 WHERE id = ANY($1)
                 "#,
-                &ids,
-            )
-            .execute(&mut *tx)
-            .await?;
+                    &ids,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         }
     }
     tx.commit().await?;

@@ -25,7 +25,7 @@ use sqlx::{FromRow, types::Json};
 
 use crate::{
     AppState,
-    authz::{Action, Principal as Identity, Resource, authorize},
+    authz::{Action, Permission, Principal as Identity, Resource, authorize},
     db::{self, Transaction},
     error::ApiError,
     lifecycle::UploadStatus,
@@ -116,7 +116,7 @@ async fn cache(
     .ok_or_else(|| error(404, "Cache not found"))?;
     authorize(
         identity,
-        Action::NixPush,
+        Action::Use(Permission::PUSH),
         &Resource::cache(identity.org(), id, name),
     )
     .map_err(|_| error(403, "Forbidden"))?;

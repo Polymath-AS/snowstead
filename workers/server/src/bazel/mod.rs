@@ -21,7 +21,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState,
-    authz::{self, Action, Resource},
+    authz::{self, Access, Action, Protocol, Resource},
     cache,
     error::ApiError,
     protocol_policy::CallerLimit,
@@ -351,11 +351,7 @@ async fn open(
         .await?;
         authz::authorize(
             &principal,
-            if write {
-                Action::BazelWrite
-            } else {
-                Action::BazelRead
-            },
+            Action::Use(Protocol::Bazel.permission(Access::of(write))),
             &Resource::cache(&target.org, target.id, name),
         )?;
     }

@@ -8,6 +8,7 @@ Cloudflare gateway. `pnpm` manages workspace commands.
 - `workers/server`: Rust APIs, protocols, maintenance, SQL migrations, and tests
 - `workers/gateway`: forwarding-only Cloudflare Worker using `API_ORIGIN`
 - `apps/cli`: Rust CLI with Zig NAR core
+- `pkg/cache-types`: the `Protocol`, `Compiler`, `Permission`, and `Entry` types every crate shares. Add a protocol there first; match on these types instead of comparing protocol names as strings.
 - `apps/go-cache`: native Go build-cache helper
 - `infra`: Rust service deployment and infrastructure
 

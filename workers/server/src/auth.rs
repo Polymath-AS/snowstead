@@ -479,7 +479,7 @@ pub async fn authorize_read(
     let principal = authenticate_read(headers, state).await?;
     crate::authz::authorize(
         &principal,
-        crate::authz::Action::NixPull,
+        crate::authz::Action::Use(Permission::PULL),
         &crate::authz::Resource::cache(org, cache_id, cache_name),
     )?;
     Ok(())

@@ -2799,6 +2799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "snowstead-cache-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "snowstead-cli"
 version = "0.1.0"
 dependencies = [
@@ -2819,6 +2827,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "snowstead-cache-types",
  "snowstead-protocol",
  "tempfile",
  "tokio",
@@ -2867,6 +2876,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "snowstead-cache-types",
  "snowstead-protocol",
  "sqlx",
  "subtle",

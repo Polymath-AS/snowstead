@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     AppState,
-    artifacts::{self, Access, Product},
+    artifacts::{self, Access},
     cache,
     error::ApiError,
 };
@@ -103,7 +103,7 @@ async fn open(
     let (path, resource) = parse(path, request.uri.path())?;
     let access = artifacts::open(
         state,
-        Product::Sccache,
+        snowstead_cache_types::Compiler::Sccache,
         &path.slug,
         &path.cache,
         resource.action(),

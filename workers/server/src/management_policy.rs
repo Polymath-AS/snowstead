@@ -22,6 +22,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use snowstead_cache_types::{Compiler, Protocol};
 
 fn bad(message: &str) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
@@ -325,7 +326,7 @@ async fn get_pins(
     let org = context_org(&context);
     valid_cache(&path.cache)?;
     let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, true).await?;
-    protocol(&mut tx, id, "nix").await?;
+    protocol(&mut tx, id, Protocol::Nix).await?;
     let response = ok(json!({"pins":list_pins(&mut tx,id).await?}));
     tx.commit().await?;
     Ok(response)
@@ -341,7 +342,7 @@ async fn create_pin(
     valid_cache(&path.cache)?;
     let input = body(request).await?;
     let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, false).await?;
-    protocol(&mut tx, id, "nix").await?;
+    protocol(&mut tx, id, Protocol::Nix).await?;
     let response = put_pin(&mut tx, id, input).await?;
     tx.commit().await?;
     Ok(response)
@@ -355,7 +356,7 @@ async fn remove_pin(
     let org = context_org(&context);
     valid_cache(&path.cache)?;
     let FencedCache { mut tx, id, .. } = load_cache(&state, org, &path.cache, false).await?;
-    protocol(&mut tx, id, "nix").await?;
+    protocol(&mut tx, id, Protocol::Nix).await?;
     let pin = path.pin.as_str();
     if !name_valid(pin) {
         return Err(bad("Invalid format"));
@@ -378,33 +379,36 @@ async fn remove_pin(
 async fn reset_compiler_generation(
     tx: &mut Transaction,
     id: i32,
-    kind: &str,
+    compiler: Compiler,
 ) -> Result<(), ApiError> {
     let generation = uuid::Uuid::now_v7().to_string();
-    if kind == "go" {
-        sqlx::query!(
-            r#"
+    match compiler {
+        Compiler::Go => {
+            sqlx::query!(
+                r#"
                         UPDATE caches
                         SET go_generation = $2
                         WHERE id = $1
                         "#,
-            id,
-            generation
-        )
-        .execute(&mut **tx)
-        .await?;
-    } else {
-        sqlx::query!(
-            r#"
+                id,
+                generation
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        Compiler::Sccache => {
+            sqlx::query!(
+                r#"
                         UPDATE caches
                         SET sccache_generation = $2
                         WHERE id = $1
                         "#,
-            id,
-            generation
-        )
-        .execute(&mut **tx)
-        .await?;
+                id,
+                generation
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -413,27 +417,33 @@ async fn compiler_stats(
     state: AppState,
     context: ManagementContext,
     name: String,
-    op: &str,
+    compiler: Compiler,
     reset: bool,
 ) -> Result<Response, ApiError> {
     let org = context_org(&context);
     valid_cache(&name)?;
     let FencedCache { mut tx, id, .. } = load_cache(&state, org, &name, !reset).await?;
-    if op == "sccache" || reset {
-        protocol(&mut tx, id, op).await?;
+    // Reading Go statistics has never required the protocol to be enabled.
+    let enabled = match compiler {
+        Compiler::Go => reset,
+        Compiler::Sccache => true,
+    };
+    if enabled {
+        protocol(&mut tx, id, compiler.protocol()).await?;
     }
     if reset {
-        reset_compiler_generation(&mut tx, id, op).await?;
+        reset_compiler_generation(&mut tx, id, compiler).await?;
     }
     struct Stats {
         entries: i64,
         size: i64,
         added: Option<DateTime<Utc>>,
     }
-    let row = if op == "go" {
-        sqlx::query_as!(
-            Stats,
-            r#"
+    let row = match compiler {
+        Compiler::Go => {
+            sqlx::query_as!(
+                Stats,
+                r#"
                     SELECT
                         COUNT(*)::bigint AS "entries!",
                         COALESCE(SUM(e.size), 0)::bigint AS "size!",
@@ -445,14 +455,15 @@ async fn compiler_stats(
                         AND e.expires_at > NOW()
                         AND e.uploaded_at IS NOT NULL
                     "#,
-            id
-        )
-        .fetch_one(&mut *tx)
-        .await?
-    } else {
-        sqlx::query_as!(
-            Stats,
-            r#"
+                id
+            )
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        Compiler::Sccache => {
+            sqlx::query_as!(
+                Stats,
+                r#"
                     SELECT
                         COUNT(*)::bigint AS "entries!",
                         COALESCE(SUM(e.size), 0)::bigint AS "size!",
@@ -464,10 +475,11 @@ async fn compiler_stats(
                         AND e.expires_at > NOW()
                         AND e.uploaded_at IS NOT NULL
                     "#,
-            id
-        )
-        .fetch_one(&mut *tx)
-        .await?
+                id
+            )
+            .fetch_one(&mut *tx)
+            .await?
+        }
     };
     let response = ok(
         json!({"entries":row.entries,"size":row.size,"lastAddedAt":optional_date(row.added),"retentionDays":7}),
@@ -481,7 +493,7 @@ async fn get_go(
     Extension(context): Extension<ManagementContext>,
     Path(path): Path<CachePath>,
 ) -> Result<Response, ApiError> {
-    compiler_stats(state, context, path.cache, "go", false).await
+    compiler_stats(state, context, path.cache, Compiler::Go, false).await
 }
 
 async fn get_sccache(
@@ -489,7 +501,7 @@ async fn get_sccache(
     Extension(context): Extension<ManagementContext>,
     Path(path): Path<CachePath>,
 ) -> Result<Response, ApiError> {
-    compiler_stats(state, context, path.cache, "sccache", false).await
+    compiler_stats(state, context, path.cache, Compiler::Sccache, false).await
 }
 
 async fn reset_go(
@@ -497,7 +509,7 @@ async fn reset_go(
     Extension(context): Extension<ManagementContext>,
     Path(path): Path<CachePath>,
 ) -> Result<Response, ApiError> {
-    compiler_stats(state, context, path.cache, "go", true).await
+    compiler_stats(state, context, path.cache, Compiler::Go, true).await
 }
 
 async fn reset_sccache(
@@ -505,7 +517,7 @@ async fn reset_sccache(
     Extension(context): Extension<ManagementContext>,
     Path(path): Path<CachePath>,
 ) -> Result<Response, ApiError> {
-    compiler_stats(state, context, path.cache, "sccache", true).await
+    compiler_stats(state, context, path.cache, Compiler::Sccache, true).await
 }
 
 async fn get_bazel(
@@ -538,7 +550,7 @@ async fn reset_bazel(
 ) -> Result<Response, ApiError> {
     let FencedCache { mut tx, id, .. } =
         load_cache(&state, context_org(&context), &path.cache, false).await?;
-    protocol(&mut tx, id, "bazel").await?;
+    protocol(&mut tx, id, Protocol::Bazel).await?;
     sqlx::query("UPDATE bazel_caches SET generation=$2 WHERE cache_id=$1")
         .bind(id)
         .bind(uuid::Uuid::now_v7().to_string())
@@ -684,18 +696,17 @@ async fn withdraw_cache(
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let mut removed = json!({"nix":nix});
-    for kind in ["go", "sccache"] {
+    let mut removed = json!({(Protocol::Nix.as_str()): nix});
+    for compiler in Compiler::ALL {
         // Cache deletion detaches compiler entries through the foreign
         // key, keeping their cleanup records for GC. Explicit eviction
         // withdraws compiler objects with their SQL records.
         if delete {
             continue;
         }
-        let table = if kind == "go" {
-            "go_entries"
-        } else {
-            "sccache_entries"
+        let table = match compiler {
+            Compiler::Go => "go_entries",
+            Compiler::Sccache => "sccache_entries",
         };
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "WITH gone AS (DELETE FROM {table} WHERE cache_id = $1 RETURNING r2_key), \
@@ -706,8 +717,8 @@ async fn withdraw_cache(
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        removed[kind] = json!(count);
-        reset_compiler_generation(&mut tx, id, kind).await?;
+        removed[compiler.as_str()] = json!(count);
+        reset_compiler_generation(&mut tx, id, compiler).await?;
     }
     sqlx::query("UPDATE bazel_caches SET generation=$2 WHERE cache_id=$1")
         .bind(id)
@@ -766,7 +777,7 @@ async fn withdraw_cache(
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
-async fn protocol(tx: &mut Transaction, id: i32, kind: &str) -> Result<(), ApiError> {
+async fn protocol(tx: &mut Transaction, id: i32, protocol: Protocol) -> Result<(), ApiError> {
     let exists = sqlx::query_scalar!(
         r#"
         SELECT EXISTS (
@@ -777,7 +788,7 @@ async fn protocol(tx: &mut Transaction, id: i32, kind: &str) -> Result<(), ApiEr
         ) AS "exists!"
         "#,
         id,
-        kind
+        protocol.as_str()
     )
     .fetch_one(&mut **tx)
     .await?;
@@ -1308,7 +1319,10 @@ async fn eviction(
         if strict(&c, &["org", "used", "kind", "id"]).is_err()
             || c["org"] != org
             || !valid_used
-            || !matches!(c["kind"].as_str(), Some("nix" | "go" | "sccache"))
+            || !c["kind"]
+                .as_str()
+                .and_then(Protocol::parse)
+                .is_some_and(Protocol::tracks_entries)
             || !c["id"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty() && s.encode_utf16().count() <= 128)

@@ -1,7 +1,7 @@
 //! Go's build-cache actions. Each action commits to one output ID.
 use crate::{
     AppState,
-    artifacts::{self, Access, Product},
+    artifacts::{self, Access},
     cache,
     error::ApiError,
 };
@@ -42,7 +42,7 @@ async fn open(
     let (slug, name, action) = parse(path, request.uri.path())?;
     artifacts::open(
         state,
-        Product::Go,
+        snowstead_cache_types::Compiler::Go,
         &slug,
         &name,
         &action,

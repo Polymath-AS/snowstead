@@ -1,0 +1,13 @@
+[package]
+name = "snowstead-cache-types"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "../../LICENSE"
+description = "The cache protocols Snowstead serves, and the names everything else derives from them"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json.workspace = true

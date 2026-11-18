@@ -13,6 +13,7 @@ mod push_job;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
+use snowstead_cache_types::Protocol;
 use std::io::IsTerminal;
 
 #[derive(Parser)]
@@ -153,15 +154,16 @@ fn nonempty_csv(value: &str) -> std::result::Result<String, String> {
 fn protocols(value: &str) -> std::result::Result<String, String> {
     let values: Vec<_> = value.split(',').map(str::trim).collect();
     if values.is_empty()
-        || values
-            .iter()
-            .any(|p| !matches!(*p, "nix" | "go" | "sccache"))
+        || values.iter().any(|p| Protocol::parse(p).is_none())
         || values
             .iter()
             .enumerate()
             .any(|(i, p)| values[..i].contains(p))
     {
-        return Err("must be a unique comma-separated list of nix, go, or sccache".into());
+        return Err(format!(
+            "must be a unique comma-separated list of {}",
+            Protocol::names()
+        ));
     }
     Ok(values.join(","))
 }
@@ -339,7 +341,10 @@ async fn run(mut cli: Cli) -> Result<()> {
         Command::Cache {
             command: CacheCommand::Create { protocols, .. },
         } if protocols.is_empty() => {
-            bail!("cache create requires --protocols nix|go|sccache (comma-separated)")
+            bail!(
+                "cache create requires --protocols {} (comma-separated)",
+                Protocol::ALL.map(Protocol::as_str).join("|")
+            )
         }
         Command::Cache {
             command:

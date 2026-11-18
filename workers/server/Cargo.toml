@@ -42,6 +42,7 @@ prost-types = "0.14"
 reqwest = { workspace = true, features = ["rustls", "json", "query"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+snowstead-cache-types = { path = "../../pkg/cache-types" }
 snowstead-protocol = { path = "../../pkg/protocol" }
 sha2.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "macros", "migrate"] }

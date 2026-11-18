@@ -639,3 +639,43 @@ async fn legacy_narinfo_retirement_queues_every_placement_once() -> Result<()> {
     })
     .await
 }
+
+/// The names SQL admits are the names the shared enums carry: a protocol
+/// added to one without the other fails here, not in production.
+#[tokio::test]
+async fn schema_admits_exactly_the_shared_protocols_and_permissions() -> Result<()> {
+    use snowstead_server::authz::{Permission, Protocol};
+    isolated(|pool| async move {
+        migrations::run(&pool).await?;
+        let tracked = Protocol::ALL
+            .into_iter()
+            .filter(|p| p.tracks_entries())
+            .map(Protocol::as_str)
+            .collect();
+        for (constraint, mut expected) in [
+            (
+                "cache_protocols_protocol_valid",
+                Protocol::ALL.map(Protocol::as_str).to_vec(),
+            ),
+            (
+                "token_permissions_permission_check",
+                Permission::ALL.map(Permission::as_str).to_vec(),
+            ),
+            ("bandwidth_daily_product_valid", tracked),
+        ] {
+            let definition: String = sqlx::query_scalar(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = $1",
+            )
+            .bind(constraint)
+            .fetch_one(&pool)
+            .await?;
+            // The quoted literals: every second piece between single quotes.
+            let mut admitted: Vec<_> = definition.split('\'').skip(1).step_by(2).collect();
+            admitted.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(admitted, expected, "{constraint}: {definition}");
+        }
+        Ok(())
+    })
+    .await
+}

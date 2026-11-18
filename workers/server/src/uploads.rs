@@ -36,7 +36,7 @@ use finalization::{enqueue_finalizations, status};
 
 use crate::{
     AppState,
-    authz::{Action, Principal as Identity, Resource, authorize as decide},
+    authz::{Action, Permission, Principal as Identity, Resource, authorize as decide},
     error::ApiError,
     lifecycle::UploadStatus,
     native, signing,
@@ -246,7 +246,7 @@ fn authorize_session(
 ) -> Result<(), ApiError> {
     decide(
         identity,
-        Action::NixPush,
+        Action::Use(Permission::PUSH),
         &Resource::cache(org, cache_id, name),
     )
     .map_err(|_| error(403, "Forbidden"))?;
@@ -548,7 +548,7 @@ async fn create(
     .ok_or_else(|| error(404, "Cache not found"))?;
     decide(
         identity,
-        Action::NixPush,
+        Action::Use(Permission::PUSH),
         &Resource::cache(identity.org(), cache_id, cache),
     )
     .map_err(|_| error(403, "Forbidden"))?;
@@ -1250,7 +1250,7 @@ async fn session_authority(
     if let Some(current) = authority {
         decide(
             current,
-            Action::NixPush,
+            Action::Use(Permission::PUSH),
             &Resource::cache(&session.org_id, session.cache_id, &session.name),
         )
         .map_err(|_| error(403, "Forbidden"))?;

@@ -15,7 +15,7 @@ use snowstead_protocol::{MissingPaths, limits, routes};
 
 use crate::{
     AppState,
-    authz::{self, Action, CacheGrant, Principal as Identity, Resource},
+    authz::{self, Action, CacheGrant, Permission, Principal as Identity, Resource},
     cache,
     error::ApiError,
     protocol_policy::CallerLimit,
@@ -51,9 +51,11 @@ pub(crate) async fn write_access(
     // Authentication precedes parsing, including on malformed requests.
     let identity = cache::caller(&state, request.headers(), CallerLimit::Push).await?;
     let ip = crate::app::client_ip(&state, &request);
-    if let Err(denied) =
-        authz::authorize(&identity, Action::NixPush, &Resource::Org(identity.org()))
-    {
+    if let Err(denied) = authz::authorize(
+        &identity,
+        Action::Use(Permission::PUSH),
+        &Resource::Org(identity.org()),
+    ) {
         if matches!(identity, Identity::ApiToken(_)) {
             // A token reaching past its permissions is the security record
             // here: write it before the refusal is sent.
@@ -221,7 +223,7 @@ async fn get_missing_paths(
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Cache not found"))?;
     authz::authorize(
         &identity,
-        Action::NixPush,
+        Action::Use(Permission::PUSH),
         &Resource::cache(identity.org(), found.id, cache_name),
     )?;
     let existing: HashSet<String> = found.existing.into_iter().collect();
@@ -267,7 +269,7 @@ fn push_scope(identity: &Identity, name: &str) -> (bool, Vec<i32>) {
             id,
             name,
         };
-        authz::authorize(identity, Action::NixPush, &resource).is_ok()
+        authz::authorize(identity, Action::Use(Permission::PUSH), &resource).is_ok()
     };
     if allowed(None) {
         return (true, Vec::new());

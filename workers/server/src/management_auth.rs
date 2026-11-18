@@ -107,7 +107,8 @@ fn strings(value: &Value, field: &str, max: usize) -> Result<Vec<String>, ApiErr
                     .map(str::to_owned)
                     .unwrap_or_else(|| item.to_string());
                 return Err(bad(format!(
-                    "perms[{index}]: invalid permission: {input}, expected \"pull\", \"push\", \"go:read\", \"go:write\", \"sccache:read\", \"sccache:write\", \"bazel:read\", or \"bazel:write\""
+                    "perms[{index}]: invalid permission: {input}, expected {}",
+                    crate::authz::Permission::names()
                 )));
             }
             s

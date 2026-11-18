@@ -18,6 +18,7 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use snowstead_cache_types::{Compiler, Protocol};
 use sqlx::PgPool;
 
 use crate::{
@@ -70,6 +71,13 @@ fn limited() -> ApiError {
 
 fn bad(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+
+fn unknown_protocol() -> ApiError {
+    bad(format!(
+        "Choose at least one protocol: {}",
+        Protocol::names()
+    ))
 }
 fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "Not Found")
@@ -712,7 +720,11 @@ async fn bandwidth(
         label = "management.bandwidth_sql"
     )
     .await?;
-    let mut result = json!({"servedThisMonth":0,"publicServedThisMonth":0,"servedThisMonthByProduct":{"nix":0,"go":0,"sccache":0}});
+    let mut result =
+        json!({"servedThisMonth":0,"publicServedThisMonth":0,"servedThisMonthByProduct":{}});
+    for protocol in Protocol::ALL.into_iter().filter(|p| p.tracks_entries()) {
+        result["servedThisMonthByProduct"][protocol.as_str()] = json!(0);
+    }
     let mut served = 0;
     let mut public = 0;
     for row in rows {
@@ -1265,17 +1277,17 @@ async fn create_cache(
         let p = p
             .as_array()
             .filter(|a| !a.is_empty())
-            .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
+            .ok_or_else(unknown_protocol)?;
         let mut result = Vec::new();
         for value in p {
             let protocol = value
                 .as_str()
-                .filter(|s| ["nix", "go", "sccache", "bazel"].contains(s))
-                .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
-            if result.iter().any(|p| p == protocol) {
+                .and_then(Protocol::parse)
+                .ok_or_else(unknown_protocol)?;
+            if result.contains(&protocol) {
                 return Err(bad("protocols must not contain duplicates"));
             }
-            result.push(protocol.to_owned());
+            result.push(protocol);
         }
         Some(result)
     } else {
@@ -1320,7 +1332,7 @@ async fn create_cache(
     )
     .fetch_optional(&mut *tx)
     .await?;
-    let old_protocols: Vec<String> = if let Some(c) = &existing {
+    let old_protocols: Vec<Protocol> = if let Some(c) = &existing {
         sqlx::query_scalar!(
             r#"
             SELECT protocol
@@ -1332,12 +1344,15 @@ async fn create_cache(
         )
         .fetch_all(&mut *tx)
         .await?
+        .iter()
+        .map(|p| Protocol::parse(p).expect("cache_protocols admits only known protocols"))
+        .collect()
     } else {
         Vec::new()
     };
     let protocols = requested
         .or_else(|| existing.as_ref().map(|_| old_protocols.clone()))
-        .ok_or_else(|| bad("Choose at least one protocol: nix, go, sccache, or bazel"))?;
+        .ok_or_else(unknown_protocol)?;
     if old_protocols.iter().any(|p| !protocols.contains(p)) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1399,14 +1414,17 @@ async fn create_cache(
                 "only a cache without published paths can change visibility",
             ));
         }
-        for (kind, present) in [("go", present.go), ("sccache", present.sccache)] {
+        for compiler in Compiler::ALL {
+            let present = match compiler {
+                Compiler::Go => present.go,
+                Compiler::Sccache => present.sccache,
+            };
+            let label = compiler.protocol().label();
             if present {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     format!(
-                        "only a cache without {} entries or uploads can change visibility; reset {} data first",
-                        if kind == "go" { "Go" } else { kind },
-                        if kind == "go" { "Go" } else { kind }
+                        "only a cache without {label} entries or uploads can change visibility; reset {label} data first"
                     ),
                 ));
             }
@@ -1485,8 +1503,8 @@ async fn create_cache(
         .execute(&mut *tx)
         .await?;
     }
-    if protocols.iter().any(|p| p == "bazel")
-        && (!old_protocols.iter().any(|p| p == "bazel") || raw.get("bazelCapacity").is_some())
+    if protocols.contains(&Protocol::Bazel)
+        && (!old_protocols.contains(&Protocol::Bazel) || raw.get("bazelCapacity").is_some())
     {
         let limit: Option<i64> = sqlx::query_scalar("SELECT storage_limit FROM orgs WHERE id=$1")
             .bind(id)
@@ -1527,6 +1545,9 @@ async fn create_cache(
         "#,
         cache,
         &protocols
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect::<Vec<_>>()
     )
     .execute(&mut *tx)
     .await?;
@@ -1554,7 +1575,7 @@ async fn create_cache(
     );
     set_cache_info(&mut tx, &path(&slug, name)).await?;
     tx.commit().await?;
-    if protocols.iter().any(|p| p == "bazel") {
+    if protocols.contains(&Protocol::Bazel) {
         // A new Bazel cache divides its organization's remaining storage
         // further, and a capacity may have been lowered.
         state.bazel.retarget();

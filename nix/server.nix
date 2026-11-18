@@ -44,6 +44,8 @@ craneLib.buildPackage (
           || rel == "pkg"
           || rel == "pkg/nix-archive"
           || lib.hasPrefix "pkg/nix-archive/" rel
+          || rel == "pkg/cache-types"
+          || lib.hasPrefix "pkg/cache-types/" rel
           || rel == "pkg/protocol"
           || lib.hasPrefix "pkg/protocol/" rel
           || rel == "pkg/snitch"

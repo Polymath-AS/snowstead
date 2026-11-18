@@ -9,6 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use snowstead_cache_types::Compiler;
 use tokio_util::io::ReaderStream;
 
 use crate::{
@@ -20,28 +21,6 @@ use crate::{
 };
 
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Product {
-    Go,
-    Sccache,
-}
-impl Product {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Go => "go",
-            Self::Sccache => "sccache",
-        }
-    }
-    fn action(self, write: bool) -> Action {
-        match (self, write) {
-            (Self::Go, true) => Action::GoWrite,
-            (Self::Go, false) => Action::GoRead,
-            (Self::Sccache, true) => Action::SccacheWrite,
-            (Self::Sccache, false) => Action::SccacheRead,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct Target {
@@ -89,7 +68,7 @@ const PRIVATE_REFUSED: &str = "this org does not allow private caches: its priva
 /// request's place in its organization's admission lane.
 pub struct Access {
     pub target: Target,
-    product: Product,
+    product: Compiler,
     _admission: Option<Admission>,
 }
 
@@ -131,7 +110,7 @@ pub fn literal(pathname: &str, slug: &str, name: &str) -> bool {
 /// own grammar: admission, lookup, then authorization.
 pub async fn open(
     state: &AppState,
-    product: Product,
+    product: Compiler,
     slug: &str,
     name: &str,
     action: &str,
@@ -142,8 +121,8 @@ pub async fn open(
     // but not through a returned download body. Go's client turns its remote
     // off for the rest of a build on 429, so only sccache queues.
     let admission = match product {
-        Product::Sccache => Some(state.protocol_limits.admit_sccache(slug, write).await?),
-        Product::Go => None,
+        Compiler::Sccache => Some(state.protocol_limits.admit_sccache(slug, write).await?),
+        Compiler::Go => None,
     };
     let target = target(state, slug, name, product, action)
         .await?
@@ -161,11 +140,11 @@ async fn target(
     state: &AppState,
     slug: &str,
     name: &str,
-    product: Product,
+    product: Compiler,
     action: &str,
 ) -> Result<Option<Target>, ApiError> {
     Ok(match product {
-        Product::Go => {
+        Compiler::Go => {
             sqlx::query_as!(
                 Target,
                 r#"
@@ -194,7 +173,7 @@ async fn target(
             .fetch_optional(&state.pool)
             .await?
         }
-        Product::Sccache => {
+        Compiler::Sccache => {
             sqlx::query_as!(
                 Target,
                 r#"
@@ -232,7 +211,7 @@ async fn authorize(
     headers: &HeaderMap,
     target: &Target,
     name: &str,
-    product: Product,
+    product: Compiler,
     write: bool,
 ) -> Result<(), ApiError> {
     if !write && target.public {
@@ -246,7 +225,11 @@ async fn authorize(
     let principal = cache::caller(state, headers, limit).await?;
     authz::authorize(
         &principal,
-        product.action(write),
+        Action::Use(
+            product
+                .protocol()
+                .permission(snowstead_cache_types::Access::of(write)),
+        ),
         &Resource::cache(&target.org, target.cache_id, name),
     )?;
     Ok(())
@@ -257,11 +240,11 @@ async fn download(
     state: &AppState,
     target: &Target,
     head: bool,
-    product: Product,
+    product: Compiler,
 ) -> Result<Response, ApiError> {
-    let kind = product.name();
+    let kind = product.as_str();
     let entry = match product {
-        Product::Go => sqlx::query_as!(
+        Compiler::Go => sqlx::query_as!(
             Entry,
             r#"
             SELECT
@@ -298,7 +281,7 @@ async fn download(
         )
         .fetch_optional(&state.pool)
         .await?,
-        Product::Sccache => sqlx::query_as!(
+        Compiler::Sccache => sqlx::query_as!(
             Entry,
             r#"
             SELECT
@@ -399,7 +382,7 @@ async fn download(
     let access = async {
         if entry.access_due {
             let result = match product {
-                Product::Go => sqlx::query!(
+                Compiler::Go => sqlx::query!(
                     r#"
                     UPDATE go_entries
                     SET last_accessed_at = NOW()
@@ -410,7 +393,7 @@ async fn download(
                 )
                 .execute(&state.pool)
                 .await,
-                Product::Sccache => sqlx::query!(
+                Compiler::Sccache => sqlx::query!(
                     r#"
                     UPDATE sccache_entries
                     SET last_accessed_at = NOW()
@@ -498,13 +481,13 @@ struct Policy {
 async fn policy(
     tx: &mut Transaction,
     target: &Target,
-    product: Product,
+    product: Compiler,
     changed_status: StatusCode,
 ) -> Result<Option<i64>, ApiError> {
     let row = crate::profile_future!(
         async {
             match product {
-                Product::Go => {
+                Compiler::Go => {
                     sqlx::query_as!(
                         Policy,
                         r#"
@@ -532,7 +515,7 @@ async fn policy(
                     .fetch_optional(&mut **tx)
                     .await
                 }
-                Product::Sccache => {
+                Compiler::Sccache => {
                     sqlx::query_as!(
                         Policy,
                         r#"
@@ -594,12 +577,12 @@ struct StagingUsage {
 async fn reserve(
     state: &AppState,
     target: &Target,
-    product: Product,
+    product: Compiler,
     action: &str,
     size: u64,
     output: Option<&str>,
 ) -> Result<Entry, ApiError> {
-    let kind = product.name();
+    let kind = product.as_str();
     let mut tx = crate::profile_future!(
         crate::db::begin(state),
         label = "artifacts.reserve_pool_begin"
@@ -612,11 +595,12 @@ async fn reserve(
             "Artifact exceeds retained capacity",
         )
     };
-    if product == Product::Go && limit.is_some_and(|n| size > n as u64) {
-        return Err(too_large());
+    match product {
+        Compiler::Go if limit.is_some_and(|n| size > n as u64) => return Err(too_large()),
+        Compiler::Go | Compiler::Sccache => {}
     }
     let existing = match product {
-        Product::Go => sqlx::query_as!(
+        Compiler::Go => sqlx::query_as!(
             Entry,
             r#"
             WITH expired AS (
@@ -652,7 +636,7 @@ async fn reserve(
         .fetch_optional(&mut *tx)
         .await
         .map_err(lock_error)?,
-        Product::Sccache => sqlx::query_as!(
+        Compiler::Sccache => sqlx::query_as!(
             Entry,
             r#"
             WITH expired AS (
@@ -731,7 +715,7 @@ async fn reserve(
         crate::capacity::admit_upload(state, &mut tx, &target.org, limit).await?;
     }
     let staging = match product {
-        Product::Go => {
+        Compiler::Go => {
             sqlx::query_as!(
                 StagingUsage,
                 r#"
@@ -749,7 +733,7 @@ async fn reserve(
             .fetch_one(&mut *tx)
             .await?
         }
-        Product::Sccache => {
+        Compiler::Sccache => {
             sqlx::query_as!(
                 StagingUsage,
                 r#"
@@ -776,7 +760,7 @@ async fn reserve(
     }
     if let Some(mut entry) = existing {
         match product {
-            Product::Go => {
+            Compiler::Go => {
                 sqlx::query!(
                     "UPDATE go_entries SET size = $2 WHERE id = $1",
                     &entry.id,
@@ -785,7 +769,7 @@ async fn reserve(
                 .execute(&mut *tx)
                 .await?
             }
-            Product::Sccache => {
+            Compiler::Sccache => {
                 sqlx::query!(
                     "UPDATE sccache_entries SET size = $2 WHERE id = $1",
                     &entry.id,
@@ -805,7 +789,7 @@ async fn reserve(
         target.cache_id, target.generation
     );
     let inserted = match product {
-        Product::Go => sqlx::query_as!(
+        Compiler::Go => sqlx::query_as!(
             Entry,
             r#"
             INSERT INTO go_entries AS e (
@@ -842,7 +826,7 @@ async fn reserve(
         )
         .fetch_optional(&mut *tx)
         .await?,
-        Product::Sccache => sqlx::query_as!(
+        Compiler::Sccache => sqlx::query_as!(
             Entry,
             r#"
             INSERT INTO sccache_entries AS e (
@@ -881,7 +865,7 @@ async fn reserve(
     let entry = match inserted {
         Some(entry) => entry,
         None => match product {
-            Product::Go => sqlx::query_as!(
+            Compiler::Go => sqlx::query_as!(
                 Entry,
                 r#"
                 SELECT
@@ -909,7 +893,7 @@ async fn reserve(
             .fetch_optional(&mut *tx)
             .await
             .map_err(lock_error)?,
-            Product::Sccache => sqlx::query_as!(
+            Compiler::Sccache => sqlx::query_as!(
                 Entry,
                 r#"
                 SELECT
@@ -948,13 +932,13 @@ async fn reserve(
 async fn locked_entry(
     tx: &mut Transaction,
     target: &Target,
-    product: Product,
+    product: Compiler,
     id: &str,
 ) -> Result<Entry, ApiError> {
     let entry: Entry = crate::profile_future!(
         async {
             match product {
-                Product::Go => sqlx::query_as!(
+                Compiler::Go => sqlx::query_as!(
                     Entry,
                     r#"
                     SELECT
@@ -976,7 +960,7 @@ async fn locked_entry(
                 )
                 .fetch_optional(&mut **tx)
                 .await,
-                Product::Sccache => sqlx::query_as!(
+                Compiler::Sccache => sqlx::query_as!(
                     Entry,
                     r#"
                     SELECT
@@ -1024,7 +1008,7 @@ struct Transfer {
 async fn finish(
     state: &AppState,
     target: &Target,
-    product: Product,
+    product: Compiler,
     expected: &Entry,
     attempt: Option<Transfer>,
 ) -> Result<Response, ApiError> {
@@ -1037,34 +1021,27 @@ async fn finish(
     policy(&mut tx, target, product, StatusCode::SERVICE_UNAVAILABLE).await?;
     let entry = locked_entry(&mut tx, target, product, id).await?;
     let won = entry.stored_at.is_none() && entry.uploaded_at.is_none();
-    if !won
-        && ((product == Product::Go
-            && (entry.size != expected.size || entry.output != expected.output))
-            || (product == Product::Sccache
-                && entry.uploaded_at.is_none()
-                && entry.size != expected.size))
-    {
+    let conflict = match product {
+        Compiler::Go => (entry.size != expected.size || entry.output != expected.output)
+            .then_some("Action already has a different output"),
+        Compiler::Sccache => (entry.uploaded_at.is_none() && entry.size != expected.size)
+            .then_some("Upload in progress; retry"),
+    };
+    if !won && let Some(conflict) = conflict {
         tx.rollback().await?;
         if let Some(transfer) = &attempt
             && transfer.key != entry.r2_key
         {
             let _ = state.storage.delete(true, &transfer.key).await;
         }
-        return Err(error(
-            StatusCode::CONFLICT,
-            if product == Product::Go {
-                "Action already has a different output"
-            } else {
-                "Upload in progress; retry"
-            },
-        ));
+        return Err(error(StatusCode::CONFLICT, conflict));
     }
     if won {
         let transfer = attempt
             .as_ref()
             .ok_or_else(|| busy("Upload changed; retry"))?;
         match product {
-            Product::Go => {
+            Compiler::Go => {
                 sqlx::query!(
                     r#"
                     UPDATE go_entries
@@ -1084,7 +1061,7 @@ async fn finish(
                 .execute(&mut *tx)
                 .await?
             }
-            Product::Sccache => {
+            Compiler::Sccache => {
                 sqlx::query!(
                     r#"
                     UPDATE sccache_entries
@@ -1125,7 +1102,7 @@ async fn finish(
             .stored_at
             .ok_or_else(|| busy("Upload changed; retry"))?;
         match product {
-            Product::Go => {
+            Compiler::Go => {
                 sqlx::query!(
                     r#"
                     UPDATE go_entries
@@ -1140,7 +1117,7 @@ async fn finish(
                 .execute(&mut *tx)
                 .await?
             }
-            Product::Sccache => {
+            Compiler::Sccache => {
                 sqlx::query!(
                     r#"
                     UPDATE sccache_entries
@@ -1175,7 +1152,7 @@ async fn finish(
 async fn upload(
     state: &AppState,
     target: &Target,
-    product: Product,
+    product: Compiler,
     action: &str,
     size: u64,
     output: Option<&str>,
@@ -1200,22 +1177,22 @@ async fn upload(
     } else {
         None
     };
-    if product == Product::Go
-        && (stored.is_some() || recovered.is_some())
-        && (entry.output.as_deref() != output || entry.size != size as i64)
-    {
-        checked(&consume_hash(body, size).await.map_err(|_| length())?)?;
-        return Err(error(
-            StatusCode::CONFLICT,
-            "Action already has a different output",
-        ));
-    }
-    if product == Product::Sccache
-        && entry.uploaded_at.is_none()
-        && (stored.is_some() || recovered.is_some())
-        && entry.size != size as i64
-    {
-        return Err(error(StatusCode::CONFLICT, "Upload in progress; retry"));
+    let settled = stored.is_some() || recovered.is_some();
+    match product {
+        Compiler::Go => {
+            if settled && (entry.output.as_deref() != output || entry.size != size as i64) {
+                checked(&consume_hash(body, size).await.map_err(|_| length())?)?;
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "Action already has a different output",
+                ));
+            }
+        }
+        Compiler::Sccache => {
+            if entry.uploaded_at.is_none() && settled && entry.size != size as i64 {
+                return Err(error(StatusCode::CONFLICT, "Upload in progress; retry"));
+            }
+        }
     }
     let attempt = if stored.is_some() || recovered.is_some() {
         checked(&consume_hash(body, size).await.map_err(|_| length())?)?;
@@ -1227,7 +1204,7 @@ async fn upload(
     } else {
         let key = format!(
             "{}-attempt/{}/{}",
-            product.name(),
+            product.as_str(),
             entry.id,
             uuid::Uuid::now_v7()
         );

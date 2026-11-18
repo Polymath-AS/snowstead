@@ -36,6 +36,7 @@ These features are API-only; they do not add dashboard or CLI commands.
 workers/gateway/      Forwarding-only gateway to API_ORIGIN
 workers/server/       Rust API, protocols, maintenance, migrations, and tests
 apps/cli/             CLI for pushing store paths
+pkg/cache-types/      The protocols a cache serves, their permissions, and entry IDs
 pkg/protocol/         Wire types, limits, and version shared by the CLI and server
 apps/go-cache/        Native GOCACHEPROG helper
 infra/                Rust service deployment
