@@ -31,7 +31,18 @@ impl Drop for Host {
 
 async fn host(pool: &PgPool, storage: snowstead_server::storage::Storage) -> Host {
     let token = seed(pool).await;
-    serve(pool, storage, token, false).await
+    serve(pool, storage, token, Hosting::Shared).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Hosting {
+    /// Path-based addresses on the shared host.
+    Shared,
+    /// Every request arrives with the organization Host, as nginx forwards it.
+    Forwarded,
+    /// The organization host is configured; each request's own host or
+    /// `:authority` names the organization.
+    Direct,
 }
 
 /// Seeds the `alpha` organization's public and private Bazel caches and a token
@@ -55,15 +66,16 @@ async fn seed(pool: &PgPool) -> String {
     format!("snowstead_tok_{id}_fixture")
 }
 
-/// Serves the seeded caches. With `org`, every request arrives with the
-/// organization Host `alpha.snowstead.com`; the `/_api/v1/…` addresses are
-/// unreachable on this server.
+/// Serves the seeded caches. Unless `Hosting::Shared`, the organization host
+/// is configured, and `Hosting::Forwarded` rewrites every Host to
+/// `alpha.snowstead.com`; the `/_api/v1/…` addresses are unreachable there.
 async fn serve(
     pool: &PgPool,
     storage: snowstead_server::storage::Storage,
     token: String,
-    org: bool,
+    hosting: Hosting,
 ) -> Host {
+    let org = hosting != Hosting::Shared;
     let config = if org {
         Config {
             cache_host_suffix: "snowstead.com".into(),
@@ -75,7 +87,7 @@ async fn serve(
     };
     let state = AppState::new(pool.clone(), config, storage, reqwest::Client::new()).unwrap();
     let app = router(state);
-    let app = if org {
+    let app = if hosting == Hosting::Forwarded {
         app.layer(axum::middleware::map_request(
             |mut request: axum::extract::Request| async move {
                 request
@@ -822,7 +834,7 @@ async fn native_bazel_upload_and_clean_remote_hit(pool: PgPool) {
 #[ignore = "requires Bazel 8 from the development shell"]
 async fn native_bazel_through_the_organization_host(pool: PgPool) {
     let token = seed(&pool).await;
-    let host = serve(&pool, common::s3_storage(), token, true).await;
+    let host = serve(&pool, common::s3_storage(), token, Hosting::Forwarded).await;
     let bazel = std::env::var("BAZEL").unwrap_or_else(|_| "bazel".to_owned());
     tokio::task::spawn_blocking(move || {
         let root = std::env::temp_dir().join(format!("bazel-org-e2e-{}", uuid::Uuid::now_v7()));
@@ -832,8 +844,18 @@ async fn native_bazel_through_the_organization_host(pool: PgPool) {
             "genrule(name='artifact', outs=['artifact.bin'], cmd='dd if=/dev/zero of=$@ bs=1048576 count=9; echo executed >> {}/executions')\n",
             root.display()
         )).unwrap();
-        for protocol in ["http"] {
-            let endpoint = format!("{}/private/bazel", host.url);
+        for protocol in ["grpc", "http"] {
+            // The organization host names the organization; gRPC's instance names the cache.
+            let endpoint = if protocol == "http" {
+                format!("{}/private/bazel", host.url)
+            } else {
+                host.url.replace("http://", "grpc://")
+            };
+            let instance: &[&str] = if protocol == "grpc" {
+                &["--remote_instance_name=private"]
+            } else {
+                &[]
+            };
             for run in 0..2 {
                 let output = std::process::Command::new(&bazel)
                     .current_dir(&root)
@@ -841,6 +863,7 @@ async fn native_bazel_through_the_organization_host(pool: PgPool) {
                     .arg(format!("--output_user_root={}/{protocol}-{run}", root.display()))
                     .args(["build", "//:artifact", "--spawn_strategy=local", "--remote_download_outputs=all"])
                     .arg(format!("--remote_cache={endpoint}"))
+                    .args(instance)
                     .arg(format!("--remote_header=Authorization=Bearer {}", host.token))
                     .output().unwrap();
                 assert!(output.status.success(), "{protocol} run {run}: {}", String::from_utf8_lossy(&output.stderr));
@@ -1609,4 +1632,196 @@ async fn action_tree_validation_deduplicates_and_bounds_total_bytes(pool: PgPool
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn grpc_through_the_organization_host(pool: PgPool) {
+    let token = seed(&pool).await;
+    let host = serve(&pool, common::storage(), token, Hosting::Direct).await;
+    // HTTP/2 sends no Host header here: the organization is named by `:authority`.
+    let org = Channel::from_shared(host.url.clone())
+        .unwrap()
+        .origin("http://alpha.snowstead.com".parse().unwrap())
+        .connect()
+        .await
+        .unwrap();
+    let mut capabilities = capabilities_client::CapabilitiesClient::new(org.clone());
+    let mut cas =
+        content_addressable_storage_client::ContentAddressableStorageClient::new(org.clone());
+    let mut bytestream = byte_stream_client::ByteStreamClient::new(org);
+    assert!(
+        capabilities
+            .get_capabilities(authorized(
+                GetCapabilitiesRequest {
+                    instance_name: "private".into(),
+                },
+                &host,
+            ))
+            .await
+            .is_ok()
+    );
+    // The shared-host shape is not accepted on the organization host.
+    let shared_shape = capabilities
+        .get_capabilities(authorized(
+            GetCapabilitiesRequest {
+                instance_name: "alpha/private".into(),
+            },
+            &host,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(shared_shape.code(), tonic::Code::NotFound);
+
+    let batched = b"organization batch";
+    let batched_digest = digest(batched);
+    let batch = BatchUpdateBlobsRequest {
+        instance_name: "private".into(),
+        requests: vec![batch_update_blobs_request::Request {
+            digest: Some(batched_digest.clone()),
+            data: batched.to_vec(),
+            compressor: 0,
+        }],
+        ..Default::default()
+    };
+    let written = cas
+        .batch_update_blobs(authorized(batch, &host))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(written.responses[0].status.as_ref().unwrap().code, 0);
+    let missing = cas
+        .find_missing_blobs(authorized(
+            FindMissingBlobsRequest {
+                instance_name: "private".into(),
+                blob_digests: vec![batched_digest.clone()],
+                ..Default::default()
+            },
+            &host,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(missing.missing_blob_digests.is_empty());
+
+    let streamed = b"organization stream";
+    let streamed_digest = digest(streamed);
+    let upload = WriteRequest {
+        resource_name: format!(
+            "private/uploads/org-upload/blobs/{}/{}",
+            streamed_digest.hash, streamed_digest.size_bytes
+        ),
+        write_offset: 0,
+        finish_write: true,
+        data: streamed.to_vec(),
+    };
+    bytestream
+        .write(authorized(stream::iter([upload]), &host))
+        .await
+        .unwrap();
+    let mut response = bytestream
+        .read(authorized(
+            ReadRequest {
+                resource_name: format!(
+                    "private/blobs/{}/{}",
+                    streamed_digest.hash, streamed_digest.size_bytes
+                ),
+                read_offset: 0,
+                read_limit: 0,
+            },
+            &host,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = response.message().await.unwrap() {
+        bytes.extend(part.data);
+    }
+    assert_eq!(bytes, streamed);
+
+    // A client without the organization Host reaches the shared-host shape only.
+    let plain = Channel::from_shared(host.url.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut shared =
+        content_addressable_storage_client::ContentAddressableStorageClient::new(plain);
+    let missing = shared
+        .find_missing_blobs(authorized(
+            FindMissingBlobsRequest {
+                instance_name: "alpha/private".into(),
+                blob_digests: vec![batched_digest.clone()],
+                ..Default::default()
+            },
+            &host,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(missing.missing_blob_digests.is_empty());
+    assert_eq!(
+        shared
+            .find_missing_blobs(authorized(
+                FindMissingBlobsRequest {
+                    instance_name: "private".into(),
+                    blob_digests: vec![batched_digest.clone()],
+                    ..Default::default()
+                },
+                &host,
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    // A second organization with its own private cache named `private`. Alpha's
+    // token must not reach it through the organization host `beta`.
+    sqlx::raw_sql(
+        "INSERT INTO orgs(id,slug,private_caches) VALUES ('beta-org','beta',true);
+        INSERT INTO caches(name,org_id,is_public) VALUES ('private','beta-org',false);
+        INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'bazel' FROM caches WHERE org_id='beta-org';
+        INSERT INTO bazel_caches(cache_id,generation,capacity) SELECT id,'generation-beta-' || id,33554432 FROM caches WHERE org_id='beta-org';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let beta = Channel::from_shared(host.url.clone())
+        .unwrap()
+        .origin("http://beta.snowstead.com".parse().unwrap())
+        .connect()
+        .await
+        .unwrap();
+    let mut beta = content_addressable_storage_client::ContentAddressableStorageClient::new(beta);
+    assert_eq!(
+        beta.find_missing_blobs(authorized(
+            FindMissingBlobsRequest {
+                instance_name: "private".into(),
+                blob_digests: vec![batched_digest.clone()],
+                ..Default::default()
+            },
+            &host,
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::PermissionDenied
+    );
+    let beta_write = BatchUpdateBlobsRequest {
+        instance_name: "private".into(),
+        requests: vec![batch_update_blobs_request::Request {
+            digest: Some(batched_digest.clone()),
+            data: batched.to_vec(),
+            compressor: 0,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        beta.batch_update_blobs(authorized(beta_write, &host))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
 }

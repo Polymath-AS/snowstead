@@ -11,7 +11,7 @@ use tokio_util::io::ReaderStream;
 use tonic::{Request, Response, Status};
 
 use super::{MAX_METADATA, blob, complete, failure, open, proto, store::Store, valid_digest};
-use crate::{AppState, error::ApiError};
+use crate::{AppState, cache_host::OrganizationHost, error::ApiError};
 use proto::build::bazel::{remote::execution::v2::*, semver::SemVer};
 use proto::google::bytestream::{self as bs, byte_stream_server::ByteStream};
 
@@ -63,6 +63,15 @@ fn wire_status(value: Result<(), Status>) -> Option<proto::google::rpc::Status> 
     })
 }
 
+/// The organization named by the host, when the request came from an
+/// organization host.
+fn organization<T>(request: &Request<T>) -> Option<&str> {
+    request
+        .extensions()
+        .get::<OrganizationHost>()
+        .map(|host| host.0.as_str())
+}
+
 impl Cache {
     async fn store<T>(
         &self,
@@ -72,6 +81,7 @@ impl Cache {
     ) -> Result<Store, Status> {
         open(
             &self.0,
+            organization(request),
             instance,
             &request.metadata().clone().into_headers(),
             write,
@@ -433,21 +443,26 @@ pub(super) fn router(state: AppState) -> axum::Router<AppState> {
         )
 }
 
-fn resource(name: &str, write: bool) -> Result<(String, Digest), Status> {
+/// Parses a ByteStream resource name. On an organization host the name has
+/// no owner segment, so `depth` is the number of instance segments before the
+/// protocol path: two (`<slug>/<cache>`) on the shared host, one (`<cache>`)
+/// on an organization host.
+fn resource(name: &str, write: bool, org_host: bool) -> Result<(String, Digest), Status> {
     let parts: Vec<_> = name.split('/').collect();
+    let depth = if org_host { 1 } else { 2 };
     let (hash, size) = if write
-        && parts.len() >= 7
-        && parts[2] == "uploads"
-        && parts[4] == "blobs"
-        && !parts[3].is_empty()
-        && parts[3].len() <= 128
-        && parts[3]
+        && parts.len() >= depth + 5
+        && parts[depth] == "uploads"
+        && parts[depth + 2] == "blobs"
+        && !parts[depth + 1].is_empty()
+        && parts[depth + 1].len() <= 128
+        && parts[depth + 1]
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
     {
-        (parts[5], parts[6])
-    } else if !write && parts.len() == 5 && parts[2] == "blobs" {
-        (parts[3], parts[4])
+        (parts[depth + 3], parts[depth + 4])
+    } else if !write && parts.len() == depth + 3 && parts[depth] == "blobs" {
+        (parts[depth + 1], parts[depth + 2])
     } else {
         return Err(Status::invalid_argument("Invalid ByteStream resource name"));
     };
@@ -460,7 +475,7 @@ fn resource(name: &str, write: bool) -> Result<(String, Digest), Status> {
             .parse()
             .map_err(|_| Status::invalid_argument("Invalid blob size"))?,
     }))?;
-    Ok((format!("{}/{}", parts[0], parts[1]), digest))
+    Ok((parts[..depth].join("/"), digest))
 }
 
 #[tonic::async_trait]
@@ -470,7 +485,11 @@ impl ByteStream for Cache {
         &self,
         request: Request<bs::ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        let (instance, digest) = resource(&request.get_ref().resource_name, false)?;
+        let (instance, digest) = resource(
+            &request.get_ref().resource_name,
+            false,
+            organization(&request).is_some(),
+        )?;
         let store = self.store(&request, &instance, false).await?;
         let request = request.into_inner();
         if request.read_offset < 0 || request.read_limit < 0 {
@@ -542,14 +561,16 @@ impl ByteStream for Cache {
             let mut progress_deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let headers = request.metadata().clone().into_headers();
+            // Extensions do not survive `into_inner`, so capture the owner first.
+            let owner = organization(&request).map(str::to_owned);
             let mut stream = request.into_inner();
             let first = tokio::time::timeout_at(progress_deadline, stream.message())
                 .await
                 .map_err(|_| Status::deadline_exceeded("Upload made no byte progress"))??
                 .ok_or_else(|| Status::invalid_argument("Write request required"))?;
             let name = first.resource_name.clone();
-            let (instance, digest) = resource(&name, true)?;
-            let (store, _) = open(&self.0, &instance, &headers, true)
+            let (instance, digest) = resource(&name, true, owner.is_some())?;
+            let (store, _) = open(&self.0, owner.as_deref(), &instance, &headers, true)
                 .await
                 .map_err(status)?;
             let size = digest.size_bytes as u64;
@@ -772,7 +793,11 @@ impl ByteStream for Cache {
         &self,
         request: Request<bs::QueryWriteStatusRequest>,
     ) -> Result<Response<bs::QueryWriteStatusResponse>, Status> {
-        let (instance, digest) = resource(&request.get_ref().resource_name, true)?;
+        let (instance, digest) = resource(
+            &request.get_ref().resource_name,
+            true,
+            organization(&request).is_some(),
+        )?;
         let store = self.store(&request, &instance, true).await?;
         let (committed, complete) = store
             .upload_status(
@@ -792,5 +817,50 @@ impl ByteStream for Cache {
             committed_size: committed as i64,
             complete,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resource;
+
+    fn hash() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn resource_names_follow_the_host() {
+        let h = hash();
+        // Shared host: the instance is `<slug>/<cache>`.
+        let (instance, digest) =
+            resource(&format!("alpha/private/blobs/{h}/3"), false, false).expect("shared read");
+        assert_eq!(instance, "alpha/private");
+        assert_eq!((digest.hash.as_str(), digest.size_bytes), (h.as_str(), 3));
+        let (instance, _) = resource(
+            &format!("alpha/private/uploads/u-1/blobs/{h}/3"),
+            true,
+            false,
+        )
+        .expect("shared write");
+        assert_eq!(instance, "alpha/private");
+        // The organization host's name has no owner, so the shared shape is refused.
+        assert!(resource(&format!("alpha/private/blobs/{h}/3"), false, true).is_err());
+        assert!(
+            resource(
+                &format!("alpha/private/uploads/u-1/blobs/{h}/3"),
+                true,
+                true
+            )
+            .is_err()
+        );
+
+        // Organization host: the instance is `<cache>`.
+        let (instance, _) =
+            resource(&format!("private/blobs/{h}/3"), false, true).expect("organization read");
+        assert_eq!(instance, "private");
+        let (instance, digest) = resource(&format!("private/uploads/u-1/blobs/{h}/3"), true, true)
+            .expect("organization write");
+        assert_eq!(instance, "private");
+        assert_eq!(digest.size_bytes, 3);
     }
 }

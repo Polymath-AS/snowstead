@@ -581,7 +581,8 @@ async fn bazel_http_through_the_organization_host(pool: PgPool) {
         "public, no-cache, must-revalidate, no-transform"
     );
 
-    // Isolation: nothing else on the organization host reaches Bazel.
+    // Bazel over gRPC is served on the organization host: the gRPC route runs
+    // directly, so the request is answered by the gRPC service, not a Nix read.
     let (status, headers, _) = send(
         &app,
         "POST",
@@ -592,6 +593,17 @@ async fn bazel_http_through_the_organization_host(pool: PgPool) {
         b"",
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/grpc")
+    );
+    assert!(headers.contains_key("grpc-status"));
+    assert_eq!(headers["cloudflare-cdn-cache-control"], "no-store");
+    // Other unmatched POSTs on the organization host remain Nix reads.
+    let (status, headers, _) = send(&app, "POST", Some(org), "/team/zig/x", None, &[], b"").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(headers["allow"], "GET, HEAD");
 

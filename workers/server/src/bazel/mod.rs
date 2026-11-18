@@ -136,11 +136,17 @@ struct Target {
 
 async fn open(
     state: &AppState,
+    owner: Option<&str>,
     instance: &str,
     headers: &HeaderMap,
     write: bool,
 ) -> Result<(store::Store, bool), ApiError> {
-    let (slug, name) = instance.split_once('/').ok_or_else(cache::not_found)?;
+    let (slug, name) = match owner {
+        // On an organization host the host names the organization and the
+        // instance names only the cache.
+        Some(owner) => (owner, instance),
+        None => instance.split_once('/').ok_or_else(cache::not_found)?,
+    };
     if !cache::valid_name(slug, cache::SLUG_MAX) || !cache::valid_name(name, cache::NAME_MAX) {
         return Err(cache::not_found());
     }
@@ -380,8 +386,10 @@ async fn http(
         return Err(cache::not_found());
     }
     let (parts, body) = request.into_parts();
+    // The HTTP organization path is already rewritten to the canonical route.
     let (store, public) = open(
         &state,
+        None,
         &format!("{slug}/{name}"),
         &parts.headers,
         method == Method::PUT,

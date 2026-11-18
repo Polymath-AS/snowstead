@@ -561,7 +561,13 @@ remain reserved independently of these settings. Hosted DNS policy belongs
 to the embedding application, not the cache core. On an organization host,
 `/<cache>/go`, `/<cache>/sccache/`, and `/<cache>/bazel` (Bazel over HTTP)
 serve the same handlers as `/_api/v1/<product>/<org-slug>/<cache>`, which
-keeps working; every other path on that host is a Nix read.
+keeps working; every other path on that host, apart from the Bazel gRPC
+services, is a Nix read. Bazel over gRPC names the organization by host and
+the cache by instance:
+`--remote_cache=grpcs://<org-slug>.<suffix> --remote_instance_name=<cache>`.
+The organization host rejects the `<org-slug>/<cache>` instance shape that the
+shared host keeps. Organization hosts answer HTTP/2 requests that send no
+`Host` header by their `:authority`.
 
 ### Migrating JWT-era tokens
 

@@ -1,4 +1,4 @@
-//! Direct organization ingress. Only Host is authoritative, never forwarded headers.
+//! Direct organization ingress. Host is authoritative, or the request URI's authority (`:authority` on HTTP/2) when no Host is sent; never forwarded headers.
 use axum::{
     Router,
     extract::{ConnectInfo, MatchedPath, Request, State},
@@ -22,6 +22,13 @@ pub(crate) const PRODUCTS: &[&str] = &["go", "sccache", "bazel"];
 /// rewrote it to the protocol's canonical route.
 #[derive(Clone)]
 pub(crate) struct PublicPath(pub String);
+
+/// Fixed gRPC service paths. On an organization host they run directly, and
+/// the instance names only the cache.
+const GRPC_PREFIXES: &[&str] = &[
+    "/build.bazel.remote.execution.v2.",
+    "/google.bytestream.ByteStream/",
+];
 
 /// `/<cache>/<product>/…`. A product only on an organization host; on any
 /// other host this shape is a path-based Nix read.
@@ -157,10 +164,17 @@ pub(crate) async fn ingress(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<Authority>().ok())
+        // HTTP/2 names the host in `:authority`, which hyper puts on the URI.
+        .or_else(|| {
+            (!request.headers().contains_key(header::HOST))
+                .then(|| request.uri().authority().cloned())
+                .flatten()
+        })
         .filter(|v| !v.host().ends_with(".."))
         .map(|v| v.host().trim_end_matches('.').to_ascii_lowercase());
     if request.headers().get_all(header::HOST).iter().count() > 1
-        || (request.headers().contains_key(header::HOST) && host.is_none())
+        || ((request.headers().contains_key(header::HOST) || request.uri().authority().is_some())
+            && host.is_none())
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -225,12 +239,18 @@ pub(crate) async fn ingress(
             // Product routes are the only ones registered under `/{cache}/`.
             // The cache router must be merged, not nested: a nest would prefix
             // the matched path, so product requests would miss this check and
-            // fall back to Nix reads.
-            let product = request
+            // fall back to Nix reads. gRPC services run directly as well: they
+            // read the organization from this extension, since their instance
+            // names carry no owner segment on an organization host.
+            let direct = request
                 .extensions()
                 .get::<MatchedPath>()
-                .is_some_and(|path| path.as_str().starts_with("/{cache}/"));
-            if product {
+                .is_some_and(|path| {
+                    let path = path.as_str();
+                    path.starts_with("/{cache}/")
+                        || GRPC_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+                });
+            if direct {
                 next.run(request).await
             } else {
                 match crate::reads::handle(State(state), request).await {
@@ -318,5 +338,56 @@ mod tests {
             response.headers()["cloudflare-cdn-cache-control"],
             "no-store"
         );
+    }
+
+    #[tokio::test]
+    async fn http2_authority_names_the_host_when_no_host_header_is_sent() {
+        let config = Config {
+            cache_host_suffix: "example.test".into(),
+            cache_canonical_hosts: "api.example.test".into(),
+            cache_reserved_hosts: "blocked.example.test".into(),
+            ..Default::default()
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let storage = crate::storage::Storage::from_stores(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+        );
+        let state = AppState::new(pool, config, storage, reqwest::Client::new()).unwrap();
+        let app = axum::Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(axum::middleware::from_fn_with_state(state, ingress));
+        use tower::ServiceExt;
+        let send = |host: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().uri("http://blocked.example.test/healthz");
+                if let Some(host) = host {
+                    request = request.header("host", host);
+                }
+                app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        // Without a Host header, the `:authority` names a reserved host.
+        assert_eq!(send(None).await, StatusCode::NOT_FOUND);
+        // A malformed authority is refused as an invalid Host, as a Host header would be.
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("http://blocked.example.test../healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        // A Host header wins over the authority: the canonical host passes through.
+        assert_eq!(send(Some("api.example.test")).await, StatusCode::NO_CONTENT);
     }
 }
