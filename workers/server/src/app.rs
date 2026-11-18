@@ -271,6 +271,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::go::router())
         .merge(crate::sccache::router())
         .merge(crate::bazel::router(state.clone()))
+        .merge(crate::cache_host::product_routes(state.clone()))
         .merge(management::router(state.clone()))
         .route("/_api/v1", any(api_not_found))
         .route("/_api/v1/{*unmatched}", any(api_not_found))

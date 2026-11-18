@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer, request as httpRequest } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,7 @@ const exec = promisify(execFile);
 const serverBinary = new URL("../../../target/debug/snowstead-server", import.meta.url).pathname;
 const goSource = new URL("../../../apps/go-cache/", import.meta.url).pathname;
 
-test("unchanged compiler clients reuse Rust TCP artifacts with fresh local caches", { timeout: 240_000 }, async t => {
+test("unchanged compiler clients reuse Rust TCP artifacts with fresh local caches", { timeout: 480_000 }, async t => {
   const base = process.env.SNOWSTEAD_TEST_DATABASE_URL;
   assert.ok(base, "run via scripts/with-postgres.sh inside nix develop");
   assert.equal(process.env.R2_ENDPOINT, process.env.SNOWSTEAD_TEST_R2_ENDPOINT, "run via scripts/with-r2.sh");
@@ -54,6 +55,7 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
     SIGNING_PRIVATE_KEY: "", REQUIRE_CACHE_SIGNING_KEYS: "false", PUBLIC_URL: "", UPSTREAM_CACHES: "",
     PUBLIC_CACHE_ORIGIN: "", CDN_ZONE_ID: "", CDN_PURGE_TOKEN: "",
     ANALYTICS_TOKEN: "", TRUSTED_PROXY_IPS: "",
+    CACHE_HOST_SUFFIX: "cache.test", CACHE_CANONICAL_HOSTS: "", CACHE_RESERVED_NAMES: "", CACHE_RESERVED_HOSTS: "",
     DATABASE_MAX_CONNECTIONS: "2", LISTEN_ADDR: "127.0.0.1:0", RUST_LOG: "info",
   };
   await exec(serverBinary, ["migrate"], { env, timeout: 30_000 });
@@ -78,6 +80,21 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
       await db.query("INSERT INTO token_caches(token_jti,cache_id) VALUES ($1,$2)", [jti, id]);
       tokens[protocol] = `snowstead_tok_${jti}_${tokenSecret}`;
     }
+    // A private organization cache reached through its organization host.
+    await db.query("INSERT INTO orgs(id,slug) VALUES ('org_alpha','alpha')");
+    const { rows: [{ id: teamId }] } = await db.query(
+      "INSERT INTO caches(name,org_id,is_public) VALUES ('team','org_alpha',false) RETURNING id");
+    await db.query("INSERT INTO cache_protocols(cache_id,protocol) VALUES ($1,'go'),($1,'sccache')", [teamId]);
+    const orgJti = randomUUID();
+    const orgSecret = randomBytes(32).toString("base64url");
+    await db.query(
+      "INSERT INTO api_tokens(jti,subject,secret_hash,created_by,org_id,expires_at) VALUES ($1,'compiler-fixture',$2,'test','org_alpha',now()+interval '1 hour')",
+      [orgJti, createHash("sha256").update(orgSecret).digest("hex")]);
+    await db.query(
+      "INSERT INTO token_permissions(token_jti,permission,position) VALUES ($1,'go:read',1),($1,'go:write',2),($1,'sccache:read',3),($1,'sccache:write',4)",
+      [orgJti]);
+    await db.query("INSERT INTO token_caches(token_jti,cache_id) VALUES ($1,$2)", [orgJti, teamId]);
+    tokens.org = `snowstead_tok_${orgJti}_${orgSecret}`;
   } finally { await db.end(); }
   const token = protocol => tokens[protocol];
   server = spawn(serverBinary, [], { env, stdio: ["ignore", "pipe", "inherit"] });
@@ -91,40 +108,64 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
   const address = /127\.0\.0\.1:\d+/.exec(line)?.[0];
   assert.ok(address, line);
   const url = `http://${address}`;
-
-  // Exercise unmodified Rust and C++ compiler clients with fresh local caches.
-  const dir = join(home, "sccache");
-  await mkdir(dir);
-  const clientEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("SCCACHE_")));
-  Object.assign(clientEnv, {
-    SCCACHE_SERVER_UDS: join(dir, "server.sock"), SCCACHE_CONF: join(dir, "config"),
-    SCCACHE_WEBDAV_ENDPOINT: `${url}/_api/v1/sccache/default/sccache/`,
-    SCCACHE_WEBDAV_TOKEN: token("sccache"),
+  // Stand in for nginx on the organization host: forward to the Rust service
+  // with the Host the organization address would carry. The Go helper refuses
+  // plain HTTP except on loopback, so this stays on 127.0.0.1.
+  const [upstreamHost, upstreamPort] = address.split(":");
+  const front = createServer((incoming, outgoing) => {
+    const upstream = httpRequest({ host: upstreamHost, port: upstreamPort, method: incoming.method,
+      path: incoming.url, headers: { ...incoming.headers, host: "alpha.cache.test" } }, response => {
+      outgoing.writeHead(response.statusCode, response.headers);
+      response.pipe(outgoing);
+    });
+    upstream.on("error", () => outgoing.destroy());
+    incoming.pipe(upstream);
   });
-  const run = args => exec("sccache", args, { env: clientEnv, cwd: dir, timeout: 30_000 });
-  try {
-    await writeFile(join(dir, "config"), "");
-    await writeFile(join(dir, "input.cpp"), "int cached(int n) { return n * 7 + 3; }\n");
-    await writeFile(join(dir, "input.rs"), "pub fn cached(n: u64) -> u64 { n * 11 + 5 }\n");
-    let expected;
-    for (let pass = 0; pass < 2; pass++) {
-      clientEnv.SCCACHE_DIR = join(dir, `local-${pass}`);
-      await run(["--start-server"]);
-      await run(["c++", "-c", "input.cpp", "-o", "cpp.o", "-O2"]);
-      await run(["rustc", "--crate-name", "fixture", "--crate-type", "rlib", "--emit=link", "input.rs", "--out-dir", ".", "-O"]);
-      const stats = JSON.parse((await run(["--show-stats", "--stats-format", "json"])).stdout).stats;
-      const sum = counts => Object.values(counts).reduce((a, b) => a + b, 0);
-      assert.equal(sum(stats.cache_hits.counts), pass ? 2 : 0, JSON.stringify(stats));
-      assert.equal(sum(stats.cache_misses.counts), pass ? 0 : 2, JSON.stringify(stats));
-      assert.equal(stats.cache_write_errors, 0, JSON.stringify(stats));
-      const outputs = await Promise.all(["cpp.o", "libfixture.rlib"].map(name => readFile(join(dir, name))));
-      if (expected) assert.deepEqual(outputs, expected);
-      expected = outputs;
-      console.log(`sccache ${pass ? "warm" : "cold"}: hits=${sum(stats.cache_hits.counts)} misses=${sum(stats.cache_misses.counts)} write_errors=${stats.cache_write_errors} output_bytes=${outputs.map(b => b.length).join(",")}`);
-      await run(["--stop-server"]);
-      await Promise.all(["cpp.o", "libfixture.rlib"].map(name => rm(join(dir, name))));
-    }
-  } finally { await run(["--stop-server"]).catch(() => {}); }
+  front.listen(0, "127.0.0.1");
+  await once(front, "listening");
+  t.after(() => { front.closeAllConnections(); front.close(); });
+  const orgUrl = `http://127.0.0.1:${front.address().port}`;
+
+  // Exercise unmodified Rust and C++ compiler clients with fresh local caches,
+  // on the shared address and on the organization host.
+  const sccacheEndpoints = [
+    ["shared", `${url}/_api/v1/sccache/default/sccache/`, token("sccache")],
+    ["org", `${orgUrl}/team/sccache/`, tokens.org],
+  ];
+  for (const [label, endpoint, bearer] of sccacheEndpoints) {
+    const dir = join(home, `sccache-${label}`);
+    await mkdir(dir);
+    const clientEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("SCCACHE_")));
+    Object.assign(clientEnv, {
+      SCCACHE_SERVER_UDS: join(dir, "server.sock"), SCCACHE_CONF: join(dir, "config"),
+      SCCACHE_WEBDAV_ENDPOINT: endpoint,
+      SCCACHE_WEBDAV_TOKEN: bearer,
+    });
+    const run = args => exec("sccache", args, { env: clientEnv, cwd: dir, timeout: 30_000 });
+    try {
+      await writeFile(join(dir, "config"), "");
+      await writeFile(join(dir, "input.cpp"), "int cached(int n) { return n * 7 + 3; }\n");
+      await writeFile(join(dir, "input.rs"), "pub fn cached(n: u64) -> u64 { n * 11 + 5 }\n");
+      let expected;
+      for (let pass = 0; pass < 2; pass++) {
+        clientEnv.SCCACHE_DIR = join(dir, `local-${pass}`);
+        await run(["--start-server"]);
+        await run(["c++", "-c", "input.cpp", "-o", "cpp.o", "-O2"]);
+        await run(["rustc", "--crate-name", "fixture", "--crate-type", "rlib", "--emit=link", "input.rs", "--out-dir", ".", "-O"]);
+        const stats = JSON.parse((await run(["--show-stats", "--stats-format", "json"])).stdout).stats;
+        const sum = counts => Object.values(counts).reduce((a, b) => a + b, 0);
+        assert.equal(sum(stats.cache_hits.counts), pass ? 2 : 0, JSON.stringify(stats));
+        assert.equal(sum(stats.cache_misses.counts), pass ? 0 : 2, JSON.stringify(stats));
+        assert.equal(stats.cache_write_errors, 0, JSON.stringify(stats));
+        const outputs = await Promise.all(["cpp.o", "libfixture.rlib"].map(name => readFile(join(dir, name))));
+        if (expected) assert.deepEqual(outputs, expected);
+        expected = outputs;
+        console.log(`sccache ${label} ${pass ? "warm" : "cold"}: hits=${sum(stats.cache_hits.counts)} misses=${sum(stats.cache_misses.counts)} write_errors=${stats.cache_write_errors} output_bytes=${outputs.map(b => b.length).join(",")}`);
+        await run(["--stop-server"]);
+        await Promise.all(["cpp.o", "libfixture.rlib"].map(name => rm(join(dir, name))));
+      }
+    } finally { await run(["--stop-server"]).catch(() => {}); }
+  }
 
   // Build the unchanged helper with an isolated Go cache, not the user's cache.
   const goEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GO") && !key.startsWith("SNOWSTEAD_GO_")));
@@ -142,39 +183,44 @@ test("unchanged compiler clients reuse Rust TCP artifacts with fresh local cache
   // Make both passes eligible instead of creating a warm-only index record.
   const timestamp = new Date(Date.now() - 60_000);
   for (const name of ["go.mod", "main.go"]) await utimes(join(project, name), timestamp, timestamp);
-  const goToken = token("go");
-  let expectedGo;
-  for (let pass = 0; pass < 2; pass++) {
-    const output = join(project, "fixture");
-    // This throwaway module has no VCS metadata (nor any need for stamping).
-    const result = await exec("go", ["build", "-trimpath", "-buildvcs=false", "-o", output, "."], {
-      cwd: project, timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
-      env: { ...goEnv, GOCACHE: join(home, `go-local-${pass}`), GOCACHEPROG: helper,
-        SNOWSTEAD_GO_CACHE_DIR: join(home, `go-helper-${pass}`),
-        SNOWSTEAD_GO_CACHE_URL: `${url}/_api/v1/go/default/go`, SNOWSTEAD_GO_CACHE_TOKEN: goToken,
-        SNOWSTEAD_GO_CACHE_READ_ONLY: "false" },
-    });
-    const summary = result.stderr.split("\n").filter(line => line.startsWith("snowstead-go-cache: local_hits="));
-    assert.equal(summary.length, 1, result.stderr);
-    const stats = Object.fromEntries([...summary[0].matchAll(/(\w+)=(\w+)/g)].map(([, key, value]) => [key, value === "true" ? true : value === "false" ? false : Number(value)]));
-    for (const key of ["upload_errors", "read_errors", "read_timeouts", "conflicts"]) assert.equal(stats[key], 0, summary[0]);
-    assert.equal(stats.remote_disabled, false, summary[0]);
-    if (pass === 0) {
-      assert.equal(stats.remote_hits, 0, summary[0]);
-      assert.ok(stats.misses > 0 && stats.uploads > 0 && stats.uploaded_bytes > 0, summary[0]);
-    } else {
-      // Go does not request every cold metadata put on a warm build, and
-      // linking can still put an empty stdout record. Require real artifact
-      // downloads and no newly uploaded payload, not identical request counts.
-      assert.ok(stats.remote_hits > 0 && stats.downloaded_bytes >= expectedGo.length, summary[0]);
-      assert.equal(stats.uploaded_bytes, 0, summary[0]);
+  const goEndpoints = [
+    ["shared", `${url}/_api/v1/go/default/go`, token("go")],
+    ["org", `${orgUrl}/team/go`, tokens.org],
+  ];
+  for (const [label, endpoint, bearer] of goEndpoints) {
+    let expectedGo;
+    for (let pass = 0; pass < 2; pass++) {
+      const output = join(project, "fixture");
+      // This throwaway module has no VCS metadata (nor any need for stamping).
+      const result = await exec("go", ["build", "-trimpath", "-buildvcs=false", "-o", output, "."], {
+        cwd: project, timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+        env: { ...goEnv, GOCACHE: join(home, `go-local-${label}-${pass}`), GOCACHEPROG: helper,
+          SNOWSTEAD_GO_CACHE_DIR: join(home, `go-helper-${label}-${pass}`),
+          SNOWSTEAD_GO_CACHE_URL: endpoint, SNOWSTEAD_GO_CACHE_TOKEN: bearer,
+          SNOWSTEAD_GO_CACHE_READ_ONLY: "false" },
+      });
+      const summary = result.stderr.split("\n").filter(line => line.startsWith("snowstead-go-cache: local_hits="));
+      assert.equal(summary.length, 1, result.stderr);
+      const stats = Object.fromEntries([...summary[0].matchAll(/(\w+)=(\w+)/g)].map(([, key, value]) => [key, value === "true" ? true : value === "false" ? false : Number(value)]));
+      for (const key of ["upload_errors", "read_errors", "read_timeouts", "conflicts"]) assert.equal(stats[key], 0, summary[0]);
+      assert.equal(stats.remote_disabled, false, summary[0]);
+      if (pass === 0) {
+        assert.equal(stats.remote_hits, 0, summary[0]);
+        assert.ok(stats.misses > 0 && stats.uploads > 0 && stats.uploaded_bytes > 0, summary[0]);
+      } else {
+        // Go does not request every cold metadata put on a warm build, and
+        // linking can still put an empty stdout record. Require real artifact
+        // downloads and no newly uploaded payload, not identical request counts.
+        assert.ok(stats.remote_hits > 0 && stats.downloaded_bytes >= expectedGo.length, summary[0]);
+        assert.equal(stats.uploaded_bytes, 0, summary[0]);
+      }
+      const bytes = await readFile(output);
+      if (expectedGo) assert.deepEqual(bytes, expectedGo);
+      expectedGo = bytes;
+      const executed = await exec(output, [], { timeout: 10_000 });
+      assert.equal(executed.stderr, "snowstead compiler fixture\n");
+      console.log(`Go ${label} ${pass ? "warm" : "cold"}: ${summary[0]} executable_bytes=${bytes.length} sha256=${createHash("sha256").update(bytes).digest("hex")}`);
+      await rm(output);
     }
-    const bytes = await readFile(output);
-    if (expectedGo) assert.deepEqual(bytes, expectedGo);
-    expectedGo = bytes;
-    const executed = await exec(output, [], { timeout: 10_000 });
-    assert.equal(executed.stderr, "snowstead compiler fixture\n");
-    console.log(`Go ${pass ? "warm" : "cold"}: ${summary[0]} executable_bytes=${bytes.length} sha256=${createHash("sha256").update(bytes).digest("hex")}`);
-    await rm(output);
   }
 });

@@ -140,7 +140,10 @@ async fn propfind(state: AppState, path: DavPath, request: Request) -> Result<Re
         return Err(method_not_allowed());
     }
     let modified = httpdate::fmt_http_date(access.target.created_at.into());
-    let pathname = request.uri.path();
+    let pathname = request
+        .extensions
+        .get::<crate::cache_host::PublicPath>()
+        .map_or(request.uri.path(), |path| path.0.as_str());
     let xml = format!(
         "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>{pathname}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getlastmodified>{modified}</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"
     );

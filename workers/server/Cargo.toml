@@ -51,6 +51,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tokio-util = { workspace = true, features = ["rt", "io-util"] }
 tonic = "0.14"
 tonic-prost = "0.14"
+tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tracing-opentelemetry = { version = "0.34.0", default-features = false, optional = true }
@@ -64,5 +65,4 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 hegeltest.workspace = true
-tower = { workspace = true, features = ["util"] }
 zstd = { workspace = true, features = ["pkg-config"] }

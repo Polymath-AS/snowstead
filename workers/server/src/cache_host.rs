@@ -1,15 +1,106 @@
 //! Direct organization ingress. Only Host is authoritative, never forwarded headers.
 use axum::{
-    extract::{Request, State},
-    http::{StatusCode, header, uri::Authority},
+    Router,
+    extract::{ConnectInfo, MatchedPath, Request, State},
+    http::{Extensions, StatusCode, header, uri::Authority},
     middleware::Next,
     response::{IntoResponse, Response},
+    routing::any,
 };
+use std::net::SocketAddr;
+use tower::ServiceExt;
 
 use crate::{AppState, cache, config::Config};
 
 #[derive(Clone)]
 pub(crate) struct OrganizationHost(pub String);
+
+/// Products served at `/<cache>/<product>` on an organization host.
+pub(crate) const PRODUCTS: &[&str] = &["go", "sccache"];
+
+/// The path the client used on an organization host, before dispatch
+/// rewrote it to the protocol's canonical route.
+#[derive(Clone)]
+pub(crate) struct PublicPath(pub String);
+
+/// `/<cache>/<product>/…`. A product only on an organization host; on any
+/// other host this shape is a path-based Nix read.
+pub(crate) fn product_routes(state: AppState) -> Router<AppState> {
+    // Protocol routers only: an organization host must never reach
+    // management, upload, or operator routes.
+    let protocols: Router = Router::new()
+        .merge(crate::go::router())
+        .merge(crate::sccache::router())
+        .fallback(|| async { cache::not_found() })
+        .with_state(state);
+    let mut routes = Router::new();
+    for &product in PRODUCTS {
+        for tail in ["", "/", "/{*rest}"] {
+            let protocols = protocols.clone();
+            routes = routes.route(
+                &format!("/{{cache}}/{product}{tail}"),
+                any(move |State(state): State<AppState>, request: Request| {
+                    dispatch(protocols.clone(), product, state, request)
+                }),
+            );
+        }
+    }
+    routes
+}
+
+async fn dispatch(
+    protocols: Router,
+    product: &'static str,
+    state: AppState,
+    request: Request,
+) -> Response {
+    let Some(owner) = request
+        .extensions()
+        .get::<OrganizationHost>()
+        .map(|host| host.0.clone())
+    else {
+        return match crate::reads::handle(State(state), request).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+    };
+    let public = request.uri().path().to_owned();
+    let target = public
+        .strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .and_then(|(name, rest)| {
+            // The route matched `/<cache>/<product>` followed by `/` or nothing.
+            let tail = rest
+                .strip_prefix(product)
+                .filter(|tail| tail.is_empty() || tail.starts_with('/'))?;
+            let query = request
+                .uri()
+                .query()
+                .map(|q| format!("?{q}"))
+                .unwrap_or_default();
+            Some(format!("/_api/v1/{product}/{owner}/{name}{tail}{query}"))
+        })
+        .and_then(|target| target.parse::<axum::http::Uri>().ok());
+    let Some(target) = target else {
+        return cache::not_found().into_response();
+    };
+    // Rebuild the extensions: axum appends inner captures after the outer
+    // `{cache}` capture, which breaks the protocol handlers' `Path` extractors.
+    // Go and sccache read no request extensions; the peer address is carried
+    // for handlers that audit by IP.
+    let (mut parts, body) = request.into_parts();
+    let mut extensions = Extensions::new();
+    if let Some(peer) = parts.extensions.get::<ConnectInfo<SocketAddr>>() {
+        extensions.insert(*peer);
+    }
+    extensions.insert(PublicPath(public));
+    parts.extensions = extensions;
+    parts.uri = target;
+    match protocols.oneshot(Request::from_parts(parts, body)).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
+}
 
 /// Names that conflict with the core's path-based protocol namespace.
 pub(crate) const PROTOCOL_NAMES: &[&str] = &["default", "nar", "private", "_api", "healthz"];
@@ -130,9 +221,21 @@ pub(crate) async fn ingress(
             request
                 .extensions_mut()
                 .insert(OrganizationHost(owner.to_owned()));
-            match crate::reads::handle(State(state), request).await {
-                Ok(response) => response,
-                Err(error) => error.into_response(),
+            // Product routes are the only ones registered under `/{cache}/`.
+            // The cache router must be merged, not nested: a nest would prefix
+            // the matched path, so product requests would miss this check and
+            // fall back to Nix reads.
+            let product = request
+                .extensions()
+                .get::<MatchedPath>()
+                .is_some_and(|path| path.as_str().starts_with("/{cache}/"));
+            if product {
+                next.run(request).await
+            } else {
+                match crate::reads::handle(State(state), request).await {
+                    Ok(response) => response,
+                    Err(error) => error.into_response(),
+                }
             }
         };
     // Every alias hit must observe current SQL policy, even with a warm CDN.
