@@ -4,6 +4,20 @@
   inventory,
 }:
 let
+  # nginx 1.30.7 fixes HTTP/2 flow control memory corruption (CVE-2026-123007)
+  # and a TLS 1.3 request body loop (CVE-2026-118899); this proxy uses both.
+  # The guard drops the override once the pinned nixpkgs ships the release.
+  nginx =
+    if pkgs.lib.versionOlder pkgs.nginx.version "1.30.7" then
+      pkgs.nginx.overrideAttrs rec {
+        version = "1.30.7";
+        src = pkgs.fetchurl {
+          url = "https://nginx.org/download/nginx-${version}.tar.gz";
+          hash = "sha256-JWW1yDcFDpWPcPsPc8SOK8pFQq00n9NW9G+wxyYQvG4=";
+        };
+      }
+    else
+      pkgs.nginx;
   nginxStart = pkgs.writeShellScript "snowstead-nginx" ''
     set -eu
     ${pkgs.coreutils}/bin/cat > "$RUNTIME_DIRECTORY/nginx.conf" <<EOF
@@ -75,7 +89,7 @@ let
       }
     }
     EOF
-    exec ${pkgs.nginx}/bin/nginx -e stderr -p "$RUNTIME_DIRECTORY/" -c "$RUNTIME_DIRECTORY/nginx.conf"
+    exec ${nginx}/bin/nginx -e stderr -p "$RUNTIME_DIRECTORY/" -c "$RUNTIME_DIRECTORY/nginx.conf"
   '';
   units = pkgs.runCommand "snowstead-units" { } ''
     mkdir -p $out/lib/systemd/system
