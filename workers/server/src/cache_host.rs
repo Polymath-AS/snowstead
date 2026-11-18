@@ -16,7 +16,7 @@ use crate::{AppState, cache, config::Config};
 pub(crate) struct OrganizationHost(pub String);
 
 /// Products served at `/<cache>/<product>` on an organization host.
-pub(crate) const PRODUCTS: &[&str] = &["go", "sccache"];
+pub(crate) const PRODUCTS: &[&str] = &["go", "sccache", "bazel"];
 
 /// The path the client used on an organization host, before dispatch
 /// rewrote it to the protocol's canonical route.
@@ -31,6 +31,7 @@ pub(crate) fn product_routes(state: AppState) -> Router<AppState> {
     let protocols: Router = Router::new()
         .merge(crate::go::router())
         .merge(crate::sccache::router())
+        .merge(crate::bazel::http_router())
         .fallback(|| async { cache::not_found() })
         .with_state(state);
     let mut routes = Router::new();
@@ -86,8 +87,8 @@ async fn dispatch(
     };
     // Rebuild the extensions: axum appends inner captures after the outer
     // `{cache}` capture, which breaks the protocol handlers' `Path` extractors.
-    // Go and sccache read no request extensions; the peer address is carried
-    // for handlers that audit by IP.
+    // Go, sccache, and Bazel over HTTP read no request extensions; the peer
+    // address is carried for handlers that audit by IP.
     let (mut parts, body) = request.into_parts();
     let mut extensions = Extensions::new();
     if let Some(peer) = parts.extensions.get::<ConnectInfo<SocketAddr>>() {

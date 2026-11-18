@@ -112,7 +112,13 @@ pub(crate) async fn collect(state: &AppState) -> anyhow::Result<u64> {
 }
 
 pub(crate) fn router(state: AppState) -> Router<AppState> {
-    grpc::router(state).route(
+    grpc::router(state).merge(http_router())
+}
+
+/// Bazel over HTTP alone, without gRPC. Organization hosts route to this
+/// router so that the gRPC service never sees their requests.
+pub(crate) fn http_router() -> Router<AppState> {
+    Router::new().route(
         "/_api/v1/bazel/{slug}/{cache}/{kind}/{digest}",
         get(http).head(http).put(http),
     )

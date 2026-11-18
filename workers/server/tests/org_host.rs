@@ -53,7 +53,15 @@ async fn seed(pool: &PgPool) {
            ('go','org_a',true,'2020-01-02 03:04:05+00'),
            ('sccache','org_a',true,'2020-01-02 03:04:05+00');
          INSERT INTO cache_protocols(cache_id,protocol)
-           SELECT id,kind FROM caches CROSS JOIN (VALUES ('go'),('sccache'),('nix')) p(kind);",
+           SELECT id,kind FROM caches CROSS JOIN (VALUES ('go'),('sccache'),('nix')) p(kind);
+         INSERT INTO caches(name,org_id,is_public,created_at) VALUES
+           ('bazel','org_a',true,'2020-01-02 03:04:05+00');
+         INSERT INTO cache_protocols(cache_id,protocol)
+           SELECT id,kind FROM caches CROSS JOIN (VALUES ('bazel'),('nix')) p(kind) WHERE caches.name='bazel';
+         INSERT INTO cache_protocols(cache_id,protocol)
+           SELECT id,'bazel' FROM caches WHERE name='team';
+         INSERT INTO bazel_caches(cache_id,generation,capacity)
+           SELECT id,'generation-' || id,33554432 FROM caches WHERE name IN ('team','bazel');",
     )
     .execute(pool)
     .await
@@ -482,6 +490,172 @@ async fn sccache_webdav_through_the_organization_host(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+async fn bazel_http_through_the_organization_host(pool: PgPool) {
+    seed(&pool).await;
+    let app = app(&pool, "snowstead.com").await;
+    let token = token(&pool, "org_a", "team", &["bazel:read", "bazel:write"]).await;
+    let bytes: &[u8] = b"build output";
+    let hash = hex::encode(Sha256::digest(bytes));
+    let second_bytes: &[u8] = b"second build output";
+    let second_hash = hex::encode(Sha256::digest(second_bytes));
+    let org = "alpha.snowstead.com";
+    let api = "api.snowstead.com";
+    let org_path = format!("/team/bazel/cas/{hash}");
+    let legacy_path = format!("/_api/v1/bazel/alpha/team/cas/{hash}");
+
+    let (status, _, _) = send(&app, "PUT", Some(org), &org_path, None, &[], bytes).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, headers, _) = put_bytes(&app, org, &org_path, &token, bytes).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(headers["cloudflare-cdn-cache-control"], "no-store");
+
+    let (status, headers, body) =
+        send(&app, "GET", Some(org), &org_path, Some(&token), &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cloudflare-cdn-cache-control"], "no-store");
+    assert_eq!(body, bytes);
+
+    let (status, _, body) = send(&app, "HEAD", Some(org), &org_path, Some(&token), &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+
+    let (status, _, body) =
+        send(&app, "GET", Some(api), &legacy_path, Some(&token), &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+
+    let legacy_second = format!("/_api/v1/bazel/alpha/team/cas/{second_hash}");
+    let (status, _, _) = put_bytes(&app, api, &legacy_second, &token, second_bytes).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let org_second = format!("/team/bazel/cas/{second_hash}");
+    let (status, _, body) = send(&app, "GET", Some(org), &org_second, Some(&token), &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, second_bytes);
+
+    for path in [
+        "/team/bazel".to_owned(),
+        "/team/bazel/".to_owned(),
+        format!("/team/bazel/xx/{hash}"),
+    ] {
+        let (status, _, _) = send(&app, "GET", Some(org), &path, Some(&token), &[], b"").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let (status, _, _) = send(
+        &app,
+        "GET",
+        Some("beta.snowstead.com"),
+        &org_path,
+        Some(&token),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The public cache is where the CDN-facing headers are observable: the
+    // organization host must stay uncacheable at the edge, while the shared
+    // host's CAS reads keep their public revalidation policy.
+    let public_token = crate::token(&pool, "org_a", "bazel", &["bazel:read", "bazel:write"]).await;
+    let public_bytes: &[u8] = b"public build output";
+    let public_hash = hex::encode(Sha256::digest(public_bytes));
+    let public_path = format!("/bazel/bazel/cas/{public_hash}");
+    let (status, _, _) = put_bytes(&app, org, &public_path, &public_token, public_bytes).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, headers, body) = send(&app, "GET", Some(org), &public_path, None, &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, public_bytes);
+    assert_eq!(headers["cloudflare-cdn-cache-control"], "no-store");
+    assert_eq!(
+        headers["cache-control"],
+        "public, no-cache, must-revalidate, no-transform"
+    );
+    let shared_public = format!("/_api/v1/bazel/alpha/bazel/cas/{public_hash}");
+    let (status, headers, body) =
+        send(&app, "GET", Some(api), &shared_public, None, &[], b"").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, public_bytes);
+    assert_eq!(
+        headers["cloudflare-cdn-cache-control"],
+        "public, no-cache, must-revalidate, no-transform"
+    );
+
+    // Isolation: nothing else on the organization host reaches Bazel.
+    let (status, headers, _) = send(
+        &app,
+        "POST",
+        Some(org),
+        "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
+        None,
+        &[("content-type", "application/grpc")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(headers["allow"], "GET, HEAD");
+
+    // The go cache has no Bazel protocol, so its Bazel address does not exist.
+    let go_token = crate::token(&pool, "org_a", "go", &["bazel:read"]).await;
+    let (status, _, _) = send(
+        &app,
+        "GET",
+        Some(org),
+        &format!("/go/bazel/cas/{hash}"),
+        Some(&go_token),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = send(
+        &app,
+        "GET",
+        Some(org),
+        &format!("/team/bazel/cas/{}", hash.to_uppercase()),
+        Some(&token),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = send(
+        &app,
+        "GET",
+        Some(org),
+        &format!("/te%61m/bazel/cas/{hash}"),
+        Some(&token),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, headers, _) =
+        send(&app, "DELETE", Some(org), &org_path, Some(&token), &[], b"").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(headers["allow"], "GET,HEAD,PUT");
+
+    // A body that does not hash to its path is refused and never stored.
+    let mismatched_path = format!("/team/bazel/cas/{}", "c".repeat(64));
+    let (status, _, _) = put_bytes(&app, org, &mismatched_path, &token, b"twelve bytes").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = send(
+        &app,
+        "GET",
+        Some(org),
+        &mismatched_path,
+        Some(&token),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
 async fn caches_named_after_products_keep_their_nix_addresses(pool: PgPool) {
     seed(&pool).await;
     let plain = app(&pool, "").await;
@@ -489,7 +663,7 @@ async fn caches_named_after_products_keep_their_nix_addresses(pool: PgPool) {
     let go_write = token(&pool, "org_a", "go", &["go:read", "go:write"]).await;
     let action = "a".repeat(64);
 
-    for name in ["go", "sccache"] {
+    for name in ["go", "sccache", "bazel"] {
         let nix = format!("/{name}/nix-cache-info");
         let (status, headers, _) = send(
             &app,

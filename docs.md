@@ -559,9 +559,9 @@ organization names with `CACHE_RESERVED_NAMES` and exact DNS hosts with
 Reserved hosts take precedence over canonical hosts. Core protocol names
 remain reserved independently of these settings. Hosted DNS policy belongs
 to the embedding application, not the cache core. On an organization host,
-`/<cache>/go` and `/<cache>/sccache/` serve the same handlers as
-`/_api/v1/<product>/<org-slug>/<cache>`, which keeps working; every other path
-on that host is a Nix read.
+`/<cache>/go`, `/<cache>/sccache/`, and `/<cache>/bazel` (Bazel over HTTP)
+serve the same handlers as `/_api/v1/<product>/<org-slug>/<cache>`, which
+keeps working; every other path on that host is a Nix read.
 
 ### Migrating JWT-era tokens
 

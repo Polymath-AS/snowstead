@@ -30,6 +30,13 @@ impl Drop for Host {
 }
 
 async fn host(pool: &PgPool, storage: snowstead_server::storage::Storage) -> Host {
+    let token = seed(pool).await;
+    serve(pool, storage, token, false).await
+}
+
+/// Seeds the `alpha` organization's public and private Bazel caches and a token
+/// that reads and writes both. Run once per database. Returns the token.
+async fn seed(pool: &PgPool) -> String {
     sqlx::raw_sql("INSERT INTO orgs(id,slug,private_caches) VALUES ('bazel-org','alpha',true);
         INSERT INTO caches(name,org_id,is_public) VALUES ('public','bazel-org',true),('private','bazel-org',false);
         INSERT INTO cache_protocols(cache_id,protocol) SELECT id,'bazel' FROM caches;
@@ -45,23 +52,47 @@ async fn host(pool: &PgPool, storage: snowstead_server::storage::Storage) -> Hos
         .execute(pool)
         .await
         .unwrap();
-    let state = AppState::new(
-        pool.clone(),
-        Config::default(),
-        storage,
-        reqwest::Client::new(),
-    )
-    .unwrap();
+    format!("snowstead_tok_{id}_fixture")
+}
+
+/// Serves the seeded caches. With `org`, every request arrives with the
+/// organization Host `alpha.snowstead.com`; the `/_api/v1/…` addresses are
+/// unreachable on this server.
+async fn serve(
+    pool: &PgPool,
+    storage: snowstead_server::storage::Storage,
+    token: String,
+    org: bool,
+) -> Host {
+    let config = if org {
+        Config {
+            cache_host_suffix: "snowstead.com".into(),
+            cache_canonical_hosts: "api.snowstead.com".into(),
+            ..Default::default()
+        }
+    } else {
+        Config::default()
+    };
+    let state = AppState::new(pool.clone(), config, storage, reqwest::Client::new()).unwrap();
+    let app = router(state);
+    let app = if org {
+        app.layer(axum::middleware::map_request(
+            |mut request: axum::extract::Request| async move {
+                request
+                    .headers_mut()
+                    .insert("host", "alpha.snowstead.com".parse().unwrap());
+                request
+            },
+        ))
+    } else {
+        app
+    };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
-        axum::serve(listener, router(state)).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
-    Host {
-        url,
-        token: format!("snowstead_tok_{id}_fixture"),
-        task,
-    }
+    Host { url, token, task }
 }
 
 fn authorized<T>(body: T, host: &Host) -> Request<T> {
@@ -782,6 +813,43 @@ async fn native_bazel_upload_and_clean_remote_hit(pool: PgPool) {
             }
         }
         // HTTP and gRPC share the same action keys and outputs across clean builds.
+        assert_eq!(std::fs::read_to_string(root.join("executions")).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }).await.unwrap();
+}
+
+#[sqlx::test(migrator = "snowstead_server::migrations::MIGRATOR")]
+#[ignore = "requires Bazel 8 from the development shell"]
+async fn native_bazel_through_the_organization_host(pool: PgPool) {
+    let token = seed(&pool).await;
+    let host = serve(&pool, common::s3_storage(), token, true).await;
+    let bazel = std::env::var("BAZEL").unwrap_or_else(|_| "bazel".to_owned());
+    tokio::task::spawn_blocking(move || {
+        let root = std::env::temp_dir().join(format!("bazel-org-e2e-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("MODULE.bazel"), "module(name = 'cache_fixture')\n").unwrap();
+        std::fs::write(root.join("BUILD.bazel"), format!(
+            "genrule(name='artifact', outs=['artifact.bin'], cmd='dd if=/dev/zero of=$@ bs=1048576 count=9; echo executed >> {}/executions')\n",
+            root.display()
+        )).unwrap();
+        for protocol in ["http"] {
+            let endpoint = format!("{}/private/bazel", host.url);
+            for run in 0..2 {
+                let output = std::process::Command::new(&bazel)
+                    .current_dir(&root)
+                    .arg("--batch")
+                    .arg(format!("--output_user_root={}/{protocol}-{run}", root.display()))
+                    .args(["build", "//:artifact", "--spawn_strategy=local", "--remote_download_outputs=all"])
+                    .arg(format!("--remote_cache={endpoint}"))
+                    .arg(format!("--remote_header=Authorization=Bearer {}", host.token))
+                    .output().unwrap();
+                assert!(output.status.success(), "{protocol} run {run}: {}", String::from_utf8_lossy(&output.stderr));
+                assert_eq!(std::fs::metadata(root.join("bazel-bin/artifact.bin")).unwrap().len(), 9 * 1024 * 1024);
+                if run == 1 {
+                    assert!(String::from_utf8_lossy(&output.stderr).contains("remote cache hit"), "{}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        }
         assert_eq!(std::fs::read_to_string(root.join("executions")).unwrap().lines().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }).await.unwrap();
