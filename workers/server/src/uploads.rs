@@ -1276,15 +1276,14 @@ async fn session_authority(
         expected,
     )
     .fetch_optional(&mut **tx)
-    .await?
-    .map(|b| (b.authorized, b.work_id, b.claimed));
-    if matches!(batch, Some((false, ..))) {
+    .await?;
+    if batch.as_ref().is_some_and(|b| !b.authorized) {
         return Err(error(401, "Finalization authorization expired or replaced"));
     }
-    if expected.is_some() && !matches!(batch, Some((_, _, true))) {
+    if expected.is_some() && !batch.as_ref().is_some_and(|b| b.claimed) {
         return Err(error(409, "Finalization claim expired or replaced"));
     }
-    Ok(batch.and_then(|(_, claim, _)| claim))
+    Ok(batch.and_then(|b| b.work_id))
 }
 
 #[cfg_attr(feature = "profiling", hotpath::measure)]
